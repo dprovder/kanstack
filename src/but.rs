@@ -9,7 +9,7 @@ use std::process::Command;
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use crate::model::{CliError, MutationEnvelope, WorkspaceStatus};
+use crate::model::{CliError, MutationEnvelope, PushPreview, WorkspaceStatus};
 
 /// Oldest `but` whose JSON shape this was verified against.
 pub const MIN_VERSION: Version = Version {
@@ -160,10 +160,16 @@ impl But {
     }
 
     /// Runs `but rub SOURCE TARGET`, the CLI's combine primitive, and returns the
-    /// refreshed workspace from the same invocation.
+    /// refreshed workspace.
     ///
-    /// `--status-after` is what keeps a card move to a single round trip instead of a
-    /// mutation followed by a separate refresh.
+    /// Both a move and a squash are this same call — only the target id differs. Rubbing
+    /// onto a branch moves or stages; rubbing onto a commit squashes or amends.
+    ///
+    /// `--status-after` reports whether the mutation landed, but the status it embeds is
+    /// *not* equivalent to `but status -f`: it omits per-commit file lists, and `rub`
+    /// rejects `-f`, so there is no way to ask for them in the same invocation. A second
+    /// detailed query follows, which costs roughly another 90ms and is what keeps cards
+    /// from losing their file context the moment you move one.
     pub fn rub(&self, source: &str, target: &str) -> Result<WorkspaceStatus> {
         let raw = self.run(&["rub", source, target, "-j", "--status-after"])?;
         let env: MutationEnvelope = serde_json::from_str(raw.trim())
@@ -171,9 +177,184 @@ impl But {
         if let Some(err) = env.status_error {
             bail!("rub succeeded but the workspace refresh failed: {err}");
         }
-        env.status
-            .ok_or_else(|| anyhow!("`but rub` returned no status payload"))
+        if env.status.is_none() {
+            bail!("`but rub` returned no status payload");
+        }
+        self.status()
     }
+}
+
+impl But {
+    /// Commits the changes assigned to `branch`, and only those.
+    ///
+    /// `--only` is not optional here. Without it `but commit` also sweeps in every
+    /// *unassigned* change in the worktree — documented behaviour, and reasonable for a
+    /// command line, but wrong for a board: the entire point of dragging cards into a lane
+    /// is that the lane's contents are what gets committed. Omitting the flag silently
+    /// empties the backlog into whichever lane you happened to be standing on.
+    ///
+    /// The embedded status still lacks `-f` file lists, so a detailed query follows.
+    pub fn commit(&self, branch: &str, message: &str) -> Result<WorkspaceStatus> {
+        let raw = self.run(&[
+            "commit",
+            branch,
+            "-m",
+            message,
+            "--only",
+            "-j",
+            "--status-after",
+        ])?;
+        let env: MutationEnvelope = serde_json::from_str(raw.trim())
+            .with_context(|| format!("could not parse `but commit` output: {raw:.400}"))?;
+        if let Some(err) = env.status_error {
+            bail!("commit succeeded but the workspace refresh failed: {err}");
+        }
+        self.status()
+    }
+
+    /// Asks what a push would do, without doing it.
+    ///
+    /// The branch is always explicit. `but push` with no branch and a non-interactive
+    /// stdin does not prompt — it pushes *every* branch with unpushed commits, which is
+    /// not something a single keystroke should ever be able to trigger.
+    pub fn push_preview(&self, branch: &str) -> Result<PushPreview> {
+        let raw = self.run(&["push", branch, "-j", "--dry-run"])?;
+        serde_json::from_str(raw.trim())
+            .with_context(|| format!("could not parse `but push --dry-run` output: {raw:.400}"))
+    }
+
+    /// Creates a branch, optionally stacked on top of `anchor`.
+    ///
+    /// With no anchor the branch becomes its own lane, applied in parallel. With one, it
+    /// is stacked on top of that branch and shares its lane — which is what makes the two
+    /// gestures on a board different operations rather than the same one.
+    ///
+    /// `branch new` ignores `--status-after` the way `push` does (verified against 0.19.3:
+    /// the reply is just `{"branch":…,"anchor":…}`), so the board is queried separately.
+    pub fn branch_new(&self, name: &str, anchor: Option<&str>) -> Result<WorkspaceStatus> {
+        let mut args = vec!["branch", "new", name];
+        if let Some(a) = anchor {
+            args.push("--anchor");
+            args.push(a);
+        }
+        args.push("-j");
+        self.run(&args)?;
+        self.status()
+    }
+
+    /// Deletes a branch from the workspace.
+    pub fn branch_delete(&self, name: &str) -> Result<()> {
+        self.run(&["branch", "delete", name, "-j"])?;
+        Ok(())
+    }
+
+    /// Renames a branch. `reword` takes a commit *or* a branch as its target.
+    pub fn rename_branch(&self, current: &str, new_name: &str) -> Result<()> {
+        self.run(&["reword", current, "-m", new_name, "-j"])?;
+        Ok(())
+    }
+
+    /// Stacks an existing branch on top of another one.
+    ///
+    /// GitButler can do this — `but_api::branch::move_branch` — but only their TUI reaches
+    /// it; no `but` subcommand exposes it, and `rub` between two branches reassigns
+    /// uncommitted changes rather than restacking. So this composes the effect from four
+    /// operations that *are* exposed.
+    ///
+    /// Commits are moved oldest-first, and the workspace is re-queried before each one,
+    /// because CLI ids describe the current state and every move rebases whatever is left.
+    /// Taking "the oldest remaining commit" each time sidesteps the need for any id to
+    /// survive across a mutation.
+    ///
+    /// This rewrites history: moved commits get new SHAs, so a branch that was already
+    /// pushed will need a force push afterwards.
+    ///
+    /// Not atomic. If a step fails, the error says which one and what state that leaves,
+    /// rather than implying a clean rollback that did not happen.
+    pub fn restack_branch(&self, source: &str, target: &str) -> Result<WorkspaceStatus> {
+        if source == target {
+            bail!("a branch cannot be stacked on itself");
+        }
+        let status = self.status()?;
+        if find_branch(&status, source).is_none() {
+            bail!("no branch named {source}");
+        }
+        if find_branch(&status, target).is_none() {
+            bail!("no branch named {target}");
+        }
+
+        let temp = format!("{source}-restack-tmp");
+        if find_branch(&status, &temp).is_some() {
+            bail!("{temp} already exists — clean it up before restacking again");
+        }
+
+        self.branch_new(&temp, Some(target))
+            .with_context(|| format!("could not create {temp} on top of {target}"))?;
+
+        // Re-resolve every iteration: ids are state-dependent and each move rebases.
+        let total = find_branch(&status, source).map_or(0, |b| b.commits.len());
+        for moved in 0..total {
+            let status = self.status()?;
+            let Some(branch) = find_branch(&status, source) else {
+                break;
+            };
+            let Some(oldest) = branch.commits.last() else {
+                break;
+            };
+            // Full hash, not the CLI id: `rub` fuzzy-matches and short ids collide with
+            // branch names.
+            let id = oldest.commit_id.clone();
+            self.rub(&id, &temp).with_context(|| {
+                format!(
+                    "moved {moved} of {total} commits before failing; your work is split \
+                     between {source} and {temp}"
+                )
+            })?;
+        }
+
+        // Uncommitted changes assigned to the branch move with it. This is the one thing
+        // `rub` between branches *does* do.
+        let status = self.status()?;
+        if find_stack_of(&status, source).is_some_and(|s| !s.assigned_changes.is_empty()) {
+            self.rub(source, &temp)
+                .with_context(|| format!("could not move {source}'s staged changes to {temp}"))?;
+        }
+
+        self.branch_delete(source).with_context(|| {
+            format!("commits are on {temp} but {source} could not be deleted; \
+                     delete it and rename {temp} to finish")
+        })?;
+        self.rename_branch(&temp, source).with_context(|| {
+            format!("the restack worked but {temp} could not be renamed; \
+                     rename it to {source} to finish")
+        })?;
+
+        self.status()
+    }
+
+    /// Performs the push.
+    ///
+    /// `--status-after` is silently ignored by `push` (verified against 0.19.3: the
+    /// envelope simply does not appear), so the caller must refresh separately. Hook flags
+    /// are deliberately not passed: the spelling changed from `--run-hooks` to
+    /// `--no-hooks`, so naming either one would break on one side of that release.
+    pub fn push(&self, branch: &str) -> Result<()> {
+        self.run(&["push", branch, "-j"])?;
+        Ok(())
+    }
+}
+
+fn find_branch<'a>(s: &'a WorkspaceStatus, name: &str) -> Option<&'a crate::model::Branch> {
+    s.stacks
+        .iter()
+        .flat_map(|st| st.branches.iter())
+        .find(|b| b.name == name)
+}
+
+fn find_stack_of<'a>(s: &'a WorkspaceStatus, branch: &str) -> Option<&'a crate::model::Stack> {
+    s.stacks
+        .iter()
+        .find(|st| st.branches.iter().any(|b| b.name == branch))
 }
 
 /// Split out so it can be tested against captured output without spawning anything.

@@ -11,3 +11,4 @@ pub mod model;
 pub mod snapshot;
 pub mod theme;
 pub mod ui;
+pub mod watch;

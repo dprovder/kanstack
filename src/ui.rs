@@ -31,9 +31,93 @@ pub fn draw(f: &mut Frame, app: &App) {
     draw_board(f, app, chunks[1]);
     draw_footer(f, app, chunks[2]);
 
-    if app.mode == Mode::Help {
-        draw_help(f, f.area());
+    match app.mode {
+        Mode::Help => draw_help(f, f.area()),
+        Mode::PushConfirm => draw_push_confirm(f, app, f.area()),
+        _ => {}
     }
+}
+
+/// What a push is about to do. Shown before it happens because `but push` force-pushes by
+/// default, so the destination and the force flag need to be visible, not implied.
+fn draw_push_confirm(f: &mut Frame, app: &App, area: Rect) {
+    let Some(preview) = &app.push_preview else {
+        return;
+    };
+
+    let mut body = vec![Line::styled("  push", theme::muted()), Line::raw("")];
+    let mut any_force = false;
+
+    for b in &preview.branches {
+        let dest = format!("{}/{}", b.remote, b.branch_name);
+        body.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                format!("{} commit{}", b.unpushed_commits, if b.unpushed_commits == 1 { "" } else { "s" }),
+                theme::title(true),
+            ),
+            Span::styled("  →  ", theme::faint()),
+            Span::styled(dest, theme::tone(crate::board::Tone::Accent)),
+        ]));
+        if b.requires_force {
+            any_force = true;
+            body.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("force — this rewrites remote history", theme::tone(crate::board::Tone::Bad)),
+            ]));
+        }
+        if b.remote_ref.is_none() {
+            body.push(Line::styled("  new branch on the remote", theme::muted()));
+        }
+        for c in b.commits.iter().take(6) {
+            body.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(format!("{}  ", c.sha_short), theme::faint()),
+                Span::styled(
+                    truncate(c.message.lines().next().unwrap_or(""), 46),
+                    theme::muted(),
+                ),
+            ]));
+        }
+        if b.commits.len() > 6 {
+            body.push(Line::styled(
+                format!("    … and {} more", b.commits.len() - 6),
+                theme::faint(),
+            ));
+        }
+        body.push(Line::raw(""));
+    }
+
+    body.push(Line::styled(
+        if any_force {
+            "  ⏎ / y  push anyway      esc / n  cancel"
+        } else {
+            "  ⏎ / y  push      esc / n  cancel"
+        },
+        theme::faint(),
+    ));
+
+    let w = 64.min(area.width.saturating_sub(4));
+    let h = (body.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, popup);
+    f.render_widget(
+        Paragraph::new(body).block(
+            Block::bordered()
+                .border_style(if any_force {
+                    theme::tone(crate::board::Tone::Bad)
+                } else {
+                    theme::faint()
+                })
+                .style(Style::default().bg(theme::SELECTED_BG)),
+        ),
+        popup,
+    );
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
@@ -128,8 +212,11 @@ fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect) {
     let is_current = idx == app.col;
     let inner_w = area.width as usize;
 
-    // Header: dot, name, count.
-    let header = Line::from(vec![
+    // Header: dot, name, count. While moving, the header is itself a drop position, so it
+    // highlights when the drop cursor sits on it.
+    let header_is_target =
+        app.mode == Mode::Moving && is_current && app.target_card.is_none();
+    let mut header = Line::from(vec![
         Span::styled("● ", theme::status_dot(col.status)),
         Span::styled(
             truncate(&col.title, inner_w.saturating_sub(8)),
@@ -137,6 +224,9 @@ fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect) {
         ),
         Span::styled(format!("  {}", col.cards.len()), theme::faint()),
     ]);
+    if header_is_target {
+        header = header.style(Style::default().bg(theme::SELECTED_BG));
+    }
 
     let mut lines = vec![header];
 
@@ -178,8 +268,13 @@ fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect) {
             }
         }
 
-        let selected = is_current && ci == app.card;
-        let picked = app.mode == Mode::Moving && idx == app.origin_col && ci == app.card;
+        let picked = app.mode == Mode::Moving && idx == app.origin_col && ci == app.origin_card;
+        // In move mode the cursor marks the drop position, not the browsing position.
+        let selected = if app.mode == Mode::Moving {
+            is_current && app.target_card == Some(ci)
+        } else {
+            is_current && ci == app.card
+        };
         let start = lines.len();
         let card_lines = render_card(card, inner_w, selected, picked);
         if selected {
@@ -189,7 +284,10 @@ fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect) {
         lines.extend(card_lines);
     }
 
-    if col.cards.is_empty() {
+    // A branch lane already carries an "empty" status badge, so a placeholder underneath
+    // it just says the same thing twice. Only the backlog lane, which has no badges of its
+    // own, needs one.
+    if col.cards.is_empty() && col.badges.is_empty() {
         lines.push(Line::styled("  empty", theme::faint()));
     }
 
@@ -301,13 +399,61 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                 Paragraph::new(Line::from(vec![
                     Span::raw("  "),
                     Span::styled(action, theme::tone(crate::board::Tone::Accent)),
-                    Span::styled("   ←/→ pick lane · ⏎ confirm · esc cancel", theme::faint()),
+                    Span::styled(
+                        "   ←/→ lane · ↑/↓ drop on card · ⏎ confirm · esc cancel",
+                        theme::faint(),
+                    ),
                 ])),
                 area,
             );
         }
+        Mode::Commit => {
+            // The typed message with a block cursor, so the footer doubles as the input.
+            return f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("  message  ", theme::faint()),
+                    Span::styled(app.commit_input.clone(), theme::title(true)),
+                    Span::styled("█", theme::tone(crate::board::Tone::Accent)),
+                    Span::styled("   ⏎ commit · esc cancel", theme::faint()),
+                ])),
+                area,
+            );
+        }
+        Mode::Branch => {
+            // The pending action is named here for the same reason move mode names its
+            // verb: stacking and adding a parallel lane are different things.
+            return f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("  branch  ", theme::faint()),
+                    Span::styled(app.branch_input.clone(), theme::title(true)),
+                    Span::styled("█", theme::tone(crate::board::Tone::Accent)),
+                    Span::styled("   ", theme::faint()),
+                    Span::styled(
+                        app.pending_branch_action(),
+                        theme::tone(crate::board::Tone::Accent),
+                    ),
+                    Span::styled("   ⏎ create · tab switch · esc cancel", theme::faint()),
+                ])),
+                area,
+            );
+        }
+        Mode::Restacking => {
+            let action = app.pending_restack().unwrap_or_default();
+            return f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(action, theme::tone(crate::board::Tone::Accent)),
+                    Span::styled("  rewrites history", theme::tone(crate::board::Tone::Bad)),
+                    Span::styled("   ←/→ lane · ⏎ confirm · esc cancel", theme::faint()),
+                ])),
+                area,
+            );
+        }
+        Mode::PushConfirm => "",
         Mode::Help => "  esc close",
-        Mode::Normal => "  ←/→ lane · ↑/↓ card · m move · r refresh · ? help · q quit",
+        Mode::Normal => {
+            "  ←/→ lane · ↑/↓ card · m move · u unstage · c commit · b branch · s stack · p push · ? help"
+        }
     };
     f.render_widget(Paragraph::new(Line::styled(keys, theme::faint())), area);
 }
@@ -319,19 +465,35 @@ fn draw_help(f: &mut Frame, area: Rect) {
         help_row("←/→  h/l", "move between lanes"),
         help_row("↑/↓  j/k", "move between cards"),
         help_row("g / G", "first / last card"),
-        help_row("m", "pick up a card, then ←/→ and ⏎ to drop"),
-        help_row("r", "refresh from `but status`"),
+        help_row("m", "pick up a card"),
+        help_row("  then ←/→", "choose a lane"),
+        help_row("  then ↑/↓", "drop on the lane, or onto a card"),
+        help_row("  then ⏎", "confirm · esc cancels"),
+        help_row("u", "send this card back to the backlog — uncommit or unstage"),
+        help_row("c", "commit the staged files in this lane"),
+        help_row("b", "new branch — stacks on this lane, tab for parallel"),
+        help_row("s", "stack this whole lane onto another — rewrites history"),
+        help_row("p", "push this lane — shows what it will do first"),
         help_row("? / esc", "toggle this help"),
         help_row("q", "quit"),
         Line::raw(""),
-        Line::styled("  what a move does", theme::muted()),
+        Line::styled("  what a drop does", theme::muted()),
         Line::raw(""),
         help_row("commit → lane", "moves the commit to that branch"),
+        help_row("commit → commit", "squashes them together"),
         help_row("commit → unassigned", "uncommits it into the worktree"),
         help_row("file → lane", "stages it to that branch"),
+        help_row("file → commit", "amends it into that commit"),
         help_row("file → unassigned", "unstages it"),
         Line::raw(""),
-        Line::styled("  all moves run `but rub SOURCE TARGET`.", theme::faint()),
+        Line::styled(
+            "  every drop is one `but rub SOURCE TARGET`.",
+            theme::faint(),
+        ),
+        Line::styled(
+            "  the board follows the repo; no refresh key needed.",
+            theme::faint(),
+        ),
     ];
 
     let w = 62.min(area.width.saturating_sub(4));
@@ -445,6 +607,7 @@ mod tests {
     fn card_lines_are_padded_to_column_width() {
         let card = Card {
             cli_id: "d5".into(),
+            rub_id: "d5aa11bb".into(),
             title: "Add auth middleware".into(),
             subtitle: Some("a.txt".into()),
             badges: vec![],

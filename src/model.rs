@@ -201,6 +201,45 @@ pub enum CiConclusion {
     Unknown,
 }
 
+/// Output of `but push <branch> -j`, with or without `--dry-run`.
+///
+/// The dry-run form is the useful one: it reports exactly what a push would do, including
+/// whether it needs a force, without doing it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PushPreview {
+    #[serde(default)]
+    pub branches: Vec<PushBranch>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PushBranch {
+    pub branch_name: String,
+    #[serde(default)]
+    pub stack_name: Option<String>,
+    #[serde(default)]
+    pub unpushed_commits: usize,
+    pub remote: String,
+    /// Absent until the branch exists on the remote.
+    #[serde(default)]
+    pub remote_ref: Option<String>,
+    #[serde(default)]
+    pub commits: Vec<PushCommit>,
+    /// Whether the push rewrites remote history. `but push` force-pushes by default, so
+    /// this is the flag worth putting in front of someone before they confirm.
+    #[serde(default)]
+    pub requires_force: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PushCommit {
+    pub sha_short: String,
+    pub sha: String,
+    pub message: String,
+}
+
 /// Structured error payload `but` emits on stdout in `--json` mode, e.g. when the
 /// current directory is not a GitButler project.
 #[derive(Debug, Clone, Deserialize)]

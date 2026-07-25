@@ -43,8 +43,12 @@ kanstack
 | `←/→`, `h/l` | move between lanes |
 | `↑/↓`, `j/k` | move between cards |
 | `g` / `G` | first / last card |
-| `m` | pick up a card, then `←/→` and `⏎` to drop it |
-| `r` | refresh |
+| `m` | pick up a card, then `←/→` for a lane, `↑/↓` to drop on a card, `⏎` to confirm |
+| `u` | send this card back to the backlog — uncommit a commit, unstage a file |
+| `c` | commit the files staged to this lane (only what is staged) |
+| `b` | new branch — stacks on the selected lane, `tab` for a parallel lane |
+| `s` | stack this whole lane onto another — rewrites history |
+| `p` | push this lane — shows what it will do first |
 | `?` | help |
 | `q` | quit |
 
@@ -52,23 +56,41 @@ Every move runs `but rub SOURCE TARGET`, and the footer spells out what will hap
 you confirm — dropping a commit on the backlog lane is an *uncommit*, not a move, and that
 should never be a surprise.
 
-| drag | result |
+| drop | result |
 |---|---|
 | commit → lane | move the commit to that branch |
+| commit → commit | squash them together |
 | commit → unassigned | uncommit it into the worktree |
 | file → lane | stage it to that branch |
+| file → commit | amend it into that commit |
 | file → unassigned | unstage it |
+
+Squash and amend are not separate features — they are the same `rub`, aimed at a card
+instead of a lane. `u` is the same again, aimed at the backlog.
+
+**Committing takes only what is staged to the lane.** `but commit` otherwise sweeps in
+every unassigned change as well — documented, sensible for a command line, and wrong for a
+board, where putting cards in a lane is precisely how you say what belongs in the commit.
+kanstack always passes `--only`.
 
 ## How it talks to GitButler
 
 `kanstack` links no GitButler code. It spawns the `but` binary you installed and reads its
 documented JSON output — `but status -f -j` to read, `but rub … -j --status-after` to
-write. That last flag returns the refreshed workspace from the same invocation, so a card
-move costs one round trip instead of a mutation plus a reload.
+write.
 
-Navigation never shells out, so arrow keys are instant. Only mutations and `r` do, at
-roughly 90ms, which measurement suggests is dominated by fixed startup rather than
-repository size (`tests/live.rs` guards this).
+`--status-after` reports whether a mutation landed, but the status it embeds is not
+equivalent to `but status -f`: it omits per-commit file lists, and `rub` rejects `-f`, so
+they cannot be had in one invocation. A move therefore costs two queries, roughly 180ms.
+
+Navigation never shells out, so arrow keys are instant. `but status` is around 90ms and
+measurement suggests it is dominated by fixed startup rather than repository size
+(`tests/live.rs` guards this).
+
+**There is no refresh key.** A filesystem watcher follows the worktree and `.git`, so the
+board tracks changes made in your editor or another terminal on its own. The watch
+respects `.gitignore`, which is what stops one `cargo build` from drowning it in `target/`
+events.
 
 ### Version compatibility
 
@@ -117,7 +139,71 @@ CLI. Not yet built:
 - **CI and review badges are unverified.** The wire types are bound and rendered, but every
   workspace tested so far had no forge attached, so `ci` and `reviewId` were always null.
   If you use this with real PRs, that is where bugs will be.
-- Commit creation, push, and squash. Today those stay in the CLI.
+- `land`, which skips the pull request entirely. Deliberately not bound yet: it rewrites
+  trunk, and deserves more than a keystroke.
+- Reordering commits within a lane.
+
+## Restacking an existing branch
+
+`s` stacks one existing lane onto another. There is no `but` command for this: the
+capability exists in `but_api::branch::move_branch` and their own TUI uses it, but no
+subcommand exposes it, and `rub` between two branches reassigns *uncommitted changes*
+rather than restacking. So `s` composes the effect from four calls that are exposed:
+
+```sh
+but branch new <tmp> --anchor <target>   # a stacked branch on the target
+but rub <commit> <tmp>                   # move each commit, oldest first
+but branch delete <source>               # drop the emptied branch
+but reword <tmp> -m <source>             # rename back, so the name survives
+```
+
+Commits are re-resolved from a fresh `but status` before each move, because CLI ids
+describe the current state and every move rebases what is left.
+
+**This rewrites history.** Moved commits get new SHAs, so a lane that was already pushed
+will need a force push afterwards — the push preview will say so. And it is not atomic: if
+a step fails, the error names which one and what state that leaves, rather than implying a
+rollback that did not happen.
+
+## Identifiers, and the fuzzy-matching trap
+
+`but rub` re-resolves its arguments with fuzzy matching, and refuses rather than guessing
+when more than one thing matches. A two-character commit id like `ea` matches the branch
+`feat`, because the branch *name* contains those characters — which is fatal for a
+non-interactive caller.
+
+So the ids shown on cards are not the ids sent to `but`. Commits are rubbed by full hash,
+lanes by branch name; only file changes use their CLI id, having no alternative.
+
+## Push, and why it asks first
+
+`p` runs `but push <branch> --dry-run` and shows you the result before doing anything —
+destination, commit list, and whether a force is involved. That is not ceremony:
+
+- **`but push` force-pushes by default.** `--with-force` is `default_value_t = true`.
+- **A branch is always named explicitly.** With no branch and a non-interactive stdin,
+  `but push` does not prompt — it pushes *every* branch with unpushed commits.
+- **With GitHub native stacked PRs**, a stack push temporarily retargets open PRs onto
+  trunk, which has been able to transiently merge or close them. Opt-in, and fixed
+  upstream in July 2026, but worth knowing.
+
+Hook flags are deliberately never passed: the spelling changed from `--run-hooks` to
+`--no-hooks`, so naming either one breaks on one side of that release.
+
+## Which commands honour `--status-after`
+
+Not all of them, despite the flag being accepted everywhere. Verified against 0.19.3:
+
+| command | `-j --status-after` |
+|---|---|
+| `commit` | returns `{result, status}` |
+| `rub` | returns `{result, status}` |
+| `push` | flag accepted, silently ignored |
+| `branch new` | flag accepted, silently ignored |
+
+The two that ignore it get a separate `but status` call afterwards. And even where the
+envelope does arrive, its status omits per-commit file lists, so a detailed query follows
+regardless.
 
 ## Licence and relationship to GitButler
 

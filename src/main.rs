@@ -10,8 +10,9 @@ use std::time::Duration;
 use anyhow::Result;
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 
-use kanstack::app::App;
+use kanstack::app::{App, Mode, Notice};
 use kanstack::but::But;
+use kanstack::watch::Watcher;
 use kanstack::{snapshot, ui};
 
 const HELP: &str = "\
@@ -102,27 +103,53 @@ fn main() -> Result<()> {
     let but = But::discover(&cwd)?;
     let mut app = App::new(but)?;
 
+    // A failed watch is not fatal: the board still works, it just stops following the
+    // repository on its own. Say so rather than dying or silently going stale.
+    let mut watcher = match Watcher::new(&cwd) {
+        Ok(w) => Some(w),
+        Err(e) => {
+            app.notify(
+                format!("not watching for changes ({e}); the board may go stale"),
+                Notice::Error,
+            );
+            None
+        }
+    };
+
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, &mut app);
+    let result = run(&mut terminal, &mut app, &mut watcher);
     ratatui::restore();
     result
 }
 
-fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
+fn run(
+    terminal: &mut ratatui::DefaultTerminal,
+    app: &mut App,
+    watcher: &mut Option<Watcher>,
+) -> Result<()> {
     loop {
         terminal.draw(|f| ui::draw(f, app))?;
 
-        // A poll timeout keeps the loop responsive to resizes without busy-waiting.
-        if !event::poll(Duration::from_millis(250))? {
-            continue;
+        // Short timeout so the watcher gets looked at promptly; it is the thing that keeps
+        // the board current, which is why there is no refresh key.
+        if event::poll(Duration::from_millis(100))? {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => app.on_key(key),
+                Event::Resize(_, _) => {}
+                _ => {}
+            }
+            if app.should_quit {
+                return Ok(());
+            }
         }
-        match event::read()? {
-            Event::Key(key) if key.kind == KeyEventKind::Press => app.on_key(key),
-            Event::Resize(_, _) => {}
-            _ => {}
-        }
-        if app.should_quit {
-            return Ok(());
+
+        // Don't yank the board out from under a move in progress.
+        if app.mode != Mode::Moving {
+            if let Some(w) = watcher.as_mut() {
+                if w.poll() {
+                    app.refresh_quietly();
+                }
+            }
         }
     }
 }
