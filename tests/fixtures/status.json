@@ -1,5 +1,5 @@
 {
-  "unassignedChanges": [
+  "uncommittedChanges": [
     {
       "cliId": "mv",
       "filePath": "wip1.txt",
@@ -13,43 +13,26 @@
   ],
   "stacks": [
     {
-      "cliId": "k0",
+      "cliId": "m0",
       "assignedChanges": [],
       "branches": [
         {
-          "cliId": "au",
-          "name": "feat-auth",
+          "cliId": "fi",
+          "name": "fix-flaky-tests",
           "commits": [
             {
-              "cliId": "d5",
-              "commitId": "d593db0766d563ee2756d8971e3fd96cc63438fa",
-              "createdAt": "2026-07-25T02:29:57+00:00",
-              "message": "Wire session refresh into gateway",
+              "cliId": "cf",
+              "commitId": "cfbd894e8633d30dff5ccabbd49aefe9dcf3063c",
+              "createdAt": "2026-07-25T02:29:58+00:00",
+              "message": "Deflake worktree integration suite",
               "authorName": "Dani",
               "authorEmail": "d@e.com",
               "conflicted": false,
               "reviewId": null,
               "changes": [
                 {
-                  "cliId": "d5:nn",
-                  "filePath": "a2.txt",
-                  "changeType": "added"
-                }
-              ]
-            },
-            {
-              "cliId": "e1",
-              "commitId": "e17b60c84da4faf84301db4986d962a57ec807da",
-              "createdAt": "2026-07-25T02:29:57+00:00",
-              "message": "Add auth middleware",
-              "authorName": "Dani",
-              "authorEmail": "d@e.com",
-              "conflicted": false,
-              "reviewId": null,
-              "changes": [
-                {
-                  "cliId": "e1:nk",
-                  "filePath": "a.txt",
+                  "cliId": "cf:qs",
+                  "filePath": "d.txt",
                   "changeType": "added"
                 }
               ]
@@ -113,26 +96,43 @@
       ]
     },
     {
-      "cliId": "m0",
+      "cliId": "k0",
       "assignedChanges": [],
       "branches": [
         {
-          "cliId": "fi",
-          "name": "fix-flaky-tests",
+          "cliId": "au",
+          "name": "feat-auth",
           "commits": [
             {
-              "cliId": "cf",
-              "commitId": "cfbd894e8633d30dff5ccabbd49aefe9dcf3063c",
-              "createdAt": "2026-07-25T02:29:58+00:00",
-              "message": "Deflake worktree integration suite",
+              "cliId": "d5",
+              "commitId": "d593db0766d563ee2756d8971e3fd96cc63438fa",
+              "createdAt": "2026-07-25T02:29:57+00:00",
+              "message": "Wire session refresh into gateway",
               "authorName": "Dani",
               "authorEmail": "d@e.com",
               "conflicted": false,
               "reviewId": null,
               "changes": [
                 {
-                  "cliId": "cf:qs",
-                  "filePath": "d.txt",
+                  "cliId": "d5:nn",
+                  "filePath": "a2.txt",
+                  "changeType": "added"
+                }
+              ]
+            },
+            {
+              "cliId": "e1",
+              "commitId": "e17b60c84da4faf84301db4986d962a57ec807da",
+              "createdAt": "2026-07-25T02:29:57+00:00",
+              "message": "Add auth middleware",
+              "authorName": "Dani",
+              "authorEmail": "d@e.com",
+              "conflicted": false,
+              "reviewId": null,
+              "changes": [
+                {
+                  "cliId": "e1:nk",
+                  "filePath": "a.txt",
                   "changeType": "added"
                 }
               ]

@@ -1,8 +1,9 @@
 //! Application state and input handling.
 //!
 //! Navigation is pure in-memory so arrow keys never wait on a subprocess. Only mutations
-//! shell out, and those fold their refresh into the same call via `--status-after`, so a
-//! card move costs one round trip rather than a mutation plus a reload.
+//! shell out, and `rub`/`commit`/`move` fold their refresh into the same call by embedding
+//! a status in their reply, so a card move costs one round trip rather than a mutation plus
+//! a reload.
 
 use anyhow::Result;
 
@@ -12,7 +13,7 @@ use std::collections::HashMap;
 
 use crate::cmux::Cmux;
 use crate::diff::DiffView;
-use crate::model::{PullPreview, PushPreview};
+use crate::model::{MergeCheck, PullPreview, PushPreview};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -27,6 +28,8 @@ pub enum Mode {
     Restacking,
     /// Looking at what a push would do, before doing it.
     PushConfirm,
+    /// Looking at what landing a lane onto the target would do, before doing it.
+    LandConfirm,
     /// Confirming a lane deletion.
     DeleteConfirm,
     /// Looking at what rebasing onto the updated target would do.
@@ -67,6 +70,9 @@ pub struct App {
     pub stack_onto: Option<String>,
     /// What a push would do, valid while `mode == PushConfirm`.
     pub push_preview: Option<PushPreview>,
+    /// What landing the selected lane onto the target would do, valid while
+    /// `mode == LandConfirm`.
+    pub land_check: Option<MergeCheck>,
     /// What a rebase onto the updated target would do, valid while `mode == RebaseConfirm`.
     pub pull_preview: Option<PullPreview>,
     /// The diff being read, valid while `mode == Diff`.
@@ -115,6 +121,7 @@ impl App {
             branch_input: String::new(),
             stack_onto: None,
             push_preview: None,
+            land_check: None,
             pull_preview: None,
             diff: None,
             diff_full: false,
@@ -142,6 +149,7 @@ impl App {
             branch_input: String::new(),
             stack_onto: None,
             push_preview: None,
+            land_check: None,
             pull_preview: None,
             diff: None,
             diff_full: false,
@@ -676,9 +684,12 @@ impl App {
 
     /// Describes what deleting the selected lane would do.
     ///
-    /// `but` refuses outright when a delete would orphan commits, so nothing here can lose
-    /// work. What it *can* lose is the branch as a separate reviewable unit: deleting a
-    /// branch inside a stack folds its commits into the branch above. Worth stating.
+    /// `d` always deletes the lane's tip branch. Whether that branch is alone or stacked
+    /// on others, deleting it discards *its own* commits outright — there is no folding
+    /// into the branch below (verified against 0.21.2; earlier `but` folded a mid-stack
+    /// branch's commits upward and refused a lone branch with unpushed commits
+    /// non-interactively, neither of which happens now). `but undo` is the safety net
+    /// instead, so the confirmation says that rather than implying nothing can be lost.
     pub fn pending_delete(&self) -> Option<(String, String)> {
         let col = self.board.columns.get(self.col)?;
         let name = col.branch_name.clone()?;
@@ -689,18 +700,9 @@ impl App {
             .unwrap_or(col.cards.len());
         let detail = if commits == 0 {
             "it is empty".to_string()
-        } else if col.sections.len() > 1 {
-            format!(
-                "its {commits} commit{} fold into {}",
-                if commits == 1 { "" } else { "s" },
-                col.sections
-                    .get(1)
-                    .map(|s| s.name.as_str())
-                    .unwrap_or("the branch below")
-            )
         } else {
             format!(
-                "{commits} commit{} — but will refuse if this would orphan them",
+                "discards {commits} commit{} — recoverable with `but undo`",
                 if commits == 1 { "" } else { "s" }
             )
         };
@@ -932,6 +934,61 @@ impl App {
         }
     }
 
+    /// Asks `but` whether landing the selected lane onto the target would be clean, and
+    /// shows that before landing.
+    ///
+    /// `but land` has no dry-run of its own, so this is `branch show --check` instead —
+    /// read-only, so nothing moves until the preview has been seen and confirmed. Landing
+    /// rewrites the target branch, which is a shared one, so the same "see it before it
+    /// happens" rule as push applies here, more so — landing pushes directly to a real
+    /// remote's target, bypassing any pull-request review entirely.
+    fn begin_land(&mut self) {
+        let Some((branch, title)) = self.selected_branch() else {
+            self.notify(
+                "pick a lane to land — the backlog has no branch",
+                Notice::Info,
+            );
+            return;
+        };
+        let Some(but) = &self.but else {
+            self.notify("snapshot is read-only", Notice::Info);
+            return;
+        };
+        match but.merge_check(&branch) {
+            Ok(check) => {
+                if check.commits_ahead == 0 {
+                    self.notify(format!("{title} has nothing to land"), Notice::Info);
+                    return;
+                }
+                self.land_check = Some(check);
+                self.mode = Mode::LandConfirm;
+            }
+            Err(e) => self.notify(format!("{e}"), Notice::Error),
+        }
+    }
+
+    fn confirm_land(&mut self) {
+        let Some((branch, title)) = self.selected_branch() else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        self.mode = Mode::Normal;
+        self.land_check = None;
+
+        let Some(but) = &self.but else {
+            self.notify("snapshot is read-only", Notice::Info);
+            return;
+        };
+        match but.land(&branch) {
+            Ok(status) => {
+                self.board = Self::board_from(but, &mut self.commit_stats, &status);
+                self.clamp();
+                self.notify(format!("landed {title} onto the target"), Notice::Success);
+            }
+            Err(e) => self.notify(format!("{e}"), Notice::Error),
+        }
+    }
+
     pub fn on_key(&mut self, key: ratatui::crossterm::event::KeyEvent) {
         use ratatui::crossterm::event::KeyCode as K;
 
@@ -979,6 +1036,19 @@ impl App {
                     self.mode = Mode::Normal;
                     self.push_preview = None;
                     self.notify("push cancelled", Notice::Info);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if self.mode == Mode::LandConfirm {
+            match key.code {
+                K::Enter | K::Char('y') => self.confirm_land(),
+                K::Esc | K::Char('n') | K::Char('q') => {
+                    self.mode = Mode::Normal;
+                    self.land_check = None;
+                    self.notify("land cancelled", Notice::Info);
                 }
                 _ => {}
             }
@@ -1108,6 +1178,7 @@ impl App {
             K::Char('m') if self.mode == Mode::Normal => self.begin_move(),
             K::Char('c') if self.mode == Mode::Normal => self.begin_commit(),
             K::Char('p') if self.mode == Mode::Normal => self.begin_push(),
+            K::Char('M') if self.mode == Mode::Normal => self.begin_land(),
             K::Char('b') if self.mode == Mode::Normal => self.begin_branch(),
             K::Char('s') if self.mode == Mode::Normal => self.begin_restack(),
             K::Char('u') if self.mode == Mode::Normal => self.send_to_backlog(),

@@ -52,6 +52,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     match app.mode {
         Mode::Help => draw_help(f, f.area()),
         Mode::PushConfirm => draw_push_confirm(f, app, f.area()),
+        Mode::LandConfirm => draw_land_confirm(f, app, f.area()),
         Mode::DeleteConfirm => draw_delete_confirm(f, app, f.area()),
         Mode::RebaseConfirm => draw_rebase_confirm(f, app, f.area()),
         // The board keeps its half unless the diff is expanded, so reading a diff does not
@@ -251,7 +252,7 @@ fn draw_rebase_confirm(f: &mut Frame, app: &App, area: Rect) {
                 } else {
                     theme::faint()
                 })
-                .style(Style::default().bg(theme::SELECTED_BG)),
+                .style(theme::selected_bg()),
         ),
         popup,
     );
@@ -291,7 +292,7 @@ fn draw_delete_confirm(f: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(body).block(
             Block::bordered()
                 .border_style(theme::tone(crate::board::Tone::Warn))
-                .style(Style::default().bg(theme::SELECTED_BG)),
+                .style(theme::selected_bg()),
         ),
         popup,
     );
@@ -373,7 +374,97 @@ fn draw_push_confirm(f: &mut Frame, app: &App, area: Rect) {
                 } else {
                     theme::faint()
                 })
-                .style(Style::default().bg(theme::SELECTED_BG)),
+                .style(theme::selected_bg()),
+        ),
+        popup,
+    );
+}
+
+/// What landing the selected lane onto the target would do. `but land` has no
+/// `--dry-run`, so this is built from `branch show --check` instead — the commits that
+/// would land, and whether they land cleanly.
+fn draw_land_confirm(f: &mut Frame, app: &App, area: Rect) {
+    let Some(check) = &app.land_check else {
+        return;
+    };
+
+    let mut body = vec![
+        Line::styled("  land onto target", theme::muted()),
+        Line::raw(""),
+    ];
+    body.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            format!(
+                "{} commit{}",
+                check.commits_ahead,
+                if check.commits_ahead == 1 { "" } else { "s" }
+            ),
+            theme::title(true),
+        ),
+    ]));
+    for c in check.commits.iter().take(6) {
+        body.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(format!("{}  ", c.short_sha), theme::faint()),
+            Span::styled(truncate(c.subject(), 46), theme::muted()),
+        ]));
+    }
+    if check.commits.len() > 6 {
+        body.push(Line::styled(
+            format!("    … and {} more", check.commits.len() - 6),
+            theme::faint(),
+        ));
+    }
+
+    body.push(Line::raw(""));
+    let conflicted = !check.merge_check.merges_cleanly;
+    if conflicted {
+        body.push(Line::styled(
+            "  conflicts on land",
+            theme::tone(crate::board::Tone::Bad),
+        ));
+        for path in check.merge_check.conflicting_files.iter().take(6) {
+            body.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(truncate(path, 46), theme::muted()),
+            ]));
+        }
+    } else {
+        body.push(Line::styled(
+            "  lands cleanly",
+            theme::tone(crate::board::Tone::Good),
+        ));
+    }
+
+    body.push(Line::raw(""));
+    body.push(Line::styled(
+        if conflicted {
+            "  ⏎ / y  land anyway      esc / n  cancel"
+        } else {
+            "  ⏎ / y  land      esc / n  cancel"
+        },
+        theme::faint(),
+    ));
+
+    let w = 62.min(area.width.saturating_sub(4));
+    let h = (body.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, popup);
+    f.render_widget(
+        Paragraph::new(body).block(
+            Block::bordered()
+                .border_style(if conflicted {
+                    theme::tone(crate::board::Tone::Bad)
+                } else {
+                    theme::faint()
+                })
+                .style(theme::selected_bg()),
         ),
         popup,
     );
@@ -511,7 +602,7 @@ fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect) {
         header.push_span(Span::styled(format!(" -{r}"), theme::tone(crate::board::Tone::Bad)));
     }
     if header_is_target {
-        header = header.style(Style::default().bg(theme::SELECTED_BG));
+        header = header.style(theme::selected_bg());
     }
 
     let mut lines = vec![header];
@@ -808,7 +899,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                 area,
             );
         }
-        Mode::PushConfirm | Mode::DeleteConfirm | Mode::RebaseConfirm => "",
+        Mode::PushConfirm | Mode::LandConfirm | Mode::DeleteConfirm | Mode::RebaseConfirm => "",
         Mode::Diff => {
             let stageable = app
                 .diff
@@ -829,7 +920,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         }
         Mode::Help => "  esc close",
         Mode::Normal => {
-            "  ←/→ lane · ↑/↓ card · m move · u unstage · c commit · b branch · s stack · ⏎ diff · d delete · r rebase · p push · ?"
+            "  ←/→ lane · ↑/↓ card · m move · u unstage · c commit · b branch · s stack · ⏎ diff · d delete · r rebase · p push · M land · ?"
         }
     };
     f.render_widget(Paragraph::new(Line::styled(keys, theme::faint())), area);
@@ -854,6 +945,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         help_row("b", "new branch — stacks on this lane, tab for parallel"),
         help_row("s", "stack this whole lane onto another — rewrites history"),
         help_row("p", "push this lane — shows what it will do first"),
+        help_row("M", "land this lane onto the target — no PR, shows what will happen first"),
         help_row("? / esc", "toggle this help"),
         help_row("q", "quit"),
         Line::raw(""),

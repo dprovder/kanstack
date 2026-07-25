@@ -153,6 +153,74 @@ mod tests {
         );
     }
 
+    /// The land confirm dialog has no live CLI counterpart to snapshot against, so its
+    /// content is pinned here: the commit list, and the clean/conflicted framing that
+    /// decides whether it reads "land" or "land anyway".
+    #[test]
+    fn land_confirm_shows_commits_and_a_clean_verdict() {
+        use crate::app::Mode;
+        use crate::model::{MergeCheck, MergeCheckCommit, MergeCheckResult};
+
+        let status =
+            crate::but::parse_status(include_str!("../tests/fixtures/status.json")).unwrap();
+        let mut app = App::from_board(Board::from_status(&status));
+        app.mode = Mode::LandConfirm;
+        app.land_check = Some(MergeCheck {
+            commits_ahead: 1,
+            commits: vec![MergeCheckCommit {
+                short_sha: "67d01c0".into(),
+                message: "theme passthrough from parent terminal".into(),
+            }],
+            merge_check: MergeCheckResult {
+                merges_cleanly: true,
+                conflicting_files: Vec::new(),
+            },
+        });
+
+        let mut t = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        t.draw(|f| crate::ui::draw(f, &app)).unwrap();
+        let out = plain(&to_ansi(t.backend().buffer()));
+
+        assert!(out.contains("land onto target"));
+        assert!(out.contains("67d01c0"));
+        assert!(out.contains("theme passthrough from parent terminal"));
+        assert!(out.contains("lands cleanly"));
+        assert!(out.contains("⏎ / y  land"));
+        assert!(!out.contains("land anyway"), "a clean land must not warn:\n{out}");
+    }
+
+    /// A conflicted land must read differently, not just differently-coloured: the
+    /// verdict says "conflicts" and the confirm line says "land anyway".
+    #[test]
+    fn land_confirm_names_conflicting_files() {
+        use crate::app::Mode;
+        use crate::model::{MergeCheck, MergeCheckCommit, MergeCheckResult};
+
+        let status =
+            crate::but::parse_status(include_str!("../tests/fixtures/status.json")).unwrap();
+        let mut app = App::from_board(Board::from_status(&status));
+        app.mode = Mode::LandConfirm;
+        app.land_check = Some(MergeCheck {
+            commits_ahead: 1,
+            commits: vec![MergeCheckCommit {
+                short_sha: "abc1234".into(),
+                message: "Touch a contested file".into(),
+            }],
+            merge_check: MergeCheckResult {
+                merges_cleanly: false,
+                conflicting_files: vec!["src/app.rs".into()],
+            },
+        });
+
+        let mut t = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        t.draw(|f| crate::ui::draw(f, &app)).unwrap();
+        let out = plain(&to_ansi(t.backend().buffer()));
+
+        assert!(out.contains("conflicts on land"));
+        assert!(out.contains("src/app.rs"));
+        assert!(out.contains("land anyway"));
+    }
+
     /// Counts belong on cards, on each branch of a stack, and on the lane — not just one
     /// lump for the whole lane, which said nothing about which branch was big.
     #[test]

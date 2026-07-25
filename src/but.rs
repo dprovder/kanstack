@@ -10,20 +10,25 @@ use std::process::Command;
 use anyhow::{anyhow, bail, Context, Result};
 
 use crate::model::{
-    CliError, DiffOutput, MutationEnvelope, PullPreview, PushPreview, WorkspaceStatus,
+    CliError, DiffOutput, MergeCheck, MutationEnvelope, PullPreview, PushPreview, WorkspaceStatus,
 };
 
 /// Oldest `but` whose JSON shape this was verified against.
+///
+/// 0.21 dropped `-j`/`--json` and `--status-after` in favour of `--format json`, which is
+/// not a syntax older `but` understands — there is no flag spelling that works on both
+/// sides of that release, so this client picks a side rather than branching on version at
+/// every call site.
 pub const MIN_VERSION: Version = Version {
     major: 0,
-    minor: 19,
+    minor: 21,
     patch: 0,
 };
 /// Newest `but` actually exercised while building this. Newer is allowed but noted.
 pub const VERIFIED_THROUGH: Version = Version {
     major: 0,
-    minor: 19,
-    patch: 3,
+    minor: 21,
+    patch: 2,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -132,8 +137,11 @@ impl But {
 
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
 
-        // In --json mode `but` reports failures as a structured object on stdout. Prefer
-        // that over the exit code, since it carries a usable message and hint.
+        // In JSON format `but` sometimes reports failures as a structured object on
+        // stdout; prefer that over the exit code when present, since it carries a usable
+        // message and hint. Other failures (verified against 0.21.2, e.g. `land` onto a
+        // branch that doesn't exist) arrive as plain text on stderr instead, which the
+        // exit-code branch below handles.
         if let Ok(err) = serde_json::from_str::<CliError>(stdout.trim()) {
             let mut msg = format!("{}: {}", err.error, err.message);
             if let Some(hint) = err.hint {
@@ -161,7 +169,7 @@ impl But {
     /// Reads the whole workspace. `-f` includes per-commit file lists and costs nothing
     /// measurable, so it is always on.
     pub fn status(&self) -> Result<WorkspaceStatus> {
-        let raw = self.run(&["status", "-f", "-j"])?;
+        let raw = self.run(&["status", "-f", "--format", "json"])?;
         parse_status(&raw)
     }
 
@@ -171,13 +179,13 @@ impl But {
     /// Both a move and a squash are this same call — only the target id differs. Rubbing
     /// onto a branch moves or stages; rubbing onto a commit squashes or amends.
     ///
-    /// `--status-after` reports whether the mutation landed, but the status it embeds is
-    /// *not* equivalent to `but status -f`: it omits per-commit file lists, and `rub`
-    /// rejects `-f`, so there is no way to ask for them in the same invocation. A second
+    /// Mutating commands embed a status in their reply by default now (0.21 dropped the
+    /// old opt-in `--status-after` flag entirely), but that embedded status still omits
+    /// per-commit file lists — `rub` has no `-f` of its own to ask for them. A second
     /// detailed query follows, which costs roughly another 90ms and is what keeps cards
     /// from losing their file context the moment you move one.
     pub fn rub(&self, source: &str, target: &str) -> Result<WorkspaceStatus> {
-        let raw = self.run(&["rub", source, target, "-j", "--status-after"])?;
+        let raw = self.run(&["rub", source, target, "--format", "json"])?;
         let env: MutationEnvelope = serde_json::from_str(raw.trim())
             .with_context(|| format!("could not parse `but rub` output: {raw:.400}"))?;
         if let Some(err) = env.status_error {
@@ -207,8 +215,8 @@ impl But {
             "-m",
             message,
             "--only",
-            "-j",
-            "--status-after",
+            "--format",
+            "json",
         ])?;
         let env: MutationEnvelope = serde_json::from_str(raw.trim())
             .with_context(|| format!("could not parse `but commit` output: {raw:.400}"))?;
@@ -224,9 +232,22 @@ impl But {
     /// stdin does not prompt — it pushes *every* branch with unpushed commits, which is
     /// not something a single keystroke should ever be able to trigger.
     pub fn push_preview(&self, branch: &str) -> Result<PushPreview> {
-        let raw = self.run(&["push", branch, "-j", "--dry-run"])?;
+        let raw = self.run(&["push", branch, "--dry-run", "--format", "json"])?;
         serde_json::from_str(raw.trim())
             .with_context(|| format!("could not parse `but push --dry-run` output: {raw:.400}"))
+    }
+
+    /// Checks whether landing `branch` onto the target would be clean, without doing it.
+    ///
+    /// `but land` has no `--dry-run` of its own — `branch show --check` is the closest
+    /// thing to one: it reports the commits that would land and whether they merge
+    /// cleanly. (0.21 also fixed the branch-id cache bug this used to need a `but branch`
+    /// priming call to work around; `branch show` resolves names on its own now.)
+    pub fn merge_check(&self, branch: &str) -> Result<MergeCheck> {
+        let raw = self.run(&["branch", "show", branch, "--check", "--format", "json"])?;
+        serde_json::from_str(raw.trim()).with_context(|| {
+            format!("could not parse `but branch show --check` output: {raw:.400}")
+        })
     }
 
     /// Creates a branch, optionally stacked on top of `anchor`.
@@ -235,29 +256,31 @@ impl But {
     /// is stacked on top of that branch and shares its lane — which is what makes the two
     /// gestures on a board different operations rather than the same one.
     ///
-    /// `branch new` ignores `--status-after` the way `push` does (verified against 0.19.3:
-    /// the reply is just `{"branch":…,"anchor":…}`), so the board is queried separately.
+    /// `branch new` does not embed a status the way `rub`/`commit`/`move` do (verified
+    /// against 0.21.2: the reply is just `{"branch":…,"anchor":…}`), so the board is
+    /// queried separately.
     pub fn branch_new(&self, name: &str, anchor: Option<&str>) -> Result<WorkspaceStatus> {
         let mut args = vec!["branch", "new", name];
         if let Some(a) = anchor {
             args.push("--anchor");
             args.push(a);
         }
-        args.push("-j");
+        args.push("--format");
+        args.push("json");
         self.run(&args)?;
         self.status()
     }
 
     /// Diff of the uncommitted worktree, one entry per hunk with a rub-able id.
     pub fn diff_uncommitted(&self) -> Result<DiffOutput> {
-        let raw = self.run(&["diff", "-j"])?;
+        let raw = self.run(&["diff", "--format", "json"])?;
         serde_json::from_str(raw.trim())
             .with_context(|| format!("could not parse `but diff` output: {raw:.400}"))
     }
 
     /// Diff of a commit. Entries carry no ids — history is not stageable.
     pub fn diff_target(&self, target: &str) -> Result<DiffOutput> {
-        let raw = self.run(&["diff", target, "-j"])?;
+        let raw = self.run(&["diff", target, "--format", "json"])?;
         serde_json::from_str(raw.trim())
             .with_context(|| format!("could not parse `but diff {target}` output: {raw:.400}"))
     }
@@ -267,7 +290,7 @@ impl But {
     /// `--check` is read-only and reports per-branch outcomes, so a lane that would come
     /// out conflicted is visible before anything moves.
     pub fn pull_check(&self) -> Result<PullPreview> {
-        let raw = self.run(&["pull", "--check", "-j"])?;
+        let raw = self.run(&["pull", "--check", "--format", "json"])?;
         serde_json::from_str(raw.trim())
             .with_context(|| format!("could not parse `but pull --check` output: {raw:.400}"))
     }
@@ -275,132 +298,81 @@ impl But {
     /// Fetches and rebases every applied branch onto the updated target.
     ///
     /// This is what GitButler calls a pull: its own help describes it as rebasing all
-    /// applied branches on top of the updated target branch. Like `push`, it does not
-    /// honour `--status-after`, so the caller refreshes separately.
+    /// applied branches on top of the updated target branch. It does not embed a status
+    /// in its reply, so the caller refreshes separately.
     pub fn pull(&self) -> Result<()> {
-        self.run(&["pull", "-j"])?;
+        self.run(&["pull", "--format", "json"])?;
         Ok(())
     }
 
     /// Deletes a branch from the workspace.
     pub fn branch_delete(&self, name: &str) -> Result<()> {
-        self.run(&["branch", "delete", name, "-j"])?;
-        Ok(())
-    }
-
-    /// Renames a branch. `reword` takes a commit *or* a branch as its target.
-    pub fn rename_branch(&self, current: &str, new_name: &str) -> Result<()> {
-        self.run(&["reword", current, "-m", new_name, "-j"])?;
+        self.run(&["branch", "delete", name, "--format", "json"])?;
         Ok(())
     }
 
     /// Stacks an existing branch on top of another one.
     ///
-    /// GitButler can do this — `but_api::branch::move_branch` — but only their TUI reaches
-    /// it; no `but` subcommand exposes it, and `rub` between two branches reassigns
-    /// uncommitted changes rather than restacking. So this composes the effect from four
-    /// operations that *are* exposed.
-    ///
-    /// Commits are moved oldest-first, and the workspace is re-queried before each one,
-    /// because CLI ids describe the current state and every move rebases whatever is left.
-    /// Taking "the oldest remaining commit" each time sidesteps the need for any id to
-    /// survive across a mutation.
+    /// A single native `but move <branch> <target>` (0.21) — the branch's commits are
+    /// rebased onto the target's tip and it becomes the new lane tip. This replaced a
+    /// four-call workaround (create a stacked temp branch, `rub` each commit across,
+    /// delete the source, rename the temp branch back) that earlier `but` versions needed
+    /// because no subcommand exposed the underlying `but_api::branch::move_branch`
+    /// directly.
     ///
     /// This rewrites history: moved commits get new SHAs, so a branch that was already
     /// pushed will need a force push afterwards.
-    ///
-    /// Not atomic. If a step fails, the error says which one and what state that leaves,
-    /// rather than implying a clean rollback that did not happen.
     pub fn restack_branch(&self, source: &str, target: &str) -> Result<WorkspaceStatus> {
         if source == target {
             bail!("a branch cannot be stacked on itself");
         }
-        let status = self.status()?;
-        if find_branch(&status, source).is_none() {
-            bail!("no branch named {source}");
+        let raw = self.run(&["move", source, target, "--format", "json"])?;
+        let env: MutationEnvelope = serde_json::from_str(raw.trim())
+            .with_context(|| format!("could not parse `but move` output: {raw:.400}"))?;
+        if let Some(err) = env.status_error {
+            bail!("move succeeded but the workspace refresh failed: {err}");
         }
-        if find_branch(&status, target).is_none() {
-            bail!("no branch named {target}");
-        }
-
-        let temp = format!("{source}-restack-tmp");
-        if find_branch(&status, &temp).is_some() {
-            bail!("{temp} already exists — clean it up before restacking again");
-        }
-
-        self.branch_new(&temp, Some(target))
-            .with_context(|| format!("could not create {temp} on top of {target}"))?;
-
-        // Re-resolve every iteration: ids are state-dependent and each move rebases.
-        let total = find_branch(&status, source).map_or(0, |b| b.commits.len());
-        for moved in 0..total {
-            let status = self.status()?;
-            let Some(branch) = find_branch(&status, source) else {
-                break;
-            };
-            let Some(oldest) = branch.commits.last() else {
-                break;
-            };
-            // Full hash, not the CLI id: `rub` fuzzy-matches and short ids collide with
-            // branch names.
-            let id = oldest.commit_id.clone();
-            self.rub(&id, &temp).with_context(|| {
-                format!(
-                    "moved {moved} of {total} commits before failing; your work is split \
-                     between {source} and {temp}"
-                )
-            })?;
-        }
-
-        // Uncommitted changes assigned to the branch move with it. This is the one thing
-        // `rub` between branches *does* do.
-        let status = self.status()?;
-        if find_stack_of(&status, source).is_some_and(|s| !s.assigned_changes.is_empty()) {
-            self.rub(source, &temp)
-                .with_context(|| format!("could not move {source}'s staged changes to {temp}"))?;
-        }
-
-        self.branch_delete(source).with_context(|| {
-            format!("commits are on {temp} but {source} could not be deleted; \
-                     delete it and rename {temp} to finish")
-        })?;
-        self.rename_branch(&temp, source).with_context(|| {
-            format!("the restack worked but {temp} could not be renamed; \
-                     rename it to {source} to finish")
-        })?;
-
         self.status()
     }
 
     /// Performs the push.
     ///
-    /// `--status-after` is silently ignored by `push` (verified against 0.19.3: the
-    /// envelope simply does not appear), so the caller must refresh separately. Hook flags
-    /// are deliberately not passed: the spelling changed from `--run-hooks` to
+    /// `push` does not embed a status in its reply, so the caller refreshes separately.
+    /// Hook flags are deliberately not passed: the spelling changed from `--run-hooks` to
     /// `--no-hooks`, so naming either one would break on one side of that release.
     pub fn push(&self, branch: &str) -> Result<()> {
-        self.run(&["push", branch, "-j"])?;
+        self.run(&["push", branch, "--format", "json"])?;
         Ok(())
+    }
+
+    /// Lands `branch` directly onto the configured target — no pull request — and, per
+    /// `but land`'s own documented behaviour, reconciles every other applied branch onto
+    /// the result afterwards, the same as `but pull` does.
+    ///
+    /// Unlike the `but merge` this replaces (removed in 0.21), `land` works whether the
+    /// target is local (`gb-local`, refs updated locally only) or a real remote (pushed
+    /// directly, bypassing any PR/review process — verified against 0.21.2 with a real
+    /// bare-repo remote). `--yes` skips the CLI's own confirmation prompt, since this
+    /// client shows its own confirmation first. `land` prints nothing on success, so the
+    /// board is queried separately.
+    pub fn land(&self, branch: &str) -> Result<WorkspaceStatus> {
+        self.run(&["land", branch, "--yes", "--format", "json"])?;
+        self.status()
     }
 }
 
-fn find_branch<'a>(s: &'a WorkspaceStatus, name: &str) -> Option<&'a crate::model::Branch> {
-    s.stacks
-        .iter()
-        .flat_map(|st| st.branches.iter())
-        .find(|b| b.name == name)
-}
-
-fn find_stack_of<'a>(s: &'a WorkspaceStatus, branch: &str) -> Option<&'a crate::model::Stack> {
-    s.stacks
-        .iter()
-        .find(|st| st.branches.iter().any(|b| b.name == branch))
-}
-
 /// Split out so it can be tested against captured output without spawning anything.
+///
+/// Reverses `stacks` back to oldest-first: verified against 0.21.2, the wire order is
+/// newest-created-first, reversed from 0.19's oldest-first. Normalizing here, at the one
+/// place every caller's status passes through, keeps lane position stable as work
+/// continues — a new parallel lane appends on the right rather than shoving every existing
+/// lane sideways — without every downstream consumer needing to know about the flip.
 pub fn parse_status(raw: &str) -> Result<WorkspaceStatus> {
-    serde_json::from_str(raw.trim())
-        .with_context(|| format!("could not parse `but status` output: {raw:.400}"))
+    let mut status: WorkspaceStatus = serde_json::from_str(raw.trim())
+        .with_context(|| format!("could not parse `but status` output: {raw:.400}"))?;
+    status.stacks.reverse();
+    Ok(status)
 }
 
 #[cfg(test)]
@@ -439,9 +411,9 @@ mod tests {
 
     #[test]
     fn version_ordering_drives_the_gate() {
-        assert!(Version::parse("but 0.18.9").unwrap() < MIN_VERSION);
-        assert!(Version::parse("but 0.19.0").unwrap() >= MIN_VERSION);
-        assert!(Version::parse("but 0.21.2").unwrap() > VERIFIED_THROUGH);
+        assert!(Version::parse("but 0.19.3").unwrap() < MIN_VERSION);
+        assert!(Version::parse("but 0.21.0").unwrap() >= MIN_VERSION);
+        assert!(Version::parse("but 0.22.0").unwrap() > VERIFIED_THROUGH);
     }
 
     #[test]

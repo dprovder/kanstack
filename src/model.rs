@@ -1,9 +1,13 @@
-//! Typed bindings for the `but status --json` wire format.
+//! Typed bindings for the `but status --format json` wire format.
 //!
 //! These mirror the *wire* format, not the upstream Rust structs. The two differ in
-//! places that matter — upstream's `uncommitted_changes` field is emitted as
-//! `unassignedChanges`, and `createdAt` is RFC3339 despite a doc comment claiming
+//! places that matter — `createdAt` is RFC3339 despite a doc comment claiming
 //! `"YYYY-MM-DD HH:MM:SS +ZZZZ"`. Everything here was derived from observed output.
+//!
+//! Verified against 0.21.2. 0.19.3's wire format named the field below `unassignedChanges`
+//! instead of `uncommittedChanges`, among other differences (`-j`/`--status-after` instead
+//! of `--format json`, a `Branch ID map not found` bug in `branch show`, `but merge`
+//! instead of `but land`) — this client no longer supports that release; see `but.rs`.
 //!
 //! Compatibility policy: unknown *new* fields are ignored (forward compatible), but a
 //! renamed or removed field we depend on surfaces as a hard deserialization error rather
@@ -20,10 +24,9 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceStatus {
-    /// Working-tree changes not assigned to any stack. Upstream calls this
-    /// `uncommitted_changes` internally; the wire name is `unassignedChanges`.
+    /// Working-tree changes not assigned to any stack.
     #[serde(default)]
-    pub unassigned_changes: Vec<FileChange>,
+    pub uncommitted_changes: Vec<FileChange>,
     #[serde(default)]
     pub conflicted_files: Vec<String>,
     #[serde(default)]
@@ -202,7 +205,7 @@ pub enum CiConclusion {
     Unknown,
 }
 
-/// Output of `but push <branch> -j`, with or without `--dry-run`.
+/// Output of `but push <branch> --format json`, with or without `--dry-run`.
 ///
 /// The dry-run form is the useful one: it reports exactly what a push would do, including
 /// whether it needs a force, without doing it.
@@ -222,9 +225,12 @@ pub struct PushBranch {
     #[serde(default)]
     pub unpushed_commits: usize,
     pub remote: String,
-    /// Absent until the branch exists on the remote.
+    /// Absent until the branch exists on the remote. Untyped rather than `Option<String>`:
+    /// verified against 0.21.2, once present it serializes as a JSON array of byte values
+    /// instead of a string (an upstream bug) — since only presence is ever checked here,
+    /// there is no need to parse its content either way.
     #[serde(default)]
-    pub remote_ref: Option<String>,
+    pub remote_ref: Option<serde_json::Value>,
     #[serde(default)]
     pub commits: Vec<PushCommit>,
     /// Whether the push rewrites remote history. `but push` force-pushes by default, so
@@ -241,7 +247,7 @@ pub struct PushCommit {
     pub message: String,
 }
 
-/// Output of `but diff -j`, with or without a target.
+/// Output of `but diff --format json`, with or without a target.
 ///
 /// The two forms differ in a way that matters: for *uncommitted* changes `but` emits one
 /// entry per hunk, each carrying its own `id` that `rub` accepts — which is what makes
@@ -287,7 +293,7 @@ pub struct Hunk {
     pub diff: String,
 }
 
-/// Output of `but pull --check -j`: what rebasing onto the updated target would do,
+/// Output of `but pull --check --format json`: what rebasing onto the updated target would do,
 /// without doing it.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -350,6 +356,41 @@ pub enum PullStatus {
     Unknown,
 }
 
+/// Output of `but branch show <branch> --check --format json`: whether landing the branch
+/// onto the target would be clean, without doing it. The only preview `but land` itself
+/// offers — unlike push and pull, it takes no `--dry-run`.
+///
+/// Mixed wire casing, verified against 0.21.2: the top level and `mergeCheck` are
+/// camelCase, but each entry in `commits` is snake_case.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeCheck {
+    pub commits_ahead: usize,
+    #[serde(default)]
+    pub commits: Vec<MergeCheckCommit>,
+    pub merge_check: MergeCheckResult,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MergeCheckCommit {
+    pub short_sha: String,
+    pub message: String,
+}
+
+impl MergeCheckCommit {
+    pub fn subject(&self) -> &str {
+        self.message.lines().next().unwrap_or("").trim()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeCheckResult {
+    pub merges_cleanly: bool,
+    #[serde(default)]
+    pub conflicting_files: Vec<String>,
+}
+
 /// Structured error payload `but` emits on stdout in `--json` mode, e.g. when the
 /// current directory is not a GitButler project.
 #[derive(Debug, Clone, Deserialize)]
@@ -360,7 +401,8 @@ pub struct CliError {
     pub hint: Option<String>,
 }
 
-/// Envelope produced by mutation commands run with `--status-after`.
+/// Envelope embedded by default in mutation commands' replies (0.21 dropped the old
+/// opt-in `--status-after` flag in favour of always including this).
 #[derive(Debug, Clone, Deserialize)]
 pub struct MutationEnvelope {
     #[serde(default)]
@@ -377,24 +419,23 @@ pub struct MutationEnvelope {
 mod tests {
     use super::*;
 
-    /// Captured verbatim from `but status -f -j` on a real workspace (but 0.19.3).
+    /// Captured verbatim from `but status -f --format json` on a real workspace (but 0.21.2).
     const SAMPLE: &str = include_str!("../tests/fixtures/status.json");
 
     #[test]
     fn parses_real_status_output() {
         let s: WorkspaceStatus = serde_json::from_str(SAMPLE).expect("sample parses");
         assert_eq!(s.stacks.len(), 3, "sample has three parallel stacks");
-        assert_eq!(
-            s.unassigned_changes.len(),
-            2,
-            "unassignedChanges is read despite upstream naming the field uncommitted_changes"
-        );
+        assert_eq!(s.uncommitted_changes.len(), 2);
         let names: Vec<_> = s
             .stacks
             .iter()
             .flat_map(|st| st.branches.iter().map(|b| b.name.as_str()))
             .collect();
-        assert_eq!(names, ["feat-auth", "feat-ui", "fix-flaky-tests"]);
+        // Wire order (verified against 0.21.2): newest-created stack first. `but::parse_status`
+        // reverses this back to oldest-first for callers; this test is pinning the raw
+        // contract, not that normalization — see `but::tests::parses_captured_status`.
+        assert_eq!(names, ["fix-flaky-tests", "feat-ui", "feat-auth"]);
     }
 
     #[test]
@@ -410,6 +451,42 @@ mod tests {
         .unwrap();
         assert_eq!(c.subject(), "Add auth middleware");
         assert_eq!(c.short_id(), "0123456");
+    }
+
+    #[test]
+    fn merge_check_handles_mixed_wire_casing() {
+        // Captured verbatim from `but branch show feat-theme --check --format json` (but 0.21.2):
+        // the envelope is camelCase but each commit entry is snake_case.
+        let raw = r#"{
+            "branch": "feat-theme",
+            "commitsAhead": 1,
+            "commits": [{
+                "sha": "67d01c027475ec483ec84c6454047eff1c380eb9",
+                "short_sha": "67d01c0",
+                "message": "theme passthrough from parent terminal",
+                "author_name": "dprovder"
+            }],
+            "unassignedFiles": [],
+            "reviews": [],
+            "mergeCheck": {"mergesCleanly": true, "conflictingFiles": []}
+        }"#;
+        let check: MergeCheck = serde_json::from_str(raw).unwrap();
+        assert_eq!(check.commits_ahead, 1);
+        assert_eq!(check.commits[0].subject(), "theme passthrough from parent terminal");
+        assert!(check.merge_check.merges_cleanly);
+        assert!(check.merge_check.conflicting_files.is_empty());
+    }
+
+    #[test]
+    fn merge_check_reports_conflicting_files() {
+        let raw = r#"{
+            "commitsAhead": 2,
+            "commits": [],
+            "mergeCheck": {"mergesCleanly": false, "conflictingFiles": ["src/app.rs"]}
+        }"#;
+        let check: MergeCheck = serde_json::from_str(raw).unwrap();
+        assert!(!check.merge_check.merges_cleanly);
+        assert_eq!(check.merge_check.conflicting_files, ["src/app.rs"]);
     }
 
     #[test]

@@ -43,7 +43,7 @@ impl Sandbox {
 
     fn new(name: &str) -> Sandbox {
         let sb = Sandbox::bare(name);
-        sb.but(&["setup", "--init", "-j"]);
+        sb.but(&["setup", "--init", "--format", "json"]);
         sb
     }
 
@@ -62,7 +62,7 @@ impl Sandbox {
             .unwrap();
         sb.git(&["remote", "add", "origin", remote.to_str().unwrap()]);
         sb.git(&["push", "-q", "origin", "HEAD:main"]);
-        sb.but(&["setup", "--init", "-j"]);
+        sb.but(&["setup", "--init", "--format", "json"]);
         sb
     }
 
@@ -473,6 +473,95 @@ fn pushing_a_lane_updates_the_remote() {
     assert!(refs.contains("feat"), "remote should have the branch, got {refs:?}");
 }
 
+/// The merge check is what makes `M` safe to bind, the same way the push and rebase
+/// previews are: it must report what would land and whether it lands cleanly, without
+/// touching anything.
+#[test]
+#[ignore = "requires the GitButler CLI"]
+fn land_check_reports_a_clean_land_without_landing() {
+    if skip_if_no_but() {
+        return;
+    }
+    let sb = Sandbox::new("landcheck");
+    sb.branch_with_commit("feat", "a.txt", "Landable");
+
+    let but = But::discover(&sb.repo()).unwrap();
+    let check = but.merge_check("feat").expect("merge check");
+    assert_eq!(check.commits_ahead, 1);
+    assert_eq!(check.commits[0].subject(), "Landable");
+    assert!(check.merge_check.merges_cleanly);
+    assert!(check.merge_check.conflicting_files.is_empty());
+
+    // A check must not have landed anything.
+    let board = Board::from_status(&but.status().unwrap());
+    let lane = board
+        .columns
+        .iter()
+        .find(|c| c.branch_name.as_deref() == Some("feat"))
+        .expect("the lane is still there, unlanded");
+    assert_eq!(lane.cards.len(), 1, "the commit is still only on the lane");
+}
+
+/// `but land` prints nothing on success, so the caller must refresh separately — pinned
+/// here so a regression shows up as a stale board rather than a parse error users only see
+/// at the keyboard.
+#[test]
+#[ignore = "requires the GitButler CLI"]
+fn landing_a_lane_lands_it_on_the_target() {
+    if skip_if_no_but() {
+        return;
+    }
+    let sb = Sandbox::new("land");
+    sb.branch_with_commit("feat", "a.txt", "Landable");
+
+    let but = But::discover(&sb.repo()).unwrap();
+    let status = but.land("feat").expect("land");
+    let board = Board::from_status(&status);
+
+    // The lane's commit is no longer ahead of the target — it landed, it did not vanish.
+    let lane = board.columns.iter().find(|c| c.branch_name.as_deref() == Some("feat"));
+    if let Some(lane) = lane {
+        assert!(
+            lane.cards.iter().all(|c| c.kind != CardKind::Commit),
+            "the landed commit should no longer be ahead of the target"
+        );
+    }
+    let log = sb.git(&["log", "--oneline", "--all"]);
+    assert!(log.contains("Landable"), "landing must land the content: {log}");
+}
+
+/// The whole reason `M` is built on `but land` and not the older `but merge`: `merge`
+/// flatly refuses when the workspace target tracks a real remote ("Target remote is
+/// origin, not gb-local. This command only works with gb-local targets" — verified against
+/// 0.21.2 against this project's own repository). `land` is designed for exactly this case
+/// and pushes the result directly, bypassing any pull request.
+#[test]
+#[ignore = "requires the GitButler CLI"]
+fn landing_a_lane_pushes_directly_to_a_real_remote() {
+    if skip_if_no_but() {
+        return;
+    }
+    let sb = Sandbox::with_remote("landremote");
+    sb.branch_with_commit("feat", "a.txt", "Landable");
+
+    let but = But::discover(&sb.repo()).unwrap();
+    but.land("feat").expect("land onto a real remote target");
+
+    let refs = sb.remote_refs();
+    assert!(refs.contains("refs/heads/main"), "the bare remote should still have main");
+    let remote_log = Command::new("git")
+        .args(["--git-dir"])
+        .arg(sb.root.join("remote.git"))
+        .args(["log", "--oneline", "main"])
+        .output()
+        .unwrap();
+    let remote_log = String::from_utf8_lossy(&remote_log.stdout);
+    assert!(
+        remote_log.contains("Landable"),
+        "the commit must be pushed straight to the remote's main, got {remote_log:?}"
+    );
+}
+
 /// The two branch gestures are genuinely different operations, so both are pinned:
 /// an anchor stacks into the existing lane, no anchor opens a new one.
 #[test]
@@ -627,36 +716,45 @@ fn sending_a_commit_to_the_backlog_uncommits_without_losing_content() {
     );
 }
 
-/// `d` is only safe to bind because `but` refuses to delete a branch whose commits would
-/// be left orphaned. That guarantee is upstream's, not ours, so it is worth a test.
+/// `d` used to be safe to bind only because `but` refused to delete a branch whose commits
+/// would be left orphaned. That guarantee is upstream's, not ours — and 0.21 changed it:
+/// deleting a lone branch with unpushed commits now succeeds non-interactively and
+/// discards them outright, rather than refusing. `but undo` still recovers them, which is
+/// what `pending_delete`'s confirmation text promises instead of a refusal now.
 #[test]
 #[ignore = "requires the GitButler CLI"]
-fn deleting_a_lone_branch_with_commits_is_refused() {
+fn deleting_a_lone_branch_with_commits_is_undoable_not_refused() {
     if skip_if_no_but() {
         return;
     }
-    let sb = Sandbox::new("delrefuse");
+    let sb = Sandbox::new("delundo");
     sb.branch_with_commit("feat", "a.txt", "Important work");
 
     let but = But::discover(&sb.repo()).unwrap();
-    let err = but.branch_delete("feat").expect_err("must refuse");
+    but.branch_delete("feat").expect("0.21 no longer refuses this non-interactively");
+
+    let after = Board::from_status(&but.status().unwrap());
     assert!(
-        format!("{err}").to_lowercase().contains("refusing"),
-        "expected a refusal, got: {err}"
+        after.columns.iter().all(|c| c.branch_name.as_deref() != Some("feat")),
+        "the branch and its commit are gone, not refused"
     );
 
-    // And the work is untouched.
-    let after = Board::from_status(&but.status().unwrap());
-    let lane = after.columns.iter().find(|c| c.title == "feat").unwrap();
+    // `but undo` is the safety net now, so it had better work.
+    sb.but(&["undo", "--format", "json"]);
+    let restored = Board::from_status(&but.status().unwrap());
+    let lane = restored.columns.iter().find(|c| c.title == "feat").expect("undo restores the lane");
     assert_eq!(lane.cards.len(), 1);
-    assert!(sb.repo().join("a.txt").exists());
 }
 
 /// Inside a stack it succeeds, and the commits fold into the branch above rather than
-/// disappearing — which is what the confirmation dialog promises.
+/// disappearing on their own — recoverable with `but undo`, which is what the confirmation
+/// dialog now promises instead of a fold (see `App::pending_delete`).
+///
+/// `d` in the actual UI always targets the lane's *tip* branch (`col.branch_name`), so this
+/// deletes "upper", not the base — matching what a keypress on this lane would really do.
 #[test]
 #[ignore = "requires the GitButler CLI"]
-fn deleting_a_branch_inside_a_stack_folds_its_commits_upward() {
+fn deleting_the_tip_of_a_stack_discards_only_its_own_commit() {
     if skip_if_no_but() {
         return;
     }
@@ -667,21 +765,33 @@ fn deleting_a_branch_inside_a_stack_folds_its_commits_upward() {
     sb.but(&["commit", "upper", "-m", "Upper work"]);
 
     let but = But::discover(&sb.repo()).unwrap();
-    but.branch_delete("lower").expect("delete inside a stack");
+    but.branch_delete("upper").expect("delete the tip of a stack");
 
     let after = Board::from_status(&but.status().unwrap());
     assert!(
-        after.columns.iter().all(|c| c.branch_name.as_deref() != Some("lower")),
-        "the branch is gone"
+        after.columns.iter().all(|c| c.branch_name.as_deref() != Some("upper")),
+        "the tip branch is gone"
     );
-    let lane = after.columns.iter().find(|c| c.title == "upper").unwrap();
+    let lane = after.columns.iter().find(|c| c.title == "lower").unwrap();
     let titles: Vec<&str> = lane.cards.iter().map(|c| c.title.as_str()).collect();
     assert_eq!(
         titles,
-        ["Upper work", "Lower work"],
-        "both commits survive on the branch above, got {titles:?}"
+        ["Lower work"],
+        "the branch below is untouched, but the tip's own commit is gone, got {titles:?}"
     );
-    assert!(sb.repo().join("a.txt").exists(), "and its file is still there");
+
+    sb.but(&["undo", "--format", "json"]);
+    let restored = Board::from_status(&but.status().unwrap());
+    let titles: Vec<&str> = restored
+        .columns
+        .iter()
+        .find(|c| c.title == "upper +1")
+        .expect("undo restores the deleted branch")
+        .cards
+        .iter()
+        .map(|c| c.title.as_str())
+        .collect();
+    assert_eq!(titles, ["Upper work", "Lower work"], "undo brings the discarded commit back");
 }
 
 /// The rebase preview is what makes `r` safe to bind: it must report the incoming commits
@@ -760,7 +870,7 @@ fn hunks_of_one_file_can_be_staged_to_different_lanes() {
     );
     sb.git(&["add", "."]);
     sb.git(&["commit", "-qm", "seed"]);
-    sb.but(&["setup", "--init", "-j"]);
+    sb.but(&["setup", "--init", "--format", "json"]);
     sb.but(&["branch", "new", "top"]);
     sb.but(&["branch", "new", "bottom"]);
     // Two edits far enough apart to be separate hunks.
@@ -842,7 +952,7 @@ fn cards_carry_real_line_counts() {
     sb.write("a.txt", "one\ntwo\nthree\n");
     sb.git(&["add", "."]);
     sb.git(&["commit", "-qm", "seed"]);
-    sb.but(&["setup", "--init", "-j"]);
+    sb.but(&["setup", "--init", "--format", "json"]);
     // One line changed, two added: +3 -1.
     sb.write("a.txt", "ONE\ntwo\nthree\nfour\nfive\n");
 

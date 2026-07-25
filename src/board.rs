@@ -5,7 +5,7 @@
 //! | board            | GitButler                      |
 //! |------------------|--------------------------------|
 //! | column           | stack (a lane of applied work) |
-//! | backlog column   | `unassignedChanges`            |
+//! | backlog column   | `uncommittedChanges`           |
 //! | card             | commit, or an assigned file    |
 //! | card id badge    | `cliId` — also the rub handle  |
 //! | card badges      | branch status, CI, review, conflict |
@@ -259,7 +259,7 @@ impl Board {
             state: None,
             badges: Vec::new(),
             cards: s
-                .unassigned_changes
+                .uncommitted_changes
                 .iter()
                 .map(|c| change_card(c, stats))
                 .collect(),
@@ -538,7 +538,7 @@ mod tests {
     #[test]
     fn a_lane_holding_staged_work_is_not_empty() {
         let mut s = sample();
-        let staged = s.unassigned_changes.remove(0);
+        let staged = s.uncommitted_changes.remove(0);
         s.stacks[0].branches[0].commits.clear();
         s.stacks[0].assigned_changes.push(staged);
 
