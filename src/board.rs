@@ -77,13 +77,99 @@ pub enum ColumnKind {
     Stack,
 }
 
+/// What a branch's dot and status badge both mean.
+///
+/// Derived once so the two cannot disagree. They previously did: the badge special-cased
+/// an empty branch, but the dot read `nothingToPush` straight from the wire and painted it
+/// the same green as a pushed one — so a lane with nothing in it looked finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaneState {
+    /// No commits and nothing staged.
+    Empty,
+    /// Staged work, not yet committed.
+    Uncommitted,
+    /// Commits that have never reached the remote.
+    Unpushed,
+    /// Pushing would rewrite remote history.
+    NeedsForce,
+    /// Everything is on the remote.
+    Pushed,
+    /// Merged into the target.
+    Integrated,
+    /// At least one commit is in conflict.
+    Conflicted,
+    Unknown,
+}
+
+impl LaneState {
+    pub fn label(self) -> &'static str {
+        match self {
+            LaneState::Empty => "empty",
+            LaneState::Uncommitted => "uncommitted",
+            LaneState::Unpushed => "unpushed",
+            LaneState::NeedsForce => "needs force",
+            LaneState::Pushed => "pushed",
+            LaneState::Integrated => "integrated",
+            LaneState::Conflicted => "conflicted",
+            LaneState::Unknown => "unknown",
+        }
+    }
+
+    pub fn tone(self) -> Tone {
+        match self {
+            LaneState::Empty | LaneState::Unknown => Tone::Neutral,
+            LaneState::Uncommitted | LaneState::Unpushed => Tone::Accent,
+            LaneState::NeedsForce => Tone::Warn,
+            LaneState::Pushed | LaneState::Integrated => Tone::Good,
+            LaneState::Conflicted => Tone::Bad,
+        }
+    }
+}
+
+fn lane_state(b: &Branch, has_staged: bool) -> LaneState {
+    // Conflict outranks everything: it is the one state you must act on.
+    if b.commits.iter().any(|c| c.conflicted == Some(true)) {
+        return LaneState::Conflicted;
+    }
+    if b.commits.is_empty() {
+        return if has_staged {
+            LaneState::Uncommitted
+        } else {
+            LaneState::Empty
+        };
+    }
+    match b.branch_status {
+        BranchStatus::Integrated => LaneState::Integrated,
+        BranchStatus::NothingToPush => LaneState::Pushed,
+        BranchStatus::UnpushedCommits | BranchStatus::CompletelyUnpushed => LaneState::Unpushed,
+        BranchStatus::UnpushedCommitsRequiringForce => LaneState::NeedsForce,
+        BranchStatus::Unknown => LaneState::Unknown,
+    }
+}
+
+/// A branch within a lane, rendered with the same treatment as the lane header so a stack
+/// visibly reads as stacked. Every branch gets one, including the tip — the tip's is drawn
+/// by the lane header itself.
+#[derive(Debug, Clone)]
+pub struct Section {
+    pub name: String,
+    pub state: LaneState,
+    pub badges: Vec<Badge>,
+    pub commits: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct Column {
     pub kind: ColumnKind,
     pub title: String,
-    pub status: Option<BranchStatus>,
+    /// `None` for the backlog, which is not a branch.
+    pub state: Option<LaneState>,
     pub badges: Vec<Badge>,
     pub cards: Vec<Card>,
+    /// One entry per branch in the lane, tip first. Lets the renderer give each stacked
+    /// branch its own header, and its own push status — which the lane header alone could
+    /// not show, since it only ever described the tip.
+    pub sections: Vec<Section>,
     /// Identifier to rub a card onto when dropping it here. The branch *name* rather than
     /// its CLI id, for the same fuzzy-matching reason as [`Card::rub_id`].
     pub drop_target: String,
@@ -107,9 +193,10 @@ impl Board {
         columns.push(Column {
             kind: ColumnKind::Unassigned,
             title: "unassigned".into(),
-            status: None,
+            state: None,
             badges: Vec::new(),
             cards: s.unassigned_changes.iter().map(change_card).collect(),
+            sections: Vec::new(),
             drop_target: UNASSIGNED_TARGET.into(),
             branch_name: None,
         });
@@ -159,12 +246,30 @@ impl Board {
                 top.name.clone()
             };
 
+            // Staged changes belong to the stack rather than to any one branch, so they
+            // only count toward the tip's "uncommitted" badge.
+            let sections = stack
+                .branches
+                .iter()
+                .enumerate()
+                .map(|(i, b)| {
+                    let staged = i == 0 && !stack.assigned_changes.is_empty();
+                    Section {
+                        name: b.name.clone(),
+                        state: lane_state(b, staged),
+                        badges: branch_badges(b, staged),
+                        commits: b.commits.len(),
+                    }
+                })
+                .collect();
+
             columns.push(Column {
                 kind: ColumnKind::Stack,
                 title,
-                status: Some(top.branch_status),
+                state: Some(lane_state(top, !stack.assigned_changes.is_empty())),
                 badges: branch_badges(top, !stack.assigned_changes.is_empty()),
                 cards,
+                sections,
                 drop_target: top.name.clone(),
                 branch_name: Some(top.name.clone()),
             });
@@ -196,13 +301,7 @@ fn branch_badges(b: &Branch, has_staged: bool) -> Vec<Badge> {
     // A branch with no commits reports `nothingToPush`, which renders as "in sync" and
     // reads as "already pushed" rather than "nothing here yet". And a lane holding staged
     // work is not empty even though it has no commits yet, so check that before saying so.
-    let status = if !b.commits.is_empty() {
-        b.branch_status.label()
-    } else if has_staged {
-        "uncommitted"
-    } else {
-        "empty"
-    };
+    let status = lane_state(b, has_staged).label();
     // The header dot already encodes push state by colour; the label spells it out, since
     // "needs force" and "unpushed" are the same hue family at a glance.
     let mut badges = vec![Badge::new(status, Tone::Neutral)];
@@ -349,6 +448,79 @@ mod tests {
         assert!(labels.contains(&"uncommitted"), "got {labels:?}");
         assert!(!labels.contains(&"empty"), "got {labels:?}");
         assert_eq!(lane.cards.len(), 1, "the staged file shows as a card");
+    }
+
+    /// Each branch in a stack carries its own push status. The lane header only ever
+    /// described the tip, so a pushed branch underneath had nothing showing it at all.
+    #[test]
+    fn every_branch_in_a_stack_gets_its_own_status() {
+        let mut s = sample();
+        let extra = s.stacks.remove(2).branches.remove(0);
+        let extra_name = extra.name.clone();
+        s.stacks[0].branches.push(extra);
+
+        let b = Board::from_status(&s);
+        let lane = &b.columns[1];
+        assert_eq!(lane.sections.len(), 2, "one section per branch, tip first");
+        assert_eq!(lane.sections[0].name, "feat-auth");
+        assert_eq!(lane.sections[1].name, extra_name);
+        assert!(
+            lane.sections.iter().all(|s| !s.badges.is_empty()),
+            "each branch reports its own state, not just the tip"
+        );
+    }
+
+    /// The dot colour and the status word come from one value, so they cannot drift.
+    /// They did: an empty branch reports `nothingToPush`, which the dot painted the same
+    /// green as a fully pushed branch while the badge correctly said "empty".
+    #[test]
+    fn an_empty_lane_is_not_coloured_like_a_pushed_one() {
+        let mut s = sample();
+        s.stacks[0].branches[0].commits.clear();
+        s.stacks[0].branches[0].branch_status = BranchStatus::NothingToPush;
+
+        let b = Board::from_status(&s);
+        let lane = b.columns.iter().find(|c| c.title == "feat-auth").unwrap();
+        assert_eq!(lane.state, Some(LaneState::Empty));
+        assert_eq!(lane.state.unwrap().tone(), Tone::Neutral, "not the good/green tone");
+        assert_ne!(LaneState::Empty.tone(), LaneState::Pushed.tone());
+    }
+
+    #[test]
+    fn a_conflicted_commit_outranks_the_push_status() {
+        let mut s = sample();
+        s.stacks[0].branches[0].commits[0].conflicted = Some(true);
+        s.stacks[0].branches[0].branch_status = BranchStatus::NothingToPush;
+        let b = Board::from_status(&s);
+        let lane = b.columns.iter().find(|c| c.title == "feat-auth").unwrap();
+        assert_eq!(lane.state, Some(LaneState::Conflicted));
+        assert_eq!(lane.state.unwrap().tone(), Tone::Bad);
+    }
+
+    #[test]
+    fn the_dot_and_the_badge_always_agree() {
+        // Whatever the state, the word next to the lane is that state's own label.
+        let b = Board::from_status(&sample());
+        for col in b.columns.iter().filter(|c| c.state.is_some()) {
+            let state = col.state.unwrap();
+            let labels: Vec<&str> = col.badges.iter().map(|b| b.text.as_str()).collect();
+            assert!(
+                labels.contains(&state.label()),
+                "lane {:?} is {state:?} but its badges say {labels:?}",
+                col.title
+            );
+        }
+    }
+
+    #[test]
+    fn a_pushed_branch_says_pushed() {
+        // `nothingToPush` used to render as "in sync", which nobody reads as "pushed".
+        let mut s = sample();
+        s.stacks[0].branches[0].branch_status = BranchStatus::NothingToPush;
+        let b = Board::from_status(&s);
+        let lane = b.columns.iter().find(|c| c.title == "feat-auth").unwrap();
+        let labels: Vec<&str> = lane.badges.iter().map(|b| b.text.as_str()).collect();
+        assert!(labels.contains(&"pushed"), "got {labels:?}");
     }
 
     #[test]

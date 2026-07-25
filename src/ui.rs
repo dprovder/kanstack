@@ -34,8 +34,156 @@ pub fn draw(f: &mut Frame, app: &App) {
     match app.mode {
         Mode::Help => draw_help(f, f.area()),
         Mode::PushConfirm => draw_push_confirm(f, app, f.area()),
+        Mode::DeleteConfirm => draw_delete_confirm(f, app, f.area()),
+        Mode::RebaseConfirm => draw_rebase_confirm(f, app, f.area()),
         _ => {}
     }
+}
+
+/// What rebasing onto the updated target would do, per lane.
+///
+/// The per-branch outcome is the point: a lane that comes out `conflicted` is worth
+/// knowing about before anything moves, and an `integrated` one can be deleted afterwards.
+fn draw_rebase_confirm(f: &mut Frame, app: &App, area: Rect) {
+    use crate::model::PullStatus;
+    let Some(p) = &app.pull_preview else {
+        return;
+    };
+
+    let mut body = vec![Line::styled("  rebase onto target", theme::muted()), Line::raw("")];
+    body.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            format!(
+                "{} commit{} from ",
+                p.upstream_commits.count,
+                if p.upstream_commits.count == 1 { "" } else { "s" }
+            ),
+            theme::title(true),
+        ),
+        Span::styled(p.base_branch.name.clone(), theme::tone(crate::board::Tone::Accent)),
+    ]));
+    for c in p.upstream_commits.commits.iter().take(4) {
+        body.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(
+                truncate(c.description.lines().next().unwrap_or(""), 40),
+                theme::muted(),
+            ),
+            Span::styled(
+                c.author_name.clone().map(|a| format!("  {a}")).unwrap_or_default(),
+                theme::faint(),
+            ),
+        ]));
+    }
+    if p.upstream_commits.commits.len() > 4 {
+        body.push(Line::styled(
+            format!("    … and {} more", p.upstream_commits.commits.len() - 4),
+            theme::faint(),
+        ));
+    }
+
+    let mut any_conflict = false;
+    if !p.branch_statuses.is_empty() {
+        body.push(Line::raw(""));
+        body.push(Line::styled("  your lanes", theme::muted()));
+        for b in &p.branch_statuses {
+            let (word, tone) = match b.status {
+                PullStatus::Updatable => ("rebases cleanly", crate::board::Tone::Good),
+                PullStatus::Integrated => ("already integrated", crate::board::Tone::Neutral),
+                PullStatus::Conflicted => {
+                    any_conflict = true;
+                    ("conflicts", crate::board::Tone::Bad)
+                }
+                PullStatus::Unknown => ("unknown", crate::board::Tone::Neutral),
+            };
+            body.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(format!("{:<22}", truncate(&b.name, 22)), theme::title(false)),
+                Span::styled(word, theme::tone(tone)),
+            ]));
+        }
+    }
+    if p.has_worktree_conflicts {
+        any_conflict = true;
+        body.push(Line::raw(""));
+        body.push(Line::styled(
+            "  the worktree has conflicts already",
+            theme::tone(crate::board::Tone::Bad),
+        ));
+    }
+
+    body.push(Line::raw(""));
+    body.push(Line::styled(
+        if any_conflict {
+            "  ⏎ / y  rebase anyway      esc / n  cancel"
+        } else {
+            "  ⏎ / y  rebase      esc / n  cancel"
+        },
+        theme::faint(),
+    ));
+
+    let w = 62.min(area.width.saturating_sub(4));
+    let h = (body.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, popup);
+    f.render_widget(
+        Paragraph::new(body).block(
+            Block::bordered()
+                .border_style(if any_conflict {
+                    theme::tone(crate::board::Tone::Bad)
+                } else {
+                    theme::faint()
+                })
+                .style(Style::default().bg(theme::SELECTED_BG)),
+        ),
+        popup,
+    );
+}
+
+/// Deleting cannot lose commits — `but` refuses when it would orphan them — but it can
+/// dissolve a branch into the one above it, so the consequence is spelled out.
+fn draw_delete_confirm(f: &mut Frame, app: &App, area: Rect) {
+    let Some((name, detail)) = app.pending_delete() else {
+        return;
+    };
+    let body = vec![
+        Line::styled("  delete lane", theme::muted()),
+        Line::raw(""),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(name, theme::title(true)),
+        ]),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(detail, theme::muted()),
+        ]),
+        Line::raw(""),
+        Line::styled("  ⏎ / y  delete      esc / n  cancel", theme::faint()),
+    ];
+
+    let w = 56.min(area.width.saturating_sub(4));
+    let h = (body.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, popup);
+    f.render_widget(
+        Paragraph::new(body).block(
+            Block::bordered()
+                .border_style(theme::tone(crate::board::Tone::Warn))
+                .style(Style::default().bg(theme::SELECTED_BG)),
+        ),
+        popup,
+    );
 }
 
 /// What a push is about to do. Shown before it happens because `but push` force-pushes by
@@ -217,12 +365,12 @@ fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect) {
     let header_is_target =
         app.mode == Mode::Moving && is_current && app.target_card.is_none();
     let mut header = Line::from(vec![
-        Span::styled("● ", theme::status_dot(col.status)),
+        Span::styled("● ", theme::status_dot(col.state)),
         Span::styled(
             truncate(&col.title, inner_w.saturating_sub(8)),
             theme::title(is_current),
         ),
-        Span::styled(format!("  {}", col.cards.len()), theme::faint()),
+        Span::styled(format!("  {}", header_count(col)), theme::faint()),
     ]);
     if header_is_target {
         header = header.style(Style::default().bg(theme::SELECTED_BG));
@@ -260,10 +408,15 @@ fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect) {
     for (ci, card) in col.cards.iter().enumerate() {
         if let Some(group) = card.group.as_deref() {
             if last_group != Some(group) {
-                lines.push(Line::from(vec![
-                    Span::styled("┈ ", theme::faint()),
-                    Span::styled(truncate(group, inner_w.saturating_sub(4)), theme::muted()),
-                ]));
+                // The tip branch is already described by the lane header; the ones below it
+                // get the same treatment here so the lane reads as visibly stacked.
+                let is_tip = col.sections.first().is_some_and(|s| s.name == group);
+                if !is_tip {
+                    if let Some(section) = col.sections.iter().find(|s| s.name == group) {
+                        lines.push(Line::raw(""));
+                        lines.extend(section_header(section, inner_w));
+                    }
+                }
                 last_group = Some(group);
             }
         }
@@ -305,6 +458,53 @@ fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect) {
             .scroll((scroll, 0)),
         area,
     );
+}
+
+/// The count shown next to a lane's name.
+///
+/// For a plain lane that is just its cards. For a stack it must be the *tip branch's*
+/// share, not the lane total, because the branches below print their own counts right
+/// underneath — a lane reading `board-ops +1  2` above a `live-refresh  1` says board-ops
+/// has two commits, which it does not.
+fn header_count(col: &crate::board::Column) -> usize {
+    if col.sections.len() < 2 {
+        return col.cards.len();
+    }
+    let below: usize = col.sections.iter().skip(1).map(|s| s.commits).sum();
+    // Whatever is left is the tip's commits plus any changes staged to the stack.
+    col.cards.len().saturating_sub(below)
+}
+
+/// A branch header inside a lane, drawn like the lane header itself: dot, name, count,
+/// rule, status. Repeating the treatment is the point — it is what makes a stack look
+/// stacked rather than like one list with faint dividers in it.
+fn section_header(section: &crate::board::Section, width: usize) -> Vec<Line<'static>> {
+    let mut out = vec![
+        Line::from(vec![
+            Span::styled("● ", theme::status_dot(Some(section.state))),
+            Span::styled(
+                truncate(&section.name, width.saturating_sub(8)),
+                theme::title(false),
+            ),
+            Span::styled(format!("  {}", section.commits), theme::faint()),
+        ]),
+        Line::styled("─".repeat(width), theme::faint()),
+    ];
+    if !section.badges.is_empty() {
+        out.push(Line::from(
+            section
+                .badges
+                .iter()
+                .flat_map(|b| {
+                    [
+                        Span::styled(b.text.clone(), theme::tone(b.tone)),
+                        Span::raw("  "),
+                    ]
+                })
+                .collect::<Vec<_>>(),
+        ));
+    }
+    out
 }
 
 fn render_card(card: &Card, width: usize, selected: bool, picked: bool) -> Vec<Line<'static>> {
@@ -449,10 +649,10 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                 area,
             );
         }
-        Mode::PushConfirm => "",
+        Mode::PushConfirm | Mode::DeleteConfirm | Mode::RebaseConfirm => "",
         Mode::Help => "  esc close",
         Mode::Normal => {
-            "  ←/→ lane · ↑/↓ card · m move · u unstage · c commit · b branch · s stack · p push · ? help"
+            "  ←/→ lane · ↑/↓ card · m move · u unstage · c commit · b branch · s stack · d delete · r rebase · p push · ? help"
         }
     };
     f.render_widget(Paragraph::new(Line::styled(keys, theme::faint())), area);
@@ -470,6 +670,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
         help_row("  then ↑/↓", "drop on the lane, or onto a card"),
         help_row("  then ⏎", "confirm · esc cancels"),
         help_row("u", "send this card back to the backlog — uncommit or unstage"),
+        help_row("d", "delete this lane — asks first"),
+        help_row("r", "rebase onto the updated target — shows what will happen"),
         help_row("c", "commit the staged files in this lane"),
         help_row("b", "new branch — stacks on this lane, tab for parallel"),
         help_row("s", "stack this whole lane onto another — rewrites history"),

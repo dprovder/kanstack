@@ -66,6 +66,39 @@ impl Sandbox {
         sb
     }
 
+    /// Lands a commit on the remote's `main` from a separate clone, so the workspace
+    /// falls behind its target the way it would when a colleague pushes.
+    fn push_upstream_commit(&self, file: &str, message: &str) {
+        let clone = self.root.join("upstream-clone");
+        let remote = self.root.join("remote.git");
+        let git = |args: &[&str], dir: &std::path::Path| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("HOME", self.home())
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        Command::new("git")
+            .args(["clone", "-q"])
+            .arg(&remote)
+            .arg(&clone)
+            .output()
+            .unwrap();
+        git(&["config", "user.email", "other@example.com"], &clone);
+        git(&["config", "user.name", "Other"], &clone);
+        std::fs::write(clone.join(file), "upstream\n").unwrap();
+        git(&["add", "."], &clone);
+        git(&["commit", "-qm", message], &clone);
+        git(&["push", "-q", "origin", "main"], &clone);
+        let _ = std::fs::remove_dir_all(&clone);
+    }
+
     /// Ref names present on the bare remote, for asserting what a push actually did.
     fn remote_refs(&self) -> String {
         let out = Command::new("git")
@@ -592,6 +625,121 @@ fn sending_a_commit_to_the_backlog_uncommits_without_losing_content() {
         "hello\nworld\n",
         "uncommitting must not touch the worktree content"
     );
+}
+
+/// `d` is only safe to bind because `but` refuses to delete a branch whose commits would
+/// be left orphaned. That guarantee is upstream's, not ours, so it is worth a test.
+#[test]
+#[ignore = "requires the GitButler CLI"]
+fn deleting_a_lone_branch_with_commits_is_refused() {
+    if skip_if_no_but() {
+        return;
+    }
+    let sb = Sandbox::new("delrefuse");
+    sb.branch_with_commit("feat", "a.txt", "Important work");
+
+    let but = But::discover(&sb.repo()).unwrap();
+    let err = but.branch_delete("feat").expect_err("must refuse");
+    assert!(
+        format!("{err}").to_lowercase().contains("refusing"),
+        "expected a refusal, got: {err}"
+    );
+
+    // And the work is untouched.
+    let after = Board::from_status(&but.status().unwrap());
+    let lane = after.columns.iter().find(|c| c.title == "feat").unwrap();
+    assert_eq!(lane.cards.len(), 1);
+    assert!(sb.repo().join("a.txt").exists());
+}
+
+/// Inside a stack it succeeds, and the commits fold into the branch above rather than
+/// disappearing — which is what the confirmation dialog promises.
+#[test]
+#[ignore = "requires the GitButler CLI"]
+fn deleting_a_branch_inside_a_stack_folds_its_commits_upward() {
+    if skip_if_no_but() {
+        return;
+    }
+    let sb = Sandbox::new("delstack");
+    sb.branch_with_commit("lower", "a.txt", "Lower work");
+    sb.write("b.txt", "upper\n");
+    sb.but(&["branch", "new", "upper", "--anchor", "lower"]);
+    sb.but(&["commit", "upper", "-m", "Upper work"]);
+
+    let but = But::discover(&sb.repo()).unwrap();
+    but.branch_delete("lower").expect("delete inside a stack");
+
+    let after = Board::from_status(&but.status().unwrap());
+    assert!(
+        after.columns.iter().all(|c| c.branch_name.as_deref() != Some("lower")),
+        "the branch is gone"
+    );
+    let lane = after.columns.iter().find(|c| c.title == "upper").unwrap();
+    let titles: Vec<&str> = lane.cards.iter().map(|c| c.title.as_str()).collect();
+    assert_eq!(
+        titles,
+        ["Upper work", "Lower work"],
+        "both commits survive on the branch above, got {titles:?}"
+    );
+    assert!(sb.repo().join("a.txt").exists(), "and its file is still there");
+}
+
+/// The rebase preview is what makes `r` safe to bind: it must report the incoming commits
+/// and each lane's outcome without touching anything.
+#[test]
+#[ignore = "requires the GitButler CLI"]
+fn rebase_preview_reports_upstream_work_without_applying_it() {
+    if skip_if_no_but() {
+        return;
+    }
+    let sb = Sandbox::with_remote("rebase");
+    sb.branch_with_commit("feat", "a.txt", "My work");
+    sb.push_upstream_commit("upstream.txt", "Upstream change");
+
+    let but = But::discover(&sb.repo()).unwrap();
+    let preview = but.pull_check().expect("pull --check");
+
+    assert!(!preview.up_to_date, "the target has moved");
+    assert_eq!(preview.upstream_commits.count, 1);
+    assert_eq!(
+        preview.upstream_commits.commits[0].description.trim(),
+        "Upstream change"
+    );
+    let feat = preview
+        .branch_statuses
+        .iter()
+        .find(|b| b.name == "feat")
+        .expect("our lane is assessed");
+    assert_eq!(feat.status, kanstack::model::PullStatus::Updatable);
+
+    // A check must not have rebased anything.
+    let board = Board::from_status(&but.status().unwrap());
+    let lane = board.columns.iter().find(|c| c.title == "feat").unwrap();
+    assert_eq!(lane.cards.len(), 1);
+    assert!(!sb.repo().join("upstream.txt").exists(), "check applied nothing");
+}
+
+#[test]
+#[ignore = "requires the GitButler CLI"]
+fn rebasing_brings_upstream_work_in() {
+    if skip_if_no_but() {
+        return;
+    }
+    let sb = Sandbox::with_remote("rebasedo");
+    sb.branch_with_commit("feat", "a.txt", "My work");
+    sb.push_upstream_commit("upstream.txt", "Upstream change");
+
+    let but = But::discover(&sb.repo()).unwrap();
+    but.pull().expect("pull");
+
+    assert!(
+        sb.repo().join("upstream.txt").exists(),
+        "upstream work landed in the worktree"
+    );
+    let board = Board::from_status(&but.status().unwrap());
+    let lane = board.columns.iter().find(|c| c.title == "feat").unwrap();
+    assert_eq!(lane.cards.len(), 1, "our commit survived the rebase");
+    assert!(but.pull_check().unwrap().up_to_date, "and we are current now");
 }
 
 #[test]

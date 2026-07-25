@@ -8,7 +8,7 @@ use anyhow::Result;
 
 use crate::board::{Board, Card, CardKind, ColumnKind};
 use crate::but::But;
-use crate::model::PushPreview;
+use crate::model::{PullPreview, PushPreview};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -23,6 +23,10 @@ pub enum Mode {
     Restacking,
     /// Looking at what a push would do, before doing it.
     PushConfirm,
+    /// Confirming a lane deletion.
+    DeleteConfirm,
+    /// Looking at what rebasing onto the updated target would do.
+    RebaseConfirm,
     Help,
 }
 
@@ -55,6 +59,8 @@ pub struct App {
     pub stack_onto: Option<String>,
     /// What a push would do, valid while `mode == PushConfirm`.
     pub push_preview: Option<PushPreview>,
+    /// What a rebase onto the updated target would do, valid while `mode == RebaseConfirm`.
+    pub pull_preview: Option<PullPreview>,
     pub message: Option<(String, Notice)>,
     pub should_quit: bool,
 }
@@ -87,6 +93,7 @@ impl App {
             branch_input: String::new(),
             stack_onto: None,
             push_preview: None,
+            pull_preview: None,
             message,
             should_quit: false,
         })
@@ -108,6 +115,7 @@ impl App {
             branch_input: String::new(),
             stack_onto: None,
             push_preview: None,
+            pull_preview: None,
             message: None,
             should_quit: false,
         }
@@ -191,12 +199,13 @@ impl App {
         };
     }
 
+    /// Moves the card cursor, wrapping at the ends the way lane movement does.
     fn move_card(&mut self, delta: isize) {
         let n = self.cards_in_current_column();
         if n == 0 {
             return;
         }
-        self.card = (self.card as isize + delta).clamp(0, n as isize - 1) as usize;
+        self.card = (self.card as isize + delta).rem_euclid(n as isize) as usize;
     }
 
     /// The card currently picked up, valid while moving.
@@ -270,12 +279,13 @@ impl App {
         self.mode = Mode::Moving;
     }
 
-    /// Moves the drop cursor through a lane: the header, then each card in turn.
+    /// Moves the drop cursor through a lane: the header, then each card in turn, wrapping
+    /// back round to the header past the last card.
     fn move_target(&mut self, delta: isize) {
         let n = self.cards_in_current_column() as isize;
-        // -1 represents the lane header.
+        // -1 represents the lane header, giving n + 1 positions to cycle through.
         let cur = self.target_card.map_or(-1, |i| i as isize);
-        let next = (cur + delta).clamp(-1, n - 1);
+        let next = (cur + 1 + delta).rem_euclid(n + 1) - 1;
         self.target_card = if next < 0 { None } else { Some(next as usize) };
     }
 
@@ -461,6 +471,108 @@ impl App {
             Err(e) => self.notify(format!("{e}"), Notice::Error),
         }
         self.branch_input.clear();
+    }
+
+    /// Fetches and previews a rebase onto the updated target.
+    ///
+    /// The header already reports how far behind upstream the workspace is; without this
+    /// that number is a dead end. `--check` is read-only, so nothing moves until the
+    /// preview has been seen and confirmed.
+    fn begin_rebase(&mut self) {
+        let Some(but) = &self.but else {
+            self.notify("snapshot is read-only", Notice::Info);
+            return;
+        };
+        match but.pull_check() {
+            Ok(preview) => {
+                if preview.up_to_date {
+                    self.notify("already up to date with the target", Notice::Info);
+                    return;
+                }
+                self.pull_preview = Some(preview);
+                self.mode = Mode::RebaseConfirm;
+            }
+            Err(e) => self.notify(format!("{e}"), Notice::Error),
+        }
+    }
+
+    fn confirm_rebase(&mut self) {
+        self.mode = Mode::Normal;
+        self.pull_preview = None;
+
+        let Some(but) = &self.but else {
+            self.notify("snapshot is read-only", Notice::Info);
+            return;
+        };
+        match but.pull() {
+            Ok(()) => {
+                // `pull` ignores `--status-after`, like `push`.
+                self.refresh_quietly();
+                self.notify("rebased onto the updated target", Notice::Success);
+            }
+            Err(e) => self.notify(format!("{e}"), Notice::Error),
+        }
+    }
+
+    /// Describes what deleting the selected lane would do.
+    ///
+    /// `but` refuses outright when a delete would orphan commits, so nothing here can lose
+    /// work. What it *can* lose is the branch as a separate reviewable unit: deleting a
+    /// branch inside a stack folds its commits into the branch above. Worth stating.
+    pub fn pending_delete(&self) -> Option<(String, String)> {
+        let col = self.board.columns.get(self.col)?;
+        let name = col.branch_name.clone()?;
+        let commits = col
+            .sections
+            .first()
+            .map(|s| s.commits)
+            .unwrap_or(col.cards.len());
+        let detail = if commits == 0 {
+            "it is empty".to_string()
+        } else if col.sections.len() > 1 {
+            format!(
+                "its {commits} commit{} fold into {}",
+                if commits == 1 { "" } else { "s" },
+                col.sections
+                    .get(1)
+                    .map(|s| s.name.as_str())
+                    .unwrap_or("the branch below")
+            )
+        } else {
+            format!(
+                "{commits} commit{} — but will refuse if this would orphan them",
+                if commits == 1 { "" } else { "s" }
+            )
+        };
+        Some((name, detail))
+    }
+
+    fn begin_delete(&mut self) {
+        if self.pending_delete().is_none() {
+            self.notify("the backlog is not a branch", Notice::Info);
+            return;
+        }
+        self.mode = Mode::DeleteConfirm;
+    }
+
+    fn confirm_delete(&mut self) {
+        let Some((name, _)) = self.pending_delete() else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        self.mode = Mode::Normal;
+
+        let Some(but) = &self.but else {
+            self.notify("snapshot is read-only", Notice::Info);
+            return;
+        };
+        match but.branch_delete(&name) {
+            Ok(()) => {
+                self.refresh_quietly();
+                self.notify(format!("deleted {name}"), Notice::Success);
+            }
+            Err(e) => self.notify(format!("{e}"), Notice::Error),
+        }
     }
 
     /// Sends the selected card back to the backlog.
@@ -713,6 +825,31 @@ impl App {
             return;
         }
 
+        if self.mode == Mode::RebaseConfirm {
+            match key.code {
+                K::Enter | K::Char('y') => self.confirm_rebase(),
+                K::Esc | K::Char('n') | K::Char('q') => {
+                    self.mode = Mode::Normal;
+                    self.pull_preview = None;
+                    self.notify("rebase cancelled", Notice::Info);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if self.mode == Mode::DeleteConfirm {
+            match key.code {
+                K::Enter | K::Char('y') => self.confirm_delete(),
+                K::Esc | K::Char('n') | K::Char('q') => {
+                    self.mode = Mode::Normal;
+                    self.notify("delete cancelled", Notice::Info);
+                }
+                _ => {}
+            }
+            return;
+        }
+
         // Help swallows everything except the keys that dismiss it.
         if self.mode == Mode::Help {
             if matches!(key.code, K::Esc | K::Char('?') | K::Char('q')) {
@@ -785,6 +922,8 @@ impl App {
             K::Char('b') if self.mode == Mode::Normal => self.begin_branch(),
             K::Char('s') if self.mode == Mode::Normal => self.begin_restack(),
             K::Char('u') if self.mode == Mode::Normal => self.send_to_backlog(),
+            K::Char('d') if self.mode == Mode::Normal => self.begin_delete(),
+            K::Char('r') if self.mode == Mode::Normal => self.begin_rebase(),
             K::Enter if self.mode == Mode::Restacking => self.confirm_restack(),
             K::Enter if self.mode == Mode::Moving => self.confirm_move(),
             _ => {}
@@ -871,12 +1010,13 @@ mod tests {
     }
 
     #[test]
-    fn the_drop_cursor_walks_from_lane_header_through_cards() {
-        // -1 is the lane header; the cursor must reach it again on the way back up.
+    fn the_drop_cursor_cycles_through_the_header_and_cards() {
+        // -1 is the lane header, so there are n + 1 positions and they wrap, matching how
+        // lane and card movement behave everywhere else.
         let n: isize = 2;
         let step = |cur: Option<usize>, delta: isize| -> Option<usize> {
             let c = cur.map_or(-1, |i| i as isize);
-            let next = (c + delta).clamp(-1, n - 1);
+            let next = (c + 1 + delta).rem_euclid(n + 1) - 1;
             if next < 0 {
                 None
             } else {
@@ -885,9 +1025,18 @@ mod tests {
         };
         assert_eq!(step(None, 1), Some(0), "down from the header lands on card 0");
         assert_eq!(step(Some(0), 1), Some(1));
-        assert_eq!(step(Some(1), 1), Some(1), "clamps at the last card");
+        assert_eq!(step(Some(1), 1), None, "past the last card, back to the header");
         assert_eq!(step(Some(0), -1), None, "up from card 0 returns to the header");
-        assert_eq!(step(None, -1), None, "clamps at the header");
+        assert_eq!(step(None, -1), Some(1), "up from the header wraps to the last card");
+    }
+
+    #[test]
+    fn the_card_cursor_wraps_like_the_lane_cursor() {
+        let n = 3isize;
+        let step = |cur: usize, delta: isize| (cur as isize + delta).rem_euclid(n) as usize;
+        assert_eq!(step(2, 1), 0, "past the last card, back to the first");
+        assert_eq!(step(0, -1), 2, "before the first, round to the last");
+        assert_eq!(step(1, 1), 2);
     }
 
     /// Regression: the restack cursor used to just step one column, which from the last

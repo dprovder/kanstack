@@ -55,14 +55,12 @@ pub fn tone(t: Tone) -> Style {
     })
 }
 
-/// Lane header dot. Colour carries push state at a glance.
-pub fn status_dot(status: Option<crate::model::BranchStatus>) -> Style {
-    use crate::model::BranchStatus as B;
-    Style::default().fg(match status {
-        None => FAINT,
-        Some(B::Integrated) | Some(B::NothingToPush) => GOOD,
-        Some(B::UnpushedCommits) | Some(B::CompletelyUnpushed) => ACCENT,
-        Some(B::UnpushedCommitsRequiringForce) => WARN,
-        Some(B::Unknown) => FAINT,
-    })
+/// Lane header dot. Takes the same [`LaneState`](crate::board::LaneState) the status badge
+/// prints, so the colour and the word can never disagree — they did once, and an empty
+/// lane came out the same green as a fully pushed one.
+pub fn status_dot(state: Option<crate::board::LaneState>) -> Style {
+    match state {
+        None => Style::default().fg(FAINT),
+        Some(s) => tone(s.tone()),
+    }
 }

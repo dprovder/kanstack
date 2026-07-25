@@ -149,7 +149,8 @@ pub enum BranchStatus {
 impl BranchStatus {
     pub fn label(self) -> &'static str {
         match self {
-            BranchStatus::NothingToPush => "in sync",
+            // "in sync" was too coy: after pushing, people look for the word "pushed".
+            BranchStatus::NothingToPush => "pushed",
             BranchStatus::UnpushedCommits => "unpushed",
             BranchStatus::UnpushedCommitsRequiringForce => "needs force",
             BranchStatus::CompletelyUnpushed => "local only",
@@ -238,6 +239,69 @@ pub struct PushCommit {
     pub sha_short: String,
     pub sha: String,
     pub message: String,
+}
+
+/// Output of `but pull --check -j`: what rebasing onto the updated target would do,
+/// without doing it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PullPreview {
+    pub base_branch: BaseBranch,
+    pub upstream_commits: UpstreamCommits,
+    #[serde(default)]
+    pub branch_statuses: Vec<PullBranchStatus>,
+    pub up_to_date: bool,
+    #[serde(default)]
+    pub has_worktree_conflicts: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BaseBranch {
+    pub name: String,
+    pub remote_name: String,
+    pub base_sha: String,
+    pub current_sha: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpstreamCommits {
+    pub count: usize,
+    #[serde(default)]
+    pub commits: Vec<UpstreamCommit>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpstreamCommit {
+    pub id: String,
+    pub description: String,
+    #[serde(default)]
+    pub author_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PullBranchStatus {
+    pub name: String,
+    pub status: PullStatus,
+    /// `Some(true)` on a conflicted branch that can still be rebased.
+    #[serde(default)]
+    pub rebasable: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PullStatus {
+    /// Rebases cleanly.
+    Updatable,
+    /// Already merged into the target; the lane can be deleted afterwards.
+    Integrated,
+    /// Rebasing produces conflicts.
+    Conflicted,
+    #[serde(other)]
+    Unknown,
 }
 
 /// Structured error payload `but` emits on stdout in `--json` mode, e.g. when the

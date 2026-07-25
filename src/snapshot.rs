@@ -126,6 +126,33 @@ mod tests {
         }
     }
 
+    /// A stacked lane must look stacked: each branch below the tip repeats the lane
+    /// header's treatment, and the counts must agree rather than double-counting.
+    #[test]
+    fn a_stacked_lane_renders_a_header_per_branch() {
+        let mut status =
+            crate::but::parse_status(include_str!("../tests/fixtures/status.json")).unwrap();
+        let extra = status.stacks.remove(2).branches.remove(0);
+        status.stacks[0].branches.push(extra);
+
+        let app = App::from_board(Board::from_status(&status));
+        let mut t = Terminal::new(TestBackend::new(150, 24)).unwrap();
+        t.draw(|f| crate::ui::draw(f, &app)).unwrap();
+        let out = plain(&to_ansi(t.backend().buffer()));
+
+        assert!(out.contains("feat-auth +1"), "lane names the stack depth");
+        assert!(
+            out.contains("● fix-flaky-tests"),
+            "the stacked branch gets its own dot-and-name header:\n{out}"
+        );
+        // feat-auth has 2 commits of its own; the stacked branch has 1. The lane header
+        // must show 2, not the lane total of 3.
+        assert!(
+            out.contains("feat-auth +1  2"),
+            "lane header counts only the tip's commits:\n{out}"
+        );
+    }
+
     #[test]
     fn long_commit_subjects_wrap_inside_the_lane() {
         let mut status =

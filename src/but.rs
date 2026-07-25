@@ -9,7 +9,7 @@ use std::process::Command;
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use crate::model::{CliError, MutationEnvelope, PushPreview, WorkspaceStatus};
+use crate::model::{CliError, MutationEnvelope, PullPreview, PushPreview, WorkspaceStatus};
 
 /// Oldest `but` whose JSON shape this was verified against.
 pub const MIN_VERSION: Version = Version {
@@ -240,6 +240,26 @@ impl But {
         args.push("-j");
         self.run(&args)?;
         self.status()
+    }
+
+    /// Asks what rebasing onto the updated target would do, without doing it.
+    ///
+    /// `--check` is read-only and reports per-branch outcomes, so a lane that would come
+    /// out conflicted is visible before anything moves.
+    pub fn pull_check(&self) -> Result<PullPreview> {
+        let raw = self.run(&["pull", "--check", "-j"])?;
+        serde_json::from_str(raw.trim())
+            .with_context(|| format!("could not parse `but pull --check` output: {raw:.400}"))
+    }
+
+    /// Fetches and rebases every applied branch onto the updated target.
+    ///
+    /// This is what GitButler calls a pull: its own help describes it as rebasing all
+    /// applied branches on top of the updated target branch. Like `push`, it does not
+    /// honour `--status-after`, so the caller refreshes separately.
+    pub fn pull(&self) -> Result<()> {
+        self.run(&["pull", "-j"])?;
+        Ok(())
     }
 
     /// Deletes a branch from the workspace.

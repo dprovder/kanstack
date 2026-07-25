@@ -40,11 +40,13 @@ kanstack
 
 | key | does |
 |---|---|
-| `←/→`, `h/l` | move between lanes |
-| `↑/↓`, `j/k` | move between cards |
+| `←/→`, `h/l` | move between lanes — wraps around |
+| `↑/↓`, `j/k` | move between cards — wraps around |
 | `g` / `G` | first / last card |
 | `m` | pick up a card, then `←/→` for a lane, `↑/↓` to drop on a card, `⏎` to confirm |
 | `u` | send this card back to the backlog — uncommit a commit, unstage a file |
+| `d` | delete this lane — asks first |
+| `r` | rebase onto the updated target — shows what will happen |
 | `c` | commit the files staged to this lane (only what is staged) |
 | `b` | new branch — stacks on the selected lane, `tab` for a parallel lane |
 | `s` | stack this whole lane onto another — rewrites history |
@@ -142,6 +144,44 @@ CLI. Not yet built:
 - `land`, which skips the pull request entirely. Deliberately not bound yet: it rewrites
   trunk, and deserves more than a keystroke.
 - Reordering commits within a lane.
+
+## Rebasing onto the target
+
+`r` runs `but pull`, which GitButler describes as rebasing every applied branch on top of
+the updated target. It is gated behind `but pull --check`, which is read-only and reports
+the incoming commits plus each lane's outcome — `rebases cleanly`, `already integrated`, or
+`conflicts` — before anything moves. Worktree conflicts are called out too, and the dialog
+turns red and says "rebase anyway" when either is true.
+
+The header has always shown how far behind the target you are; without this that number
+was a dead end.
+
+Note `r` here is *rebase*, whereas GitButler's own TUI binds `r` to squash — worth knowing
+if you use both.
+
+## Deleting a lane
+
+`d` asks first, and says what will happen. It cannot lose commits: `but` refuses to delete
+a branch that would leave its commits orphaned. What it *can* do is dissolve a branch that
+sits inside a stack, folding its commits into the branch above — so the confirmation names
+that outcome rather than just asking "are you sure".
+
+## Lane and branch state
+
+Each branch shows a coloured dot and a word, both derived from one value so they cannot
+disagree — they did once, and an empty lane came out the same green as a fully pushed one.
+
+| state | meaning |
+|---|---|
+| empty | no commits, nothing staged |
+| uncommitted | staged work, not yet committed |
+| unpushed | commits that have never reached the remote |
+| needs force | pushing would rewrite remote history |
+| pushed | everything is on the remote |
+| integrated | merged into the target |
+| conflicted | at least one commit is in conflict — outranks the rest |
+
+In a stack, every branch gets its own dot and word, not just the tip.
 
 ## Restacking an existing branch
 
