@@ -13,6 +13,7 @@ use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use kanstack::app::{App, Mode, Notice};
 use kanstack::but::But;
 use kanstack::cmux::Cmux;
+use kanstack::tutorial::{self, Tutorial};
 use kanstack::watch::Watcher;
 use kanstack::{snapshot, ui};
 
@@ -24,6 +25,7 @@ usage:
 
 options:
   -C <path>          run against the repository at <path> (default: cwd)
+  --tutorial         walk through the keys in a real, throwaway practice repo
   --snapshot <file>  render captured `but status -f --format json` output and exit
   --size <WxH>       terminal size for --snapshot (default: 160x30)
   -V, --version      print version
@@ -50,9 +52,11 @@ fn main() -> Result<()> {
     let mut cwd: Option<PathBuf> = None;
     let mut snapshot: Option<String> = None;
     let mut size = (160u16, 30u16);
+    let mut tutorial_mode = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--tutorial" => tutorial_mode = true,
             "--snapshot" => {
                 snapshot = Some(
                     args.next()
@@ -91,10 +95,9 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let cwd = match cwd {
-        Some(p) => p,
-        None => std::env::current_dir()?,
-    };
+    if tutorial_mode && cwd.is_some() {
+        anyhow::bail!("--tutorial builds its own practice repo; -C does not apply with it");
+    }
 
     // `ratatui::init()` panics rather than erroring when there is no terminal to attach
     // to, which is what happens under a pipe, a CI job, or `kanstack > out.txt`. Check first
@@ -107,11 +110,23 @@ fn main() -> Result<()> {
         );
     }
 
+    let cwd = if tutorial_mode {
+        tutorial::build_practice_repo()?
+    } else {
+        match cwd {
+            Some(p) => p,
+            None => std::env::current_dir()?,
+        }
+    };
+
     // Everything else that can fail with a readable message happens before the alternate
     // screen is entered, so errors are not wiped by the terminal restore.
     let but = But::discover(&cwd)?;
     let cmux = Cmux::discover();
     let mut app = App::new(but, cmux)?;
+    if tutorial_mode {
+        app.tutorial = Some(Tutorial::new(1));
+    }
 
     // A failed watch is not fatal: the board still works, it just stops following the
     // repository on its own. Say so rather than dying or silently going stale.

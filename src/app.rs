@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use crate::cmux::Cmux;
 use crate::diff::DiffView;
 use crate::model::{MergeCheck, PullPreview, PushPreview};
+use crate::tutorial::Tutorial;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -88,6 +89,9 @@ pub struct App {
     pub move_source: Option<(String, String)>,
     pub message: Option<(String, Notice)>,
     pub should_quit: bool,
+    /// Present only under `kanstack --tutorial`. Checked after every keystroke; absent for
+    /// ordinary runs, so the check costs nothing outside that mode.
+    pub tutorial: Option<Tutorial>,
 }
 
 impl App {
@@ -129,6 +133,7 @@ impl App {
             commit_stats,
             message,
             should_quit: false,
+            tutorial: None,
         })
     }
 
@@ -157,6 +162,7 @@ impl App {
             commit_stats: HashMap::new(),
             message: None,
             should_quit: false,
+            tutorial: None,
         }
     }
 
@@ -1024,7 +1030,19 @@ impl App {
         }
     }
 
+    /// Handles a keystroke, then — under `--tutorial` — checks whether it satisfied the
+    /// current step. Wrapping rather than checking inline: `handle_key` returns early from
+    /// many different branches depending on mode, and the check needs to run after all of
+    /// them, not just whichever one happens to fall through to the end.
     pub fn on_key(&mut self, key: ratatui::crossterm::event::KeyEvent) {
+        self.handle_key(key);
+        if let Some(mut t) = self.tutorial.take() {
+            t.advance(self);
+            self.tutorial = Some(t);
+        }
+    }
+
+    fn handle_key(&mut self, key: ratatui::crossterm::event::KeyEvent) {
         use ratatui::crossterm::event::KeyCode as K;
 
         // Typing a commit message swallows ordinary keys, so navigation bindings do not

@@ -12,5 +12,6 @@ pub mod diff;
 pub mod model;
 pub mod snapshot;
 pub mod theme;
+pub mod tutorial;
 pub mod ui;
 pub mod watch;

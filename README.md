@@ -79,6 +79,17 @@ cd kanstack
 cargo install --path .
 ```
 
+## Tutorial
+
+```sh
+kanstack --tutorial
+```
+
+Builds a real, throwaway GitButler workspace in a temp directory and walks through moving,
+diffing, staging, committing, and landing a change — each step only advances once you've
+actually done it, not on any keypress. Nothing it touches is one of your real projects; the
+practice repo is thrown away when you're done. `esc` or `q` leaves any time.
+
 ## Keys
 
 | key | does |

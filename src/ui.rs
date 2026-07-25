@@ -17,21 +17,32 @@ const MAX_COL_WIDTH: u16 = 46;
 const COL_GAP: u16 = 2;
 
 pub fn draw(f: &mut Frame, app: &App) {
+    let mut constraints = vec![Constraint::Length(2)]; // header
+    if app.tutorial.is_some() {
+        constraints.push(Constraint::Length(4)); // tutorial banner
+    }
+    constraints.push(Constraint::Min(1)); // board
+    constraints.push(Constraint::Length(1)); // footer
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2), // header
-            Constraint::Min(1),    // board
-            Constraint::Length(1), // footer
-        ])
+        .constraints(constraints)
         .split(f.area());
 
     draw_header(f, app, chunks[0]);
+    let mut next = 1;
+    if let Some(t) = &app.tutorial {
+        draw_tutorial_banner(f, t, chunks[next]);
+        next += 1;
+    }
+    let board_area = chunks[next];
+    let footer_area = chunks[next + 1];
+
     if app.mode == Mode::Diff && !app.diff_full {
         let split = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-            .split(chunks[1]);
+            .split(board_area);
         draw_board(f, app, split[0]);
         draw_diff(
             f,
@@ -43,11 +54,11 @@ pub fn draw(f: &mut Frame, app: &App) {
             },
         );
     } else if app.mode == Mode::Diff {
-        draw_diff(f, app, chunks[1]);
+        draw_diff(f, app, board_area);
     } else {
-        draw_board(f, app, chunks[1]);
+        draw_board(f, app, board_area);
     }
-    draw_footer(f, app, chunks[2]);
+    draw_footer(f, app, footer_area);
 
     match app.mode {
         Mode::Help => draw_help(f, f.area()),
@@ -60,6 +71,25 @@ pub fn draw(f: &mut Frame, app: &App) {
         Mode::Diff => {}
         _ => {}
     }
+}
+
+/// The scripted lesson's current instruction, always visible so it survives whatever mode
+/// or popup is on screen — a step like "open a diff" would otherwise hide the very prompt
+/// that sent you there.
+fn draw_tutorial_banner(f: &mut Frame, t: &crate::tutorial::Tutorial, area: Rect) {
+    let w = area.width.saturating_sub(2) as usize;
+    let mut lines = vec![Line::styled(
+        format!("  tutorial — step {}", t.step_label()),
+        theme::muted(),
+    )];
+    for wrapped in wrap(t.prompt(), w.max(1)) {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(wrapped, theme::title(true)),
+        ]));
+    }
+    lines.push(Line::styled("─".repeat(area.width as usize), theme::faint()));
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 /// The diff pane, full screen.
