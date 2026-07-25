@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.82"
 description = "An unofficial kanban-style terminal UI for the GitButler CLI"
 license = "MIT"
-repository = "https://github.com/danielprovder/kanstack"
+repository = "https://github.com/dprovder/kanstack"
 readme = "README.md"
 
 [lib]
