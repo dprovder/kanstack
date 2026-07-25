@@ -4,28 +4,27 @@
 //! rhythm, a muted id above a bright title, and metadata that recedes. Cards are
 //! separated by whitespace instead of boxes — terminal box-drawing at card density reads
 //! as noise, and the whole point is to feel less like a graph dump.
+//!
+//! Grey text (title/muted/faint/id) never names a color at all — it leaves `fg` unset,
+//! so the terminal's own default foreground shows through, and reaches for `Modifier::DIM`
+//! /`BOLD` for the tiers below/above it. A named ANSI grey (`Color::Gray`,
+//! `Color::DarkGray`) is still a *separate* palette slot from "default foreground": themes
+//! tune it for things like comments or line numbers, not body text, so it can end up too
+//! pale to read against that same theme's own background (as happened here — a light
+//! Ghostty theme with washed-out ANSI greys). Only the tone accents (good/warn/bad/accent)
+//! still name a color, since their whole job is to *be* a specific hue.
 
 use ratatui::style::{Color, Modifier, Style};
 
 use crate::board::Tone;
 
-pub const TITLE: Color = Color::Indexed(253);
-pub const MUTED: Color = Color::Indexed(244);
-pub const FAINT: Color = Color::Indexed(240);
-pub const ID: Color = Color::Indexed(245);
-
-pub const GOOD: Color = Color::Indexed(114);
-pub const WARN: Color = Color::Indexed(179);
-pub const BAD: Color = Color::Indexed(203);
-pub const ACCENT: Color = Color::Indexed(110);
-
-/// Background for the card under the cursor.
-pub const SELECTED_BG: Color = Color::Indexed(236);
-/// Background for the card being moved.
-pub const PICKED_BG: Color = Color::Indexed(238);
+pub const GOOD: Color = Color::Green;
+pub const WARN: Color = Color::Yellow;
+pub const BAD: Color = Color::Red;
+pub const ACCENT: Color = Color::Cyan;
 
 pub fn title(selected: bool) -> Style {
-    let s = Style::default().fg(TITLE);
+    let s = Style::default();
     if selected {
         s.add_modifier(Modifier::BOLD)
     } else {
@@ -34,25 +33,38 @@ pub fn title(selected: bool) -> Style {
 }
 
 pub fn muted() -> Style {
-    Style::default().fg(MUTED)
+    Style::default()
 }
 
 pub fn faint() -> Style {
-    Style::default().fg(FAINT)
+    Style::default().add_modifier(Modifier::DIM)
 }
 
 pub fn id() -> Style {
-    Style::default().fg(ID)
+    Style::default().add_modifier(Modifier::BOLD)
 }
 
 pub fn tone(t: Tone) -> Style {
-    Style::default().fg(match t {
-        Tone::Neutral => FAINT,
-        Tone::Good => GOOD,
-        Tone::Warn => WARN,
-        Tone::Bad => BAD,
-        Tone::Accent => ACCENT,
-    })
+    match t {
+        Tone::Neutral => faint(),
+        Tone::Good => Style::default().fg(GOOD),
+        Tone::Warn => Style::default().fg(WARN),
+        Tone::Bad => Style::default().fg(BAD),
+        Tone::Accent => Style::default().fg(ACCENT),
+    }
+}
+
+/// Highlight for the card/row under the cursor. Reverse video instead of a fixed
+/// background color: it swaps whatever foreground/background are already in play, so it
+/// reads correctly no matter which way the terminal's theme is set.
+pub fn selected_bg() -> Style {
+    Style::default().add_modifier(Modifier::REVERSED)
+}
+
+/// Highlight for the card being moved. Same reverse-video trick as `selected_bg`, plus
+/// bold so the two remain distinguishable from each other, not just from an unselected row.
+pub fn picked_bg() -> Style {
+    Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
 }
 
 /// Lane header dot. Colour carries push state at a glance.

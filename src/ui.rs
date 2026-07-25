@@ -4,7 +4,6 @@
 //! vertically on its own so a long lane never pushes its neighbours around.
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
@@ -211,9 +210,9 @@ fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect) {
 
 fn render_card(card: &Card, width: usize, selected: bool, picked: bool) -> Vec<Line<'static>> {
     let bg = if picked {
-        Some(theme::PICKED_BG)
+        Some(theme::picked_bg())
     } else if selected {
-        Some(theme::SELECTED_BG)
+        Some(theme::selected_bg())
     } else {
         None
     };
@@ -222,8 +221,8 @@ fn render_card(card: &Card, width: usize, selected: bool, picked: bool) -> Vec<L
         if used < width {
             line.spans.push(Span::raw(" ".repeat(width - used)));
         }
-        if let Some(c) = bg {
-            line = line.style(Style::default().bg(c));
+        if let Some(style) = bg {
+            line = line.style(style);
         }
         line
     };
@@ -348,7 +347,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Paragraph::new(body).block(
             Block::bordered()
                 .border_style(theme::faint())
-                .style(Style::default().bg(theme::SELECTED_BG)),
+                .style(theme::selected_bg()),
         ),
         popup,
     );
@@ -359,7 +358,7 @@ fn help_row(keys: &str, what: &str) -> Line<'static> {
         Span::raw("  "),
         Span::styled(
             format!("{keys:<22}"),
-            Style::default().fg(theme::ID).add_modifier(Modifier::BOLD),
+            theme::id(),
         ),
         Span::styled(what.to_string(), theme::muted()),
     ])
