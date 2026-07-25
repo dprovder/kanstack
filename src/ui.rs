@@ -28,7 +28,26 @@ pub fn draw(f: &mut Frame, app: &App) {
         .split(f.area());
 
     draw_header(f, app, chunks[0]);
-    draw_board(f, app, chunks[1]);
+    if app.mode == Mode::Diff && !app.diff_full {
+        let split = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+            .split(chunks[1]);
+        draw_board(f, app, split[0]);
+        draw_diff(
+            f,
+            app,
+            Rect {
+                x: split[1].x + 1,
+                width: split[1].width.saturating_sub(1),
+                ..split[1]
+            },
+        );
+    } else if app.mode == Mode::Diff {
+        draw_diff(f, app, chunks[1]);
+    } else {
+        draw_board(f, app, chunks[1]);
+    }
     draw_footer(f, app, chunks[2]);
 
     match app.mode {
@@ -36,8 +55,101 @@ pub fn draw(f: &mut Frame, app: &App) {
         Mode::PushConfirm => draw_push_confirm(f, app, f.area()),
         Mode::DeleteConfirm => draw_delete_confirm(f, app, f.area()),
         Mode::RebaseConfirm => draw_rebase_confirm(f, app, f.area()),
+        // The board keeps its half unless the diff is expanded, so reading a diff does not
+        // cost you your place — the same split gitui uses, and for the same reason.
+        Mode::Diff => {}
         _ => {}
     }
+}
+
+/// The diff pane, full screen.
+///
+/// Hunks are listed one after another with the cursor on one of them, because a hunk is
+/// the unit `but` will stage — pressing `m` here picks up exactly the hunk under the
+/// cursor, which is how one file ends up split across two lanes.
+fn draw_diff(f: &mut Frame, app: &App, area: Rect) {
+    use crate::diff::LineKind;
+    let Some(view) = &app.diff else { return };
+
+    f.render_widget(Clear, area);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(1)])
+        .split(area);
+
+    let (added, removed) = view.totals();
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(view.title.clone(), theme::title(true)),
+            Span::styled("   ", theme::faint()),
+            Span::styled(format!("+{added}"), theme::tone(crate::board::Tone::Good)),
+            Span::raw(" "),
+            Span::styled(format!("-{removed}"), theme::tone(crate::board::Tone::Bad)),
+            Span::styled(
+                format!("   hunk {} of {}", view.cursor + 1, view.entries.len()),
+                theme::faint(),
+            ),
+        ])),
+        chunks[0],
+    );
+
+    let w = chunks[1].width as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    let mut sel_start = 0usize;
+    let mut sel_len = 0usize;
+
+    for (i, entry) in view.entries.iter().enumerate() {
+        let selected = i == view.cursor;
+        let start = lines.len();
+
+        let mut head = vec![
+            Span::styled(if selected { "▌ " } else { "  " }, theme::tone(crate::board::Tone::Accent)),
+            Span::styled(entry.path.clone(), theme::title(selected)),
+            Span::styled(format!("  +{} -{}", entry.added, entry.removed), theme::faint()),
+        ];
+        if entry.rub_id.is_none() {
+            head.push(Span::styled("  committed", theme::faint()));
+        }
+        lines.push(Line::from(head));
+
+        for l in &entry.lines {
+            let (sign, style) = match l.kind {
+                LineKind::Added => ("+", theme::tone(crate::board::Tone::Good)),
+                LineKind::Removed => ("-", theme::tone(crate::board::Tone::Bad)),
+                LineKind::Header => ("~", theme::tone(crate::board::Tone::Accent)),
+                LineKind::Context => (" ", theme::muted()),
+            };
+            let no = l
+                .new_no
+                .map(|n| format!("{n:>4} "))
+                .unwrap_or_else(|| "     ".to_string());
+            // The sign is its own column rather than glued to the text: colour alone is
+            // not a marker you can rely on, and `+foo` reads as content.
+            let body = truncate(&l.text, w.saturating_sub(9));
+            lines.push(Line::from(vec![
+                Span::styled(if selected { "▌" } else { " " }, theme::tone(crate::board::Tone::Accent)),
+                Span::styled(no, theme::faint()),
+                Span::styled(format!("{sign} "), style),
+                Span::styled(body, style),
+            ]));
+        }
+        lines.push(Line::raw(""));
+
+        if selected {
+            sel_start = start;
+            sel_len = lines.len() - start;
+        }
+    }
+
+    // Keep the selected hunk on screen, showing its start rather than its end.
+    let h = chunks[1].height as usize;
+    let scroll = if sel_start + sel_len > h && sel_start + h > sel_len {
+        sel_start.min(sel_start + sel_len - h) as u16
+    } else {
+        0
+    };
+    f.render_widget(Paragraph::new(lines).scroll((scroll, 0)), chunks[1]);
 }
 
 /// What rebasing onto the updated target would do, per lane.
@@ -275,6 +387,27 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         Span::styled("  ·  ", theme::faint()),
         Span::styled(format!("base {}", b.base_short_id), theme::faint()),
     ];
+    // Working-tree cards only. Lane totals now include commits, but the word here is
+    // "uncommitted", so counting those would make the header say something untrue.
+    let totals = b
+        .columns
+        .iter()
+        .flat_map(|c| c.cards.iter())
+        .filter(|c| c.kind == crate::board::CardKind::Change)
+        .filter_map(|c| c.stats)
+        .fold((0usize, 0usize), |(a, r), (ca, cr)| (a + ca, r + cr));
+    if totals != (0, 0) {
+        spans.push(Span::styled("  ·  ", theme::faint()));
+        spans.push(Span::styled(
+            format!("+{}", totals.0),
+            theme::tone(crate::board::Tone::Good),
+        ));
+        spans.push(Span::styled(
+            format!(" -{}", totals.1),
+            theme::tone(crate::board::Tone::Bad),
+        ));
+        spans.push(Span::styled(" uncommitted", theme::faint()));
+    }
     if b.behind > 0 {
         spans.push(Span::styled("  ·  ", theme::faint()));
         spans.push(Span::styled(
@@ -340,18 +473,19 @@ fn draw_board(f: &mut Frame, app: &App, area: Rect) {
         x += width + COL_GAP;
     }
 
-    // Hint that there is more board off-screen.
-    if last < app.board.columns.len() {
+    // Hint that there is more board off-screen. One mark, not a wall of them: repeated
+    // down every row it reads as a border between panes rather than as a hint.
+    if last < app.board.columns.len() && area.height > 0 {
         let marker = Rect {
             x: area.x + area.width.saturating_sub(1),
-            y: area.y,
+            y: area.y + area.height / 2,
             width: 1,
-            height: area.height,
+            height: 1,
         };
-        let more: Vec<Line> = (0..area.height)
-            .map(|_| Line::styled("›", theme::faint()))
-            .collect();
-        f.render_widget(Paragraph::new(more), marker);
+        f.render_widget(
+            Paragraph::new(Line::styled("›", theme::faint())),
+            marker,
+        );
     }
 }
 
@@ -579,6 +713,16 @@ fn render_card(card: &Card, width: usize, selected: bool, picked: bool) -> Vec<L
             ]
         })
         .collect();
+    if let Some((a, r)) = card.stats {
+        meta.push(Span::styled(
+            format!("+{a}"),
+            theme::tone(crate::board::Tone::Good),
+        ));
+        meta.push(Span::styled(
+            format!(" -{r}  "),
+            theme::tone(crate::board::Tone::Bad),
+        ));
+    }
     if let Some(author) = &card.author {
         meta.push(Span::styled(author.clone(), theme::faint()));
     }
@@ -706,6 +850,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         help_row("u", "send this card back to the backlog — uncommit or unstage"),
         help_row("d", "delete this lane — asks first"),
         help_row("r", "rebase onto the updated target — shows what will happen"),
+        help_row("⏎", "open the diff beside the board — ← goes back"),
         help_row("c", "commit the staged files in this lane"),
         help_row("b", "new branch — stacks on this lane, tab for parallel"),
         help_row("s", "stack this whole lane onto another — rewrites history"),

@@ -13,7 +13,11 @@
 //! A stack may hold several branches stacked in series. Those stay in one column and
 //! become groups within it, since they are one lane of work, not parallel lanes.
 
-use crate::model::{Branch, BranchStatus, Ci, CiConclusion, CiStatus, FileChange, WorkspaceStatus};
+use std::collections::HashMap;
+
+use crate::model::{
+    Branch, BranchStatus, Ci, CiConclusion, CiStatus, DiffOutput, FileChange, WorkspaceStatus,
+};
 
 /// The special `but` target meaning "unassigned".
 pub const UNASSIGNED_TARGET: &str = "zz";
@@ -69,6 +73,13 @@ pub struct Card {
     pub kind: CardKind,
     /// Branch name, set only when the column holds more than one branch.
     pub group: Option<String>,
+    /// Lines added and removed.
+    ///
+    /// Only working-tree cards have this. Commit cards would need a `but diff <sha>` each
+    /// — roughly 60ms per commit — where every uncommitted change is covered by the single
+    /// `but diff` already being run. Paying N subprocess spawns per refresh to decorate a
+    /// card is not worth it; see the README.
+    pub stats: Option<(usize, usize)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,8 +202,55 @@ pub struct Board {
     pub conflicted_files: Vec<String>,
 }
 
+/// Sums added/removed per file path. `but diff` emits one entry per hunk, so a file with
+/// several hunks appears several times and its counts accumulate.
+pub fn stats_by_path(diff: &DiffOutput) -> HashMap<String, (usize, usize)> {
+    let mut map: HashMap<String, (usize, usize)> = HashMap::new();
+    for change in &diff.changes {
+        let Some(body) = &change.diff else { continue };
+        let e = map.entry(change.path.clone()).or_default();
+        for hunk in &body.hunks {
+            for line in hunk.diff.lines() {
+                match line.as_bytes().first() {
+                    Some(b'+') => e.0 += 1,
+                    Some(b'-') => e.1 += 1,
+                    _ => {}
+                }
+            }
+        }
+    }
+    // The `@@` header starts with neither, so nothing to discount.
+    map
+}
+
 impl Board {
     pub fn from_status(s: &WorkspaceStatus) -> Board {
+        Board::build(s, &HashMap::new(), &HashMap::new())
+    }
+
+    /// As [`Board::from_status`], with line counts attached to working-tree cards.
+    pub fn from_status_and_diff(s: &WorkspaceStatus, diff: &DiffOutput) -> Board {
+        Board::build(s, &stats_by_path(diff), &HashMap::new())
+    }
+
+    /// The full picture: working-tree counts by path, plus commit counts by SHA.
+    ///
+    /// Commit counts are passed in rather than fetched because they need one
+    /// `but diff <sha>` each. A commit's content is fixed by its hash, so the caller can
+    /// cache them forever and only pay for hashes it has not seen.
+    pub fn from_status_diff_and_commits(
+        s: &WorkspaceStatus,
+        diff: &DiffOutput,
+        commits: &HashMap<String, (usize, usize)>,
+    ) -> Board {
+        Board::build(s, &stats_by_path(diff), commits)
+    }
+
+    fn build(
+        s: &WorkspaceStatus,
+        stats: &HashMap<String, (usize, usize)>,
+        commit_stats: &HashMap<String, (usize, usize)>,
+    ) -> Board {
         let mut columns = Vec::with_capacity(s.stacks.len() + 1);
 
         columns.push(Column {
@@ -200,8 +258,13 @@ impl Board {
             title: "unassigned".into(),
             state: None,
             badges: Vec::new(),
-            cards: s.unassigned_changes.iter().map(change_card).collect(),
+            cards: s
+                .unassigned_changes
+                .iter()
+                .map(|c| change_card(c, stats))
+                .collect(),
             sections: Vec::new(),
+            stats: None,
             drop_target: UNASSIGNED_TARGET.into(),
             branch_name: None,
         });
@@ -213,7 +276,11 @@ impl Board {
             };
             let multi = stack.branches.len() > 1;
 
-            let mut cards: Vec<Card> = stack.assigned_changes.iter().map(change_card).collect();
+            let mut cards: Vec<Card> = stack
+                .assigned_changes
+                .iter()
+                .map(|c| change_card(c, stats))
+                .collect();
             for branch in &stack.branches {
                 let group = multi.then(|| branch.name.clone());
                 for commit in &branch.commits {
@@ -241,6 +308,7 @@ impl Board {
                         author: Some(commit.author_name.clone()),
                         kind: CardKind::Commit,
                         group: group.clone(),
+                        stats: commit_stats.get(&commit.commit_id).copied(),
                     });
                 }
             }
@@ -292,9 +360,18 @@ impl Board {
                 badges: branch_badges(top, !stack.assigned_changes.is_empty()),
                 cards,
                 sections,
+                stats: None,
                 drop_target: top.name.clone(),
                 branch_name: Some(top.name.clone()),
             });
+        }
+
+        for col in &mut columns {
+            let totals = col.cards.iter().filter_map(|c| c.stats).fold(
+                (0usize, 0usize),
+                |(a, r), (ca, cr)| (a + ca, r + cr),
+            );
+            col.stats = (totals != (0, 0)).then_some(totals);
         }
 
         Board {
@@ -306,8 +383,9 @@ impl Board {
     }
 }
 
-fn change_card(c: &FileChange) -> Card {
+fn change_card(c: &FileChange, stats: &HashMap<String, (usize, usize)>) -> Card {
     Card {
+        stats: stats.get(&c.file_path).copied(),
         cli_id: c.cli_id.clone(),
         rub_id: c.cli_id.clone(),
         title: c.file_path.clone(),

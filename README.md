@@ -10,20 +10,22 @@ lane for unstaged work.
 ```
   workspace  ·  base 3189356
 
- ● unassigned  2                      ● feat-auth  2                       ● feat-ui  2
- ──────────────────────────────       ──────────────────────────────       ──────────────────────────────
- mv                                   local only                           local only
- wip1.txt                             d5                                   ca
- added                                Wire session refresh into gateway    Fix settings tab focus ring
-                                      a2.txt                               b2.txt
- nr                                   d593db0  Dani                        ca3b30b  Dani
- wip2.txt
- added                                e1                                   47
-                                      Add auth middleware                  Redesign settings page
-                                      a.txt                                b.txt
-                                      e17b60c  Dani                        47a6412  Dani
+ ● unassigned  2             ● feat-auth  2              ● feat-ui  2
+ ──────────────────────────  ──────────────────────────  ──────────────────────────
+ mv                          unpushed                    unpushed
+ wip1.txt                    d5                          ca
+ added                       Wire session refresh into   Fix settings tab focus
+                             gateway                     ring
+ nr                          a2.txt                      b2.txt                                        ›
+ wip2.txt                    d593db0  Dani               ca3b30b  Dani
+ added
+                             e1                          47
+                             Add auth middleware         Redesign settings page
+                             a.txt                       b.txt
+                             e17b60c  Dani               47a6412  Dani
 
-  ←/→ lane · ↑/↓ card · m move · r refresh · ? help · q quit
+  ←/→ lane · ↑/↓ card · m move · u unstage · c commit · b branch
+  s stack · ⏎ diff · d delete · r rebase · p push · ? help · q quit
 ```
 
 ## Install
@@ -47,6 +49,7 @@ kanstack
 | `u` | send this card back to the backlog — uncommit a commit, unstage a file |
 | `d` | delete this lane — asks first |
 | `r` | rebase onto the updated target — shows what will happen |
+| `⏎` | open the diff beside the board — `←` goes back, `m` stages one hunk |
 | `c` | commit the files staged to this lane (only what is staged) |
 | `b` | new branch — stacks on the selected lane, `tab` for a parallel lane |
 | `s` | stack this whole lane onto another — rewrites history |

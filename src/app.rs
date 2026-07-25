@@ -31,6 +31,8 @@ pub enum Mode {
     DeleteConfirm,
     /// Looking at what rebasing onto the updated target would do.
     RebaseConfirm,
+    /// Reading a diff, hunk by hunk.
+    Diff,
     Help,
 }
 
@@ -44,6 +46,8 @@ pub enum Notice {
 pub struct App {
     /// `None` in snapshot mode, where a captured status is rendered read-only.
     but: Option<But>,
+    /// `None` outside cmux, or when `cmux-tui` is not installed. See [`crate::cmux`].
+    cmux: Option<Cmux>,
     pub board: Board,
     pub col: usize,
     pub card: usize,
@@ -65,13 +69,26 @@ pub struct App {
     pub push_preview: Option<PushPreview>,
     /// What a rebase onto the updated target would do, valid while `mode == RebaseConfirm`.
     pub pull_preview: Option<PullPreview>,
+    /// The diff being read, valid while `mode == Diff`.
+    pub diff: Option<DiffView>,
+    /// Whether the diff takes the whole width. Split by default so the board stays
+    /// visible — reading a diff should not cost you your place on the board.
+    pub diff_full: bool,
+    /// Line counts per commit hash. A commit's diff never changes, so this only ever
+    /// grows and a refresh costs no extra subprocesses once warm.
+    commit_stats: HashMap<String, (usize, usize)>,
+    /// Set when a move was started from a hunk in the diff pane rather than from a card.
+    /// Lets hunk staging reuse the ordinary lane-targeting flow unchanged.
+    pub move_source: Option<(String, String)>,
     pub message: Option<(String, Notice)>,
     pub should_quit: bool,
 }
 
 impl App {
-    pub fn new(but: But) -> Result<Self> {
-        let board = Board::from_status(&but.status()?);
+    pub fn new(but: But, cmux: Option<Cmux>) -> Result<Self> {
+        let status = but.status()?;
+        let mut commit_stats = HashMap::new();
+        let board = Self::board_from(&but, &mut commit_stats, &status);
         let mut message = None;
         if but.is_untested_version() {
             message = Some((
@@ -86,6 +103,7 @@ impl App {
         }
         Ok(App {
             but: Some(but),
+            cmux,
             board,
             col: 0,
             card: 0,
@@ -98,6 +116,10 @@ impl App {
             stack_onto: None,
             push_preview: None,
             pull_preview: None,
+            diff: None,
+            diff_full: false,
+            move_source: None,
+            commit_stats,
             message,
             should_quit: false,
         })
@@ -108,6 +130,7 @@ impl App {
     pub fn from_board(board: Board) -> Self {
         App {
             but: None,
+            cmux: None,
             board,
             col: 0,
             card: 0,
@@ -120,6 +143,10 @@ impl App {
             stack_onto: None,
             push_preview: None,
             pull_preview: None,
+            diff: None,
+            diff_full: false,
+            move_source: None,
+            commit_stats: HashMap::new(),
             message: None,
             should_quit: false,
         }
@@ -156,6 +183,41 @@ impl App {
         self.message = Some((msg.into(), kind));
     }
 
+    /// Builds a board from a status, attaching line counts everywhere they belong.
+    ///
+    /// One `but diff` covers every uncommitted change at once. Commits need one
+    /// `but diff <sha>` each, which would be ruinous per refresh — except that a commit's
+    /// content is fixed by its hash, so the result caches forever. Only hashes never seen
+    /// before cost anything, which in steady state is none of them: a refresh after
+    /// editing a file re-reads the worktree diff and nothing else.
+    fn board_from(
+        but: &But,
+        cache: &mut HashMap<String, (usize, usize)>,
+        s: &crate::model::WorkspaceStatus,
+    ) -> Board {
+        for stack in &s.stacks {
+            for branch in &stack.branches {
+                for commit in &branch.commits {
+                    if cache.contains_key(&commit.commit_id) {
+                        continue;
+                    }
+                    // A commit whose diff cannot be read simply goes uncounted.
+                    if let Ok(d) = but.diff_target(&commit.commit_id) {
+                        let totals = crate::board::stats_by_path(&d)
+                            .into_values()
+                            .fold((0, 0), |(a, r), (ca, cr)| (a + ca, r + cr));
+                        cache.insert(commit.commit_id.clone(), totals);
+                    }
+                }
+            }
+        }
+        match but.diff_uncommitted() {
+            Ok(d) => Board::from_status_diff_and_commits(s, &d, cache),
+            // Counts are a nicety; a board without them beats no board.
+            Err(_) => Board::from_status(s),
+        }
+    }
+
     pub fn refresh(&mut self) {
         let Some(but) = &self.but else {
             self.notify("snapshot is read-only", Notice::Info);
@@ -163,7 +225,7 @@ impl App {
         };
         match but.status() {
             Ok(s) => {
-                self.board = Board::from_status(&s);
+                self.board = Self::board_from(but, &mut self.commit_stats, &s);
                 self.clamp();
             }
             Err(e) => self.notify(format!("refresh failed: {e}"), Notice::Error),
@@ -797,7 +859,7 @@ impl App {
         };
         match but.restack_branch(&source, &target) {
             Ok(status) => {
-                self.board = Board::from_status(&status);
+                self.board = Self::board_from(but, &mut self.commit_stats, &status);
                 self.clamp();
                 self.notify(
                     format!("stacked {source} onto {target} — commits were rewritten"),
@@ -991,6 +1053,7 @@ impl App {
             K::Esc => match self.mode {
                 Mode::Moving => {
                     self.mode = Mode::Normal;
+                    self.move_source = None;
                     self.col = self.origin_col;
                     self.notify("move cancelled", Notice::Info);
                 }
@@ -1050,6 +1113,7 @@ impl App {
             K::Char('u') if self.mode == Mode::Normal => self.send_to_backlog(),
             K::Char('d') if self.mode == Mode::Normal => self.begin_delete(),
             K::Char('r') if self.mode == Mode::Normal => self.begin_rebase(),
+            K::Enter if self.mode == Mode::Normal => self.open_diff(),
             K::Enter if self.mode == Mode::Restacking => self.confirm_restack(),
             K::Enter if self.mode == Mode::Moving => self.confirm_move(),
             _ => {}

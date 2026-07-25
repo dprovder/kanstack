@@ -113,6 +113,10 @@ impl But {
         self.version
     }
 
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
     /// True when running against a `but` newer than anything this was tested with.
     /// Worth surfacing in the UI, but not worth refusing to start over.
     pub fn is_untested_version(&self) -> bool {

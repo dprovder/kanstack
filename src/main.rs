@@ -30,7 +30,15 @@ options:
   -h, --help         print this help
 
 environment:
-  KANSTACK_BUT_BIN  path to the `but` binary (default: `but` on PATH)
+  KANSTACK_BUT_BIN   path to the `but` binary (default: `but` on PATH)
+  KANSTACK_CMUX_BIN  path to the `cmux` CLI, to open a terminal split for each new
+                     parallel lane (default: `cmux` on PATH if present; the integration is
+                     silently skipped otherwise)
+  KANSTACK_HARNESS   command typed into that terminal (default: `claude`)
+  KANSTACK_CMUX_DIRECTION  split direction for the first lane, off kanstack's own pane:
+                           left, right, above, or below (default: `above`)
+  KANSTACK_CMUX_CHAIN_DIRECTION  split direction for every lane after the first, off the
+                           previous lane instead of kanstack (default: `right`)
 
 capture a snapshot for a bug report:
   but status -f -j > board.json && kanstack --snapshot board.json
@@ -102,7 +110,8 @@ fn main() -> Result<()> {
     // Everything else that can fail with a readable message happens before the alternate
     // screen is entered, so errors are not wiped by the terminal restore.
     let but = But::discover(&cwd)?;
-    let mut app = App::new(but)?;
+    let cmux = Cmux::discover();
+    let mut app = App::new(but, cmux)?;
 
     // A failed watch is not fatal: the board still works, it just stops following the
     // repository on its own. Say so rather than dying or silently going stale.
