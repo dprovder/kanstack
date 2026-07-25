@@ -6,6 +6,7 @@ rust-version = "1.82"
 description = "An unofficial kanban-style terminal UI for the GitButler CLI"
 license = "MIT"
 repository = "https://github.com/dprovder/kanstack"
+homepage = "https://github.com/dprovder/kanstack"
 readme = "README.md"
 
 [lib]
@@ -28,3 +29,8 @@ serde_json = "1.0"
 [profile.release]
 lto = "thin"
 strip = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

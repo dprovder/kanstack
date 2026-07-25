@@ -24,7 +24,7 @@ usage:
 
 options:
   -C <path>          run against the repository at <path> (default: cwd)
-  --snapshot <file>  render captured `but status -f -j` output and exit
+  --snapshot <file>  render captured `but status -f --format json` output and exit
   --size <WxH>       terminal size for --snapshot (default: 160x30)
   -V, --version      print version
   -h, --help         print this help
@@ -41,7 +41,7 @@ environment:
                            previous lane instead of kanstack (default: `right`)
 
 capture a snapshot for a bug report:
-  but status -f -j > board.json && kanstack --snapshot board.json
+  but status -f --format json > board.json && kanstack --snapshot board.json
 
 requires the GitButler CLI: https://docs.gitbutler.com/cli-overview
 ";
@@ -103,7 +103,7 @@ fn main() -> Result<()> {
         anyhow::bail!(
             "not running in a terminal, so there is no board to draw.\n\
              To render a captured board non-interactively:\n\
-             \n    but status -f -j > board.json && kanstack --snapshot board.json"
+             \n    but status -f --format json > board.json && kanstack --snapshot board.json"
         );
     }
 

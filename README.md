@@ -30,14 +30,46 @@ lane for unstaged work.
 
 ## Install
 
-Requires the [GitButler CLI](https://docs.gitbutler.com/cli-overview) on your `PATH`
-(`but` 0.21 or newer — 0.21 changed enough of the CLI's flags and JSON that older releases
-are no longer supported, see [Version compatibility](#version-compatibility)) and a
-repository you have run `but setup` in.
+Two things are required first:
+
+1. **The [GitButler CLI](https://docs.gitbutler.com/cli-overview)**, `but` 0.21 or newer, on
+   your `PATH` — 0.21 changed enough of the CLI's flags and JSON that older releases are no
+   longer supported (see [Version compatibility](#version-compatibility)). On macOS:
+   ```sh
+   brew install --cask gitbutler
+   ```
+   Otherwise, follow GitButler's own install docs linked above.
+2. **A repository you have run `but setup` in.** If you don't have one yet:
+   ```sh
+   cd your-project
+   but setup
+   ```
+
+Then install `kanstack` itself — no Rust toolchain required:
 
 ```sh
-cargo install --path .
+brew install dprovder/tap/kanstack
+```
+
+Or grab a prebuilt binary for macOS (Apple Silicon or Intel) or Linux (x86_64 or aarch64)
+from the [Releases page](https://github.com/dprovder/kanstack/releases) and put it on your
+`PATH`.
+
+Then, from inside the repository you ran `but setup` in:
+
+```sh
 kanstack
+```
+
+### Building from source
+
+If you'd rather build it yourself (or want to hack on it), this does need Rust — install it
+via [rustup](https://rustup.rs) if you don't have it already:
+
+```sh
+git clone https://github.com/dprovder/kanstack
+cd kanstack
+cargo install --path .
 ```
 
 ## Keys
