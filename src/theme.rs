@@ -72,7 +72,7 @@ pub fn picked_bg() -> Style {
 /// lane came out the same green as a fully pushed one.
 pub fn status_dot(state: Option<crate::board::LaneState>) -> Style {
     match state {
-        None => Style::default().fg(FAINT),
+        None => faint(),
         Some(s) => tone(s.tone()),
     }
 }
