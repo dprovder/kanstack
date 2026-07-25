@@ -18,6 +18,9 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0"
+# Filesystem watching, so the board follows the repo instead of waiting for a keypress.
+ignore = "0.4"
+notify = "8"
 ratatui = "0.30"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
