@@ -25,7 +25,7 @@ lane for unstaged work.
                              e17b60c  Dani               47a6412  Dani
 
   ←/→ lane · ↑/↓ card · m move · u unstage · c commit · b branch
-  s stack · ⏎ diff · d delete · r rebase · p push · M land · ? help · q quit
+  s stack · ⏎ diff · d delete · r rebase · p push · M land · z/Z undo/redo · ? help · q quit
 ```
 
 ## Install
@@ -57,6 +57,7 @@ kanstack
 | `s` | stack this whole lane onto another — rewrites history |
 | `p` | push this lane — shows what it will do first |
 | `M` | land this lane onto the target, no PR — shows what will happen first |
+| `z` / `Z` | undo / redo the last operation — fires immediately, no confirm |
 | `?` | help |
 | `q` | quit |
 
@@ -149,8 +150,8 @@ so they never touch your GitButler project registry or settings.
 ## Status
 
 Usable. Reading, moving, staging by hunk, committing, branching, stacking, deleting,
-pushing, rebasing and landing all work and are covered by tests against the real CLI. Not
-yet built:
+pushing, rebasing, landing, and undo/redo all work and are covered by tests against the
+real CLI. Not yet built:
 
 - **CI and review badges are unverified.** The wire types are bound and rendered, but every
   workspace tested so far had no forge attached, so `ci` and `reviewId` were always null.
@@ -224,6 +225,19 @@ branch (alone, or the tip or base of a stack) now discards *its own* commits out
 non-interactively, with no refusal and no folding into a neighbouring branch. `but undo` is
 the safety net instead, so the confirmation names that rather than implying nothing can be
 lost.
+
+## Undo and redo
+
+`z` runs `but undo`, `Z` runs `but redo`. Both fire immediately with no confirmation dialog
+— unlike every other mutation here, undo/redo *is* the confirmation: it is what makes `d`
+safe to bind at all now that deleting no longer refuses to lose work, and it reverses
+anything else, including a `land`.
+
+`but undo`/`but redo` restore the entire prior workspace state, uncommitted changes
+included, not just the last commit. Both always succeed and print nothing, whether or not
+there was anything to undo or redo — verified against 0.21.2, there is no way to tell a real
+undo from a silent no-op except by comparing the board before and after, so the notification
+here just says "undid"/"redid" without claiming to know which happened.
 
 ## Lane and branch state
 

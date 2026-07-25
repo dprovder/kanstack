@@ -716,6 +716,34 @@ fn sending_a_commit_to_the_backlog_uncommits_without_losing_content() {
     );
 }
 
+/// `z`/`Z` are the safety net every other destructive action here now leans on (`d` in
+/// particular, since 0.21 stopped refusing an orphaning delete). Both must actually round
+/// trip: undo an operation, then redo it back, and land on the exact state each time.
+#[test]
+#[ignore = "requires the GitButler CLI"]
+fn undo_and_redo_round_trip_a_branch_creation() {
+    if skip_if_no_but() {
+        return;
+    }
+    let sb = Sandbox::new("undoredo");
+
+    let but = But::discover(&sb.repo()).unwrap();
+    let after_create = Board::from_status(&but.branch_new("feat", None).unwrap());
+    assert!(after_create.columns.iter().any(|c| c.branch_name.as_deref() == Some("feat")));
+
+    let after_undo = Board::from_status(&but.undo().unwrap());
+    assert!(
+        after_undo.columns.iter().all(|c| c.branch_name.as_deref() != Some("feat")),
+        "undo removes the branch it created"
+    );
+
+    let after_redo = Board::from_status(&but.redo().unwrap());
+    assert!(
+        after_redo.columns.iter().any(|c| c.branch_name.as_deref() == Some("feat")),
+        "redo brings it back"
+    );
+}
+
 /// `d` used to be safe to bind only because `but` refused to delete a branch whose commits
 /// would be left orphaned. That guarantee is upstream's, not ours — and 0.21 changed it:
 /// deleting a lone branch with unpushed commits now succeeds non-interactively and
