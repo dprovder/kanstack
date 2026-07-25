@@ -34,11 +34,18 @@ Two things are required first:
 
 1. **The [GitButler CLI](https://docs.gitbutler.com/cli-overview)**, `but` 0.21 or newer, on
    your `PATH` — 0.21 changed enough of the CLI's flags and JSON that older releases are no
-   longer supported (see [Version compatibility](#version-compatibility)). On macOS:
+   longer supported (see [Version compatibility](#version-compatibility)).
+
+   Just the CLI, no GUI app (macOS or Linux):
+   ```sh
+   curl -fsSL https://gitbutler.com/install.sh | sh
+   ```
+   If you also want the GitButler desktop app, on macOS:
    ```sh
    brew install --cask gitbutler
    ```
-   Otherwise, follow GitButler's own install docs linked above.
+   (this also puts `but` on your `PATH`). Otherwise, follow GitButler's own install docs
+   linked above.
 2. **A repository you have run `but setup` in.** If you don't have one yet:
    ```sh
    cd your-project
