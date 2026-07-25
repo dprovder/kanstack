@@ -241,6 +241,52 @@ pub struct PushCommit {
     pub message: String,
 }
 
+/// Output of `but diff -j`, with or without a target.
+///
+/// The two forms differ in a way that matters: for *uncommitted* changes `but` emits one
+/// entry per hunk, each carrying its own `id` that `rub` accepts — which is what makes
+/// hunk-level staging possible. For a commit's diff the entries have no ids and may hold
+/// several hunks each, because a hunk already in history is not something to stage.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DiffOutput {
+    #[serde(default)]
+    pub changes: Vec<DiffChange>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiffChange {
+    /// Present only for uncommitted changes; this is the hunk's rub handle.
+    #[serde(default)]
+    pub id: Option<String>,
+    pub path: String,
+    #[serde(default)]
+    pub status: Option<ChangeType>,
+    #[serde(default)]
+    pub diff: Option<DiffBody>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiffBody {
+    /// `"patch"` for text. Binary files report something else and carry no hunks.
+    #[serde(rename = "type", default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub hunks: Vec<Hunk>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Hunk {
+    pub old_start: u32,
+    pub old_lines: u32,
+    pub new_start: u32,
+    pub new_lines: u32,
+    /// The unified patch text, `@@` header included.
+    pub diff: String,
+}
+
 /// Output of `but pull --check -j`: what rebasing onto the updated target would do,
 /// without doing it.
 #[derive(Debug, Clone, Deserialize)]

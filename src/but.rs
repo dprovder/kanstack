@@ -9,7 +9,9 @@ use std::process::Command;
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use crate::model::{CliError, MutationEnvelope, PullPreview, PushPreview, WorkspaceStatus};
+use crate::model::{
+    CliError, DiffOutput, MutationEnvelope, PullPreview, PushPreview, WorkspaceStatus,
+};
 
 /// Oldest `but` whose JSON shape this was verified against.
 pub const MIN_VERSION: Version = Version {
@@ -240,6 +242,20 @@ impl But {
         args.push("-j");
         self.run(&args)?;
         self.status()
+    }
+
+    /// Diff of the uncommitted worktree, one entry per hunk with a rub-able id.
+    pub fn diff_uncommitted(&self) -> Result<DiffOutput> {
+        let raw = self.run(&["diff", "-j"])?;
+        serde_json::from_str(raw.trim())
+            .with_context(|| format!("could not parse `but diff` output: {raw:.400}"))
+    }
+
+    /// Diff of a commit. Entries carry no ids — history is not stageable.
+    pub fn diff_target(&self, target: &str) -> Result<DiffOutput> {
+        let raw = self.run(&["diff", target, "-j"])?;
+        serde_json::from_str(raw.trim())
+            .with_context(|| format!("could not parse `but diff {target}` output: {raw:.400}"))
     }
 
     /// Asks what rebasing onto the updated target would do, without doing it.

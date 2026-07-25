@@ -12,6 +12,7 @@ use ratatui::crossterm::event::{self, Event, KeyEventKind};
 
 use kanstack::app::{App, Mode, Notice};
 use kanstack::but::But;
+use kanstack::cmux::Cmux;
 use kanstack::watch::Watcher;
 use kanstack::{snapshot, ui};
 

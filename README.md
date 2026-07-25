@@ -131,19 +131,57 @@ so they never touch your GitButler project registry or settings.
 
 ## Status
 
-Early. The board, navigation, and `rub`-backed moves work and are tested against the real
-CLI. Not yet built:
+Usable. Reading, moving, staging by hunk, committing, branching, stacking, deleting,
+pushing and rebasing all work and are covered by tests against the real CLI. Not yet built:
 
-- **A diff pane.** `but diff -j` already returns hunk-level patches with ids, so the data
-  is there; the work is rendering and syntax highlighting.
-- **Live refresh.** Right now you press `r`. The CLI has no watch mode, so this needs a
-  filesystem watcher on `.git` and the worktree, debounced.
 - **CI and review badges are unverified.** The wire types are bound and rendered, but every
   workspace tested so far had no forge attached, so `ci` and `reviewId` were always null.
   If you use this with real PRs, that is where bugs will be.
 - `land`, which skips the pull request entirely. Deliberately not bound yet: it rewrites
   trunk, and deserves more than a keystroke.
-- Reordering commits within a lane.
+- Flipping through adjacent cards' diffs without leaving the pane. `→` used to do this,
+  but both arrows now close, which is the clearer rule; `n`/`p` or `[`/`]` would give the
+  behaviour back without overloading the arrows.
+- Reordering commits within a lane. `but move <commit> <target> -a` does it; the open
+  question is the gesture, since dropping a card on a card already means squash.
+
+## The diff pane, and hunk staging
+
+`⏎` opens the diff **beside** the board rather than over it, so you keep your place. `←`
+goes back to the board — the diff sits to the right, so leaving it is a direction rather
+than a second meaning for `⏎`. `→` walks on to the next lane's diff without leaving. `tab` widens it to full width when
+you want to read properly. This is the split [gitui](https://github.com/gitui-org/gitui)
+uses, for the same reason.
+
+Added and removed lines carry a `+` / `-` in a column of their own, next to the new-file
+line number. gitui relies on colour alone; a marker survives being read without it.
+
+## Line counts
+
+`+`/`-` appear on every card, on each branch of a stack, and on the lane and workspace
+headers. In a stack each branch totals only its own commits, so a lane like
+`feat-auth +1  2  +31 -4` sitting above `● fix-flaky-tests  1  +10 -1` tells you which
+branch is the big one.
+
+Uncommitted changes all come from the single `but diff` run alongside `but status`. Commits
+need `but diff <sha>` *each*, which would be ruinous per refresh — except a commit's content
+is fixed by its hash, so those results are cached by SHA and never expire. Only hashes never
+seen before cost anything, which after the first draw is usually none of them.
+
+The workspace header counts working-tree changes only; it says "uncommitted", so including
+committed lines there would make it lie.
+
+A working-tree file shows its hunks; a commit shows its own diff, read-only.
+
+The useful part is that `but diff -j` emits **one entry per hunk**, each with its own id
+that `rub` accepts. So `m` inside the pane picks up the hunk under the cursor and hands it
+to the same lane-targeting flow cards use — which means one file's hunks can go to
+different lanes. That is the only way to split a file that touches two unrelated things.
+
+Committed hunks carry no id and are marked as such; history is not stageable.
+
+Hunk ids describe the *current* state, and staging one renumbers the rest, so the pane
+closes when you stage. Reopening re-queries rather than trusting a stale list.
 
 ## Rebasing onto the target
 

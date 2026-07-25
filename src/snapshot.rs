@@ -153,6 +153,121 @@ mod tests {
         );
     }
 
+    /// Counts belong on cards, on each branch of a stack, and on the lane — not just one
+    /// lump for the whole lane, which said nothing about which branch was big.
+    #[test]
+    fn line_counts_appear_on_cards_and_on_each_stacked_branch() {
+        use std::collections::HashMap;
+        let mut status =
+            crate::but::parse_status(include_str!("../tests/fixtures/status.json")).unwrap();
+        // Fold the third stack into the first so the lane holds two branches.
+        let extra = status.stacks.remove(2).branches.remove(0);
+        status.stacks[0].branches.push(extra);
+
+        let mut commits: HashMap<String, (usize, usize)> = HashMap::new();
+        for (i, stack) in status.stacks.iter().enumerate() {
+            for branch in &stack.branches {
+                for (j, c) in branch.commits.iter().enumerate() {
+                    commits.insert(c.commit_id.clone(), (10 * (i + 1) + j, j + 1));
+                }
+            }
+        }
+        let diff: crate::model::DiffOutput = serde_json::from_str(
+            r#"{"changes":[{"id":"h0","path":"wip1.txt","diff":{"type":"patch","hunks":[
+                {"oldStart":1,"oldLines":1,"newStart":1,"newLines":2,
+                 "diff":"@@ -1 +1,2 @@\n-a\n+A\n+B\n"}]}}]}"#,
+        )
+        .unwrap();
+
+        let board = Board::from_status_diff_and_commits(&status, &diff, &commits);
+        let app = App::from_board(board);
+        let mut t = Terminal::new(TestBackend::new(120, 22)).unwrap();
+        t.draw(|f| crate::ui::draw(f, &app)).unwrap();
+        let out = plain(&to_ansi(t.backend().buffer()));
+
+        assert!(out.contains("+2 -1"), "a working-tree card counts its own hunk:\n{out}");
+        assert!(out.contains("+10 -1"), "and a commit card carries its own");
+        // Each branch of the stack reports separately rather than sharing one figure.
+        // The stacked branch totals only its own commit, not the lane's.
+        assert!(
+            out.contains("● fix-flaky-tests  1  +10 -1"),
+            "the stacked branch shows its own total:\n{out}"
+        );
+        assert!(
+            out.contains("feat-auth +1  2  +31 -4"),
+            "and the tip's header counts the tip's commits, not the whole lane:\n{out}"
+        );
+        // The header says "uncommitted", so it must exclude committed lines.
+        assert!(
+            out.contains("+2 -1 uncommitted"),
+            "the workspace header counts only working-tree changes:\n{out}"
+        );
+    }
+
+    #[test]
+    fn the_diff_pane_shows_hunks_with_line_numbers_and_signs() {
+        let out: crate::model::DiffOutput = serde_json::from_str(
+            r#"{"changes":[
+              {"id":"h0","path":"a.txt","status":"modified","diff":{"type":"patch","hunks":[
+                {"oldStart":1,"oldLines":4,"newStart":1,"newLines":4,
+                 "diff":"@@ -1,4 +1,4 @@\n-one\n+ONE CHANGED\n two\n three\n"}]}},
+              {"id":"i0","path":"a.txt","status":"modified","diff":{"type":"patch","hunks":[
+                {"oldStart":9,"oldLines":2,"newStart":9,"newLines":2,
+                 "diff":"@@ -9,2 +9,2 @@\n nine\n-ten\n+TEN CHANGED\n"}]}}
+            ]}"#,
+        )
+        .unwrap();
+
+        let status =
+            crate::but::parse_status(include_str!("../tests/fixtures/status.json")).unwrap();
+        let mut app = App::from_board(Board::from_status(&status));
+        app.diff = Some(crate::diff::DiffView::from_output("a.txt", &out));
+        app.mode = crate::app::Mode::Diff;
+
+        let mut t = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        t.draw(|f| crate::ui::draw(f, &app)).unwrap();
+        let out = plain(&to_ansi(t.backend().buffer()));
+
+        assert!(out.contains("hunk 1 of 2"), "which hunk is selected");
+        // The sign is a column of its own, so it survives being read without colour.
+        assert!(out.contains("- one"), "removed lines carry a marker:\n{out}");
+        assert!(out.contains("+ ONE CHANGED"), "added lines too");
+        assert!(out.contains("m stage this hunk"), "staging is offered");
+        // The board is still there: reading a diff must not cost you your place.
+        assert!(
+            out.contains("unassigned"),
+            "the board stays visible beside it:\n{out}"
+        );
+        assert!(
+            out.contains('›'),
+            "and advertises the lanes its narrower half cannot fit"
+        );
+        eprintln!("{out}");
+    }
+
+    #[test]
+    fn a_committed_hunk_does_not_offer_staging() {
+        let out: crate::model::DiffOutput = serde_json::from_str(
+            r#"{"changes":[{"path":"a.txt","status":"modified","diff":{"type":"patch","hunks":[
+                {"oldStart":1,"oldLines":1,"newStart":1,"newLines":1,"diff":"@@ -1 +1 @@\n-a\n+b\n"}]}}]}"#,
+        )
+        .unwrap();
+        let status =
+            crate::but::parse_status(include_str!("../tests/fixtures/status.json")).unwrap();
+        let mut app = App::from_board(Board::from_status(&status));
+        app.diff = Some(crate::diff::DiffView::from_output("Add auth", &out));
+        app.mode = crate::app::Mode::Diff;
+
+        let mut t = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        t.draw(|f| crate::ui::draw(f, &app)).unwrap();
+        let out = plain(&to_ansi(t.backend().buffer()));
+        assert!(out.contains("committed"), "the hunk is marked as history");
+        assert!(
+            !out.contains("m stage this hunk"),
+            "and staging is not offered:\n{out}"
+        );
+    }
+
     #[test]
     fn long_commit_subjects_wrap_inside_the_lane() {
         let mut status =

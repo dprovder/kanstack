@@ -156,6 +156,9 @@ pub struct Section {
     pub state: LaneState,
     pub badges: Vec<Badge>,
     pub commits: usize,
+    /// Lines added and removed by this branch alone, so a stack shows a figure per branch
+    /// rather than one lump for the whole lane.
+    pub stats: Option<(usize, usize)>,
 }
 
 #[derive(Debug, Clone)]
@@ -173,6 +176,8 @@ pub struct Column {
     /// Identifier to rub a card onto when dropping it here. The branch *name* rather than
     /// its CLI id, for the same fuzzy-matching reason as [`Card::rub_id`].
     pub drop_target: String,
+    /// Lines added and removed across the lane's working-tree cards.
+    pub stats: Option<(usize, usize)>,
     /// Real name of the lane's tip branch, as `--anchor` wants it. `None` for the backlog.
     /// Distinct from `title`, which may carry a `+N` suffix for stacked branches.
     pub branch_name: Option<String>,
@@ -254,11 +259,28 @@ impl Board {
                 .enumerate()
                 .map(|(i, b)| {
                     let staged = i == 0 && !stack.assigned_changes.is_empty();
+                    // Each branch totals its own commits; the tip also owns whatever the
+                    // stack has staged, since staged changes belong to no branch below it.
+                    let mut totals = b.commits.iter().filter_map(|c| {
+                        commit_stats.get(&c.commit_id).copied()
+                    });
+                    let mut sum = totals.next().unwrap_or((0, 0));
+                    for (a, r) in totals {
+                        sum = (sum.0 + a, sum.1 + r);
+                    }
+                    if staged {
+                        for c in &stack.assigned_changes {
+                            if let Some((a, r)) = stats.get(&c.file_path) {
+                                sum = (sum.0 + a, sum.1 + r);
+                            }
+                        }
+                    }
                     Section {
                         name: b.name.clone(),
                         state: lane_state(b, staged),
                         badges: branch_badges(b, staged),
                         commits: b.commits.len(),
+                        stats: (sum != (0, 0)).then_some(sum),
                     }
                 })
                 .collect();
@@ -510,6 +532,43 @@ mod tests {
                 col.title
             );
         }
+    }
+
+    /// `but diff` emits one entry per hunk, so a file with several hunks must have its
+    /// counts summed rather than overwritten.
+    #[test]
+    fn line_counts_accumulate_across_a_files_hunks() {
+        let diff: crate::model::DiffOutput = serde_json::from_str(
+            r#"{"changes":[
+              {"id":"h0","path":"wip1.txt","diff":{"type":"patch","hunks":[
+                {"oldStart":1,"oldLines":1,"newStart":1,"newLines":2,
+                 "diff":"@@ -1 +1,2 @@\n-a\n+A\n+B\n"}]}},
+              {"id":"i0","path":"wip1.txt","diff":{"type":"patch","hunks":[
+                {"oldStart":9,"oldLines":1,"newStart":10,"newLines":1,
+                 "diff":"@@ -9 +10 @@\n-z\n+Z\n"}]}}
+            ]}"#,
+        )
+        .unwrap();
+        let by_path = stats_by_path(&diff);
+        assert_eq!(by_path.get("wip1.txt"), Some(&(3, 2)), "3 added, 2 removed");
+
+        let b = Board::from_status_and_diff(&sample(), &diff);
+        let card = b.columns[0]
+            .cards
+            .iter()
+            .find(|c| c.title == "wip1.txt")
+            .unwrap();
+        assert_eq!(card.stats, Some((3, 2)));
+        assert_eq!(b.columns[0].stats, Some((3, 2)), "the lane totals its cards");
+    }
+
+    #[test]
+    fn commit_cards_carry_no_line_counts() {
+        // Deliberate: those would cost one `but diff <sha>` per commit, per refresh.
+        let b = Board::from_status(&sample());
+        let lane = b.columns.iter().find(|c| c.title == "feat-auth").unwrap();
+        assert!(lane.cards.iter().all(|c| c.stats.is_none()));
+        assert!(lane.stats.is_none(), "so the lane has nothing to total");
     }
 
     #[test]

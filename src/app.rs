@@ -8,6 +8,10 @@ use anyhow::Result;
 
 use crate::board::{Board, Card, CardKind, ColumnKind};
 use crate::but::But;
+use std::collections::HashMap;
+
+use crate::cmux::Cmux;
+use crate::diff::DiffView;
 use crate::model::{PullPreview, PushPreview};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,7 +180,7 @@ impl App {
         let Some(but) = &self.but else { return };
         match but.status() {
             Ok(s) => {
-                self.board = Board::from_status(&s);
+                self.board = Self::board_from(but, &mut self.commit_stats, &s);
                 self.clamp();
             }
             Err(e) => self.notify(format!("refresh failed: {e}"), Notice::Error),
@@ -206,6 +210,16 @@ impl App {
             return;
         }
         self.card = (self.card as isize + delta).rem_euclid(n as isize) as usize;
+    }
+
+    /// What a move will rub, and how to name it. Normally the picked-up card; when a move
+    /// began from the diff pane, the hunk chosen there.
+    fn move_source_ref(&self) -> Option<(String, String)> {
+        if let Some((id, label)) = &self.move_source {
+            return Some((id.clone(), label.clone()));
+        }
+        let c = self.source_card()?;
+        Some((c.rub_id.clone(), c.cli_id.clone()))
     }
 
     /// The card currently picked up, valid while moving.
@@ -240,19 +254,24 @@ impl App {
         if self.mode != Mode::Moving {
             return None;
         }
-        let source = self.source_card()?;
+        let (_, source_label) = self.move_source_ref()?;
         let (_, target_label) = self.resolve_target()?;
         let verb = self.pending_verb()?;
-        Some(format!("{} {} → {}", verb, source.cli_id, target_label))
+        Some(format!("{verb} {source_label} → {target_label}"))
     }
 
     /// `None` when the combination is not a supported rub.
     fn pending_verb(&self) -> Option<&'static str> {
-        let source = self.source_card()?;
+        // A hunk picked from the diff pane behaves like any other working-tree change.
+        let source_kind = if self.move_source.is_some() {
+            CardKind::Change
+        } else {
+            self.source_card()?.kind
+        };
         let col = self.board.columns.get(self.col)?;
         match self.target_card {
             // Dropping on a lane: move or stage, per the matrix's Branch column.
-            None => Some(match (source.kind, col.kind) {
+            None => Some(match (source_kind, col.kind) {
                 (CardKind::Change, ColumnKind::Unassigned) => "unstage",
                 (CardKind::Change, ColumnKind::Stack) => "stage to",
                 (CardKind::Commit, ColumnKind::Unassigned) => "uncommit into",
@@ -260,7 +279,7 @@ impl App {
             }),
             // Dropping on a card: only commits are valid targets. The matrix has no
             // file-onto-file operation, so that combination is refused rather than guessed.
-            Some(i) => match (source.kind, col.cards.get(i)?.kind) {
+            Some(i) => match (source_kind, col.cards.get(i)?.kind) {
                 (CardKind::Commit, CardKind::Commit) => Some("squash into"),
                 (CardKind::Change, CardKind::Commit) => Some("amend into"),
                 (_, CardKind::Change) => None,
@@ -290,18 +309,21 @@ impl App {
     }
 
     fn confirm_move(&mut self) {
-        let Some(source) = self.source_card().cloned() else {
+        let Some((source_id, source_label)) = self.move_source_ref() else {
             self.mode = Mode::Normal;
+            self.move_source = None;
             return;
         };
+        let from_hunk = self.move_source.is_some();
 
         // Dropping a card onto itself is a no-op, not an error worth calling `but` for.
-        if self.col == self.origin_col && self.target_card == Some(self.origin_card) {
+        // A hunk has no "own lane" to land back in, so the check only applies to cards.
+        if !from_hunk && self.col == self.origin_col && self.target_card == Some(self.origin_card) {
             self.mode = Mode::Normal;
             self.notify("cancelled — same card", Notice::Info);
             return;
         }
-        if self.col == self.origin_col && self.target_card.is_none() {
+        if !from_hunk && self.col == self.origin_col && self.target_card.is_none() {
             self.mode = Mode::Normal;
             self.notify("cancelled — same lane", Notice::Info);
             return;
@@ -317,17 +339,18 @@ impl App {
             return;
         };
         self.mode = Mode::Normal;
+        self.move_source = None;
 
         let Some(but) = &self.but else {
             self.notify("snapshot is read-only", Notice::Info);
             return;
         };
 
-        match but.rub(&source.rub_id, &target_id) {
+        match but.rub(&source_id, &target_id) {
             Ok(status) => {
-                self.board = Board::from_status(&status);
+                self.board = Self::board_from(but, &mut self.commit_stats, &status);
                 self.clamp();
-                self.notify(format!("{verb} {} → {target_label}", source.cli_id), Notice::Success);
+                self.notify(format!("{verb} {source_label} → {target_label}"), Notice::Success);
             }
             Err(e) => self.notify(format!("{e}"), Notice::Error),
         }
@@ -385,7 +408,7 @@ impl App {
         };
         match but.commit(&branch, &message) {
             Ok(status) => {
-                self.board = Board::from_status(&status);
+                self.board = Self::board_from(but, &mut self.commit_stats, &status);
                 self.clamp();
                 self.notify(format!("committed to {title}"), Notice::Success);
             }
@@ -446,9 +469,10 @@ impl App {
             self.notify("snapshot is read-only", Notice::Info);
             return;
         };
+        let cwd = but.cwd().to_path_buf();
         match but.branch_new(&name, anchor.as_deref()) {
             Ok(status) => {
-                self.board = Board::from_status(&status);
+                self.board = Self::board_from(but, &mut self.commit_stats, &status);
                 self.clamp();
                 self.notify(
                     match &anchor {
@@ -467,11 +491,85 @@ impl App {
                     self.col = i;
                     self.card = 0;
                 }
+                // A stacked lane shares its base's tab; only a parallel lane is new work
+                // worth a harness of its own.
+                if anchor.is_none() {
+                    if let Some(cmux) = &mut self.cmux {
+                        if let Err(e) = cmux.spawn_harness(&cwd, &name) {
+                            self.notify(format!("cmux: {e}"), Notice::Error);
+                        }
+                    }
+                }
             }
             Err(e) => self.notify(format!("{e}"), Notice::Error),
         }
         self.branch_input.clear();
     }
+
+    /// Opens the diff for the selected card.
+    ///
+    /// A working-tree file resolves to its hunks, each individually stageable. A commit
+    /// resolves to its own diff, which is read-only — `but` gives committed changes no ids.
+    fn open_diff(&mut self) {
+        let Some(card) = self.selected_card().cloned() else {
+            self.notify("nothing selected", Notice::Info);
+            return;
+        };
+        let Some(but) = &self.but else {
+            self.notify("snapshot is read-only", Notice::Info);
+            return;
+        };
+        let result = match card.kind {
+            CardKind::Change => but.diff_uncommitted().map(|out| {
+                // `but diff` covers the whole worktree; keep the file we asked about.
+                let filtered = crate::model::DiffOutput {
+                    changes: out
+                        .changes
+                        .into_iter()
+                        .filter(|c| c.path == card.title)
+                        .collect(),
+                };
+                DiffView::from_output(card.title.clone(), &filtered)
+            }),
+            CardKind::Commit => but
+                .diff_target(&card.rub_id)
+                .map(|out| DiffView::from_output(card.title.clone(), &out)),
+        };
+        match result {
+            Ok(view) if view.entries.is_empty() => {
+                self.diff = None;
+                self.notify("no diff to show", Notice::Info);
+            }
+            Ok(view) => {
+                self.diff = Some(view);
+                self.mode = Mode::Diff;
+            }
+            Err(e) => self.notify(format!("{e}"), Notice::Error),
+        }
+    }
+
+    /// Picks up the hunk under the diff cursor and hands off to the ordinary move flow,
+    /// so staging a hunk uses the same lane targeting as everything else.
+    ///
+    /// Closing the pane here is load-bearing, not tidiness: hunk ids describe the current
+    /// state, and staging one renumbers whatever is left. Holding the old list open would
+    /// leave every remaining id pointing at the wrong hunk. Reopening re-queries.
+    fn move_hunk_from_diff(&mut self) {
+        let Some(view) = &self.diff else { return };
+        let Some(entry) = view.selected() else { return };
+        let Some(id) = entry.rub_id.clone() else {
+            self.notify("this hunk is already committed", Notice::Info);
+            return;
+        };
+        let label = format!("hunk in {}", entry.path);
+        self.diff = None;
+        self.move_source = Some((id, label));
+        self.origin_col = self.col;
+        self.origin_card = self.card;
+        self.target_card = None;
+        self.mode = Mode::Moving;
+    }
+
 
     /// Fetches and previews a rebase onto the updated target.
     ///
@@ -609,7 +707,7 @@ impl App {
         };
         match but.rub(&card.rub_id, crate::board::UNASSIGNED_TARGET) {
             Ok(status) => {
-                self.board = Board::from_status(&status);
+                self.board = Self::board_from(but, &mut self.commit_stats, &status);
                 self.clamp();
                 self.notify(format!("{verb} {}", card.cli_id), Notice::Success);
             }
@@ -820,6 +918,34 @@ impl App {
                     self.push_preview = None;
                     self.notify("push cancelled", Notice::Info);
                 }
+                _ => {}
+            }
+            return;
+        }
+
+        if self.mode == Mode::Diff {
+            match key.code {
+                // Left exits, because the diff sits to the right of the board and going
+                // back is a direction, not a toggle. Enter deliberately does nothing here:
+                // one key that both opens and closes reads as a surprise.
+                // Either arrow leaves. The diff is a detour off the board, not a place with
+                // its own left and right, so both horizontal keys mean "back".
+                K::Esc | K::Char('q') | K::Left | K::Char('h') | K::Right | K::Char('l') => {
+                    self.mode = Mode::Normal;
+                    self.diff = None;
+                }
+                K::Down | K::Char('j') => {
+                    if let Some(v) = self.diff.as_mut() {
+                        v.move_cursor(1)
+                    }
+                }
+                K::Up | K::Char('k') => {
+                    if let Some(v) = self.diff.as_mut() {
+                        v.move_cursor(-1)
+                    }
+                }
+                K::Char('m') => self.move_hunk_from_diff(),
+                K::Tab => self.diff_full = !self.diff_full,
                 _ => {}
             }
             return;

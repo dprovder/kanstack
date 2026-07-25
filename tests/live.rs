@@ -742,6 +742,124 @@ fn rebasing_brings_upstream_work_in() {
     assert!(but.pull_check().unwrap().up_to_date, "and we are current now");
 }
 
+/// The point of the diff pane: `but diff` emits one entry per hunk with its own id, so a
+/// single file's hunks can be sent to different lanes. Whole-file staging could not do
+/// this, and it is what makes a mixed file reviewable in pieces.
+#[test]
+#[ignore = "requires the GitButler CLI"]
+fn hunks_of_one_file_can_be_staged_to_different_lanes() {
+    if skip_if_no_but() {
+        return;
+    }
+    // The base file has to exist before `but setup`: once GitButler owns the workspace it
+    // refuses direct `git commit`s to its branch.
+    let sb = Sandbox::bare("hunks");
+    sb.write(
+        "a.txt",
+        "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n",
+    );
+    sb.git(&["add", "."]);
+    sb.git(&["commit", "-qm", "seed"]);
+    sb.but(&["setup", "--init", "-j"]);
+    sb.but(&["branch", "new", "top"]);
+    sb.but(&["branch", "new", "bottom"]);
+    // Two edits far enough apart to be separate hunks.
+    sb.write(
+        "a.txt",
+        "ONE\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nTEN\n",
+    );
+
+    let but = But::discover(&sb.repo()).unwrap();
+    let out = but.diff_uncommitted().expect("diff");
+    let view = kanstack::diff::DiffView::from_output("a.txt", &out);
+    assert_eq!(view.entries.len(), 2, "two hunks in one file");
+    assert!(
+        view.entries.iter().all(|e| e.path == "a.txt"),
+        "both hunks belong to the same file"
+    );
+
+    // Ids describe the current state, so the second hunk must be resolved *after* the
+    // first move — staging one renumbers whatever is left.
+    let first = view.entries[0].rub_id.clone().expect("stageable");
+    but.rub(&first, "top").expect("stage first hunk");
+
+    let out = but.diff_uncommitted().expect("diff again");
+    let view = kanstack::diff::DiffView::from_output("a.txt", &out);
+    let remaining = view
+        .entries
+        .iter()
+        .find_map(|e| e.rub_id.clone())
+        .expect("the other hunk is still unassigned");
+    let board = Board::from_status(&but.rub(&remaining, "bottom").expect("stage second hunk"));
+
+    let staged_in = |name: &str| -> bool {
+        board
+            .columns
+            .iter()
+            .find(|c| c.branch_name.as_deref() == Some(name))
+            .is_some_and(|c| c.cards.iter().any(|k| k.title == "a.txt"))
+    };
+    assert!(staged_in("top"), "one hunk landed in top");
+    assert!(staged_in("bottom"), "the other landed in bottom");
+    assert!(
+        board.columns[0].cards.is_empty(),
+        "and nothing is left unassigned"
+    );
+}
+
+/// A commit's diff is readable but not stageable — `but` gives committed changes no ids.
+#[test]
+#[ignore = "requires the GitButler CLI"]
+fn a_commits_diff_is_readable_but_not_stageable() {
+    if skip_if_no_but() {
+        return;
+    }
+    let sb = Sandbox::new("commitdiff");
+    sb.branch_with_commit("feat", "a.txt", "Work");
+
+    let but = But::discover(&sb.repo()).unwrap();
+    let board = Board::from_status(&but.status().unwrap());
+    let commit = board.columns.iter().find(|c| c.title == "feat").unwrap().cards[0].clone();
+
+    let out = but.diff_target(&commit.rub_id).expect("diff of a commit");
+    let view = kanstack::diff::DiffView::from_output(commit.title.clone(), &out);
+    assert!(!view.entries.is_empty(), "there is something to read");
+    assert!(
+        view.entries.iter().all(|e| e.rub_id.is_none()),
+        "history offers no hunk to stage"
+    );
+}
+
+/// Line counts on cards come from a real `but diff`, so check them against a known edit
+/// rather than only against a hand-written fixture.
+#[test]
+#[ignore = "requires the GitButler CLI"]
+fn cards_carry_real_line_counts() {
+    if skip_if_no_but() {
+        return;
+    }
+    let sb = Sandbox::bare("stats");
+    sb.write("a.txt", "one\ntwo\nthree\n");
+    sb.git(&["add", "."]);
+    sb.git(&["commit", "-qm", "seed"]);
+    sb.but(&["setup", "--init", "-j"]);
+    // One line changed, two added: +3 -1.
+    sb.write("a.txt", "ONE\ntwo\nthree\nfour\nfive\n");
+
+    let but = But::discover(&sb.repo()).unwrap();
+    let status = but.status().unwrap();
+    let diff = but.diff_uncommitted().unwrap();
+    let board = Board::from_status_and_diff(&status, &diff);
+
+    let card = board.columns[0]
+        .cards
+        .iter()
+        .find(|c| c.title == "a.txt")
+        .expect("the edited file is on the board");
+    assert_eq!(card.stats, Some((3, 1)), "3 added, 1 removed");
+    assert_eq!(board.columns[0].stats, Some((3, 1)), "and the lane totals it");
+}
+
 #[test]
 #[ignore = "requires the GitButler CLI"]
 fn reports_a_useful_error_outside_a_gitbutler_project() {

@@ -372,6 +372,11 @@ fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect) {
         ),
         Span::styled(format!("  {}", header_count(col)), theme::faint()),
     ]);
+    if let Some((a, r)) = col.stats {
+        header.push_span(Span::styled("  ", theme::faint()));
+        header.push_span(Span::styled(format!("+{a}"), theme::tone(crate::board::Tone::Good)));
+        header.push_span(Span::styled(format!(" -{r}"), theme::tone(crate::board::Tone::Bad)));
+    }
     if header_is_target {
         header = header.style(Style::default().bg(theme::SELECTED_BG));
     }
@@ -490,6 +495,17 @@ fn section_header(section: &crate::board::Section, width: usize) -> Vec<Line<'st
         ]),
         Line::styled("─".repeat(width), theme::faint()),
     ];
+    if let Some((a, r)) = section.stats {
+        out[0].push_span(Span::styled("  ", theme::faint()));
+        out[0].push_span(Span::styled(
+            format!("+{a}"),
+            theme::tone(crate::board::Tone::Good),
+        ));
+        out[0].push_span(Span::styled(
+            format!(" -{r}"),
+            theme::tone(crate::board::Tone::Bad),
+        ));
+    }
     if !section.badges.is_empty() {
         out.push(Line::from(
             section
@@ -650,9 +666,27 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             );
         }
         Mode::PushConfirm | Mode::DeleteConfirm | Mode::RebaseConfirm => "",
+        Mode::Diff => {
+            let stageable = app
+                .diff
+                .as_ref()
+                .and_then(|v| v.selected())
+                .is_some_and(|e| e.rub_id.is_some());
+            return f.render_widget(
+                Paragraph::new(Line::styled(
+                    if stageable {
+                        "  ↑/↓ hunk · m stage this hunk · tab widen · ←/→ back to board"
+                    } else {
+                        "  ↑/↓ hunk · tab widen · ←/→ back to board"
+                    },
+                    theme::faint(),
+                )),
+                area,
+            );
+        }
         Mode::Help => "  esc close",
         Mode::Normal => {
-            "  ←/→ lane · ↑/↓ card · m move · u unstage · c commit · b branch · s stack · d delete · r rebase · p push · ? help"
+            "  ←/→ lane · ↑/↓ card · m move · u unstage · c commit · b branch · s stack · ⏎ diff · d delete · r rebase · p push · ?"
         }
     };
     f.render_widget(Paragraph::new(Line::styled(keys, theme::faint())), area);
@@ -809,6 +843,7 @@ mod tests {
     fn card_lines_are_padded_to_column_width() {
         let card = Card {
             cli_id: "d5".into(),
+            stats: Some((3, 1)),
             rub_id: "d5aa11bb".into(),
             title: "Add auth middleware".into(),
             subtitle: Some("a.txt".into()),
