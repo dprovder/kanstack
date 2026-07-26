@@ -377,6 +377,12 @@ touching anything. The dialog turns red and says "land anyway" when they would n
 Bound to `M`, not `m`: that key already means "move a card." And not `l`: that is a
 navigation key (`←/→`, `h/l` move between lanes).
 
+Once confirmed, `land` itself runs on a background thread with a spinner over the board,
+rather than freezing the UI for however long the push takes — real-remote targets mean a
+network round trip, not just a local ref update. Input is swallowed while it's in flight (no
+cancel key: by the time the spinner is up it may already be pushing) and the board updates
+the moment the result comes back.
+
 **Read this before binding it to a project that uses pull requests.** `land` deliberately
 bypasses PR-based review — that is the whole point of the command — so it is the wrong tool
 if your project's process expects one. GitButler's own guidance here: use `but push` and

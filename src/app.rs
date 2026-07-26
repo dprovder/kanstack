@@ -10,10 +10,13 @@ use anyhow::Result;
 use crate::board::{Board, Card, CardKind, ColumnKind};
 use crate::but::But;
 use std::collections::HashMap;
+use std::sync::mpsc;
+use std::sync::Arc;
+use std::thread;
 
 use crate::cmux::Cmux;
 use crate::diff::DiffView;
-use crate::model::{MergeCheck, PullPreview, PushPreview};
+use crate::model::{MergeCheck, PullPreview, PushPreview, WorkspaceStatus};
 use crate::text_input::TextInput;
 use crate::tutorial::Tutorial;
 
@@ -32,6 +35,10 @@ pub enum Mode {
     PushConfirm,
     /// Looking at what landing a lane onto the target would do, before doing it.
     LandConfirm,
+    /// `but land` is running on a background thread; see [`PendingLand`]. Input is
+    /// swallowed here — a land in flight is not a state to navigate the board out from
+    /// under, and there is nothing left to cancel once it has started pushing.
+    Landing,
     /// Confirming a lane deletion.
     DeleteConfirm,
     /// Looking at what rebasing onto the updated target would do.
@@ -48,9 +55,24 @@ pub enum Notice {
     Error,
 }
 
+/// A `but land` call running on a background thread, started by `confirm_land`.
+///
+/// Landing pushes directly to the target — sometimes a real remote — so it can take
+/// long enough (and fail in ways worth explaining) that running it on the main thread
+/// would freeze the whole UI with no feedback for however long the network takes.
+pub struct PendingLand {
+    pub title: String,
+    // `pub(crate)` rather than private: `ui`'s tests build one directly to exercise the
+    // spinner overlay without a real `but` and thread.
+    pub(crate) rx: mpsc::Receiver<Result<WorkspaceStatus>>,
+    /// Advanced once per poll so the UI can animate a spinner without its own clock.
+    pub spinner: usize,
+}
+
 pub struct App {
     /// `None` in snapshot mode, where a captured status is rendered read-only.
-    but: Option<But>,
+    /// `Arc` so `confirm_land` can hand a handle to the background thread it spawns.
+    but: Option<Arc<But>>,
     /// `None` outside cmux, or when `cmux-tui` is not installed. See [`crate::cmux`].
     cmux: Option<Cmux>,
     pub board: Board,
@@ -75,6 +97,8 @@ pub struct App {
     /// What landing the selected lane onto the target would do, valid while
     /// `mode == LandConfirm`.
     pub land_check: Option<MergeCheck>,
+    /// The `but land` call in flight, valid while `mode == Landing`.
+    pub landing: Option<PendingLand>,
     /// What a rebase onto the updated target would do, valid while `mode == RebaseConfirm`.
     pub pull_preview: Option<PullPreview>,
     /// The diff being read, valid while `mode == Diff`.
@@ -113,7 +137,7 @@ impl App {
             ));
         }
         Ok(App {
-            but: Some(but),
+            but: Some(Arc::new(but)),
             cmux,
             board,
             col: 0,
@@ -127,6 +151,7 @@ impl App {
             stack_onto: None,
             push_preview: None,
             land_check: None,
+            landing: None,
             pull_preview: None,
             diff: None,
             diff_full: false,
@@ -156,6 +181,7 @@ impl App {
             stack_onto: None,
             push_preview: None,
             land_check: None,
+            landing: None,
             pull_preview: None,
             diff: None,
             diff_full: false,
@@ -974,25 +1000,63 @@ impl App {
         }
     }
 
+    /// Starts landing on a background thread rather than blocking the UI for however long
+    /// the push takes — `but land` can reach a real remote, and a frozen terminal with no
+    /// feedback looks indistinguishable from a hang. `poll_land` picks up the result.
     fn confirm_land(&mut self) {
         let Some((branch, title)) = self.selected_branch() else {
             self.mode = Mode::Normal;
             return;
         };
-        self.mode = Mode::Normal;
         self.land_check = None;
 
-        let Some(but) = &self.but else {
+        let Some(but) = self.but.clone() else {
+            self.mode = Mode::Normal;
             self.notify("snapshot is read-only", Notice::Info);
             return;
         };
-        match but.land(&branch) {
-            Ok(status) => {
-                self.board = Self::board_from(but, &mut self.commit_stats, &status);
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(but.land(&branch));
+        });
+        self.landing = Some(PendingLand {
+            title,
+            rx,
+            spinner: 0,
+        });
+        self.mode = Mode::Landing;
+    }
+
+    /// Non-blocking check on a `but land` running on a background thread. Call this every
+    /// tick of the event loop — it costs nothing when nothing is landing, and is what
+    /// advances the spinner and applies the result the moment it arrives.
+    pub fn poll_land(&mut self) {
+        let Some(pending) = self.landing.as_mut() else {
+            return;
+        };
+        pending.spinner = pending.spinner.wrapping_add(1);
+        match pending.rx.try_recv() {
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.landing = None;
+                self.mode = Mode::Normal;
+                self.notify("landing thread vanished unexpectedly", Notice::Error);
+            }
+            Ok(Ok(status)) => {
+                let title = pending.title.clone();
+                self.landing = None;
+                self.mode = Mode::Normal;
+                if let Some(but) = self.but.clone() {
+                    self.board = Self::board_from(&but, &mut self.commit_stats, &status);
+                }
                 self.clamp();
                 self.notify(format!("landed {title} onto the target"), Notice::Success);
             }
-            Err(e) => self.notify(format!("{e}"), Notice::Error),
+            Ok(Err(e)) => {
+                self.landing = None;
+                self.mode = Mode::Normal;
+                self.notify(format!("{e}"), Notice::Error);
+            }
         }
     }
 
@@ -1112,6 +1176,14 @@ impl App {
                 }
                 _ => {}
             }
+            return;
+        }
+
+        // Nothing to do here but wait: `poll_land` (driven by the event loop, not by a
+        // key) is what moves this out of `Landing`. There is deliberately no cancel —
+        // once `but land` has started it may already be pushing to a real remote, and a
+        // key that looked like it stopped that would be a lie.
+        if self.mode == Mode::Landing {
             return;
         }
 

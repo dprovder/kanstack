@@ -168,6 +168,11 @@ fn run(
             }
         }
 
+        // Non-blocking: applies the result the moment a background `but land` finishes,
+        // and advances its spinner in the meantime. Runs every tick regardless of
+        // whether a key came in, so the spinner animates even while idle.
+        app.poll_land();
+
         // Don't yank the board out from under a move in progress.
         if app.mode != Mode::Moving {
             if let Some(w) = watcher.as_mut() {

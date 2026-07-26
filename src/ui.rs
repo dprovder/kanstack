@@ -64,6 +64,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Mode::Help => draw_help(f, f.area()),
         Mode::PushConfirm => draw_push_confirm(f, app, f.area()),
         Mode::LandConfirm => draw_land_confirm(f, app, f.area()),
+        Mode::Landing => draw_landing(f, app, f.area()),
         Mode::DeleteConfirm => draw_delete_confirm(f, app, f.area()),
         Mode::RebaseConfirm => draw_rebase_confirm(f, app, f.area()),
         // The board keeps its half unless the diff is expanded, so reading a diff does not
@@ -504,6 +505,49 @@ fn draw_land_confirm(f: &mut Frame, app: &App, area: Rect) {
                 } else {
                     theme::faint()
                 })
+                .style(theme::selected_bg()),
+        ),
+        popup,
+    );
+}
+
+const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// A small popup shown while `but land` runs on a background thread. No key hints —
+/// there is nothing to press, `poll_land` is what closes this.
+fn draw_landing(f: &mut Frame, app: &App, area: Rect) {
+    let Some(pending) = &app.landing else {
+        return;
+    };
+    let frame = SPINNER[pending.spinner % SPINNER.len()];
+
+    let body = vec![
+        Line::raw(""),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(frame.to_string(), theme::tone(crate::board::Tone::Accent)),
+            Span::raw("  "),
+            Span::styled(
+                format!("landing {} onto the target…", pending.title),
+                theme::title(true),
+            ),
+        ]),
+        Line::raw(""),
+    ];
+
+    let w = 50.min(area.width.saturating_sub(4));
+    let h = (body.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, popup);
+    f.render_widget(
+        Paragraph::new(body).block(
+            Block::bordered()
+                .border_style(theme::faint())
                 .style(theme::selected_bg()),
         ),
         popup,
@@ -956,7 +1000,8 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                 area,
             );
         }
-        Mode::PushConfirm | Mode::LandConfirm | Mode::DeleteConfirm | Mode::RebaseConfirm => "",
+        Mode::PushConfirm | Mode::LandConfirm | Mode::DeleteConfirm | Mode::RebaseConfirm
+        | Mode::Landing => "",
         Mode::Diff => {
             let stageable = app
                 .diff

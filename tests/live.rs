@@ -1207,3 +1207,67 @@ fn creating_a_branch_from_unassigned_with_cards_and_a_moved_cursor_does_not_pani
 
     assert_eq!(app.column_count(), 2, "stacked onto the existing lane, not a new column");
 }
+
+/// `M` then `⏎` used to call `but land` synchronously, freezing the whole UI for however
+/// long the push took with zero feedback. It now moves to `Mode::Landing` immediately and
+/// finishes on a background thread; `poll_land` (driven by the event loop, not a key) is
+/// what applies the result. This drives that exact path through `App`, not `But` directly,
+/// so it also catches a regression where the confirm key blocks instead of backgrounding.
+#[test]
+#[ignore = "requires the GitButler CLI"]
+fn landing_through_the_app_runs_on_a_background_thread_and_updates_the_board() {
+    if skip_if_no_but() {
+        return;
+    }
+    use kanstack::app::{App, Mode};
+    use kanstack::board::CardKind;
+    use kanstack::cmux::Cmux;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent};
+
+    let sb = Sandbox::new("threadedland");
+    sb.branch_with_commit("feat", "a.txt", "Threaded landable");
+
+    let but = But::discover(&sb.repo()).unwrap();
+    let mut app = App::new(but, Cmux::discover()).expect("build the app against the workspace");
+
+    let lane = app
+        .board
+        .columns
+        .iter()
+        .position(|c| c.branch_name.as_deref() == Some("feat"))
+        .expect("the feat lane exists");
+    app.col = lane;
+
+    app.on_key(KeyEvent::from(KeyCode::Char('M')));
+    assert_eq!(app.mode, Mode::LandConfirm, "shows the preview before landing");
+    app.on_key(KeyEvent::from(KeyCode::Enter));
+    assert_eq!(
+        app.mode,
+        Mode::Landing,
+        "confirming hands off to the background thread rather than blocking here"
+    );
+    assert!(app.landing.is_some());
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.mode == Mode::Landing {
+        assert!(std::time::Instant::now() < deadline, "land never completed");
+        app.poll_land();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    assert_eq!(app.mode, Mode::Normal);
+    assert!(app.landing.is_none());
+    let lane = app
+        .board
+        .columns
+        .iter()
+        .find(|c| c.branch_name.as_deref() == Some("feat"));
+    if let Some(lane) = lane {
+        assert!(
+            lane.cards.iter().all(|c| c.kind != CardKind::Commit),
+            "the landed commit should no longer be ahead of the target"
+        );
+    }
+    let log = sb.git(&["log", "--oneline", "--all"]);
+    assert!(log.contains("Threaded landable"), "landing must land the content: {log}");
+}

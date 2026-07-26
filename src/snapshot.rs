@@ -255,6 +255,44 @@ mod tests {
         assert!(out.contains("land anyway"));
     }
 
+    /// Landing runs on a background thread now (GitHub issue #4) rather than freezing the
+    /// UI — this pins the spinner overlay that fills the gap. `PendingLand` is built by
+    /// hand rather than through a real `but land`, since the point is to check what the
+    /// still-running state looks like, not the CLI call that produces it.
+    #[test]
+    fn landing_shows_a_spinner_that_advances_and_names_the_target() {
+        use crate::app::{Mode, PendingLand};
+        use std::sync::mpsc;
+
+        let status =
+            crate::but::parse_status(include_str!("../tests/fixtures/status.json")).unwrap();
+        let mut app = App::from_board(Board::from_status(&status));
+        let (_tx, rx) = mpsc::channel();
+        app.mode = Mode::Landing;
+        app.landing = Some(PendingLand {
+            title: "feat-auth".into(),
+            rx,
+            spinner: 0,
+        });
+
+        let mut t = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        t.draw(|f| crate::ui::draw(f, &app)).unwrap();
+        let first = plain(&to_ansi(t.backend().buffer()));
+        assert!(first.contains("landing feat-auth onto the target"));
+
+        // Nothing to press while landing — the point is that input is swallowed, not that
+        // some other key happens to be a no-op.
+        app.on_key(ratatui::crossterm::event::KeyEvent::from(
+            ratatui::crossterm::event::KeyCode::Char('q'),
+        ));
+        assert_eq!(app.mode, Mode::Landing, "landing has no cancel key");
+
+        app.landing.as_mut().unwrap().spinner += 1;
+        t.draw(|f| crate::ui::draw(f, &app)).unwrap();
+        let second = plain(&to_ansi(t.backend().buffer()));
+        assert_ne!(first, second, "the spinner glyph should advance between frames");
+    }
+
     /// Counts belong on cards, on each branch of a stack, and on the lane — not just one
     /// lump for the whole lane, which said nothing about which branch was big.
     #[test]
