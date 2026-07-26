@@ -561,6 +561,18 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         Span::styled("  ·  ", theme::faint()),
         Span::styled(format!("base {}", b.base_short_id), theme::faint()),
     ];
+    // A constant, always-visible "where am I" among the lanes — not just the `‹`/`›`
+    // edge markers, which only ever say "there's more", never how much more or which lane
+    // out of how many you're currently on. Shown whenever there's more than one lane,
+    // whether or not they all currently fit on screen, so it orients you the moment you've
+    // moved, not only once you've scrolled far enough to notice something's missing.
+    if b.columns.len() > 1 {
+        spans.push(Span::styled("  ·  ", theme::faint()));
+        spans.push(Span::styled(
+            format!("lane {}/{}", app.col + 1, b.columns.len()),
+            theme::faint(),
+        ));
+    }
     // Working-tree cards only. Lane totals now include commits, but the word here is
     // "uncommitted", so counting those would make the header say something untrue.
     let totals = b
@@ -647,19 +659,26 @@ fn draw_board(f: &mut Frame, app: &App, area: Rect) {
         x += width + COL_GAP;
     }
 
-    // Hint that there is more board off-screen. One mark, not a wall of them: repeated
-    // down every row it reads as a border between panes rather than as a hint.
-    if last < app.board.columns.len() && area.height > 0 {
-        let marker = Rect {
-            x: area.x + area.width.saturating_sub(1),
-            y: area.y + area.height / 2,
-            width: 1,
-            height: 1,
-        };
-        f.render_widget(
-            Paragraph::new(Line::styled("›", theme::faint())),
-            marker,
-        );
+    // Hint that there is more board off-screen, on whichever side(s) actually have
+    // something scrolled past — symmetric now: `first > 0` means lanes are hidden to the
+    // left too, which used to have no marker of its own at all, only ever the right-hand
+    // one. One mark per side, not a wall of them: repeated down every row it reads as a
+    // border between panes rather than as a hint.
+    if area.height > 0 {
+        let row = area.y + area.height / 2;
+        if first > 0 {
+            let marker = Rect { x: area.x, y: row, width: 1, height: 1 };
+            f.render_widget(Paragraph::new(Line::styled("‹", theme::faint())), marker);
+        }
+        if last < app.board.columns.len() {
+            let marker = Rect {
+                x: area.x + area.width.saturating_sub(1),
+                y: row,
+                width: 1,
+                height: 1,
+            };
+            f.render_widget(Paragraph::new(Line::styled("›", theme::faint())), marker);
+        }
     }
 }
 
@@ -693,7 +712,13 @@ fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect) {
         header = header.style(theme::selected_bg());
     }
 
-    let mut lines = vec![header];
+    // The header, rule, and top-level badges are pinned — rendered separately from the
+    // cards below them, in their own fixed-height area, rather than as the first lines of
+    // the same scrolling text. Before this they scrolled away with everything else: on a
+    // long stack, moving the cursor down past the visible cards lost the lane name, dot,
+    // and status along with it — the one thing you'd want to still see to know where you
+    // are and what the top of the stack was.
+    let mut fixed_lines = vec![header];
 
     // A rule under the header, brighter on the active lane.
     let rule_style = if is_current {
@@ -701,7 +726,7 @@ fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect) {
     } else {
         theme::faint()
     };
-    lines.push(Line::styled("─".repeat(inner_w), rule_style));
+    fixed_lines.push(Line::styled("─".repeat(inner_w), rule_style));
 
     if !col.badges.is_empty() {
         let spans: Vec<Span> = col
@@ -714,10 +739,27 @@ fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect) {
                 ]
             })
             .collect();
-        lines.push(Line::from(spans));
+        fixed_lines.push(Line::from(spans));
     }
 
-    // Cards, tracking which lines belong to the cursor so we can scroll to it.
+    let fixed_h = (fixed_lines.len() as u16).min(area.height);
+    f.render_widget(
+        Paragraph::new(fixed_lines),
+        Rect { height: fixed_h, ..area },
+    );
+    if area.height <= fixed_h {
+        return;
+    }
+    let body_area = Rect {
+        y: area.y + fixed_h,
+        height: area.height - fixed_h,
+        ..area
+    };
+
+    // Cards, tracking which lines belong to the cursor so we can scroll to it. Everything
+    // from here down is `body_area`'s own scrolling content, independent of the fixed
+    // header above it.
+    let mut lines: Vec<Line<'static>> = Vec::new();
     let mut sel_start = 0usize;
     let mut sel_len = 0usize;
     let mut last_group: Option<&str> = None;
@@ -761,8 +803,9 @@ fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect) {
         lines.push(Line::styled("  empty", theme::faint()));
     }
 
-    // Keep the selected card in view within this column.
-    let body_h = area.height as usize;
+    // Keep the selected card in view within the scrollable body — the header above stays
+    // put regardless, so this only ever has to account for `body_area`'s own height.
+    let body_h = body_area.height as usize;
     let scroll = if sel_len > 0 && sel_start + sel_len > body_h {
         (sel_start + sel_len - body_h) as u16
     } else {
@@ -773,7 +816,7 @@ fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect) {
         Paragraph::new(lines)
             .block(Block::default())
             .scroll((scroll, 0)),
-        area,
+        body_area,
     );
 }
 

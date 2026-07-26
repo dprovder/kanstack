@@ -118,12 +118,92 @@ mod tests {
         }
     }
 
+    /// The `›` marker only ever said "there's more" on the right; scrolled right past the
+    /// first lane, there was nothing on the left saying lanes were hidden there too.
+    #[test]
+    fn scrolling_right_shows_a_left_marker_too() {
+        let status =
+            crate::but::parse_status(include_str!("../tests/fixtures/status.json")).unwrap();
+        let mut app = App::from_board(Board::from_status(&status));
+        app.col = 3; // fix-flaky-tests, the last of four lanes
+        let mut t = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        t.draw(|f| crate::ui::draw(f, &app)).unwrap();
+        let out = plain(&to_ansi(t.backend().buffer()));
+
+        assert!(
+            out.contains('‹'),
+            "lanes are hidden to the left of the current one, but nothing said so:\n{out}"
+        );
+    }
+
+    /// GitHub issue #3's other half: "I get disoriented as to where the reference point
+    /// is." The `‹`/`›` markers only ever said "there's more", never how much more or
+    /// which lane you're on — a persistent position readout in the header fixes that even
+    /// before you've scrolled far enough to hit an edge marker at all.
+    #[test]
+    fn header_shows_lane_position_among_the_total() {
+        let status =
+            crate::but::parse_status(include_str!("../tests/fixtures/status.json")).unwrap();
+        let mut app = App::from_board(Board::from_status(&status));
+        app.col = 2; // feat-ui, the third of four lanes
+        let mut t = Terminal::new(TestBackend::new(160, 24)).unwrap();
+        t.draw(|f| crate::ui::draw(f, &app)).unwrap();
+        let out = plain(&to_ansi(t.backend().buffer()));
+
+        assert!(out.contains("lane 3/4"), "expected a lane 3/4 readout in the header:\n{out}");
+    }
+
     #[test]
     fn tiny_terminal_does_not_panic() {
         // Resize handling is the classic TUI crash; make the floor explicit.
         for (w, h) in [(20, 6), (12, 4), (5, 3), (1, 1)] {
             let _ = render(w, h);
         }
+    }
+
+    /// Reported as "can't find where the top commit/card is on a long stack": the header
+    /// used to be the first lines of the same scrolling text as the cards, so navigating
+    /// deep into a long list scrolled the lane name, dot, and status away with it. It's
+    /// pinned in its own fixed area now; this forces a long list, scrolls the cursor all
+    /// the way to the bottom of it, and checks the header is still on screen right
+    /// alongside the deeply-nested selected card.
+    #[test]
+    fn the_lane_header_stays_pinned_scrolled_deep_into_a_long_stack() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent};
+
+        let mut status =
+            crate::but::parse_status(include_str!("../tests/fixtures/status.json")).unwrap();
+        let template = status.stacks[0].branches[0].commits[0].clone();
+        status.stacks[0].branches[0].commits = (0..30)
+            .map(|i| {
+                let mut c = template.clone();
+                c.cli_id = format!("c{i}");
+                c.commit_id = format!("{i:040}");
+                c.message = format!("Commit number {i}");
+                c
+            })
+            .collect();
+
+        let mut app = App::from_board(Board::from_status(&status));
+        app.col = 1; // feat-auth, now carrying the long run of commits
+        let mut t = Terminal::new(TestBackend::new(120, 16)).unwrap();
+
+        // 29 downs from card 0 reaches the last of the 30 cards without wrapping back
+        // around.
+        for _ in 0..29 {
+            app.on_key(KeyEvent::from(KeyCode::Down));
+        }
+        t.draw(|f| crate::ui::draw(f, &app)).unwrap();
+        let out = plain(&to_ansi(t.backend().buffer()));
+
+        assert!(
+            out.contains("feat-auth"),
+            "the lane header must stay visible however deep the cursor is:\n{out}"
+        );
+        assert!(
+            out.contains("Commit number 29"),
+            "and the deeply-scrolled selected card must also be on screen:\n{out}"
+        );
     }
 
     /// A stacked lane must look stacked: each branch below the tip repeats the lane
