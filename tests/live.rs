@@ -562,6 +562,53 @@ fn landing_a_lane_pushes_directly_to_a_real_remote() {
     );
 }
 
+/// `z` (`but undo`) fully restores the local board after a land — the branch and its
+/// commit reappear exactly as before. What it does *not* do is un-push: the remote a real
+/// land already reached keeps the landed commit. Nothing is lost (the content sits safely
+/// on the remote throughout) but the local board looks more reverted than it is, which is
+/// exactly the gap the land confirmation dialog now warns about before you commit to it.
+#[test]
+#[ignore = "requires the GitButler CLI"]
+fn undoing_a_land_reverts_locally_but_not_the_pushed_remote() {
+    if skip_if_no_but() {
+        return;
+    }
+    let sb = Sandbox::with_remote("landundo");
+    sb.branch_with_commit("feat", "a.txt", "Important real work");
+
+    let but = But::discover(&sb.repo()).unwrap();
+    but.land("feat").expect("land onto a real remote target");
+
+    let remote_log = |sb: &Sandbox| {
+        let out = Command::new("git")
+            .args(["--git-dir"])
+            .arg(sb.root.join("remote.git"))
+            .args(["log", "--oneline", "main"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    assert!(
+        remote_log(&sb).contains("Important real work"),
+        "sanity check: the land must have really pushed"
+    );
+
+    let status = but.undo().expect("undo the land");
+    let board = Board::from_status(&status);
+    let lane = board
+        .columns
+        .iter()
+        .find(|c| c.branch_name.as_deref() == Some("feat"))
+        .expect("undo restores the branch locally");
+    assert_eq!(lane.cards.len(), 1, "and its commit, exactly as before");
+
+    // The whole point: the remote is untouched by a purely local undo.
+    assert!(
+        remote_log(&sb).contains("Important real work"),
+        "undo must not silently revert what was already pushed to a real remote"
+    );
+}
+
 /// The two branch gestures are genuinely different operations, so both are pinned:
 /// an anchor stacks into the existing lane, no anchor opens a new one.
 #[test]

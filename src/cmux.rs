@@ -240,3 +240,74 @@ fn command_exists(bin: &Path) -> bool {
     };
     std::env::split_paths(&path_var).any(|dir| dir.join(bin).is_file())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Runs `body` with `PATH` and `KANSTACK_CMUX_BIN` swapped out and restored
+    /// afterwards, so this doesn't leak into other tests running in the same process —
+    /// both are process-wide state, and other tests never touch either, but this one
+    /// mutates both, so it must clean up regardless of how `body` returns.
+    fn with_env(path: Option<&str>, cmux_bin: Option<&str>, body: impl FnOnce()) {
+        let old_path = std::env::var_os("PATH");
+        let old_bin = std::env::var_os("KANSTACK_CMUX_BIN");
+        match path {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+        match cmux_bin {
+            Some(b) => std::env::set_var("KANSTACK_CMUX_BIN", b),
+            None => std::env::remove_var("KANSTACK_CMUX_BIN"),
+        }
+        body();
+        match old_path {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+        match old_bin {
+            Some(b) => std::env::set_var("KANSTACK_CMUX_BIN", b),
+            None => std::env::remove_var("KANSTACK_CMUX_BIN"),
+        }
+    }
+
+    /// The whole point of `Cmux::discover` returning `Option` rather than `Result`: a
+    /// machine with no `cmux` on `PATH` (the common case — kanstack works standalone) must
+    /// come back `None`, not an error, so nothing upstream has to handle a spawn failure
+    /// for a binary that was never expected to be there.
+    #[test]
+    fn discover_is_none_without_cmux_on_path_or_an_override() {
+        let dir = std::env::temp_dir().join(format!("kanstack-cmux-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        with_env(Some(dir.to_str().unwrap()), None, || {
+            assert!(
+                Cmux::discover().is_none(),
+                "an empty PATH with no KANSTACK_CMUX_BIN override must not find a cmux"
+            );
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn command_exists_is_false_for_a_path_without_the_binary() {
+        let dir = std::env::temp_dir().join(format!("kanstack-cmux-test2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        with_env(Some(dir.to_str().unwrap()), None, || {
+            assert!(!command_exists(Path::new("cmux")));
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `KANSTACK_CMUX_BIN` is trusted at face value — set it and `discover` returns
+    /// `Some`, even pointing at a path that does not exist. That's intentional (see its
+    /// doc comment): the failure surfaces later, from `spawn_harness` actually trying to
+    /// run it, as a normal error the caller already handles — not silently, and not by
+    /// `discover` re-implementing existence-checking for an explicit override.
+    #[test]
+    fn an_explicit_override_is_trusted_without_checking_it_exists() {
+        with_env(Some(""), Some("/nonexistent/not-cmux"), || {
+            let cmux = Cmux::discover();
+            assert!(cmux.is_some(), "an explicit KANSTACK_CMUX_BIN is never second-guessed");
+        });
+    }
+}

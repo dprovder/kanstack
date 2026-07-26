@@ -374,6 +374,16 @@ bypasses PR-based review — that is the whole point of the command — so it is
 if your project's process expects one. GitButler's own guidance here: use `but push` and
 `but pr new` instead. A branch-protected remote will reject the land regardless.
 
+**`z` does not undo a push to a real remote — only your local workspace.** Verified by
+landing onto a real bare-repo remote and then undoing: `but undo` fully restores the local
+board (the branch and its commits reappear, exactly as if nothing happened), but the
+remote's ref stays at the landed commit — `git log` on the remote confirms it, and
+`but status` correctly reports the workspace as now behind upstream because of it. Nothing
+is lost — the content is safely on the remote the whole time, and re-landing correctly
+reports nothing to do — but the local board *looks* fully reverted when only the local
+half is. The land confirmation says so before you commit to it, since that's the moment it's
+actually useful to know.
+
 ## Licence and relationship to GitButler
 
 `kanstack` is MIT licensed. It is an independent program that invokes the `but` CLI as a

@@ -469,6 +469,16 @@ fn draw_land_confirm(f: &mut Frame, app: &App, area: Rect) {
 
     body.push(Line::raw(""));
     body.push(Line::styled(
+        "  if the target is a real remote, this pushes to it directly — z undoes the",
+        theme::faint(),
+    ));
+    body.push(Line::styled(
+        "  local workspace afterwards, but does not un-push it",
+        theme::faint(),
+    ));
+
+    body.push(Line::raw(""));
+    body.push(Line::styled(
         if conflicted {
             "  ⏎ / y  land anyway      esc / n  cancel"
         } else {
