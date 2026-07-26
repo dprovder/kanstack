@@ -304,7 +304,15 @@ disagree — they did once, and an empty lane came out the same green as a fully
 | integrated | merged into the target |
 | conflicted | at least one commit is in conflict — outranks the rest |
 
-In a stack, every branch gets its own dot and word, not just the tip.
+In a stack, every branch gets its own dot and word, not just the tip — but only the tip's
+dot is **filled** (`●`); every branch stacked below it gets a **hollow** one (`○`). That
+distinction carries real information: `c`/`p`/`M`/`z` always act on the tip, never on
+whichever branch's cards you happen to be scrolled into, and the hollow dot is there so a
+lower branch's header never reads as if it were the one those keys will act on.
+
+The current lane's own header is reverse-video highlighted too — not just a bolder title
+and a brighter rule, which read as too subtle to tell which of several lanes is current at
+a glance once there's more than two or three on screen.
 
 ## Restacking an existing branch
 

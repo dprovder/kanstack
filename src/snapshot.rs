@@ -142,14 +142,48 @@ mod tests {
 
         assert!(out.contains("feat-auth +1"), "lane names the stack depth");
         assert!(
-            out.contains("● fix-flaky-tests"),
-            "the stacked branch gets its own dot-and-name header:\n{out}"
+            out.contains("○ fix-flaky-tests"),
+            "the stacked branch gets its own dot-and-name header, hollow since it isn't \
+             the tip actions target:\n{out}"
         );
         // feat-auth has 2 commits of its own; the stacked branch has 1. The lane header
         // must show 2, not the lane total of 3.
         assert!(
             out.contains("feat-auth +1  2"),
             "lane header counts only the tip's commits:\n{out}"
+        );
+    }
+
+    /// GitHub issue #3: bold title text and a brighter rule alone were too subtle to tell
+    /// which of several lanes is current at a glance. Checked against the actual rendered
+    /// buffer, not the plain-text output, since the fix is a background colour, which
+    /// `plain()` strips entirely.
+    #[test]
+    fn the_current_lane_header_reads_differently_from_the_others() {
+        let status =
+            crate::but::parse_status(include_str!("../tests/fixtures/status.json")).unwrap();
+        let app = App::from_board(Board::from_status(&status)); // col defaults to 0
+        let mut t = Terminal::new(TestBackend::new(160, 24)).unwrap();
+        t.draw(|f| crate::ui::draw(f, &app)).unwrap();
+        let buf = t.backend().buffer();
+
+        // `selected_bg` is reverse video (`Modifier::REVERSED`), not a fixed background
+        // colour — deliberately, so it reads correctly under any terminal theme (see
+        // `theme::selected_bg`'s doc comment). So the signal to check for is the modifier,
+        // not `cell.bg`, which never changes.
+        //
+        // The header row is the first line of the board, right under the 2-line top
+        // header. If the current lane's tint is working, some cell there is reversed and
+        // some (further along, in another lane's header) is not.
+        let header_y = 2;
+        let reversed = |x: u16| buf[(x, header_y)].modifier.contains(Modifier::REVERSED);
+        assert!(
+            (0..buf.area().width).any(reversed),
+            "expected the current lane's header to be reverse-video highlighted"
+        );
+        assert!(
+            (0..buf.area().width).any(|x| !reversed(x)),
+            "expected at least one other lane's header to stay unhighlighted"
         );
     }
 
@@ -258,7 +292,7 @@ mod tests {
         // Each branch of the stack reports separately rather than sharing one figure.
         // The stacked branch totals only its own commit, not the lane's.
         assert!(
-            out.contains("● fix-flaky-tests  1  +10 -1"),
+            out.contains("○ fix-flaky-tests  1  +10 -1"),
             "the stacked branch shows its own total:\n{out}"
         );
         assert!(

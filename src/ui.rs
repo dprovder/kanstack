@@ -625,7 +625,11 @@ fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect) {
     let inner_w = area.width as usize;
 
     // Header: dot, name, count. While moving, the header is itself a drop position, so it
-    // highlights when the drop cursor sits on it.
+    // highlights when the drop cursor sits on it. Either way, the current lane's header
+    // carries a background tint at all times — bold title text and a brighter rule alone
+    // read as too subtle to tell which of several lanes is current at a glance (GitHub
+    // issue #3); this is the same "focused thing" language `selected_bg` already gives
+    // cards, applied one level up.
     let header_is_target =
         app.mode == Mode::Moving && is_current && app.target_card.is_none();
     let mut header = Line::from(vec![
@@ -641,7 +645,7 @@ fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect) {
         header.push_span(Span::styled(format!("+{a}"), theme::tone(crate::board::Tone::Good)));
         header.push_span(Span::styled(format!(" -{r}"), theme::tone(crate::board::Tone::Bad)));
     }
-    if header_is_target {
+    if header_is_target || is_current {
         header = header.style(theme::selected_bg());
     }
 
@@ -747,10 +751,18 @@ fn header_count(col: &crate::board::Column) -> usize {
 /// A branch header inside a lane, drawn like the lane header itself: dot, name, count,
 /// rule, status. Repeating the treatment is the point — it is what makes a stack look
 /// stacked rather than like one list with faint dividers in it.
+///
+/// Only ever called for a *non-tip* branch (the tip's header is the lane header itself),
+/// which is exactly the distinction its hollow dot exists to carry: scrolling down into a
+/// lower branch's cards used to look just as "current" as the tip, with nothing on screen
+/// to say that `c`/`p`/`M`/`z` still act on the tip above, not whatever's on screen (GitHub
+/// issue #3). A hollow dot here versus the lane header's filled one is the same "state
+/// carried by the dot" convention the badge/dot pairing already uses elsewhere — see
+/// `theme::status_dot`.
 fn section_header(section: &crate::board::Section, width: usize) -> Vec<Line<'static>> {
     let mut out = vec![
         Line::from(vec![
-            Span::styled("● ", theme::status_dot(Some(section.state))),
+            Span::styled("○ ", theme::status_dot(Some(section.state))),
             Span::styled(
                 truncate(&section.name, width.saturating_sub(8)),
                 theme::title(false),
@@ -1003,6 +1015,12 @@ fn draw_help(f: &mut Frame, area: Rect) {
         help_row("file → lane", "stages it to that branch"),
         help_row("file → commit", "amends it into that commit"),
         help_row("file → unassigned", "unstages it"),
+        Line::raw(""),
+        Line::styled("  reading the board", theme::muted()),
+        Line::raw(""),
+        help_row("current lane", "tinted header — the one ←/→ and m/c/p/M/d act on"),
+        help_row("● filled dot", "a lane's tip branch — c/p/M/z always act here"),
+        help_row("○ hollow dot", "a branch stacked below the tip, along for the ride"),
         Line::raw(""),
         Line::styled(
             "  every drop is one `but rub SOURCE TARGET`.",
