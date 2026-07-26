@@ -1111,3 +1111,99 @@ fn status_stays_fast_enough_for_a_synchronous_refresh() {
     );
     eprintln!("status: {per:?} per call");
 }
+
+/// Reproduction attempt for GitHub issue #2, "crash on adding a branch on the unassigned
+/// stack": a brand-new workspace with zero applied branches (so the board is just the
+/// backlog column), pressing `b` from there, typing a name, and confirming.
+#[test]
+#[ignore = "requires the GitButler CLI"]
+fn creating_a_branch_from_the_empty_unassigned_column_does_not_panic() {
+    if skip_if_no_but() {
+        return;
+    }
+    use kanstack::app::App;
+    use kanstack::cmux::Cmux;
+    use ratatui::backend::TestBackend;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent};
+    use ratatui::Terminal;
+
+    let sb = Sandbox::new("newbranchcrash");
+    let but = But::discover(&sb.repo()).unwrap();
+    // Real detection, not `None`: if `cmux` happens to be on PATH (as it is on the machine
+    // this was first reproduced on), the spawn-a-harness path actually runs.
+    let mut app = App::new(but, Cmux::discover()).expect("build the app against a fresh workspace");
+    let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+
+    assert_eq!(app.column_count(), 1, "only the backlog column exists yet");
+    assert_eq!(app.col, 0);
+
+    let mut press = |app: &mut App, code: KeyCode| {
+        app.on_key(KeyEvent::from(code));
+        term.draw(|f| kanstack::ui::draw(f, app)).unwrap();
+    };
+    press(&mut app, KeyCode::Char('b'));
+    for c in "first-branch".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    press(&mut app, KeyCode::Enter);
+
+    assert_eq!(app.column_count(), 2, "the backlog plus the new lane");
+}
+
+/// Same issue, a second guess at repro: unassigned holds real file cards, the card cursor
+/// sits on one that isn't index 0, and `b` is pressed with Tab toggled (stack-onto) before
+/// typing a name — probing whether the crash needs cards/cursor state present, not just an
+/// empty backlog. Renders through the real `ui::draw` after every keystroke too: `on_key`
+/// alone can't catch a panic that only happens while drawing (an unsaturated subtraction in
+/// a width calculation, an out-of-bounds slice), which is exactly the kind of bug a "crash"
+/// report with no repro steps could be.
+#[test]
+#[ignore = "requires the GitButler CLI"]
+fn creating_a_branch_from_unassigned_with_cards_and_a_moved_cursor_does_not_panic() {
+    if skip_if_no_but() {
+        return;
+    }
+    use kanstack::app::App;
+    use kanstack::cmux::Cmux;
+    use ratatui::backend::TestBackend;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent};
+    use ratatui::Terminal;
+
+    let sb = Sandbox::new("newbranchcrash2");
+    sb.write("a.txt", "a\n");
+    sb.write("b.txt", "b\n");
+    let but = But::discover(&sb.repo()).unwrap();
+    let mut app = App::new(but, Cmux::discover()).expect("build the app against the workspace");
+    let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+    term.draw(|f| kanstack::ui::draw(f, &app)).unwrap();
+
+    assert_eq!(app.column_count(), 1);
+    let mut press = |app: &mut App, code: KeyCode| {
+        app.on_key(KeyEvent::from(code));
+        term.draw(|f| kanstack::ui::draw(f, app)).unwrap();
+    };
+
+    // Move the card cursor onto the second file before creating a branch.
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Char('b'));
+    press(&mut app, KeyCode::Tab); // toggle stack-onto with nothing to stack onto
+    press(&mut app, KeyCode::Tab); // toggle back
+    for c in "second-branch".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    press(&mut app, KeyCode::Enter);
+
+    assert_eq!(app.column_count(), 2);
+
+    // Pressed again immediately, from the lane `begin_branch` just landed the cursor on:
+    // that lane now has a `branch_name`, so this stacks rather than opening a new column
+    // (documented, intentional — `b`'s default is to stack when a lane is selected).
+    press(&mut app, KeyCode::Char('b'));
+    assert_eq!(app.pending_branch_action(), "stack on second-branch");
+    for c in "third-branch".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    press(&mut app, KeyCode::Enter);
+
+    assert_eq!(app.column_count(), 2, "stacked onto the existing lane, not a new column");
+}

@@ -898,12 +898,15 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             );
         }
         Mode::Commit => {
-            // The typed message with a block cursor, so the footer doubles as the input.
+            // The typed message with a block cursor between its two halves — not always
+            // after the whole string — so the footer doubles as a real, editable input.
+            let (before, after) = app.commit_input.split_at_cursor();
             return f.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::styled("  message  ", theme::faint()),
-                    Span::styled(app.commit_input.clone(), theme::title(true)),
+                    Span::styled(before.to_string(), theme::title(true)),
                     Span::styled("█", theme::tone(crate::board::Tone::Accent)),
+                    Span::styled(after.to_string(), theme::title(true)),
                     Span::styled("   ⏎ commit · esc cancel", theme::faint()),
                 ])),
                 area,
@@ -912,11 +915,13 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         Mode::Branch => {
             // The pending action is named here for the same reason move mode names its
             // verb: stacking and adding a parallel lane are different things.
+            let (before, after) = app.branch_input.split_at_cursor();
             return f.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::styled("  branch  ", theme::faint()),
-                    Span::styled(app.branch_input.clone(), theme::title(true)),
+                    Span::styled(before.to_string(), theme::title(true)),
                     Span::styled("█", theme::tone(crate::board::Tone::Accent)),
+                    Span::styled(after.to_string(), theme::title(true)),
                     Span::styled("   ", theme::faint()),
                     Span::styled(
                         app.pending_branch_action(),

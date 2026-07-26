@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use crate::cmux::Cmux;
 use crate::diff::DiffView;
 use crate::model::{MergeCheck, PullPreview, PushPreview};
+use crate::text_input::TextInput;
 use crate::tutorial::Tutorial;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,9 +64,9 @@ pub struct App {
     /// stage), `Some(i)` targets that card (a squash or amend).
     pub target_card: Option<usize>,
     /// Commit message being typed, valid while `mode == Commit`.
-    pub commit_input: String,
+    pub commit_input: TextInput,
     /// Branch name being typed, valid while `mode == Branch`.
-    pub branch_input: String,
+    pub branch_input: TextInput,
     /// While naming a branch: `Some(branch)` stacks the new one on top of it, `None` makes
     /// a parallel lane. Seeded from the selected lane and toggled with tab.
     pub stack_onto: Option<String>,
@@ -121,8 +122,8 @@ impl App {
             origin_col: 0,
             origin_card: 0,
             target_card: None,
-            commit_input: String::new(),
-            branch_input: String::new(),
+            commit_input: TextInput::default(),
+            branch_input: TextInput::default(),
             stack_onto: None,
             push_preview: None,
             land_check: None,
@@ -150,8 +151,8 @@ impl App {
             origin_col: 0,
             origin_card: 0,
             target_card: None,
-            commit_input: String::new(),
-            branch_input: String::new(),
+            commit_input: TextInput::default(),
+            branch_input: TextInput::default(),
             stack_onto: None,
             push_preview: None,
             land_check: None,
@@ -467,7 +468,7 @@ impl App {
     }
 
     fn confirm_commit(&mut self) {
-        let message = self.commit_input.trim().to_string();
+        let message = self.commit_input.trimmed();
         if message.is_empty() {
             self.notify("a commit needs a message", Notice::Info);
             return;
@@ -533,7 +534,7 @@ impl App {
     }
 
     fn confirm_branch(&mut self) {
-        let name = self.branch_input.trim().to_string();
+        let name = self.branch_input.trimmed();
         if name.is_empty() {
             self.notify("a branch needs a name", Notice::Info);
             return;
@@ -1055,10 +1056,13 @@ impl App {
                     self.notify("commit cancelled", Notice::Info);
                 }
                 K::Enter => self.confirm_commit(),
-                K::Backspace => {
-                    self.commit_input.pop();
-                }
-                K::Char(c) => self.commit_input.push(c),
+                K::Backspace => self.commit_input.backspace(),
+                K::Delete => self.commit_input.delete_forward(),
+                K::Left => self.commit_input.move_left(),
+                K::Right => self.commit_input.move_right(),
+                K::Home => self.commit_input.move_home(),
+                K::End => self.commit_input.move_end(),
+                K::Char(c) => self.commit_input.insert(c),
                 _ => {}
             }
             return;
@@ -1073,10 +1077,13 @@ impl App {
                 }
                 K::Enter => self.confirm_branch(),
                 K::Tab => self.toggle_stack_onto(),
-                K::Backspace => {
-                    self.branch_input.pop();
-                }
-                K::Char(c) => self.branch_input.push(c),
+                K::Backspace => self.branch_input.backspace(),
+                K::Delete => self.branch_input.delete_forward(),
+                K::Left => self.branch_input.move_left(),
+                K::Right => self.branch_input.move_right(),
+                K::Home => self.branch_input.move_home(),
+                K::End => self.branch_input.move_end(),
+                K::Char(c) => self.branch_input.insert(c),
                 _ => {}
             }
             return;
@@ -1173,6 +1180,14 @@ impl App {
 
         match key.code {
             K::Char('q') if self.mode == Mode::Normal => self.should_quit = true,
+            // Esc means "cancel, go back" everywhere else in this app — Commit, Branch,
+            // every confirm dialog, Diff, Help. It quitting outright from Normal mode with
+            // no confirmation was the one inconsistent case, and the exact key most people
+            // reach for on reflex to back out of something: reported (GitHub issue #2) as
+            // an unexplained "crash" — the app just vanished, no message, because that is
+            // what an instant, silent quit looks like. `q` is the documented, deliberate
+            // quit key; Esc at the top level now does nothing, matching "nothing left to
+            // cancel back to" rather than "quit".
             K::Esc => match self.mode {
                 Mode::Moving => {
                     self.mode = Mode::Normal;
@@ -1185,7 +1200,7 @@ impl App {
                     self.col = self.origin_col;
                     self.notify("restack cancelled", Notice::Info);
                 }
-                _ => self.should_quit = true,
+                _ => {}
             },
             K::Char('?') => self.mode = Mode::Help,
             // Changing lane while moving resets the drop position to the lane header.
@@ -1395,5 +1410,48 @@ mod tests {
         };
         assert_eq!(verb(commit.kind, ColumnKind::Unassigned), "uncommit into");
         assert_eq!(verb(file.kind, ColumnKind::Stack), "stage to");
+    }
+
+    fn key(code: ratatui::crossterm::event::KeyCode) -> ratatui::crossterm::event::KeyEvent {
+        ratatui::crossterm::event::KeyEvent::from(code)
+    }
+
+    /// GitHub issue #2, "crash on adding a branch on the unassigned stack": the actual
+    /// cause turned out to be `Esc` quitting outright from Normal mode with no
+    /// confirmation — reflexively pressed to "back out" of typing a branch name (or
+    /// anything else), it looked exactly like a crash: the app just vanished. Esc means
+    /// "cancel, go back" in every other mode; at the top level, with nothing left to
+    /// cancel back to, it must do nothing. `q` is the one documented, deliberate quit key.
+    #[test]
+    fn esc_does_not_quit_from_normal_mode_only_q_does() {
+        use ratatui::crossterm::event::KeyCode as K;
+
+        let mut app = App::from_board(board());
+        assert_eq!(app.mode, Mode::Normal);
+
+        app.on_key(key(K::Esc));
+        assert!(!app.should_quit, "Esc at the top level must not quit");
+        assert_eq!(app.mode, Mode::Normal);
+
+        app.on_key(key(K::Char('q')));
+        assert!(app.should_quit, "q is still the documented quit key");
+    }
+
+    /// Esc must still cancel out of the states that press it as "go back" — this pins
+    /// those against ever regressing into the old "everything else quits" fallback too.
+    #[test]
+    fn esc_still_cancels_moving_and_restacking() {
+        use ratatui::crossterm::event::KeyCode as K;
+
+        let mut app = App::from_board(board());
+        app.mode = Mode::Moving;
+        app.on_key(key(K::Esc));
+        assert!(!app.should_quit);
+        assert_eq!(app.mode, Mode::Normal);
+
+        app.mode = Mode::Restacking;
+        app.on_key(key(K::Esc));
+        assert!(!app.should_quit);
+        assert_eq!(app.mode, Mode::Normal);
     }
 }

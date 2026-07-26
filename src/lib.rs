@@ -11,6 +11,7 @@ pub mod cmux;
 pub mod diff;
 pub mod model;
 pub mod snapshot;
+pub mod text_input;
 pub mod theme;
 pub mod tutorial;
 pub mod ui;
