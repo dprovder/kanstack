@@ -182,17 +182,22 @@ impl But {
     /// Mutating commands embed a status in their reply by default now (0.21 dropped the
     /// old opt-in `--status-after` flag entirely), but that embedded status still omits
     /// per-commit file lists — `rub` has no `-f` of its own to ask for them. A second
-    /// detailed query follows, which costs roughly another 90ms and is what keeps cards
-    /// from losing their file context the moment you move one.
+    /// detailed query follows regardless, which costs roughly another 90ms and is what
+    /// keeps cards from losing their file context the moment you move one.
+    ///
+    /// The embedded status is never actually read, only used (via `status_error`) to tell
+    /// a real failure from a plain success — `commit` and `restack_branch` already work
+    /// this way. Reproduced live: `but rub`'s very first mutation against a fresh branch
+    /// can come back as a bare `{"ok":true}` with no envelope at all outside of kanstack
+    /// entirely (plain `but` CLI, no code of ours involved), so treating a missing
+    /// `status` as fatal here — the one place among these three that did — occasionally
+    /// failed an operation that had, in fact, fully succeeded.
     pub fn rub(&self, source: &str, target: &str) -> Result<WorkspaceStatus> {
         let raw = self.run(&["rub", source, target, "--format", "json"])?;
         let env: MutationEnvelope = serde_json::from_str(raw.trim())
             .with_context(|| format!("could not parse `but rub` output: {raw:.400}"))?;
         if let Some(err) = env.status_error {
             bail!("rub succeeded but the workspace refresh failed: {err}");
-        }
-        if env.status.is_none() {
-            bail!("`but rub` returned no status payload");
         }
         self.status()
     }

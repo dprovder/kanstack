@@ -403,12 +403,14 @@ pub struct CliError {
 
 /// Envelope embedded by default in mutation commands' replies (0.21 dropped the old
 /// opt-in `--status-after` flag in favour of always including this).
+///
+/// Only `status_error` is ever read — callers always re-query `but status -f` for the
+/// board itself rather than trust the embedded one (it omits per-commit file lists, and
+/// has at least once been absent entirely on an otherwise-successful mutation outside of
+/// kanstack's own code, see `But::rub`). This only needs to tell a real failure apart from
+/// a plain success.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MutationEnvelope {
-    #[serde(default)]
-    pub result: Option<serde_json::Value>,
-    #[serde(default)]
-    pub status: Option<WorkspaceStatus>,
     /// Upstream documents this key as snake_case while the rest of the payload is
     /// camelCase, so accept either spelling.
     #[serde(default, alias = "statusError")]
