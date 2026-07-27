@@ -145,7 +145,22 @@ pub fn steps(seed_commits: usize) -> Vec<Step> {
 /// runs, so it uses `But`'s own methods to seed content rather than raw `but` subprocess
 /// calls wherever that's available.
 pub fn build_practice_repo() -> Result<PathBuf> {
-    let root = std::env::temp_dir().join(format!("kanstack-tutorial-{}", std::process::id()));
+    // `but setup --init` registers this path in GitButler's *global* project list and never
+    // deregisters it — every `--tutorial` run leaves a permanent entry behind. Naming the
+    // directory by pid alone (as this used to) means a later run can reuse a pid the OS
+    // already recycled, landing on a path GitButler has stale cached project metadata for
+    // from a completely different git history; the real symptom this produced was `but rub`
+    // silently dropping its embedded status (`{"ok":true}` with no `status` key) on the very
+    // first mutation against the freshly recreated repo. A nanosecond suffix makes the path
+    // unique to this run, so there is nothing stale to collide with.
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let root = std::env::temp_dir().join(format!(
+        "kanstack-tutorial-{}-{unique}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).context("could not create a temp directory")?;
 
