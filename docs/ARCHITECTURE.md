@@ -100,3 +100,17 @@ notification just says "undid"/"redid" without claiming to know which happened.
 Verified against 0.21.2, this changed from earlier `but`: deleting a branch (alone, or the
 tip or base of a stack) now discards *its own* commits outright, non-interactively, with no
 refusal and no folding into a neighbouring branch. `but undo` is the safety net instead.
+
+## The tutorial's practice repo path must be unique per run
+
+`but setup --init` registers the repo's path in GitButler's *global* project list and never
+deregisters it — every `--tutorial` run leaves a permanent entry behind (check
+`~/Library/Application Support/com.gitbutler.app/projects.json` on macOS; dozens can pile up
+over a project's lifetime). The practice directory used to be named `kanstack-tutorial-{pid}`
+only. OS process ids get recycled, so a later run can land on a path GitButler still has
+stale cached project metadata for from a completely different git history it once pointed
+at. Reproduced live: `but rub`'s very first mutation against a freshly recreated practice
+repo returned a bare `{"ok":true}` with no embedded `status` at all, on a path that had
+previously been a different (now-deleted) practice repo. `build_practice_repo` now suffixes
+the directory with a nanosecond timestamp so the path is never reused across runs — nothing
+stale to collide with, since nothing ever points at that exact path twice.
