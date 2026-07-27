@@ -7,34 +7,28 @@ single vertical commit graph, which flattens the one axis that makes the model i
 `kanstack` draws them as a board instead: one lane per stack, one card per commit, a backlog
 lane for unstaged work.
 
-```
-  workspace  ·  base 3189356
+![kanstack board overview](docs/assets/overview.gif)
 
- ● unassigned  2             ● feat-auth  2              ● feat-ui  2
- ──────────────────────────  ──────────────────────────  ──────────────────────────
- mv                          unpushed                    unpushed
- wip1.txt                    d5                          ca
- added                       Wire session refresh into   Fix settings tab focus
-                             gateway                     ring
- nr                          a2.txt                      b2.txt                                        ›
- wip2.txt                    d593db0  Dani               ca3b30b  Dani
- added
-                             e1                          47
-                             Add auth middleware         Redesign settings page
-                             a.txt                       b.txt
-                             e17b60c  Dani               47a6412  Dani
+The lane header stays pinned no matter how deep you scroll — even into a 25-commit stack, or
+past a lower branch's own commits in a stacked lane:
 
-  ←/→ lane · ↑/↓ card · m move · u unstage · c commit · b branch
-  s stack · ⏎ diff · d delete · r rebase · p push · M land · z/Z undo/redo · ? help · q quit
-```
+<table>
+<tr>
+<td><img src="docs/assets/long-stack.gif" alt="the lane header stays visible 20 commits deep into a long run of commits"></td>
+<td><img src="docs/assets/stacked-branches.gif" alt="the tip branch's header stays pinned while a hollow-dot header for a lower branch scrolls into view"></td>
+</tr>
+<tr>
+<td>A long run of commits</td>
+<td>A lane of three stacked branches</td>
+</tr>
+</table>
 
 ## Install
 
 Two things are required first:
 
 1. **The [GitButler CLI](https://docs.gitbutler.com/cli-overview)**, `but` 0.21 or newer, on
-   your `PATH` — 0.21 changed enough of the CLI's flags and JSON that older releases are no
-   longer supported (see [Version compatibility](#version-compatibility)).
+   your `PATH`.
 
    Just the CLI, no GUI app (macOS or Linux):
    ```sh
@@ -78,6 +72,9 @@ git clone https://github.com/dprovder/kanstack
 cd kanstack
 cargo install --path .
 ```
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how it talks to `but`, the wire-format
+notes, and the version-compatibility details a contributor would need.
 
 ## Tutorial
 
@@ -132,49 +129,11 @@ every unassigned change as well — documented, sensible for a command line, and
 board, where putting cards in a lane is precisely how you say what belongs in the commit.
 kanstack always passes `--only`.
 
-## How it talks to GitButler
+## No refresh key
 
-`kanstack` links no GitButler code. It spawns the `but` binary you installed and reads its
-documented JSON output — `but status -f --format json` to read, `but rub … --format json`
-to write.
-
-Mutating commands like `rub`, `commit`, and `move` embed a status in their reply by
-default — 0.21 removed the old opt-in `--status-after` flag in favour of always including
-it. That embedded status still is not equivalent to `but status -f`, though: it omits
-per-commit file lists, and these commands have no `-f` of their own to ask for them. A move
-therefore costs two queries, roughly 180ms.
-
-Navigation never shells out, so arrow keys are instant. `but status` is around 90ms and
-measurement suggests it is dominated by fixed startup rather than repository size
-(`tests/live.rs` guards this).
-
-**There is no refresh key.** A filesystem watcher follows the worktree and `.git`, so the
-board tracks changes made in your editor or another terminal on its own. The watch
-respects `.gitignore`, which is what stops one `cargo build` from drowning it in `target/`
-events.
-
-### Version compatibility
-
-The JSON is stable by intent — upstream documents stability as a goal — but it carries no
-schema version and its types are `pub(crate)`, so there is no semver promise to lean on.
-`kanstack` therefore checks `but --version` at startup and refuses to run below 0.21, and
-notes in the UI when you are on a release newer than it has been verified against.
-
-0.21 is a hard floor, not a soft one: it dropped `-j`/`--json` and `--status-after` in
-favour of `--format json`, a syntax 0.19 does not understand, so there is no flag spelling
-that works on both sides of that release. `kanstack` picks a side rather than branching on
-version at every call site. If you hacked on an earlier version of this project against
-0.19, expect to re-verify every call site — see `but.rs` and `git log` for what changed.
-
-The bindings in `src/model.rs` track the *wire* format, which differs from upstream's Rust
-structs in ways worth knowing if you hack on this: `createdAt` is RFC3339 despite a doc
-comment claiming otherwise, and `MergeStatus::Conflicted` arrives as an object while its
-sibling variants are bare strings. `but status`'s `stacks` array also arrives
-newest-created-first on the wire (verified against 0.21.2) — `but::parse_status` reverses
-it back to oldest-first so lane position stays stable as you add lanes, which is the one
-place in this codebase where the wire order and the order everything else assumes
-deliberately differ. Unknown *new* fields are ignored; a field we depend on going missing
-is a hard error rather than a half-rendered board.
+A filesystem watcher follows the worktree and `.git`, so the board tracks changes made in
+your editor or another terminal on its own — that's the whole reason there's no refresh
+key. Navigation never shells out either, so arrow keys are instant regardless.
 
 ## Reporting a bug
 
@@ -218,12 +177,21 @@ real CLI. Not yet built:
 
 `⏎` opens the diff **beside** the board rather than over it, so you keep your place. `←`
 goes back to the board — the diff sits to the right, so leaving it is a direction rather
-than a second meaning for `⏎`. `→` walks on to the next lane's diff without leaving. `tab` widens it to full width when
-you want to read properly. This is the split [gitui](https://github.com/gitui-org/gitui)
-uses, for the same reason.
+than a second meaning for `⏎`. `→` walks on to the next lane's diff without leaving. `tab`
+widens it to full width when you want to read properly. This is the split
+[gitui](https://github.com/gitui-org/gitui) uses, for the same reason.
 
 Added and removed lines carry a `+` / `-` in a column of their own, next to the new-file
 line number. gitui relies on colour alone; a marker survives being read without it.
+
+The useful part is that `but diff --format json` emits **one entry per hunk**, each with its
+own id that `rub` accepts. So `m` inside the pane picks up the hunk under the cursor and
+hands it to the same lane-targeting flow cards use — which means one file's hunks can go to
+different lanes. That is the only way to split a file that touches two unrelated things.
+
+Committed hunks carry no id and are marked as such; history is not stageable. Staging a
+hunk renumbers the rest, so the pane closes after you stage one and re-opens fresh rather
+than trusting a now-stale list.
 
 ## Line counts
 
@@ -232,25 +200,9 @@ headers. In a stack each branch totals only its own commits, so a lane like
 `feat-auth +1  2  +31 -4` sitting above `● fix-flaky-tests  1  +10 -1` tells you which
 branch is the big one.
 
-Uncommitted changes all come from the single `but diff` run alongside `but status`. Commits
-need `but diff <sha>` *each*, which would be ruinous per refresh — except a commit's content
-is fixed by its hash, so those results are cached by SHA and never expire. Only hashes never
-seen before cost anything, which after the first draw is usually none of them.
-
-The workspace header counts working-tree changes only; it says "uncommitted", so including
-committed lines there would make it lie.
-
-A working-tree file shows its hunks; a commit shows its own diff, read-only.
-
-The useful part is that `but diff --format json` emits **one entry per hunk**, each with its own id
-that `rub` accepts. So `m` inside the pane picks up the hunk under the cursor and hands it
-to the same lane-targeting flow cards use — which means one file's hunks can go to
-different lanes. That is the only way to split a file that touches two unrelated things.
-
-Committed hunks carry no id and are marked as such; history is not stageable.
-
-Hunk ids describe the *current* state, and staging one renumbers the rest, so the pane
-closes when you stage. Reopening re-queries rather than trusting a stale list.
+A working-tree file shows its hunks; a commit shows its own diff, read-only. The workspace
+header counts working-tree changes only; it says "uncommitted", so including committed
+lines there would make it lie.
 
 ## Rebasing onto the target
 
@@ -260,9 +212,6 @@ the incoming commits plus each lane's outcome — `rebases cleanly`, `already in
 `conflicts` — before anything moves. Worktree conflicts are called out too, and the dialog
 turns red and says "rebase anyway" when either is true.
 
-The header has always shown how far behind the target you are; without this that number
-was a dead end.
-
 Note `r` here is *rebase*, whereas GitButler's own TUI binds `r` to squash — worth knowing
 if you use both.
 
@@ -270,11 +219,10 @@ if you use both.
 
 `d` always deletes the lane's *tip* branch, asks first, and says what will happen.
 
-It can lose commits — verified against 0.21.2, this changed from earlier `but`: deleting a
-branch (alone, or the tip or base of a stack) now discards *its own* commits outright,
-non-interactively, with no refusal and no folding into a neighbouring branch. `but undo` is
-the safety net instead, so the confirmation names that rather than implying nothing can be
-lost.
+It can lose commits: deleting a branch (alone, or the tip or base of a stack) discards *its
+own* commits outright, non-interactively, with no folding into a neighbouring branch. `but
+undo` is the safety net instead, so the confirmation names that rather than implying
+nothing can be lost.
 
 ## Undo and redo
 
@@ -285,14 +233,13 @@ anything else, including a `land`.
 
 `but undo`/`but redo` restore the entire prior workspace state, uncommitted changes
 included, not just the last commit. Both always succeed and print nothing, whether or not
-there was anything to undo or redo — verified against 0.21.2, there is no way to tell a real
-undo from a silent no-op except by comparing the board before and after, so the notification
-here just says "undid"/"redid" without claiming to know which happened.
+there was anything to undo or redo, so the notification here just says "undid"/"redid"
+without claiming to know whether it was a no-op.
 
 ## Lane and branch state
 
 Each branch shows a coloured dot and a word, both derived from one value so they cannot
-disagree — they did once, and an empty lane came out the same green as a fully pushed one.
+disagree.
 
 | state | meaning |
 |---|---|
@@ -310,49 +257,35 @@ distinction carries real information: `c`/`p`/`M`/`z` always act on the tip, nev
 whichever branch's cards you happen to be scrolled into, and the hollow dot is there so a
 lower branch's header never reads as if it were the one those keys will act on.
 
-The current lane's own header is reverse-video highlighted too — not just a bolder title
-and a brighter rule, which read as too subtle to tell which of several lanes is current at
-a glance once there's more than two or three on screen.
+The current lane's own header is reverse-video highlighted too, so it's still obvious which
+lane is current once there's more than two or three on screen.
 
 ## Restacking an existing branch
 
-`s` stacks one existing lane onto another: a single `but move <branch> <target>`. Its
-commits rebase onto the target's tip and it becomes the new lane tip.
-
-This is new in 0.21. Earlier `but` exposed no subcommand for it — the capability existed in
-`but_api::branch::move_branch` and only their own TUI reached it, and `rub` between two
-branches reassigns *uncommitted changes* rather than restacking — so this used to be
-composed from four separate calls (a temp branch anchored on the target, `rub` each commit
-across oldest-first, delete the source, rename the temp branch back). `but move` replaced
-all of that with one native, atomic call.
+`s` stacks one existing lane onto another. Its commits rebase onto the target's tip and it
+becomes the new lane tip.
 
 **This rewrites history.** Moved commits get new SHAs, so a lane that was already pushed
 will need a force push afterwards — the push preview will say so.
 
-## Identifiers, and the fuzzy-matching trap
+## Identifiers on cards
 
-`but rub` re-resolves its arguments with fuzzy matching, and refuses rather than guessing
-when more than one thing matches. A two-character commit id like `ea` matches the branch
-`feat`, because the branch *name* contains those characters — which is fatal for a
-non-interactive caller.
-
-So the ids shown on cards are not the ids sent to `but`. Commits are rubbed by full hash,
-lanes by branch name; only file changes use their CLI id, having no alternative.
+The ids shown on cards are not always what you'd type into `but` yourself: commits are
+addressed by full hash, lanes by branch name; only file changes use their CLI id, having no
+alternative. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) if you're scripting against
+`but` directly and wondering why.
 
 ## Push, and why it asks first
 
 `p` runs `but push <branch> --dry-run` and shows you the result before doing anything —
 destination, commit list, and whether a force is involved. That is not ceremony:
 
-- **`but push` force-pushes by default.** `--with-force` is `default_value_t = true`.
+- **`but push` force-pushes by default.**
 - **A branch is always named explicitly.** With no branch and a non-interactive stdin,
   `but push` does not prompt — it pushes *every* branch with unpushed commits.
 - **With GitHub native stacked PRs**, a stack push temporarily retargets open PRs onto
-  trunk, which has been able to transiently merge or close them. Opt-in, and fixed
-  upstream in July 2026, but worth knowing.
-
-Hook flags are deliberately never passed: the spelling changed from `--run-hooks` to
-`--no-hooks`, so naming either one breaks on one side of that release.
+  trunk, which can transiently merge or close them if you're on an affected GitButler
+  version — worth knowing either way.
 
 ## Landing onto the target, and why it asks first
 
@@ -361,18 +294,9 @@ target — no pull request — and then reconciles every other applied lane onto
 the same as `but pull` does. That is the actual "get this into trunk" step; `p` only gets a
 branch to the remote for review.
 
-`land` is what replaced `but merge` in 0.21 (see [Version compatibility](#version-compatibility)),
-and it is strictly more capable: `merge` only ever worked when the workspace target was
-GitButler's local-only `gb-local` convention, and refused outright — "Target remote is
-origin, not gb-local. This command only works with gb-local targets" — for a target
-tracking a real remote (verified against 0.21.2, against this project's own repository).
-`land` works either way: local targets are updated locally, real-remote targets are pushed
-to directly.
-
-It is gated behind a preview, the same way push and rebase are. `but land` has no
-`--dry-run` of its own, so the preview instead comes from `but branch show <branch>
---check`, which reports the commits that would land and whether they land cleanly without
-touching anything. The dialog turns red and says "land anyway" when they would not.
+It is gated behind a preview, the same way push and rebase are, reporting the commits that
+would land and whether they land cleanly before touching anything. The dialog turns red and
+says "land anyway" when they would not.
 
 Bound to `M`, not `m`: that key already means "move a card." And not `l`: that is a
 navigation key (`←/→`, `h/l` move between lanes).
@@ -388,15 +312,12 @@ bypasses PR-based review — that is the whole point of the command — so it is
 if your project's process expects one. GitButler's own guidance here: use `but push` and
 `but pr new` instead. A branch-protected remote will reject the land regardless.
 
-**`z` does not undo a push to a real remote — only your local workspace.** Verified by
-landing onto a real bare-repo remote and then undoing: `but undo` fully restores the local
-board (the branch and its commits reappear, exactly as if nothing happened), but the
-remote's ref stays at the landed commit — `git log` on the remote confirms it, and
-`but status` correctly reports the workspace as now behind upstream because of it. Nothing
-is lost — the content is safely on the remote the whole time, and re-landing correctly
-reports nothing to do — but the local board *looks* fully reverted when only the local
-half is. The land confirmation says so before you commit to it, since that's the moment it's
-actually useful to know.
+**`z` does not undo a push to a real remote — only your local workspace.** Landing onto a
+real remote and then undoing fully restores the local board (the branch and its commits
+reappear, exactly as if nothing happened), but the remote's ref stays at the landed commit.
+Nothing is lost — the content is safely on the remote the whole time, and re-landing
+correctly reports nothing to do — but the local board *looks* fully reverted when only the
+local half is. The land confirmation says so before you commit to it.
 
 ## Licence and relationship to GitButler
 
