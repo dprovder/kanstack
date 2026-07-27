@@ -1058,6 +1058,7 @@ impl App {
                 self.notify(format!("{e}"), Notice::Error);
             }
         }
+        self.check_tutorial_advance();
     }
 
     /// Undoes the last operation. Fires immediately rather than asking first: undo is
@@ -1101,6 +1102,16 @@ impl App {
     /// them, not just whichever one happens to fall through to the end.
     pub fn on_key(&mut self, key: ratatui::crossterm::event::KeyEvent) {
         self.handle_key(key);
+        self.check_tutorial_advance();
+    }
+
+    /// Under `--tutorial`, checks whether the current step is now satisfied.
+    ///
+    /// Not folded into `on_key` alone: a land now finishes on a background thread (see
+    /// `poll_land`), so the state a step is waiting on can change between keystrokes rather
+    /// than only in direct response to one. Both call sites need this, or the "press M to
+    /// land" step would never advance once the land it started actually completes.
+    fn check_tutorial_advance(&mut self) {
         if let Some(mut t) = self.tutorial.take() {
             t.advance(self);
             self.tutorial = Some(t);

@@ -266,9 +266,17 @@ mod tests {
         app.on_key(key(KeyCode::Enter));
         assert_eq!(app.tutorial.as_ref().unwrap().current, 4, "step 4 did not advance");
 
-        // Step 5: M, then ⏎ to confirm landing onto the (fake, local) target.
+        // Step 5: M, then ⏎ to confirm landing onto the (fake, local) target. Landing runs
+        // on a background thread now, so the step only advances once `poll_land` picks up
+        // the result — a step tied to `on_key` alone would never see it complete.
         app.on_key(key(KeyCode::Char('M')));
         app.on_key(key(KeyCode::Enter));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.mode == crate::app::Mode::Landing {
+            assert!(std::time::Instant::now() < deadline, "land never completed");
+            app.poll_land();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         assert_eq!(app.tutorial.as_ref().unwrap().current, 5, "step 5 did not advance");
 
         // Step 6: z to undo the land.
