@@ -93,6 +93,8 @@ practice repo is thrown away when you're done. `esc` or `q` leaves any time.
 |---|---|
 | `←/→`, `h/l` | move between lanes — wraps around |
 | `↑/↓`, `j/k` | move between cards — wraps around |
+| `shift ←/→` | page by however many lanes fit on screen at once |
+| `shift ↑/↓` | skip to the next stacked branch, or the next folder if grouped |
 | `g` / `G` | first / last card |
 | `m` | pick up a card, then `←/→` for a lane, `↑/↓` to drop on a card, `⏎` to confirm |
 | `u` | send this card back to the backlog — uncommit a commit, unstage a file |

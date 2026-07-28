@@ -1437,3 +1437,60 @@ fn tab_from_a_stack_lane_explains_itself_instead_of_toggling() {
         "message should point at the unassigned lane, got {msg:?}"
     );
 }
+
+/// Drives the real `Shift+←/→`/`Shift+↑/↓` key events (not the private methods directly)
+/// through a real App, so the KeyModifiers::SHIFT wiring in handle_key is exercised end to
+/// end and not just the navigation math underneath it.
+#[test]
+#[ignore = "requires the GitButler CLI"]
+fn shift_arrows_page_lanes_and_skip_groups_through_the_app() {
+    if skip_if_no_but() {
+        return;
+    }
+    use kanstack::app::App;
+    use kanstack::cmux::Cmux;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let sb = Sandbox::new("shiftarrows");
+    sb.branch_with_commit("base-work", "a.txt", "base work");
+
+    // A second branch, anchored on the first, so the lane is a real two-branch stack --
+    // exactly the shape Shift+↑/↓ is meant to skip across.
+    let but = But::discover(&sb.repo()).unwrap();
+    but.branch_new("mid-work", Some("base-work")).unwrap();
+    sb.write("b.txt", "mid\n");
+    let status = but.status().unwrap();
+    let id = status
+        .uncommitted_changes
+        .iter()
+        .find(|c| c.file_path == "b.txt")
+        .unwrap()
+        .cli_id
+        .clone();
+    but.rub(&id, "mid-work").unwrap();
+    but.commit("mid-work", "mid work").unwrap();
+
+    // A separate, unrelated lane, so paging has more than one column to jump across.
+    sb.branch_with_commit("other-work", "c.txt", "other work");
+
+    let but = But::discover(&sb.repo()).unwrap();
+    let mut app = App::new(but, Cmux::discover()).expect("build the app");
+    app.terminal_width = 60;
+
+    // The stacked lane ("mid-work +1") sits after the backlog; land the cursor there and
+    // confirm Shift+↓ actually crosses into the other branch's own commits.
+    app.on_key(KeyEvent::from(KeyCode::Right));
+    let stacked_col = app.col;
+    let starting_group = app.board.columns[stacked_col].cards[app.card].group.clone();
+    app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
+    let landed_group = app.board.columns[stacked_col].cards[app.card].group.clone();
+    assert_ne!(
+        landed_group, starting_group,
+        "Shift+Down through the app should cross into the other branch's group"
+    );
+
+    // Shift+Right from the backlog should page by more than one lane at this width.
+    app.col = 0;
+    app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
+    assert!(app.col > 1, "a plain Right would only ever move to column 1");
+}

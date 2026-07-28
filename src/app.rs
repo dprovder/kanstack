@@ -20,6 +20,29 @@ use crate::model::{MergeCheck, PullPreview, PushPreview, WorkspaceStatus};
 use crate::text_input::TextInput;
 use crate::tutorial::Tutorial;
 
+/// Board-layout constants shared with `ui::visible_columns`: how wide a lane is allowed to
+/// get, and the gap between lanes. Living here rather than in `ui` is what lets
+/// `columns_that_fit` answer "how many lanes fit on screen" for `Shift+←/→` paging without
+/// `App` needing to know anything about `ratatui::Rect`.
+pub(crate) const MIN_COL_WIDTH: u16 = 26;
+pub(crate) const MAX_COL_WIDTH: u16 = 46;
+pub(crate) const COL_GAP: u16 = 2;
+
+/// The lane width and how many lanes fit at once, for `n` lanes in a terminal `area_width`
+/// columns wide. Pure so it can be shared between actual layout (`ui::visible_columns`,
+/// which also needs the width to draw with) and `Shift+←/→` paging (which only needs the
+/// count) without duplicating the same clamped-width formula in two places to drift apart.
+pub(crate) fn columns_that_fit(n: usize, area_width: u16) -> (u16, usize) {
+    let n = n.max(1) as u16;
+    let usable = area_width.saturating_sub(2);
+    let width = (usable / n)
+        .saturating_sub(COL_GAP)
+        .clamp(MIN_COL_WIDTH, MAX_COL_WIDTH);
+    let per = width + COL_GAP;
+    let fit = (usable / per).max(1) as usize;
+    (width, fit)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Normal,
@@ -131,6 +154,12 @@ pub struct App {
     /// Toggled with `tab` while that lane is selected; reapplied in `clamp` so it survives
     /// every refresh rather than resetting the moment the board rebuilds.
     pub unassigned_grouped_by_folder: bool,
+    /// The terminal's width as of the last frame drawn, kept here (not just in `ui`) so
+    /// `Shift+←/→` paging knows how many lanes are actually on screen. `ui::draw` never
+    /// mutates `App` — this is set from `main`'s event loop instead, right after each
+    /// `terminal.draw`, which is the one place both the fresh size and the next keystroke
+    /// are available before the other.
+    pub terminal_width: u16,
 }
 
 type RefreshResult = Result<(Board, HashMap<String, (usize, usize)>)>;
@@ -188,6 +217,7 @@ impl App {
             board_generation: 0,
             background_refresh: None,
             unassigned_grouped_by_folder: false,
+            terminal_width: 80,
         })
     }
 
@@ -221,6 +251,7 @@ impl App {
             board_generation: 0,
             background_refresh: None,
             unassigned_grouped_by_folder: false,
+            terminal_width: 80,
         }
     }
 
@@ -461,6 +492,53 @@ impl App {
             return;
         }
         self.card = (self.card as isize + delta).rem_euclid(n as isize) as usize;
+    }
+
+    /// `Shift+←/→`: jumps by however many lanes are actually on screen at once, rather
+    /// than one at a time — the board equivalent of Page Up/Down. Reuses `move_column`,
+    /// which already wraps and keeps the card cursor on a real card in the new lane.
+    fn move_column_page(&mut self, direction: isize) {
+        let (_, fit) = columns_that_fit(self.column_count(), self.terminal_width);
+        self.move_column(fit.max(1) as isize * direction);
+    }
+
+    /// `Shift+↑/↓`: jumps to the start of the next/previous group of cards within the
+    /// lane — a stacked branch's own commits, or (when grouped) a folder in the
+    /// unassigned lane — rather than moving one card at a time. Falls back to an ordinary
+    /// single-card move in a lane with nothing to skip between, so the key never just does
+    /// nothing.
+    fn move_card_by_group(&mut self, forward: bool) {
+        let Some(col) = self.board.columns.get(self.col) else {
+            return;
+        };
+        if col.cards.is_empty() {
+            return;
+        }
+
+        // The index of the first card in each run of cards sharing the same `group`.
+        let mut starts = Vec::new();
+        let mut last: Option<&str> = None;
+        for (i, card) in col.cards.iter().enumerate() {
+            let group = card.group.as_deref();
+            if group.is_some() && group != last {
+                starts.push(i);
+            }
+            last = group;
+        }
+        if starts.is_empty() {
+            self.move_card(if forward { 1 } else { -1 });
+            return;
+        }
+
+        // Where the cursor currently sits among the group starts, then step one group in
+        // the requested direction, wrapping the same way every other move here does.
+        let pos = starts.iter().rposition(|&s| s <= self.card).unwrap_or(0);
+        let next = if forward {
+            (pos + 1) % starts.len()
+        } else {
+            (pos + starts.len() - 1) % starts.len()
+        };
+        self.card = starts[next];
     }
 
     /// What a move will rub, and how to name it. Normally the picked-up card; when a move
@@ -1268,6 +1346,7 @@ impl App {
 
     fn handle_key(&mut self, key: ratatui::crossterm::event::KeyEvent) {
         use ratatui::crossterm::event::KeyCode as K;
+        use ratatui::crossterm::event::KeyModifiers;
 
         // Typing a commit message swallows ordinary keys, so navigation bindings do not
         // eat the letters being typed.
@@ -1434,6 +1513,24 @@ impl App {
                 _ => {}
             },
             K::Char('?') => self.mode = Mode::Help,
+            // Shift+←/→ pages by however many lanes are actually on screen, rather than
+            // one at a time — the same jump `‹`/`›` already advertise is there to make.
+            // Shift+↑/↓ skips to the next group boundary within the lane instead: the next
+            // stacked branch's own commits, or (when grouped) the next folder in the
+            // unassigned lane. Scoped to Normal mode so it doesn't fight the Moving/
+            // Restacking arrows' own special-cased meaning for the same keys.
+            K::Left if key.modifiers.contains(KeyModifiers::SHIFT) && self.mode == Mode::Normal => {
+                self.move_column_page(-1);
+            }
+            K::Right if key.modifiers.contains(KeyModifiers::SHIFT) && self.mode == Mode::Normal => {
+                self.move_column_page(1);
+            }
+            K::Up if key.modifiers.contains(KeyModifiers::SHIFT) && self.mode == Mode::Normal => {
+                self.move_card_by_group(false);
+            }
+            K::Down if key.modifiers.contains(KeyModifiers::SHIFT) && self.mode == Mode::Normal => {
+                self.move_card_by_group(true);
+            }
             // Changing lane while moving resets the drop position to the lane header.
             // While restacking, only branch lanes are valid targets, so skip the rest.
             K::Left | K::Char('h') => {
@@ -1591,6 +1688,75 @@ mod tests {
         assert_eq!(step(Some(1), 1), None, "past the last card, back to the header");
         assert_eq!(step(Some(0), -1), None, "up from card 0 returns to the header");
         assert_eq!(step(None, -1), Some(1), "up from the header wraps to the last card");
+    }
+
+    #[test]
+    fn shift_left_right_pages_by_however_many_lanes_fit() {
+        let mut app = App::from_board(board()); // [unassigned, feat-auth, feat-ui, fix-flaky-tests]
+        app.terminal_width = 60;
+        let (_, fit) = columns_that_fit(app.column_count(), app.terminal_width);
+        assert_eq!(fit, 2, "fixture for this test assumes a width where 2 of 4 lanes fit");
+
+        app.move_column_page(1);
+        assert_eq!(app.col, 2, "one page forward lands exactly `fit` lanes over");
+
+        app.move_column_page(1);
+        assert_eq!(app.col, 0, "another page wraps back around, same as ordinary lane movement");
+    }
+
+    #[test]
+    fn shift_left_right_wraps_backward_too() {
+        let mut app = App::from_board(board());
+        app.terminal_width = 60; // fit == 2, see the test above
+        app.col = 0;
+        app.move_column_page(-1);
+        assert_eq!(app.col, 2, "one page back from the start wraps to the far side");
+    }
+
+    /// Builds a lane with two stacked branches (feat-ui folded into feat-auth), so
+    /// Shift+↑/↓'s "skip to the next branch" behaviour has something real to skip between.
+    fn board_with_a_stacked_lane() -> Board {
+        let mut s = parse_status(include_str!("../tests/fixtures/status.json")).unwrap();
+        let extra = s.stacks.remove(2).branches.remove(0);
+        s.stacks[0].branches.push(extra);
+        Board::from_status(&s)
+    }
+
+    #[test]
+    fn shift_up_down_skips_to_the_next_stacked_branchs_commits() {
+        let mut app = App::from_board(board_with_a_stacked_lane());
+        app.col = 1; // "feat-auth +1", the stacked lane
+        let groups: Vec<Option<&str>> = app.board.columns[1]
+            .cards
+            .iter()
+            .map(|c| c.group.as_deref())
+            .collect();
+        assert!(
+            groups.iter().any(|g| g.is_some()) && groups.iter().any(|g| g != &groups[0]),
+            "test fixture must actually have more than one group to skip between: {groups:?}"
+        );
+
+        app.card = 0;
+        app.move_card_by_group(true);
+        let landed_group = app.board.columns[1].cards[app.card].group.clone();
+        assert_ne!(
+            landed_group,
+            app.board.columns[1].cards[0].group,
+            "moved into a different group, not just the next card"
+        );
+
+        // And back down should return to the start of the first group.
+        app.move_card_by_group(false);
+        assert_eq!(app.card, 0);
+    }
+
+    #[test]
+    fn shift_up_down_falls_back_to_a_plain_move_with_nothing_to_skip() {
+        let mut app = App::from_board(board()); // no stacked lanes, nothing grouped
+        app.col = 2; // "feat-ui", two commits, no groups
+        app.card = 0;
+        app.move_card_by_group(true);
+        assert_eq!(app.card, 1, "same as an ordinary ↓ with no group boundary to jump to");
     }
 
     #[test]

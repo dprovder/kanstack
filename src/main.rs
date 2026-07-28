@@ -153,7 +153,12 @@ fn run(
     watcher: &mut Option<Watcher>,
 ) -> Result<()> {
     loop {
-        terminal.draw(|f| ui::draw(f, app))?;
+        terminal.draw(|f| {
+            // Read before drawing so Shift+←/→ paging always knows how many lanes the
+            // frame it's reacting to actually showed.
+            app.terminal_width = f.area().width;
+            ui::draw(f, app);
+        })?;
 
         // Short timeout so the watcher gets looked at promptly; it is the thing that keeps
         // the board current, which is why there is no refresh key.

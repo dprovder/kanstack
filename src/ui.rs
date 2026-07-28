@@ -8,13 +8,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{App, Mode, Notice};
+use crate::app::{columns_that_fit, App, Mode, Notice, COL_GAP};
 use crate::board::{Card, ColumnKind};
 use crate::theme;
-
-const MIN_COL_WIDTH: u16 = 26;
-const MAX_COL_WIDTH: u16 = 46;
-const COL_GAP: u16 = 2;
 
 pub fn draw(f: &mut Frame, app: &App) {
     let mut constraints = vec![Constraint::Length(2)]; // header
@@ -613,17 +609,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 
 /// Chooses a column width and the first visible column so the cursor stays on screen.
 fn visible_columns(app: &App, area: Rect) -> (u16, usize, usize) {
-    let n = app.column_count().max(1) as u16;
-    let usable = area.width.saturating_sub(2);
-
-    // Prefer showing everything; fall back to a comfortable width and scroll. `n` is
-    // floored at 1 above, so the division is always safe.
-    let width = (usable / n)
-        .saturating_sub(COL_GAP)
-        .clamp(MIN_COL_WIDTH, MAX_COL_WIDTH);
-    let per = width + COL_GAP;
-    let fit = (usable / per).max(1) as usize;
-
+    let (width, fit) = columns_that_fit(app.column_count(), area.width);
     // Scroll the window just far enough to include the selected column.
     let first = if app.col < fit { 0 } else { app.col + 1 - fit };
     (width, first, fit)
@@ -1113,6 +1099,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::raw(""),
         help_row("←/→  h/l", "move between lanes"),
         help_row("↑/↓  j/k", "move between cards"),
+        help_row("shift ←/→", "page by however many lanes fit on screen"),
+        help_row("shift ↑/↓", "skip to the next branch (stacked) or folder (grouped)"),
         help_row("g / G", "first / last card"),
         help_row("m", "pick up a card"),
         help_row("  then ←/→", "choose a lane"),
