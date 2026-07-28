@@ -189,6 +189,33 @@ mod tests {
     }
 
     #[test]
+    fn header_shows_card_position_within_the_lane_too() {
+        let status =
+            crate::but::parse_status(include_str!("../tests/fixtures/status.json")).unwrap();
+        let mut app = App::from_board(Board::from_status(&status));
+        app.col = 1; // feat-auth, two commits
+        app.card = 1;
+        let mut t = Terminal::new(TestBackend::new(160, 24)).unwrap();
+        t.draw(|f| crate::ui::draw(f, &app)).unwrap();
+        let out = plain(&to_ansi(t.backend().buffer()));
+
+        assert!(out.contains("card 2/2"), "expected a card 2/2 readout in the header:\n{out}");
+    }
+
+    #[test]
+    fn header_omits_card_position_with_only_one_card() {
+        let status =
+            crate::but::parse_status(include_str!("../tests/fixtures/status.json")).unwrap();
+        let mut app = App::from_board(Board::from_status(&status));
+        app.col = 3; // fix-flaky-tests, a single-commit lane
+        let mut t = Terminal::new(TestBackend::new(160, 24)).unwrap();
+        t.draw(|f| crate::ui::draw(f, &app)).unwrap();
+        let out = plain(&to_ansi(t.backend().buffer()));
+
+        assert!(!out.contains("card 1/1"), "a single card is not a position worth reporting:\n{out}");
+    }
+
+    #[test]
     fn tiny_terminal_does_not_panic() {
         // Resize handling is the classic TUI crash; make the floor explicit.
         for (w, h) in [(20, 6), (12, 4), (5, 3), (1, 1)] {

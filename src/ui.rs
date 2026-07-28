@@ -590,6 +590,17 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
             theme::faint(),
         ));
     }
+    // Same reasoning as the lane counter, one level down: a long stack already keeps its
+    // header pinned so the lane itself is never in doubt, but the card position within it
+    // scrolls out of view just as easily, and nothing else says where you are in it.
+    let card_count = b.columns.get(app.col).map_or(0, |c| c.cards.len());
+    if card_count > 1 {
+        spans.push(Span::styled("  ·  ", theme::faint()));
+        spans.push(Span::styled(
+            format!("card {}/{card_count}", app.card + 1),
+            theme::faint(),
+        ));
+    }
     // Working-tree cards only. Lane totals now include commits, but the word here is
     // "uncommitted", so counting those would make the header say something untrue.
     let totals = b
