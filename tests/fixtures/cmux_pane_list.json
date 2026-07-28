@@ -1,0 +1,42 @@
+{
+  "panes": [
+    {
+      "ref": "pane:13",
+      "pixel_frame": {
+        "height": 475.5313199105146,
+        "width": 1140.2903645833335,
+        "x": 329.70963541666663,
+        "y": 28
+      },
+      "surface_ids": [
+        "48169868-232C-4575-8A87-A5ACA6B296BF",
+        "AF98B0F8-8D56-4452-8AF8-D8D4521256FD"
+      ],
+      "selected_surface_ref": "surface:33",
+      "surface_refs": [
+        "surface:33",
+        "surface:34"
+      ]
+    },
+    {
+      "ref": "pane:7",
+      "pixel_frame": {
+        "height": 419.4686800894854,
+        "width": 1140.2903645833335,
+        "x": 329.70963541666663,
+        "y": 503.5313199105146
+      },
+      "surface_ids": [
+        "A5332180-4C50-4502-88F8-23F963DDCF27",
+        "BAA4100C-688F-4202-AA16-5BDBAA8FFF69",
+        "97E7199B-3287-4C08-A1B1-4E646470DA42"
+      ],
+      "selected_surface_ref": "surface:9",
+      "surface_refs": [
+        "surface:9",
+        "surface:35",
+        "surface:36"
+      ]
+    }
+  ]
+}

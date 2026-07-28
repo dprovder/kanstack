@@ -1,0 +1,38 @@
+{
+  "windows": [
+    {
+      "workspaces": [
+        {
+          "panes": [
+            {
+              "surfaces": [
+                {
+                  "ref": "surface:33",
+                  "resources": {
+                    "cpu_percent": 35.06
+                  }
+                },
+                {
+                  "ref": "surface:34",
+                  "resources": {
+                    "cpu_percent": 0.0
+                  }
+                }
+              ]
+            },
+            {
+              "surfaces": [
+                {
+                  "ref": "surface:9",
+                  "resources": {
+                    "cpu_percent": 0.87
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

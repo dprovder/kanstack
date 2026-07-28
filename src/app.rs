@@ -53,6 +53,8 @@ pub enum Mode {
     Commit,
     /// Typing a new branch name.
     Branch,
+    /// Typing a task description to send into the selected lane's cmux pane.
+    Task,
     /// A whole lane has been picked up, looking for a lane to stack onto.
     Restacking,
     /// Looking at what a push would do, before doing it.
@@ -117,6 +119,12 @@ pub struct App {
     pub commit_input: TextInput,
     /// Branch name being typed, valid while `mode == Branch`.
     pub branch_input: TextInput,
+    /// Task description being typed, valid while `mode == Task`.
+    pub task_input: TextInput,
+    /// Branch key of the pane being typed into, valid while `mode == Task`. Resolved once
+    /// in `begin_task_dispatch` rather than re-derived in `confirm_task_dispatch`, so it
+    /// can't drift if the board reshuffles while the user is typing.
+    task_target: Option<String>,
     /// While naming a branch: `Some(branch)` stacks the new one on top of it, `None` makes
     /// a parallel lane. Seeded from the selected lane and toggled with tab.
     pub stack_onto: Option<String>,
@@ -176,6 +184,11 @@ pub struct App {
     /// rather than scoped to one lane on purpose — nothing about `but rub` requires the
     /// sources to share a column, so there is no reason to make kanstack pretend they must.
     pub selected: HashSet<String>,
+    /// A cmux pane-liveness poll running on a background thread; see `maybe_begin_cmux_poll`.
+    cmux_poll: Option<PendingCmuxPoll>,
+    /// Wall-clock time of the last poll kickoff, so most ticks cost one comparison and
+    /// nothing else. `None` until the first poll ever starts.
+    cmux_poll_at: Option<std::time::Instant>,
 }
 
 type RefreshResult = Result<(Board, HashMap<String, (usize, usize)>)>;
@@ -187,6 +200,12 @@ struct PendingRefresh {
     rx: mpsc::Receiver<RefreshResult>,
     /// The board generation at the moment this refresh started; see `board_generation`.
     generation: u64,
+}
+
+/// A cmux pane-liveness poll in flight on a background thread; see
+/// `App::maybe_begin_cmux_poll`.
+struct PendingCmuxPoll {
+    rx: mpsc::Receiver<Result<HashMap<String, crate::cmux::PaneStatus>>>,
 }
 
 impl App {
@@ -218,6 +237,8 @@ impl App {
             target_card: None,
             commit_input: TextInput::default(),
             branch_input: TextInput::default(),
+            task_input: TextInput::default(),
+            task_target: None,
             stack_onto: None,
             open_harness: true,
             push_preview: None,
@@ -236,6 +257,8 @@ impl App {
             unassigned_grouped_by_folder: false,
             terminal_width: 80,
             selected: HashSet::new(),
+            cmux_poll: None,
+            cmux_poll_at: None,
         })
     }
 
@@ -254,6 +277,8 @@ impl App {
             target_card: None,
             commit_input: TextInput::default(),
             branch_input: TextInput::default(),
+            task_input: TextInput::default(),
+            task_target: None,
             stack_onto: None,
             open_harness: true,
             push_preview: None,
@@ -272,6 +297,8 @@ impl App {
             unassigned_grouped_by_folder: false,
             terminal_width: 80,
             selected: HashSet::new(),
+            cmux_poll: None,
+            cmux_poll_at: None,
         }
     }
 
@@ -312,6 +339,21 @@ impl App {
         self.col = self.col.min(self.board.columns.len() - 1);
         let n = self.cards_in_current_column();
         self.card = if n == 0 { 0 } else { self.card.min(n - 1) };
+        self.sync_pane_statuses();
+    }
+
+    /// Copies each tracked cmux pane's last known status onto the matching column/section,
+    /// so `Board::build` never needs to know cmux exists. Called from `clamp` after every
+    /// board rebuild, and again on its own after a background poll resolves (`poll_cmux`),
+    /// since a poll updates `self.cmux`'s cache without rebuilding the board at all.
+    fn sync_pane_statuses(&mut self) {
+        let Some(cmux) = &self.cmux else { return };
+        for col in &mut self.board.columns {
+            for section in &mut col.sections {
+                section.pane_status = cmux.pane_status(&section.name);
+            }
+            col.pane_status = col.sections.first().and_then(|s| s.pane_status);
+        }
     }
 
     pub fn notify(&mut self, msg: impl Into<String>, kind: Notice) {
@@ -446,6 +488,58 @@ impl App {
                 self.background_refresh = None;
                 self.notify(format!("refresh failed: {e}"), Notice::Error);
             }
+        }
+    }
+
+    /// How often `maybe_begin_cmux_poll` is willing to start a new poll.
+    const CMUX_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+
+    /// Kicks off a background cmux liveness poll if one isn't already in flight, enough
+    /// time has passed since the last one, and there's at least one pane worth asking
+    /// about. Gated on `CMUX_SURFACE_ID` being present (kanstack itself running inside a
+    /// cmux pane) — the same guard `Cmux::occupant_in_direction` already uses, rather than
+    /// querying an ambiguous default scope when it isn't. Call this every tick, the same
+    /// as `begin_background_refresh`.
+    pub fn maybe_begin_cmux_poll(&mut self) {
+        let Some(cmux) = &self.cmux else { return };
+        if cmux.is_empty() || self.cmux_poll.is_some() {
+            return;
+        }
+        if std::env::var_os("CMUX_SURFACE_ID").is_none() {
+            return;
+        }
+        if self
+            .cmux_poll_at
+            .is_some_and(|t| t.elapsed() < Self::CMUX_POLL_INTERVAL)
+        {
+            return;
+        }
+        self.cmux_poll_at = Some(std::time::Instant::now());
+        let snapshot = cmux.clone();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(snapshot.poll_statuses());
+        });
+        self.cmux_poll = Some(PendingCmuxPoll { rx });
+    }
+
+    /// Non-blocking check on a poll started by `maybe_begin_cmux_poll`. Call every tick,
+    /// the same as `poll_background_refresh`.
+    pub fn poll_cmux(&mut self) {
+        let Some(pending) = &self.cmux_poll else { return };
+        match pending.rx.try_recv() {
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => self.cmux_poll = None,
+            Ok(Ok(statuses)) => {
+                self.cmux_poll = None;
+                if let Some(cmux) = &mut self.cmux {
+                    cmux.apply_statuses(statuses);
+                }
+                self.sync_pane_statuses();
+            }
+            // Transient — a `cmux` hiccup every few seconds shouldn't spam the footer the
+            // way a user-triggered action's failure should.
+            Ok(Err(_)) => self.cmux_poll = None,
         }
     }
 
@@ -944,6 +1038,81 @@ impl App {
             Err(e) => self.notify(format!("{e}"), Notice::Error),
         }
         self.branch_input.clear();
+    }
+
+    /// The branch name identifying lane `col`'s cmux pane: whichever section already has
+    /// one tracked (the lane's original parallel branch, even once other branches have
+    /// stacked on top of it — stacking never opens a second pane), or the tip branch if
+    /// none has been opened yet, so a first dispatch spawns one labelled the way the lane
+    /// reads today.
+    fn pane_branch(&self, col: usize) -> Option<String> {
+        let column = self.board.columns.get(col)?;
+        if let Some(cmux) = &self.cmux {
+            for section in &column.sections {
+                if cmux.has_pane(&section.name) {
+                    return Some(section.name.clone());
+                }
+            }
+        }
+        column.branch_name.clone()
+    }
+
+    /// Starts typing a task description to send into the selected lane's cmux pane.
+    fn begin_task_dispatch(&mut self) {
+        if self.cmux.is_none() {
+            self.notify("cmux is not configured", Notice::Info);
+            return;
+        }
+        let Some(branch) = self.pane_branch(self.col) else {
+            self.notify("pick a lane with a branch — the backlog has no pane", Notice::Info);
+            return;
+        };
+        self.task_target = Some(branch);
+        self.task_input.clear();
+        self.mode = Mode::Task;
+    }
+
+    fn confirm_task_dispatch(&mut self) {
+        let text = self.task_input.trimmed();
+        self.mode = Mode::Normal;
+        if text.is_empty() {
+            self.notify("a task needs a description", Notice::Info);
+            return;
+        }
+        let Some(branch) = self.task_target.take() else {
+            return;
+        };
+
+        let has_pane = self.cmux.as_ref().is_some_and(|c| c.has_pane(&branch));
+        if !has_pane {
+            // Deliberately does not send the just-typed text in the same action: a fresh
+            // pane's shell needs a moment to launch the harness before it can receive a
+            // second line, and `cmux send` has no "wait until ready" primitive to lean on.
+            // Spawning now and asking the user to press `t` again is simpler and safer
+            // than guessing a delay or racing the harness's own startup.
+            let Some(but) = &self.but else {
+                self.notify("snapshot is read-only", Notice::Info);
+                return;
+            };
+            let cwd = but.cwd().to_path_buf();
+            let Some(cmux) = &mut self.cmux else { return };
+            match cmux.spawn_harness(&cwd, &branch) {
+                Ok(()) => self.notify(
+                    format!("opened a pane for {branch} — press t again once it's ready for the task"),
+                    Notice::Info,
+                ),
+                Err(e) => self.notify(format!("cmux: {e}"), Notice::Error),
+            }
+            self.task_input.clear();
+            return;
+        }
+
+        let Some(cmux) = &self.cmux else { return };
+        match cmux.send_task(&branch, &text) {
+            Ok(()) => self.notify(format!("sent task to {branch}"), Notice::Success),
+            Err(e) => self.notify(format!("cmux: {e}"), Notice::Error),
+        }
+        self.task_input.clear();
     }
 
     /// Opens the diff for the selected card.
@@ -1526,6 +1695,27 @@ impl App {
             return;
         }
 
+        if self.mode == Mode::Task {
+            match key.code {
+                K::Esc => {
+                    self.mode = Mode::Normal;
+                    self.task_input.clear();
+                    self.task_target = None;
+                    self.notify("task cancelled", Notice::Info);
+                }
+                K::Enter => self.confirm_task_dispatch(),
+                K::Backspace => self.task_input.backspace(),
+                K::Delete => self.task_input.delete_forward(),
+                K::Left => self.task_input.move_left(),
+                K::Right => self.task_input.move_right(),
+                K::Home => self.task_input.move_home(),
+                K::End => self.task_input.move_end(),
+                K::Char(c) => self.task_input.insert(c),
+                _ => {}
+            }
+            return;
+        }
+
         if self.mode == Mode::PushConfirm {
             match key.code {
                 K::Enter | K::Char('y') => self.confirm_push(),
@@ -1722,6 +1912,7 @@ impl App {
             K::Char('z') if self.mode == Mode::Normal => self.undo(),
             K::Char('Z') if self.mode == Mode::Normal => self.redo(),
             K::Char('b') if self.mode == Mode::Normal => self.begin_branch(),
+            K::Char('t') if self.mode == Mode::Normal => self.begin_task_dispatch(),
             K::Char('s') if self.mode == Mode::Normal => self.begin_restack(),
             K::Char('u') if self.mode == Mode::Normal => self.send_to_backlog(),
             K::Char('d') if self.mode == Mode::Normal => self.begin_delete(),

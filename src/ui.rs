@@ -9,8 +9,32 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::app::{columns_that_fit, App, Mode, Notice, COL_GAP};
-use crate::board::{Card, ColumnKind};
+use crate::board::{Card, ColumnKind, Tone};
+use crate::cmux::PaneStatus;
 use crate::theme;
+
+/// Label for a lane's cmux pane status, rendered alongside its ordinary badges. Kept here
+/// rather than as a method on `PaneStatus` so `cmux` doesn't need to depend on `board`'s
+/// `Tone` just to describe how it's drawn — the same reason `LaneState`'s CI-badge sibling
+/// bakes its own label/tone in `board.rs` instead of leaning on `ui.rs`, just mirrored the
+/// other way since `PaneStatus` is the newer, ui-only-facing type.
+fn pane_status_label(status: PaneStatus) -> &'static str {
+    match status {
+        PaneStatus::Busy => "● busy",
+        PaneStatus::Idle => "○ idle",
+        PaneStatus::Dead => "✕ pane closed",
+        PaneStatus::Unknown => "… pane",
+    }
+}
+
+fn pane_status_tone(status: PaneStatus) -> Tone {
+    match status {
+        PaneStatus::Busy => Tone::Accent,
+        PaneStatus::Idle => Tone::Neutral,
+        PaneStatus::Dead => Tone::Bad,
+        PaneStatus::Unknown => Tone::Neutral,
+    }
+}
 
 pub fn draw(f: &mut Frame, app: &App) {
     let mut constraints = vec![Constraint::Length(2)]; // header
@@ -735,6 +759,10 @@ fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect) {
         header.push_span(Span::styled(format!("+{a}"), theme::tone(crate::board::Tone::Good)));
         header.push_span(Span::styled(format!(" -{r}"), theme::tone(crate::board::Tone::Bad)));
     }
+    if let Some(status) = col.pane_status {
+        header.push_span(Span::styled("  ", theme::faint()));
+        header.push_span(Span::styled(pane_status_label(status), theme::tone(pane_status_tone(status))));
+    }
     if header_is_target || is_current {
         header = header.style(theme::selected_bg());
     }
@@ -933,6 +961,10 @@ fn section_header(section: &crate::board::Section, width: usize) -> Vec<Line<'st
             theme::tone(crate::board::Tone::Bad),
         ));
     }
+    if let Some(status) = section.pane_status {
+        out[0].push_span(Span::styled("  ", theme::faint()));
+        out[0].push_span(Span::styled(pane_status_label(status), theme::tone(pane_status_tone(status))));
+    }
     if !section.badges.is_empty() {
         out.push(Line::from(
             section
@@ -1113,6 +1145,19 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                 area,
             );
         }
+        Mode::Task => {
+            let (before, after) = app.task_input.split_at_cursor();
+            return f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("  task  ", theme::faint()),
+                    Span::styled(before.to_string(), theme::title(true)),
+                    Span::styled("█", theme::tone(crate::board::Tone::Accent)),
+                    Span::styled(after.to_string(), theme::title(true)),
+                    Span::styled("   ⏎ send · esc cancel", theme::faint()),
+                ])),
+                area,
+            );
+        }
         Mode::Restacking => {
             let action = app.pending_restack().unwrap_or_default();
             return f.render_widget(
@@ -1147,7 +1192,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         }
         Mode::Help => "  esc close",
         Mode::Normal => {
-            "  ←/→ lane · ↑/↓ card · m move · u unstage · c commit · b branch · s stack · ⏎ diff · d delete · r rebase · p push · M land · z/Z undo/redo · ?"
+            "  ←/→ lane · ↑/↓ card · m move · u unstage · c commit · b branch · t task · s stack · ⏎ diff · d delete · r rebase · p push · M land · z/Z undo/redo · ?"
         }
     };
     f.render_widget(Paragraph::new(Line::styled(keys, theme::faint())), area);
@@ -1175,6 +1220,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         help_row("⏎", "open the diff beside the board — ← goes back"),
         help_row("c", "commit the staged files in this lane"),
         help_row("b", "new branch — stacks on this lane, tab for parallel"),
+        help_row("t", "send a task to this lane's cmux pane — spawns one first if not open"),
         help_row("s", "stack this whole lane onto another — rewrites history"),
         help_row("p", "push this lane — shows what it will do first"),
         help_row("M", "land this lane onto the target — no PR, shows what will happen first"),
@@ -1197,6 +1243,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         help_row("● filled dot", "a lane's tip branch — c/p/M/z always act here"),
         help_row("○ hollow dot", "a branch stacked below the tip, along for the ride"),
         help_row("▸ folder", "a directory divider in unassigned, when grouped by folder"),
+        help_row("● busy / ○ idle / ✕ pane closed", "a lane's cmux harness pane, if one is open"),
         Line::raw(""),
         Line::styled(
             "  every drop is one `but rub SOURCE TARGET`.",

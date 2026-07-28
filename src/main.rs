@@ -183,6 +183,11 @@ fn run(
         // own thread, so a save in another window never stalls navigation waiting on it.
         app.poll_background_refresh();
 
+        // Same pattern again for cmux pane liveness: apply a finished poll, then kick off
+        // the next one if it's due.
+        app.poll_cmux();
+        app.maybe_begin_cmux_poll();
+
         // Don't yank the board out from under a move in progress.
         if app.mode != Mode::Moving {
             if let Some(w) = watcher.as_mut() {

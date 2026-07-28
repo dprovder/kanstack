@@ -27,6 +27,7 @@
 //! monorepo; that one is an unrelated, unbuilt experiment and is not what `cmux` resolves
 //! to on `PATH`.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -38,6 +39,32 @@ use serde::Deserialize;
 /// merely near each other.
 const ADJACENCY_EPSILON: f64 = 4.0;
 
+/// Last known liveness/activity of a lane's cmux pane. See [`Cmux::poll_statuses`] for how
+/// this is derived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneStatus {
+    /// Present in `pane.list`; `cmux top` reports CPU usage above
+    /// [`CPU_BUSY_THRESHOLD_PERCENT`] for it.
+    Busy,
+    /// Present in `pane.list`; CPU usage is at or below the busy threshold. May mean the
+    /// harness returned to a resting prompt, or never got a chance to start —
+    /// `poll_statuses` cannot tell those apart from this alone.
+    Idle,
+    /// No longer present in `pane.list` at all — the tab was closed, by the user or by
+    /// cmux itself. Whether cmux auto-closes a tab when the shell inside it exits is a
+    /// cmux/terminal configuration question this module has not verified either way.
+    Dead,
+    /// Tracked, but no poll has completed yet (or the last one couldn't classify it).
+    Unknown,
+}
+
+#[derive(Debug, Clone)]
+struct PaneHandle {
+    surface_ref: String,
+    status: PaneStatus,
+}
+
+#[derive(Clone)]
 pub struct Cmux {
     bin: PathBuf,
     /// Shell command typed into the new terminal, e.g. `"claude"` or `"codex"`.
@@ -52,6 +79,11 @@ pub struct Cmux {
     /// Surface ref of the most recently spawned harness, so the next lane splits off it
     /// instead of kanstack's own pane. `None` splits off kanstack itself (the first lane).
     last_anchor: Option<String>,
+    /// One entry per lane kanstack has opened a harness for, keyed by the branch name
+    /// passed to `spawn_harness` — the lane's *original* parallel branch, which stays the
+    /// key even if other branches later stack on top of it (stacking never opens a second
+    /// pane).
+    panes: HashMap<String, PaneHandle>,
 }
 
 impl Cmux {
@@ -83,7 +115,26 @@ impl Cmux {
             direction,
             chain_direction,
             last_anchor: None,
+            panes: HashMap::new(),
         })
+    }
+
+    /// Whether kanstack has ever opened a pane for `branch` (regardless of its current
+    /// status) — used to decide whether task dispatch needs to spawn one first.
+    pub fn has_pane(&self, branch: &str) -> bool {
+        self.panes.contains_key(branch)
+    }
+
+    /// Last known status of `branch`'s pane. `None` if kanstack has never tracked one for
+    /// it at all (as opposed to `Some(PaneStatus::Dead)`, which means one existed and its
+    /// surface has since disappeared from `pane.list`).
+    pub fn pane_status(&self, branch: &str) -> Option<PaneStatus> {
+        self.panes.get(branch).map(|p| p.status)
+    }
+
+    /// No panes tracked at all — nothing worth polling.
+    pub fn is_empty(&self) -> bool {
+        self.panes.is_empty()
     }
 
     /// Splits off the previous lane's pane (or kanstack's own, for the first lane), types
@@ -121,8 +172,77 @@ impl Cmux {
         self.run(&["send", "--surface", &surface_ref, &launch])?;
 
         self.run(&["rename-tab", "--surface", &surface_ref, name])?;
+        self.panes.insert(
+            name.to_string(),
+            PaneHandle {
+                surface_ref: surface_ref.clone(),
+                status: PaneStatus::Unknown,
+            },
+        );
         self.last_anchor = Some(surface_ref);
         Ok(())
+    }
+
+    /// Sends `text` followed by Enter into `branch`'s tracked pane via `cmux send
+    /// --surface`, the same mechanism `spawn_harness` already uses to type the launch
+    /// command — just generalized to target a pane recorded earlier rather than the one
+    /// just created.
+    pub fn send_task(&self, branch: &str, text: &str) -> Result<()> {
+        let Some(pane) = self.panes.get(branch) else {
+            bail!("no cmux pane open for {branch} yet");
+        };
+        self.run(&["send", "--surface", &pane.surface_ref, &format!("{text}\n")])?;
+        Ok(())
+    }
+
+    /// Re-derives every tracked pane's status: `cmux rpc pane.list` for whether the
+    /// surface still exists at all, then (only when a `CMUX_WORKSPACE_ID` is available to
+    /// scope the query to, and only when at least one tracked surface is still present)
+    /// `cmux top --workspace <id> --json` for whether anything beyond the resting login
+    /// shell is running in it.
+    ///
+    /// Pure and read-only on `self` — safe to call from a background thread against a
+    /// cloned snapshot.
+    pub fn poll_statuses(&self) -> Result<HashMap<String, PaneStatus>> {
+        if self.panes.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let list_out = self.run(&["rpc", "pane.list"])?;
+
+        let any_alive = {
+            let list: PaneListResponse = serde_json::from_str(&list_out)
+                .with_context(|| format!("bad pane.list response: {list_out:?}"))?;
+            let present: std::collections::HashSet<String> = list
+                .panes
+                .into_iter()
+                .flat_map(|p| p.surface_refs)
+                .collect();
+            self.panes.values().any(|p| present.contains(&p.surface_ref))
+        };
+
+        let top_out = if any_alive {
+            match std::env::var("CMUX_WORKSPACE_ID") {
+                // Else: no workspace to scope `top` to without guessing —
+                // existence-only status is still derived below; the Busy/Idle split
+                // is skipped this round.
+                Ok(workspace_id) => Some(self.run(&["top", "--workspace", &workspace_id, "--json"])?),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+        classify_statuses(&self.panes, &list_out, top_out.as_deref())
+    }
+
+    /// Merges a `poll_statuses` result back in, keyed by branch. Entries for lanes deleted
+    /// since the poll started are simply absent from `self.panes` and are ignored.
+    pub fn apply_statuses(&mut self, statuses: HashMap<String, PaneStatus>) {
+        for (branch, status) in statuses {
+            if let Some(pane) = self.panes.get_mut(&branch) {
+                pane.status = status;
+            }
+        }
     }
 
     /// Looks for a pane already touching kanstack's own pane on `direction`'s side, via
@@ -186,7 +306,63 @@ struct PaneInfo {
     pixel_frame: PixelFrame,
     surface_ids: Vec<String>,
     selected_surface_ref: String,
+    /// Surface refs (e.g. `"surface:34"`) contained in this pane. Not documented
+    /// alongside the rest of `pane.list`'s raw-RPC shape; degrades to empty rather than a
+    /// parse failure if it's ever absent or renamed.
+    #[serde(default)]
+    surface_refs: Vec<String>,
 }
+
+/// Shape of `cmux top --workspace <id> --json`. A first-class, `--help`-documented
+/// subcommand (unlike `pane.list`) that reports per-surface resource usage — used here
+/// only for `resources.cpu_percent`, as a busy/idle signal. `process_count` was tried
+/// first and rejected: a harness like `claude` keeps several child processes (MCP
+/// servers, watchers) alive even at a resting prompt, so process count alone never drops
+/// back down and every pane reads permanently `Busy`. CPU usage actually falls to near
+/// zero at rest (confirmed live: ~35% while generating vs. 0–0.9% idle), so it's the
+/// signal that can actually distinguish the two.
+#[derive(Deserialize)]
+struct TopResponse {
+    #[serde(default)]
+    windows: Vec<TopWindow>,
+}
+
+#[derive(Deserialize)]
+struct TopWindow {
+    #[serde(default)]
+    workspaces: Vec<TopWorkspace>,
+}
+
+#[derive(Deserialize)]
+struct TopWorkspace {
+    #[serde(default)]
+    panes: Vec<TopPane>,
+}
+
+#[derive(Deserialize)]
+struct TopPane {
+    #[serde(default)]
+    surfaces: Vec<TopSurface>,
+}
+
+#[derive(Deserialize)]
+struct TopSurface {
+    #[serde(rename = "ref")]
+    surface_ref: String,
+    resources: TopResources,
+}
+
+#[derive(Deserialize)]
+struct TopResources {
+    cpu_percent: f64,
+}
+
+/// CPU usage above this, for a tracked surface, counts as `Busy` rather than `Idle`.
+/// Comfortably above the 0–0.9% observed live for a resting shell or an idle `claude`
+/// prompt, and well below the 30%+ seen while a harness is actually generating — chosen
+/// to absorb background noise (telemetry pings, idle polling) without also absorbing real
+/// work.
+const CPU_BUSY_THRESHOLD_PERCENT: f64 = 3.0;
 
 #[derive(Deserialize)]
 struct PixelFrame {
@@ -194,6 +370,54 @@ struct PixelFrame {
     y: f64,
     width: f64,
     height: f64,
+}
+
+/// Pure classification step of [`Cmux::poll_statuses`], split out so it can be unit
+/// tested against captured JSON fixtures without shelling out to a real `cmux`.
+/// `list_json` is a `cmux rpc pane.list` response; `top_json`, if present, is a `cmux top
+/// --json` response.
+fn classify_statuses(
+    panes: &HashMap<String, PaneHandle>,
+    list_json: &str,
+    top_json: Option<&str>,
+) -> Result<HashMap<String, PaneStatus>> {
+    let list: PaneListResponse = serde_json::from_str(list_json)
+        .with_context(|| format!("bad pane.list response: {list_json:?}"))?;
+    let present: std::collections::HashSet<String> =
+        list.panes.into_iter().flat_map(|p| p.surface_refs).collect();
+
+    let mut cpu_percents: HashMap<String, f64> = HashMap::new();
+    if let Some(top_json) = top_json {
+        let top: TopResponse = serde_json::from_str(top_json)
+            .with_context(|| "bad `cmux top` response".to_string())?;
+        for surface in top
+            .windows
+            .into_iter()
+            .flat_map(|w| w.workspaces)
+            .flat_map(|w| w.panes)
+            .flat_map(|p| p.surfaces)
+        {
+            cpu_percents.insert(surface.surface_ref, surface.resources.cpu_percent);
+        }
+    }
+
+    Ok(panes
+        .iter()
+        .map(|(branch, pane)| {
+            let status = if !present.contains(pane.surface_ref.as_str()) {
+                PaneStatus::Dead
+            } else {
+                match cpu_percents.get(&pane.surface_ref) {
+                    Some(cpu) if *cpu > CPU_BUSY_THRESHOLD_PERCENT => PaneStatus::Busy,
+                    Some(_) => PaneStatus::Idle,
+                    // No CPU data this round: keep whatever was already known rather
+                    // than guessing.
+                    None => pane.status,
+                }
+            };
+            (branch.clone(), status)
+        })
+        .collect())
 }
 
 /// True when `other` sits flush against `own`'s `direction` edge, with any overlap along
@@ -309,5 +533,58 @@ mod tests {
             let cmux = Cmux::discover();
             assert!(cmux.is_some(), "an explicit KANSTACK_CMUX_BIN is never second-guessed");
         });
+    }
+
+    const PANE_LIST_FIXTURE: &str = include_str!("../tests/fixtures/cmux_pane_list.json");
+    const TOP_FIXTURE: &str = include_str!("../tests/fixtures/cmux_top.json");
+
+    fn pane(surface_ref: &str, status: PaneStatus) -> PaneHandle {
+        PaneHandle {
+            surface_ref: surface_ref.to_string(),
+            status,
+        }
+    }
+
+    /// A tracked surface that's present in `pane.list` and shows CPU usage above
+    /// [`CPU_BUSY_THRESHOLD_PERCENT`] in `cmux top` (a real, actively-generating `claude`
+    /// session, captured live at ~35%) classifies as `Busy`.
+    #[test]
+    fn classify_statuses_marks_a_high_cpu_surface_busy() {
+        let panes = HashMap::from([("feature-a".to_string(), pane("surface:33", PaneStatus::Unknown))]);
+        let statuses =
+            classify_statuses(&panes, PANE_LIST_FIXTURE, Some(TOP_FIXTURE)).unwrap();
+        assert_eq!(statuses["feature-a"], PaneStatus::Busy);
+    }
+
+    /// A tracked surface present in `pane.list` with CPU usage at the busy threshold or
+    /// below (a resting `claude` prompt, captured live at 0%) classifies as `Idle` even
+    /// though its process count stays high — this is the case `process_count` alone got
+    /// wrong.
+    #[test]
+    fn classify_statuses_marks_a_low_cpu_surface_idle() {
+        let panes = HashMap::from([("feature-b".to_string(), pane("surface:34", PaneStatus::Unknown))]);
+        let statuses =
+            classify_statuses(&panes, PANE_LIST_FIXTURE, Some(TOP_FIXTURE)).unwrap();
+        assert_eq!(statuses["feature-b"], PaneStatus::Idle);
+    }
+
+    /// A tracked surface absent from `pane.list` entirely — its tab was closed —
+    /// classifies as `Dead`, regardless of what `cmux top` says.
+    #[test]
+    fn classify_statuses_marks_a_missing_surface_dead() {
+        let panes = HashMap::from([("feature-c".to_string(), pane("surface:999", PaneStatus::Busy))]);
+        let statuses =
+            classify_statuses(&panes, PANE_LIST_FIXTURE, Some(TOP_FIXTURE)).unwrap();
+        assert_eq!(statuses["feature-c"], PaneStatus::Dead);
+    }
+
+    /// Without a `cmux top` response (e.g. no `CMUX_WORKSPACE_ID` to scope it), a surface
+    /// still present in `pane.list` keeps its previously known status rather than being
+    /// guessed at — existence alone can't distinguish Busy from Idle.
+    #[test]
+    fn classify_statuses_keeps_prior_status_without_a_top_response() {
+        let panes = HashMap::from([("feature-a".to_string(), pane("surface:33", PaneStatus::Busy))]);
+        let statuses = classify_statuses(&panes, PANE_LIST_FIXTURE, None).unwrap();
+        assert_eq!(statuses["feature-a"], PaneStatus::Busy);
     }
 }
