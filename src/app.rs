@@ -117,6 +117,26 @@ pub struct App {
     /// Present only under `kanstack --tutorial`. Checked after every keystroke; absent for
     /// ordinary runs, so the check costs nothing outside that mode.
     pub tutorial: Option<Tutorial>,
+    /// Bumped every time `self.board` is replaced, from any source. `poll_background_refresh`
+    /// captures this before starting a background refresh and checks it again when the
+    /// result comes back — if something else (a mutation, another refresh) has already
+    /// replaced the board in the meantime, the background result is stale and is discarded
+    /// rather than clobbering newer state with older.
+    board_generation: u64,
+    /// A watcher-driven refresh running on a background thread, so a file save elsewhere
+    /// never blocks navigation while it's picked up. See `begin_background_refresh`.
+    background_refresh: Option<PendingRefresh>,
+}
+
+type RefreshResult = Result<(Board, HashMap<String, (usize, usize)>)>;
+
+/// A watcher-triggered refresh in flight on a background thread. Unlike [`PendingLand`]
+/// this has no UI of its own — it's invisible on success, the same as `refresh_quietly`
+/// always was, just no longer blocking while it runs.
+struct PendingRefresh {
+    rx: mpsc::Receiver<RefreshResult>,
+    /// The board generation at the moment this refresh started; see `board_generation`.
+    generation: u64,
 }
 
 impl App {
@@ -160,6 +180,8 @@ impl App {
             message,
             should_quit: false,
             tutorial: None,
+            board_generation: 0,
+            background_refresh: None,
         })
     }
 
@@ -190,6 +212,8 @@ impl App {
             message: None,
             should_quit: false,
             tutorial: None,
+            board_generation: 0,
+            background_refresh: None,
         }
     }
 
@@ -210,6 +234,7 @@ impl App {
 
     /// Keeps the cursor inside the board after the shape changes under it.
     fn clamp(&mut self) {
+        self.board_generation = self.board_generation.wrapping_add(1);
         if self.board.columns.is_empty() {
             self.col = 0;
             self.card = 0;
@@ -287,6 +312,71 @@ impl App {
                 self.clamp();
             }
             Err(e) => self.notify(format!("refresh failed: {e}"), Notice::Error),
+        }
+    }
+
+    /// Starts a watcher-driven refresh on a background thread, if one isn't already in
+    /// flight. `but status` plus `but diff` together cost around 90ms of fixed subprocess
+    /// overhead regardless of repository size — small in absolute terms, but enough to
+    /// stutter navigation if it runs on the thread that also reads keys, since a save in
+    /// another window can trigger this at any moment, including mid-navigation. Unlike
+    /// `refresh_quietly`, the caller (the watcher path in `main`) never blocks on this.
+    pub fn begin_background_refresh(&mut self) {
+        if self.background_refresh.is_some() {
+            return;
+        }
+        let Some(but) = self.but.clone() else {
+            return;
+        };
+        let cache = self.commit_stats.clone();
+        let generation = self.board_generation;
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = but.status().map(|s| {
+                let mut cache = cache;
+                let board = Self::board_from(&but, &mut cache, &s);
+                (board, cache)
+            });
+            let _ = tx.send(result);
+        });
+        self.background_refresh = Some(PendingRefresh { rx, generation });
+    }
+
+    /// Whether a background refresh is still in flight. Exposed for tests that need to
+    /// poll until one resolves; the UI itself has nothing to show while this is `true` —
+    /// see `refresh_quietly`'s doc comment for why that's deliberate.
+    pub fn background_refresh_is_pending(&self) -> bool {
+        self.background_refresh.is_some()
+    }
+
+    /// Non-blocking check on a background refresh started by `begin_background_refresh`.
+    /// Call this every tick of the event loop, the same as `poll_land`.
+    pub fn poll_background_refresh(&mut self) {
+        let Some(pending) = &self.background_refresh else {
+            return;
+        };
+        match pending.rx.try_recv() {
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.background_refresh = None;
+            }
+            Ok(Ok((board, cache))) => {
+                // Something else already replaced the board since this refresh started
+                // (a mutation, another refresh) — that result is newer than this one, so
+                // applying this would go backwards. Just drop it; the watcher will fire
+                // again if anything is still actually out of date.
+                let stale = pending.generation != self.board_generation;
+                self.background_refresh = None;
+                if !stale {
+                    self.board = board;
+                    self.commit_stats = cache;
+                    self.clamp();
+                }
+            }
+            Ok(Err(e)) => {
+                self.background_refresh = None;
+                self.notify(format!("refresh failed: {e}"), Notice::Error);
+            }
         }
     }
 

@@ -173,11 +173,15 @@ fn run(
         // whether a key came in, so the spinner animates even while idle.
         app.poll_land();
 
+        // Same idea for a watcher-triggered refresh: it starts here but finishes on its
+        // own thread, so a save in another window never stalls navigation waiting on it.
+        app.poll_background_refresh();
+
         // Don't yank the board out from under a move in progress.
         if app.mode != Mode::Moving {
             if let Some(w) = watcher.as_mut() {
                 if w.poll() {
-                    app.refresh_quietly();
+                    app.begin_background_refresh();
                 }
             }
         }

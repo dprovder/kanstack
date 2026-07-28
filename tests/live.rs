@@ -1271,3 +1271,94 @@ fn landing_through_the_app_runs_on_a_background_thread_and_updates_the_board() {
     let log = sb.git(&["log", "--oneline", "--all"]);
     assert!(log.contains("Threaded landable"), "landing must land the content: {log}");
 }
+
+/// A watcher-triggered refresh used to run `but status` + `but diff` synchronously on the
+/// same thread that reads keys, so a save in another window could stall navigation for the
+/// whole round trip. `begin_background_refresh`/`poll_background_refresh` move that off
+/// the main thread the same way landing already was; this drives the pair the way `main`'s
+/// event loop does, against a change made outside the App entirely (a second `but branch
+/// new`, standing in for "someone edited a file in another terminal").
+#[test]
+#[ignore = "requires the GitButler CLI"]
+fn background_refresh_picks_up_an_external_change_without_blocking() {
+    if skip_if_no_but() {
+        return;
+    }
+    use kanstack::app::App;
+    use kanstack::cmux::Cmux;
+
+    let sb = Sandbox::new("bgrefresh");
+    let but = But::discover(&sb.repo()).unwrap();
+    let mut app = App::new(but, Cmux::discover()).expect("build the app");
+    assert_eq!(app.column_count(), 1, "only the backlog column exists yet");
+
+    // Stand in for a change made outside kanstack entirely -- another terminal, an editor,
+    // the desktop app -- the exact thing the filesystem watcher exists to notice.
+    sb.branch_with_commit("external-work", "a.txt", "Made outside kanstack");
+
+    app.begin_background_refresh();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.column_count() == 1 {
+        assert!(std::time::Instant::now() < deadline, "background refresh never landed");
+        app.poll_background_refresh();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    assert_eq!(app.column_count(), 2, "the backlog plus the externally created lane");
+    let lane = app
+        .board
+        .columns
+        .iter()
+        .find(|c| c.branch_name.as_deref() == Some("external-work"));
+    assert!(lane.is_some(), "the externally created branch should be on the board");
+}
+
+/// The one way async refresh could regress on the synchronous version it replaced: a
+/// mutation completes *after* a background refresh started but *before* that refresh's
+/// (now-stale) result arrives, and the stale result clobbers the mutation's fresher state
+/// when it lands. `board_generation` exists specifically to catch this -- this test starts
+/// a refresh, only then makes a real mutation through the App, and checks the mutation's
+/// result survives once the slower, now-stale refresh finally reports in.
+#[test]
+#[ignore = "requires the GitButler CLI"]
+fn a_stale_background_refresh_does_not_clobber_a_newer_mutation() {
+    if skip_if_no_but() {
+        return;
+    }
+    use kanstack::app::App;
+    use kanstack::cmux::Cmux;
+
+    let sb = Sandbox::new("bgrefreshstale");
+    sb.branch_with_commit("feat", "a.txt", "first");
+    let but = But::discover(&sb.repo()).unwrap();
+    let mut app = App::new(but, Cmux::discover()).expect("build the app");
+    assert_eq!(app.column_count(), 2, "backlog plus the one lane so far");
+
+    // Start a refresh as the watcher would, but don't poll it yet -- its result is still
+    // in flight, unaware of what happens next.
+    app.begin_background_refresh();
+
+    // A real mutation lands through the App while that refresh is still in the air,
+    // bumping board_generation past what the in-flight refresh captured.
+    sb.branch_with_commit("second", "b.txt", "second");
+    app.refresh(); // synchronous, the same as any ordinary in-app refresh
+    assert_eq!(app.column_count(), 3, "the mutation's own refresh sees all three lanes");
+
+    // Now let the slower, stale background refresh actually report in.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        app.poll_background_refresh();
+        if app.background_refresh_is_pending() {
+            assert!(std::time::Instant::now() < deadline, "background refresh never resolved");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            continue;
+        }
+        break;
+    }
+
+    assert_eq!(
+        app.column_count(),
+        3,
+        "the stale refresh must not have reverted the newer mutation's state"
+    );
+}

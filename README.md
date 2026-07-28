@@ -133,7 +133,8 @@ kanstack always passes `--only`.
 
 A filesystem watcher follows the worktree and `.git`, so the board tracks changes made in
 your editor or another terminal on its own — that's the whole reason there's no refresh
-key. Navigation never shells out either, so arrow keys are instant regardless.
+key. Navigation never shells out, so arrow keys are instant regardless of what the watcher
+is doing; the refresh it triggers runs on its own thread and never blocks input.
 
 ## Reporting a bug
 
