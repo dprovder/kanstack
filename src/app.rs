@@ -542,7 +542,12 @@ impl App {
             }
             last = group;
         }
-        if starts.is_empty() {
+        if starts.len() <= 1 {
+            // Nothing to skip *between*: either no groups at all (a plain lane), or —
+            // edge case, but real: unassigned grouped by folder with everything in one
+            // folder — exactly one. Stepping "to the next group" in either case would
+            // just land back where the cursor already is, which looks exactly like the
+            // key doing nothing. Fall back to an ordinary move instead.
             self.move_card(if forward { 1 } else { -1 });
             return;
         }
@@ -1818,6 +1823,29 @@ mod tests {
         app.card = 0;
         app.move_card_by_group(true);
         assert_eq!(app.card, 1, "same as an ordinary ↓ with no group boundary to jump to");
+    }
+
+    /// Regression: unassigned grouped by folder with everything landing in the same
+    /// folder has exactly one group, not zero — every card's `group` is `Some`, so the
+    /// earlier `starts.is_empty()` fallback check missed this case entirely. Stepping "to
+    /// the next group" landed back on the one group's own start, which if the cursor was
+    /// already there (or already past it) looked exactly like the key doing nothing.
+    #[test]
+    fn shift_up_down_falls_back_when_theres_only_one_group() {
+        let mut app = App::from_board(board());
+        app.col = 0; // unassigned
+        for card in &mut app.board.columns[0].cards {
+            card.group = Some("src".into());
+        }
+        let n = app.board.columns[0].cards.len();
+        assert!(n > 1, "test fixture needs more than one card in the backlog");
+
+        app.card = 0;
+        app.move_card_by_group(true);
+        assert_eq!(
+            app.card, 1,
+            "falls back to an ordinary move instead of landing back on the same group start"
+        );
     }
 
     #[test]
