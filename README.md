@@ -98,6 +98,7 @@ practice repo is thrown away when you're done. `esc` or `q` leaves any time.
 | `u` | send this card back to the backlog — uncommit a commit, unstage a file |
 | `d` | delete this lane — asks first |
 | `r` | rebase onto the updated target — shows what will happen |
+| `tab` | on the unassigned lane: group its cards by folder, or back to a flat list |
 | `⏎` | open the diff beside the board — `←` goes back, `m` stages one hunk |
 | `c` | commit the files staged to this lane (only what is staged) |
 | `b` | new branch — stacks on the selected lane, `tab` for a parallel lane |
@@ -260,6 +261,13 @@ lower branch's header never reads as if it were the one those keys will act on.
 
 The current lane's own header is reverse-video highlighted too, so it's still obvious which
 lane is current once there's more than two or three on screen.
+
+## Grouping the unassigned lane by folder
+
+A flat list of loose files stops being navigable by eye once there are a lot of them. `tab`
+on the unassigned lane groups its cards by directory instead, with a `▸ path  N` divider
+between groups — the same idea as a stacked branch's own hollow-dot header, just without a
+push status a bare directory doesn't have. `tab` again goes back to the flat list.
 
 ## Restacking an existing branch
 

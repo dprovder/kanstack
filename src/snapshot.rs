@@ -98,6 +98,41 @@ mod tests {
         plain(&to_ansi(t.backend().buffer()))
     }
 
+    /// GitHub issue #6: with a lot of loose files, a flat unassigned list stops being
+    /// navigable by eye. Grouping is applied the same way `App::clamp` does it — as a
+    /// post-process on the built board's backlog column — rather than reaching into
+    /// `Board::build`, so this pins the exact same code path a real toggle takes.
+    #[test]
+    fn folder_grouping_shows_a_divider_per_directory_and_flat_shows_none() {
+        let mut status =
+            crate::but::parse_status(include_str!("../tests/fixtures/status.json")).unwrap();
+        status.uncommitted_changes[0].file_path = "src/nested/wip1.txt".into();
+        status.uncommitted_changes[1].file_path = "docs/wip2.txt".into();
+
+        let flat = App::from_board(Board::from_status(&status));
+        let mut t = Terminal::new(TestBackend::new(160, 24)).unwrap();
+        t.draw(|f| crate::ui::draw(f, &flat)).unwrap();
+        let flat_out = plain(&to_ansi(t.backend().buffer()));
+        assert!(
+            !flat_out.contains("▸ "),
+            "flat view should show no folder dividers:\n{flat_out}"
+        );
+
+        let mut board = Board::from_status(&status);
+        crate::board::group_unassigned_by_folder(&mut board.columns[0]);
+        let grouped = App::from_board(board);
+        let mut t = Terminal::new(TestBackend::new(160, 24)).unwrap();
+        t.draw(|f| crate::ui::draw(f, &grouped)).unwrap();
+        let grouped_out = plain(&to_ansi(t.backend().buffer()));
+        assert!(grouped_out.contains("▸ docs"), "missing the docs divider:\n{grouped_out}");
+        assert!(
+            grouped_out.contains("▸ src/nested"),
+            "missing the src/nested divider:\n{grouped_out}"
+        );
+        // docs sorts before src/nested, so wip2.txt (in docs) should read first.
+        assert!(grouped_out.find("wip2.txt") < grouped_out.find("wip1.txt"));
+    }
+
     #[test]
     fn renders_every_lane_when_wide() {
         let out = render(160, 24);

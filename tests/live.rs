@@ -1362,3 +1362,78 @@ fn a_stale_background_refresh_does_not_clobber_a_newer_mutation() {
         "the stale refresh must not have reverted the newer mutation's state"
     );
 }
+
+/// GitHub issue #6: drives the real `tab` toggle through the App against a workspace with
+/// loose files nested a couple of directories deep, and checks both directions -- grouped
+/// shows a divider per directory, and toggling back off returns to the flat list rather
+/// than leaving the board stuck in whichever state the last press left it in.
+#[test]
+#[ignore = "requires the GitButler CLI"]
+fn tab_groups_the_unassigned_lane_by_folder_and_back() {
+    if skip_if_no_but() {
+        return;
+    }
+    use kanstack::app::App;
+    use kanstack::cmux::Cmux;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent};
+
+    let sb = Sandbox::new("foldergroup");
+    std::fs::create_dir_all(sb.repo().join("src/nested")).unwrap();
+    std::fs::create_dir_all(sb.repo().join("docs")).unwrap();
+    sb.write("src/nested/wip1.txt", "a\n");
+    sb.write("docs/wip2.txt", "b\n");
+    sb.write("wip3.txt", "c\n");
+
+    let but = But::discover(&sb.repo()).unwrap();
+    let mut app = App::new(but, Cmux::discover()).expect("build the app");
+    assert_eq!(app.col, 0, "starts on the backlog lane");
+    assert!(!app.unassigned_grouped_by_folder);
+
+    app.on_key(KeyEvent::from(KeyCode::Tab));
+    assert!(app.unassigned_grouped_by_folder, "tab turned grouping on");
+    let backlog = &app.board.columns[0];
+    let groups: Vec<Option<&str>> = backlog.cards.iter().map(|c| c.group.as_deref()).collect();
+    assert_eq!(
+        groups,
+        [Some("."), Some("docs"), Some("src/nested")],
+        "root file first under '.', then directories alphabetically"
+    );
+
+    app.on_key(KeyEvent::from(KeyCode::Tab));
+    assert!(!app.unassigned_grouped_by_folder, "tab turned it back off");
+    assert!(
+        app.board.columns[0].cards.iter().all(|c| c.group.is_none()),
+        "flat view has no groups left over from the toggle"
+    );
+}
+
+/// `tab` is scoped to the unassigned lane on purpose (see the App-level doc comment on
+/// `toggle_unassigned_grouping`) -- pressed from a stack lane it should explain that rather
+/// than silently doing nothing or, worse, toggling a view option for a lane the cursor
+/// isn't even on.
+#[test]
+#[ignore = "requires the GitButler CLI"]
+fn tab_from_a_stack_lane_explains_itself_instead_of_toggling() {
+    if skip_if_no_but() {
+        return;
+    }
+    use kanstack::app::App;
+    use kanstack::cmux::Cmux;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent};
+
+    let sb = Sandbox::new("foldergroupwronglane");
+    sb.branch_with_commit("feat", "a.txt", "work");
+    let but = But::discover(&sb.repo()).unwrap();
+    let mut app = App::new(but, Cmux::discover()).expect("build the app");
+
+    app.on_key(KeyEvent::from(KeyCode::Right)); // off the backlog, onto "feat"
+    assert_eq!(app.col, 1);
+    app.on_key(KeyEvent::from(KeyCode::Tab));
+
+    assert!(!app.unassigned_grouped_by_folder, "grouping must not have toggled");
+    let (msg, _) = app.message.as_ref().expect("tab should explain itself here");
+    assert!(
+        msg.contains("unassigned"),
+        "message should point at the unassigned lane, got {msg:?}"
+    );
+}

@@ -126,6 +126,11 @@ pub struct App {
     /// A watcher-driven refresh running on a background thread, so a file save elsewhere
     /// never blocks navigation while it's picked up. See `begin_background_refresh`.
     background_refresh: Option<PendingRefresh>,
+    /// Whether the unassigned lane's cards are grouped by directory. GitHub issue #6: a
+    /// flat list of loose files stops being navigable by eye once there are a lot of them.
+    /// Toggled with `tab` while that lane is selected; reapplied in `clamp` so it survives
+    /// every refresh rather than resetting the moment the board rebuilds.
+    pub unassigned_grouped_by_folder: bool,
 }
 
 type RefreshResult = Result<(Board, HashMap<String, (usize, usize)>)>;
@@ -182,6 +187,7 @@ impl App {
             tutorial: None,
             board_generation: 0,
             background_refresh: None,
+            unassigned_grouped_by_folder: false,
         })
     }
 
@@ -214,6 +220,7 @@ impl App {
             tutorial: None,
             board_generation: 0,
             background_refresh: None,
+            unassigned_grouped_by_folder: false,
         }
     }
 
@@ -235,6 +242,11 @@ impl App {
     /// Keeps the cursor inside the board after the shape changes under it.
     fn clamp(&mut self) {
         self.board_generation = self.board_generation.wrapping_add(1);
+        if self.unassigned_grouped_by_folder {
+            if let Some(col) = self.board.columns.first_mut() {
+                crate::board::group_unassigned_by_folder(col);
+            }
+        }
         if self.board.columns.is_empty() {
             self.col = 0;
             self.card = 0;
@@ -377,6 +389,52 @@ impl App {
                 self.background_refresh = None;
                 self.notify(format!("refresh failed: {e}"), Notice::Error);
             }
+        }
+    }
+
+    /// Toggles whether the unassigned lane's cards are grouped by directory (GitHub issue
+    /// #6: a flat list of loose files stops being navigable by eye once there are a lot of
+    /// them). Scoped to that lane on purpose — `tab` does nothing anywhere else in Normal
+    /// mode today, and toggling a view option for a lane you are not looking at would be a
+    /// surprising thing for a key to do.
+    ///
+    /// Re-fetches rather than un-sorting the in-memory board in place: sorting is
+    /// destructive to the original order, so turning grouping back off needs a real source
+    /// of truth to restore from, not just an inverse of `group_unassigned_by_folder`.
+    fn toggle_unassigned_grouping(&mut self) {
+        let on_unassigned = self
+            .board
+            .columns
+            .get(self.col)
+            .is_some_and(|c| c.kind == crate::board::ColumnKind::Unassigned);
+        if !on_unassigned {
+            self.notify(
+                "tab groups the unassigned lane by folder — select it first",
+                Notice::Info,
+            );
+            return;
+        }
+
+        let Some(but) = &self.but else {
+            self.notify("snapshot is read-only", Notice::Info);
+            return;
+        };
+        self.unassigned_grouped_by_folder = !self.unassigned_grouped_by_folder;
+        let grouped = self.unassigned_grouped_by_folder;
+        match but.status() {
+            Ok(s) => {
+                self.board = Self::board_from(but, &mut self.commit_stats, &s);
+                self.clamp();
+                self.notify(
+                    if grouped {
+                        "unassigned grouped by folder"
+                    } else {
+                        "unassigned back to a flat list"
+                    },
+                    Notice::Info,
+                );
+            }
+            Err(e) => self.notify(format!("refresh failed: {e}"), Notice::Error),
         }
     }
 
@@ -1427,6 +1485,7 @@ impl App {
             K::Char('u') if self.mode == Mode::Normal => self.send_to_backlog(),
             K::Char('d') if self.mode == Mode::Normal => self.begin_delete(),
             K::Char('r') if self.mode == Mode::Normal => self.begin_rebase(),
+            K::Tab if self.mode == Mode::Normal => self.toggle_unassigned_grouping(),
             K::Enter if self.mode == Mode::Normal => self.open_diff(),
             K::Enter if self.mode == Mode::Restacking => self.confirm_restack(),
             K::Enter if self.mode == Mode::Moving => self.confirm_move(),

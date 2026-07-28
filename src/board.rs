@@ -397,6 +397,34 @@ fn change_card(c: &FileChange, stats: &HashMap<String, (usize, usize)>) -> Card 
     }
 }
 
+/// Re-sorts the unassigned column's cards by the directory each file lives in, and sets
+/// each `Card::group` to that directory so the renderer prints a header between groups —
+/// reusing the same inline-header mechanism a stacked branch's own sections already use.
+///
+/// GitHub issue #6: with a lot of loose files, a flat list stops being navigable by eye.
+/// This is purely a display grouping — it doesn't touch what `but` returns, and reapplying
+/// it after every refresh (see `App::clamp`) is what keeps it in effect across the toggle.
+pub fn group_unassigned_by_folder(column: &mut Column) {
+    if column.kind != ColumnKind::Unassigned {
+        return;
+    }
+    column
+        .cards
+        .sort_by(|a, b| split_folder(&a.title).cmp(&split_folder(&b.title)));
+    for card in &mut column.cards {
+        card.group = Some(split_folder(&card.title).0.to_string());
+    }
+}
+
+/// Splits a path into `(directory, filename)`; a root-level file's directory is `"."`,
+/// matching shell convention rather than printing an empty header.
+fn split_folder(path: &str) -> (&str, &str) {
+    match path.rsplit_once('/') {
+        Some((dir, name)) => (dir, name),
+        None => (".", path),
+    }
+}
+
 fn branch_badges(b: &Branch, has_staged: bool) -> Vec<Badge> {
     // A branch with no commits reports `nothingToPush`, which renders as "in sync" and
     // reads as "already pushed" rather than "nothing here yet". And a lane holding staged
@@ -463,6 +491,79 @@ mod tests {
             ["Fix settings tab focus ring", "Redesign settings page"],
             "but status lists the tip commit first, which is the order a board wants"
         );
+    }
+
+    fn bare_change_card(title: &str) -> Card {
+        Card {
+            cli_id: "xx".into(),
+            rub_id: "xx".into(),
+            title: title.into(),
+            subtitle: None,
+            badges: Vec::new(),
+            author: None,
+            kind: CardKind::Change,
+            group: None,
+            stats: None,
+        }
+    }
+
+    #[test]
+    fn folder_grouping_sorts_by_directory_then_name() {
+        let mut col = Column {
+            kind: ColumnKind::Unassigned,
+            title: "unassigned".into(),
+            state: None,
+            badges: Vec::new(),
+            cards: vec![
+                bare_change_card("src/ui.rs"),
+                bare_change_card("README.md"),
+                bare_change_card("src/board.rs"),
+                bare_change_card("docs/assets/overview.gif"),
+            ],
+            sections: Vec::new(),
+            stats: None,
+            drop_target: UNASSIGNED_TARGET.into(),
+            branch_name: None,
+        };
+        group_unassigned_by_folder(&mut col);
+        let got: Vec<(Option<&str>, &str)> = col
+            .cards
+            .iter()
+            .map(|c| (c.group.as_deref(), c.title.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (Some("."), "README.md"),
+                (Some("docs/assets"), "docs/assets/overview.gif"),
+                (Some("src"), "src/board.rs"),
+                (Some("src"), "src/ui.rs"),
+            ],
+            "root-level files sort first under '.', then directories alphabetically, \
+             files within a directory alphabetically"
+        );
+    }
+
+    #[test]
+    fn folder_grouping_is_a_no_op_on_a_stack_column() {
+        let mut col = Column {
+            kind: ColumnKind::Stack,
+            title: "feat-auth".into(),
+            state: None,
+            badges: Vec::new(),
+            cards: vec![bare_change_card("b.txt"), bare_change_card("a.txt")],
+            sections: Vec::new(),
+            stats: None,
+            drop_target: "feat-auth".into(),
+            branch_name: Some("feat-auth".into()),
+        };
+        group_unassigned_by_folder(&mut col);
+        assert_eq!(
+            col.cards.iter().map(|c| c.title.as_str()).collect::<Vec<_>>(),
+            ["b.txt", "a.txt"],
+            "grouping only ever applies to the unassigned lane"
+        );
+        assert!(col.cards.iter().all(|c| c.group.is_none()));
     }
 
     #[test]

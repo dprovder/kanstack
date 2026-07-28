@@ -9,7 +9,7 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::app::{App, Mode, Notice};
-use crate::board::Card;
+use crate::board::{Card, ColumnKind};
 use crate::theme;
 
 const MIN_COL_WIDTH: u16 = 26;
@@ -764,16 +764,38 @@ fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect) {
     let mut sel_len = 0usize;
     let mut last_group: Option<&str> = None;
 
+    // Folder counts for the unassigned lane's own group headers (GitHub issue #6) — cheap
+    // and only built when there is a group to count, since `col.cards.len()` is at most a
+    // few hundred even in a large workspace.
+    let mut folder_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    if col.kind == ColumnKind::Unassigned {
+        for card in &col.cards {
+            if let Some(g) = card.group.as_deref() {
+                *folder_counts.entry(g).or_insert(0) += 1;
+            }
+        }
+    }
+
     for (ci, card) in col.cards.iter().enumerate() {
         if let Some(group) = card.group.as_deref() {
             if last_group != Some(group) {
-                // The tip branch is already described by the lane header; the ones below it
-                // get the same treatment here so the lane reads as visibly stacked.
-                let is_tip = col.sections.first().is_some_and(|s| s.name == group);
-                if !is_tip {
-                    if let Some(section) = col.sections.iter().find(|s| s.name == group) {
-                        lines.push(Line::raw(""));
-                        lines.extend(section_header(section, inner_w));
+                if col.kind == ColumnKind::Unassigned {
+                    lines.push(Line::raw(""));
+                    lines.extend(folder_header(
+                        group,
+                        folder_counts.get(group).copied().unwrap_or(0),
+                        inner_w,
+                    ));
+                } else {
+                    // The tip branch is already described by the lane header; the ones
+                    // below it get the same treatment here so the lane reads as visibly
+                    // stacked.
+                    let is_tip = col.sections.first().is_some_and(|s| s.name == group);
+                    if !is_tip {
+                        if let Some(section) = col.sections.iter().find(|s| s.name == group) {
+                            lines.push(Line::raw(""));
+                            lines.extend(section_header(section, inner_w));
+                        }
                     }
                 }
                 last_group = Some(group);
@@ -846,6 +868,20 @@ fn header_count(col: &crate::board::Column) -> usize {
 /// issue #3). A hollow dot here versus the lane header's filled one is the same "state
 /// carried by the dot" convention the badge/dot pairing already uses elsewhere — see
 /// `theme::status_dot`.
+/// A directory divider inside the unassigned lane (GitHub issue #6), when grouped by
+/// folder (`tab`). Lighter than `section_header` on purpose — a folder has no push status,
+/// no branch dot; it is just a place a name of one already-loose file happens to sit.
+fn folder_header(name: &str, count: usize, width: usize) -> Vec<Line<'static>> {
+    vec![
+        Line::from(vec![
+            Span::styled("▸ ", theme::faint()),
+            Span::styled(truncate(name, width.saturating_sub(6)), theme::title(false)),
+            Span::styled(format!("  {count}"), theme::faint()),
+        ]),
+        Line::styled("─".repeat(width), theme::faint()),
+    ]
+}
+
 fn section_header(section: &crate::board::Section, width: usize) -> Vec<Line<'static>> {
     let mut out = vec![
         Line::from(vec![
@@ -1085,6 +1121,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         help_row("u", "send this card back to the backlog — uncommit or unstage"),
         help_row("d", "delete this lane — asks first"),
         help_row("r", "rebase onto the updated target — shows what will happen"),
+        help_row("tab", "on unassigned: group its cards by folder, or back to flat"),
         help_row("⏎", "open the diff beside the board — ← goes back"),
         help_row("c", "commit the staged files in this lane"),
         help_row("b", "new branch — stacks on this lane, tab for parallel"),
@@ -1109,6 +1146,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         help_row("current lane", "tinted header — the one ←/→ and m/c/p/M/d act on"),
         help_row("● filled dot", "a lane's tip branch — c/p/M/z always act here"),
         help_row("○ hollow dot", "a branch stacked below the tip, along for the ride"),
+        help_row("▸ folder", "a directory divider in unassigned, when grouped by folder"),
         Line::raw(""),
         Line::styled(
             "  every drop is one `but rub SOURCE TARGET`.",
