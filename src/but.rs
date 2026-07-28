@@ -201,6 +201,28 @@ impl But {
         }
         self.status()
     }
+
+    /// `rub`s every source in `sources` onto `target`, one `but rub` call each — the batch
+    /// counterpart for a multi-select move. File `cliId`s stay stable across sequential
+    /// rubs within the same status snapshot (verified live: staging three unassigned
+    /// files one after another using ids captured before any of them, with no re-query in
+    /// between, still landed all three), so this can just walk the list once rather than
+    /// re-resolving ids after each call the way hunk ids would need.
+    pub fn rub_many(&self, sources: &[String], target: &str) -> Result<WorkspaceStatus> {
+        for (moved, source) in sources.iter().enumerate() {
+            let raw = self.run(&["rub", source, target, "--format", "json"])?;
+            let env: MutationEnvelope = serde_json::from_str(raw.trim()).with_context(|| {
+                format!("could not parse `but rub` output for `{source}`: {raw:.400}")
+            })?;
+            if let Some(err) = env.status_error {
+                bail!(
+                    "moved {moved} of {}, then the workspace refresh failed on `{source}`: {err}",
+                    sources.len()
+                );
+            }
+        }
+        self.status()
+    }
 }
 
 impl But {

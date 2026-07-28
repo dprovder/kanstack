@@ -1586,3 +1586,80 @@ fn landing_a_stacked_lane_lands_every_branch_base_first() {
         assert!(log.contains(expected), "{expected} missing from landed history:\n{log}");
     }
 }
+
+/// Multi-select: `space` two of three unassigned files, `m`, drop them on a lane, confirm
+/// — both land as staged changes on that branch in one action, and the file that was never
+/// selected stays behind in the backlog untouched. Drives it through real `space`/`m`/
+/// arrow/`⏎` KeyEvents against the App, not the private methods directly, and checks the
+/// result via a real `but status` afterward, not just in-memory state.
+#[test]
+#[ignore = "requires the GitButler CLI"]
+fn space_selecting_several_unassigned_files_then_m_moves_them_all_at_once() {
+    if skip_if_no_but() {
+        return;
+    }
+    use kanstack::app::{App, Mode};
+    use kanstack::cmux::Cmux;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent};
+
+    let sb = Sandbox::new("multiselect");
+    sb.write("keep.txt", "not selected\n");
+    sb.write("a.txt", "selected one\n");
+    sb.write("b.txt", "selected two\n");
+    let but = But::discover(&sb.repo()).unwrap();
+    but.branch_new("feat", None).unwrap();
+
+    let but = But::discover(&sb.repo()).unwrap();
+    let mut app = App::new(but, Cmux::discover()).expect("build the app");
+    assert_eq!(app.col, 0, "starts on the backlog");
+    let backlog_names: Vec<&str> = app.board.columns[0]
+        .cards
+        .iter()
+        .map(|c| c.title.as_str())
+        .collect();
+    let a_idx = backlog_names.iter().position(|&n| n == "a.txt").unwrap();
+    let b_idx = backlog_names.iter().position(|&n| n == "b.txt").unwrap();
+
+    app.card = a_idx;
+    app.on_key(KeyEvent::from(KeyCode::Char(' ')));
+    app.card = b_idx;
+    app.on_key(KeyEvent::from(KeyCode::Char(' ')));
+    assert_eq!(app.selected.len(), 2);
+
+    app.on_key(KeyEvent::from(KeyCode::Char('m')));
+    assert_eq!(app.mode, Mode::Moving);
+    let feat_col = app
+        .board
+        .columns
+        .iter()
+        .position(|c| c.branch_name.as_deref() == Some("feat"))
+        .expect("the feat lane exists");
+    while app.col != feat_col {
+        app.on_key(KeyEvent::from(KeyCode::Right));
+    }
+    app.on_key(KeyEvent::from(KeyCode::Enter));
+
+    assert_eq!(app.mode, Mode::Normal);
+    assert!(app.selected.is_empty(), "selection clears once the move lands");
+
+    let but = But::discover(&sb.repo()).unwrap();
+    let status = but.status().unwrap();
+    let assigned: Vec<&str> = status
+        .stacks
+        .iter()
+        .flat_map(|s| s.assigned_changes.iter())
+        .map(|c| c.file_path.as_str())
+        .collect();
+    assert!(assigned.contains(&"a.txt"), "a.txt should be staged to feat: {assigned:?}");
+    assert!(assigned.contains(&"b.txt"), "b.txt should be staged to feat: {assigned:?}");
+    let still_unassigned: Vec<&str> = status
+        .uncommitted_changes
+        .iter()
+        .map(|c| c.file_path.as_str())
+        .collect();
+    assert_eq!(
+        still_unassigned,
+        ["keep.txt"],
+        "only the file that was never selected should remain unassigned"
+    );
+}

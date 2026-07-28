@@ -96,7 +96,8 @@ practice repo is thrown away when you're done. `esc` or `q` leaves any time.
 | `shift ←/→` | page by however many lanes fit on screen at once |
 | `shift ↑/↓` | skip to the next stacked branch, or the next folder if grouped |
 | `g` / `G` | first / last card |
-| `m` | pick up a card, then `←/→` for a lane, `↑/↓` to drop on a card, `⏎` to confirm |
+| `space` | select this card for a bulk move — again to deselect |
+| `m` | pick up the selection (or just this card), then `←/→` for a lane, `↑/↓` to drop on a card, `⏎` to confirm |
 | `u` | send this card back to the backlog — uncommit a commit, unstage a file |
 | `d` | delete this lane — asks first |
 | `r` | rebase onto the updated target — shows what will happen |
@@ -270,6 +271,20 @@ A flat list of loose files stops being navigable by eye once there are a lot of 
 on the unassigned lane groups its cards by directory instead, with a `▸ path  N` divider
 between groups — the same idea as a stacked branch's own hollow-dot header, just without a
 push status a bare directory doesn't have. `tab` again goes back to the flat list.
+
+## Moving several cards at once
+
+`space` marks a card for a bulk move (`✓`), and the header counts how many are marked so
+the state is never just off-screen checkmarks you have to scroll back to remember. `m` with
+a marked selection picks up all of it — not just whatever the cursor happens to be sitting
+on — and drops the whole thing wherever you confirm, one `but rub` per card, same target
+for all of them.
+
+A selection can mix commits and files, or span more than one lane; `but rub` doesn't care
+that the sources differ, only that the target does not, so the confirmation just says how
+many and where rather than naming one verb that would be wrong for half the selection.
+Cancelling with `esc` leaves the selection alone, so a bulk move can be retried at a
+different target — `esc` with nothing else pending is what actually clears it.
 
 ## Restacking an existing branch
 

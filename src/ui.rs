@@ -625,6 +625,15 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
             theme::tone(crate::board::Tone::Bad),
         ));
     }
+    // A selection can span lanes, and its cards can scroll off screen individually — this
+    // is the one place it's always visible, the same reasoning as the lane position above.
+    if !app.selected.is_empty() {
+        spans.push(Span::styled("  ·  ", theme::faint()));
+        spans.push(Span::styled(
+            format!("{} selected", app.selected.len()),
+            theme::tone(crate::board::Tone::Accent),
+        ));
+    }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -817,7 +826,8 @@ fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect) {
             is_current && ci == app.card
         };
         let start = lines.len();
-        let card_lines = render_card(card, inner_w, selected, picked);
+        let checked = app.selected.contains(&card.rub_id);
+        let card_lines = render_card(card, inner_w, selected, picked, checked);
         if selected {
             sel_start = start;
             sel_len = card_lines.len();
@@ -929,7 +939,13 @@ fn section_header(section: &crate::board::Section, width: usize) -> Vec<Line<'st
     out
 }
 
-fn render_card(card: &Card, width: usize, selected: bool, picked: bool) -> Vec<Line<'static>> {
+fn render_card(
+    card: &Card,
+    width: usize,
+    selected: bool,
+    picked: bool,
+    checked: bool,
+) -> Vec<Line<'static>> {
     let bg = if picked {
         Some(theme::picked_bg())
     } else if selected {
@@ -950,8 +966,13 @@ fn render_card(card: &Card, width: usize, selected: bool, picked: bool) -> Vec<L
 
     let mut out = Vec::new();
 
-    // Id badge, plus a caret marking the card in hand.
-    let mut id_spans = vec![Span::styled(card.cli_id.clone(), theme::id())];
+    // A check marking the card as part of a pending bulk move (`space`), the id badge,
+    // and a caret marking the card in hand.
+    let mut id_spans = Vec::new();
+    if checked {
+        id_spans.push(Span::styled("✓ ", theme::tone(crate::board::Tone::Accent)));
+    }
+    id_spans.push(Span::styled(card.cli_id.clone(), theme::id()));
     if picked {
         id_spans.push(Span::styled(
             "  ⤴ moving",
@@ -1130,10 +1151,12 @@ fn draw_help(f: &mut Frame, area: Rect) {
         help_row("shift ←/→", "page by however many lanes fit on screen"),
         help_row("shift ↑/↓", "skip to the next branch (stacked) or folder (grouped)"),
         help_row("g / G", "first / last card"),
-        help_row("m", "pick up a card"),
+        help_row("space", "select this card, for a bulk move — again to deselect"),
+        help_row("m", "pick up the selection, or just this card if nothing's selected"),
         help_row("  then ←/→", "choose a lane"),
         help_row("  then ↑/↓", "drop on the lane, or onto a card"),
-        help_row("  then ⏎", "confirm · esc cancels"),
+        help_row("  then ⏎", "confirm · esc cancels, keeping the selection"),
+        help_row("esc", "with a selection and nothing else to cancel: clears it"),
         help_row("u", "send this card back to the backlog — uncommit or unstage"),
         help_row("d", "delete this lane — asks first"),
         help_row("r", "rebase onto the updated target — shows what will happen"),
@@ -1294,7 +1317,7 @@ mod tests {
             kind: crate::board::CardKind::Commit,
             group: None,
         };
-        let lines = render_card(&card, 30, true, false);
+        let lines = render_card(&card, 30, true, false, false);
         for l in &lines {
             let w: usize = l.spans.iter().map(|s| s.content.chars().count()).sum();
             // The trailing spacer line is intentionally empty.

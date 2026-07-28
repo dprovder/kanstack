@@ -10,6 +10,7 @@ use anyhow::Result;
 use crate::board::{Board, Card, CardKind, ColumnKind};
 use crate::but::But;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
@@ -169,6 +170,12 @@ pub struct App {
     /// `terminal.draw`, which is the one place both the fresh size and the next keystroke
     /// are available before the other.
     pub terminal_width: u16,
+    /// Cards picked for a bulk move, keyed by `rub_id` (stable across a refresh, unlike a
+    /// column/index position). Toggled with `space`; `m` with a non-empty selection moves
+    /// all of it in one action instead of just the card under the cursor. A `HashSet`
+    /// rather than scoped to one lane on purpose — nothing about `but rub` requires the
+    /// sources to share a column, so there is no reason to make kanstack pretend they must.
+    pub selected: HashSet<String>,
 }
 
 type RefreshResult = Result<(Board, HashMap<String, (usize, usize)>)>;
@@ -228,6 +235,7 @@ impl App {
             background_refresh: None,
             unassigned_grouped_by_folder: false,
             terminal_width: 80,
+            selected: HashSet::new(),
         })
     }
 
@@ -263,6 +271,7 @@ impl App {
             background_refresh: None,
             unassigned_grouped_by_folder: false,
             terminal_width: 80,
+            selected: HashSet::new(),
         }
     }
 
@@ -605,8 +614,14 @@ impl App {
         if self.mode != Mode::Moving {
             return None;
         }
-        let (_, source_label) = self.move_source_ref()?;
         let (_, target_label) = self.resolve_target()?;
+        // A bulk selection can mix commits and files, which take different verbs (stage
+        // vs. move, say) — rather than pick one that would be wrong for half the
+        // selection, this just says how many and where, same for a lane or a card target.
+        if !self.selected.is_empty() {
+            return Some(format!("move {} selected → {target_label}", self.selected.len()));
+        }
+        let (_, source_label) = self.move_source_ref()?;
         let verb = self.pending_verb()?;
         Some(format!("{verb} {source_label} → {target_label}"))
     }
@@ -638,8 +653,28 @@ impl App {
         }
     }
 
+    /// Toggles the card under the cursor in/out of the bulk-move selection. A no-op with
+    /// nothing under the cursor — an empty lane has no card to select.
+    fn toggle_selected(&mut self) {
+        let Some(card) = self.selected_card() else {
+            return;
+        };
+        let id = card.rub_id.clone();
+        if !self.selected.remove(&id) {
+            self.selected.insert(id);
+        }
+    }
+
+    /// Picks up the selection (if non-empty) or just the card under the cursor. A
+    /// non-empty selection always wins over the single card under the cursor — `space` a
+    /// few cards from wherever, then `m` anywhere on the board, rather than needing the
+    /// cursor to still be sitting on one of them.
+    ///
+    /// Cancelling (`esc`) deliberately leaves the selection alone, so a bulk move can be
+    /// retried at a different target without re-selecting everything; `esc` from Normal
+    /// mode with nothing else to cancel is what actually clears it.
     fn begin_move(&mut self) {
-        if self.selected_card().is_none() {
+        if self.selected.is_empty() && self.selected_card().is_none() {
             self.notify("nothing to move here", Notice::Info);
             return;
         }
@@ -660,6 +695,11 @@ impl App {
     }
 
     fn confirm_move(&mut self) {
+        if !self.selected.is_empty() {
+            self.confirm_bulk_move();
+            return;
+        }
+
         let Some((source_id, source_label)) = self.move_source_ref() else {
             self.mode = Mode::Normal;
             self.move_source = None;
@@ -702,6 +742,35 @@ impl App {
                 self.board = Self::board_from(but, &mut self.commit_stats, &status);
                 self.clamp();
                 self.notify(format!("{verb} {source_label} → {target_label}"), Notice::Success);
+            }
+            Err(e) => self.notify(format!("{e}"), Notice::Error),
+        }
+    }
+
+    /// Moves the whole selection in one action — `space` a few cards, `m`, pick a target,
+    /// `⏎`. One `but rub` call per source, same target for all of them; the target can be
+    /// a lane (batch stage/move) or a card (batch amend/squash) exactly like a single
+    /// card's move can, since `but rub` itself doesn't care which — only the id passed in
+    /// does. See `pending_action` for why this doesn't try to name one exact verb the way
+    /// a single-card move does.
+    fn confirm_bulk_move(&mut self) {
+        let Some((target_id, target_label)) = self.resolve_target() else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        self.mode = Mode::Normal;
+        let sources: Vec<String> = self.selected.drain().collect();
+        let n = sources.len();
+
+        let Some(but) = &self.but else {
+            self.notify("snapshot is read-only", Notice::Info);
+            return;
+        };
+        match but.rub_many(&sources, &target_id) {
+            Ok(status) => {
+                self.board = Self::board_from(but, &mut self.commit_stats, &status);
+                self.clamp();
+                self.notify(format!("moved {n} → {target_label}"), Notice::Success);
             }
             Err(e) => self.notify(format!("{e}"), Notice::Error),
         }
@@ -1576,6 +1645,14 @@ impl App {
                     self.col = self.origin_col;
                     self.notify("restack cancelled", Notice::Info);
                 }
+                // Esc cancelling a move deliberately leaves a selection alone (see
+                // `begin_move`'s doc comment) so a bulk move can be retried at a
+                // different target; this is the "actually give it up" gesture instead.
+                Mode::Normal if !self.selected.is_empty() => {
+                    let n = self.selected.len();
+                    self.selected.clear();
+                    self.notify(format!("cleared {n} selected"), Notice::Info);
+                }
                 _ => {}
             },
             K::Char('?') => self.mode = Mode::Help,
@@ -1637,6 +1714,7 @@ impl App {
             K::Char('G') if self.mode == Mode::Normal => {
                 self.card = self.cards_in_current_column().saturating_sub(1)
             }
+            K::Char(' ') if self.mode == Mode::Normal => self.toggle_selected(),
             K::Char('m') if self.mode == Mode::Normal => self.begin_move(),
             K::Char('c') if self.mode == Mode::Normal => self.begin_commit(),
             K::Char('p') if self.mode == Mode::Normal => self.begin_push(),
@@ -1901,6 +1979,70 @@ mod tests {
 
     fn key(code: ratatui::crossterm::event::KeyCode) -> ratatui::crossterm::event::KeyEvent {
         ratatui::crossterm::event::KeyEvent::from(code)
+    }
+
+    #[test]
+    fn space_toggles_a_cards_selection() {
+        use ratatui::crossterm::event::KeyCode as K;
+        let mut app = App::from_board(board());
+        app.col = 0; // unassigned, two files
+        app.card = 0;
+        let id = app.board.columns[0].cards[0].rub_id.clone();
+
+        app.on_key(key(K::Char(' ')));
+        assert!(app.selected.contains(&id), "space selects the card under the cursor");
+
+        app.on_key(key(K::Char(' ')));
+        assert!(!app.selected.contains(&id), "space again deselects it");
+    }
+
+    /// `m` with a non-empty selection must pick up the *selection*, not just the card the
+    /// cursor happens to be sitting on — the whole point of `space`-ing several cards
+    /// first is that the cursor doesn't need to still be on one of them.
+    #[test]
+    fn m_with_a_selection_picks_up_all_of_it_not_just_the_cursor() {
+        use ratatui::crossterm::event::KeyCode as K;
+        let mut app = App::from_board(board());
+        app.col = 0;
+        app.card = 0;
+        let first_id = app.board.columns[0].cards[0].rub_id.clone();
+        let second_id = app.board.columns[0].cards[1].rub_id.clone();
+
+        app.on_key(key(K::Char(' '))); // select card 0
+        app.on_key(key(K::Down)); // cursor moves off it, onto card 1
+        app.on_key(key(K::Char('m')));
+
+        assert_eq!(app.mode, Mode::Moving);
+        assert_eq!(app.selected.len(), 1, "only the spaced card, not the one under the cursor too");
+        assert!(app.selected.contains(&first_id));
+        assert!(!app.selected.contains(&second_id));
+        assert!(
+            app.pending_action().unwrap().starts_with("move 1 selected"),
+            "bulk phrasing, not a single-card verb: {:?}",
+            app.pending_action()
+        );
+    }
+
+    /// Esc means two different things depending on what's pending: cancel the move but
+    /// keep the selection (so a bulk move can be retried at a different target), or —
+    /// with nothing else to cancel — clear the selection itself.
+    #[test]
+    fn esc_clears_a_selection_only_when_theres_nothing_else_to_cancel() {
+        use ratatui::crossterm::event::KeyCode as K;
+        let mut app = App::from_board(board());
+        app.col = 0;
+        app.card = 0;
+        app.on_key(key(K::Char(' ')));
+        assert_eq!(app.selected.len(), 1);
+
+        app.on_key(key(K::Char('m')));
+        assert_eq!(app.mode, Mode::Moving);
+        app.on_key(key(K::Esc));
+        assert_eq!(app.mode, Mode::Normal, "cancelled the move");
+        assert_eq!(app.selected.len(), 1, "but the selection survives, for a retry");
+
+        app.on_key(key(K::Esc));
+        assert!(app.selected.is_empty(), "esc with nothing else pending clears it");
     }
 
     /// GitHub issue #2, "crash on adding a branch on the unassigned stack": the actual
