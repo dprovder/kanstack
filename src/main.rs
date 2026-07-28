@@ -35,7 +35,8 @@ environment:
   KANSTACK_BUT_BIN   path to the `but` binary (default: `but` on PATH)
   KANSTACK_CMUX_BIN  path to the `cmux` CLI, to open a terminal split for each new
                      parallel lane (default: `cmux` on PATH if present; the integration is
-                     silently skipped otherwise)
+                     silently skipped otherwise). Skip it for one branch with shift-tab
+                     while naming it; stacking a branch never opens one to begin with.
   KANSTACK_HARNESS   command typed into that terminal (default: `claude`)
   KANSTACK_CMUX_DIRECTION  split direction for the first lane, off kanstack's own pane:
                            left, right, above, or below (default: `above`)

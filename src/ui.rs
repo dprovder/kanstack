@@ -1069,7 +1069,14 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                         app.pending_branch_action(),
                         theme::tone(crate::board::Tone::Accent),
                     ),
-                    Span::styled("   ⏎ create · tab switch · esc cancel", theme::faint()),
+                    Span::styled(
+                        if app.cmux_available() {
+                            "   ⏎ create · tab switch · shift-tab cmux · esc cancel"
+                        } else {
+                            "   ⏎ create · tab switch · esc cancel"
+                        },
+                        theme::faint(),
+                    ),
                 ])),
                 area,
             );

@@ -119,6 +119,11 @@ pub struct App {
     /// While naming a branch: `Some(branch)` stacks the new one on top of it, `None` makes
     /// a parallel lane. Seeded from the selected lane and toggled with tab.
     pub stack_onto: Option<String>,
+    /// While naming a branch: whether a parallel lane (`stack_onto.is_none()`) should get
+    /// its own cmux split. Only meaningful when cmux is configured at all; irrelevant for a
+    /// stacked branch, which never opens one regardless. Reset to `true` each time branch
+    /// naming starts and toggled with shift-tab.
+    pub open_harness: bool,
     /// What a push would do, valid while `mode == PushConfirm`.
     pub push_preview: Option<PushPreview>,
     /// What landing the selected lane onto the target would do, valid while
@@ -207,6 +212,7 @@ impl App {
             commit_input: TextInput::default(),
             branch_input: TextInput::default(),
             stack_onto: None,
+            open_harness: true,
             push_preview: None,
             land_check: None,
             landing: None,
@@ -241,6 +247,7 @@ impl App {
             commit_input: TextInput::default(),
             branch_input: TextInput::default(),
             stack_onto: None,
+            open_harness: true,
             push_preview: None,
             land_check: None,
             landing: None,
@@ -257,6 +264,12 @@ impl App {
             unassigned_grouped_by_folder: false,
             terminal_width: 80,
         }
+    }
+
+    /// Whether cmux was found at startup, i.e. whether shift-tab in branch mode does
+    /// anything. See [`crate::cmux`].
+    pub fn cmux_available(&self) -> bool {
+        self.cmux.is_some()
     }
 
     pub fn column_count(&self) -> usize {
@@ -762,6 +775,7 @@ impl App {
             .columns
             .get(self.col)
             .and_then(|c| c.branch_name.clone());
+        self.open_harness = true;
         self.mode = Mode::Branch;
     }
 
@@ -781,10 +795,28 @@ impl App {
         }
     }
 
+    /// Opts a parallel lane out of its cmux split for this one branch, without touching the
+    /// standing `KANSTACK_CMUX_*` config. No-op while stacking, since a stacked branch never
+    /// opens one to opt out of.
+    fn toggle_open_harness(&mut self) {
+        if self.cmux.is_none() {
+            self.notify("cmux is not configured", Notice::Info);
+            return;
+        }
+        if self.stack_onto.is_some() {
+            return;
+        }
+        self.open_harness = !self.open_harness;
+    }
+
     /// What `b` will do, in the same spirit as the move footer: say it before doing it.
     pub fn pending_branch_action(&self) -> String {
         match &self.stack_onto {
             Some(anchor) => format!("stack on {anchor}"),
+            None if self.cmux.is_some() && self.open_harness => {
+                "new parallel lane · opens cmux".to_string()
+            }
+            None if self.cmux.is_some() => "new parallel lane · no cmux".to_string(),
             None => "new parallel lane".to_string(),
         }
     }
@@ -825,8 +857,9 @@ impl App {
                     self.card = 0;
                 }
                 // A stacked lane shares its base's tab; only a parallel lane is new work
-                // worth a harness of its own.
-                if anchor.is_none() {
+                // worth a harness of its own, and only when that wasn't opted out of with
+                // shift-tab.
+                if anchor.is_none() && self.open_harness {
                     if let Some(cmux) = &mut self.cmux {
                         if let Err(e) = cmux.spawn_harness(&cwd, &name) {
                             self.notify(format!("cmux: {e}"), Notice::Error);
@@ -1406,6 +1439,7 @@ impl App {
                 }
                 K::Enter => self.confirm_branch(),
                 K::Tab => self.toggle_stack_onto(),
+                K::BackTab => self.toggle_open_harness(),
                 K::Backspace => self.branch_input.backspace(),
                 K::Delete => self.branch_input.delete_forward(),
                 K::Left => self.branch_input.move_left(),
