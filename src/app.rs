@@ -85,6 +85,10 @@ pub enum Notice {
 /// would freeze the whole UI with no feedback for however long the network takes.
 pub struct PendingLand {
     pub title: String,
+    /// How many branches this land call covers — 1 for an ordinary land, more on a
+    /// stacked lane (see `confirm_land`). Lets the completion notification say "landed 3
+    /// branches" instead of just "landed", which would undersell what actually happened.
+    pub branch_count: usize,
     // `pub(crate)` rather than private: `ui`'s tests build one directly to exercise the
     // spinner overlay without a real `but` and thread.
     pub(crate) rx: mpsc::Receiver<Result<WorkspaceStatus>>,
@@ -1229,6 +1233,12 @@ impl App {
     /// Starts landing on a background thread rather than blocking the UI for however long
     /// the push takes — `but land` can reach a real remote, and a frozen terminal with no
     /// feedback looks indistinguishable from a hang. `poll_land` picks up the result.
+    ///
+    /// `but land` refuses a non-base branch outright when the lane is a stack ("it is
+    /// stacked on top of ... other segment(s)"), with no flag or stack-id argument that
+    /// lands the whole thing for you — so on a stacked lane this lands every branch base
+    /// first, one `but land` call each, rather than surfacing that refusal to press `M`
+    /// again N times with the CLI open to work out the right order.
     fn confirm_land(&mut self) {
         let Some((branch, title)) = self.selected_branch() else {
             self.mode = Mode::Normal;
@@ -1241,12 +1251,23 @@ impl App {
             self.notify("snapshot is read-only", Notice::Info);
             return;
         };
+        // `sections` is tip-first (see `Column::sections`'s own doc comment); landing needs
+        // the reverse, base first, or `but land` refuses the first call.
+        let branches: Vec<String> = match self.board.columns.get(self.col) {
+            Some(col) if col.sections.len() > 1 => {
+                col.sections.iter().rev().map(|s| s.name.clone()).collect()
+            }
+            _ => vec![branch],
+        };
+
+        let branch_count = branches.len();
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            let _ = tx.send(but.land(&branch));
+            let _ = tx.send(but.land_stack(&branches));
         });
         self.landing = Some(PendingLand {
             title,
+            branch_count,
             rx,
             spinner: 0,
         });
@@ -1270,13 +1291,19 @@ impl App {
             }
             Ok(Ok(status)) => {
                 let title = pending.title.clone();
+                let branch_count = pending.branch_count;
                 self.landing = None;
                 self.mode = Mode::Normal;
                 if let Some(but) = self.but.clone() {
                     self.board = Self::board_from(&but, &mut self.commit_stats, &status);
                 }
                 self.clamp();
-                self.notify(format!("landed {title} onto the target"), Notice::Success);
+                let message = if branch_count > 1 {
+                    format!("landed {branch_count} branches onto the target, base first")
+                } else {
+                    format!("landed {title} onto the target")
+                };
+                self.notify(message, Notice::Success);
             }
             Ok(Err(e)) => {
                 self.landing = None;

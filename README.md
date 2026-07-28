@@ -318,6 +318,12 @@ network round trip, not just a local ref update. Input is swallowed while it's i
 cancel key: by the time the spinner is up it may already be pushing) and the board updates
 the moment the result comes back.
 
+**On a stacked lane, `M` lands every branch in it, base first.** `but land` refuses a
+non-base branch outright — "it is stacked on top of ... other segment(s)" — and there is no
+flag or stack-id argument that lands the whole thing for you, so kanstack does it as one
+`but land` call per branch instead of surfacing that refusal. The confirmation dialog lists
+every branch it's about to land, in order, before you commit to it.
+
 **Read this before binding it to a project that uses pull requests.** `land` deliberately
 bypasses PR-based review — that is the whole point of the command — so it is the wrong tool
 if your project's process expects one. GitButler's own guidance here: use `but push` and

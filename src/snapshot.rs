@@ -386,6 +386,7 @@ mod tests {
         app.mode = Mode::Landing;
         app.landing = Some(PendingLand {
             title: "feat-auth".into(),
+            branch_count: 1,
             rx,
             spinner: 0,
         });

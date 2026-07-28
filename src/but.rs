@@ -365,6 +365,30 @@ impl But {
         self.status()
     }
 
+    /// Lands every branch in a stack, one `but land` call each.
+    ///
+    /// `but land` refuses a non-base branch outright rather than cascading on its own —
+    /// verified live: "Refusing to land `tip`: it is stacked on top of 1 other segment(s)
+    /// (base) whose commits would also be published to ... . Land the bottom segment
+    /// `base` (or the whole stack) instead." There is no flag or stack-id argument that
+    /// does that landing for you (`but land <stack-id>` fails with "Expected a branch ID,
+    /// got a stack") — landing bottom-to-top by name, one call at a time, is the only way.
+    ///
+    /// `branches` must already be ordered base first; this only ever calls `land` in the
+    /// order given; it does not sort.
+    pub fn land_stack(&self, branches: &[String]) -> Result<WorkspaceStatus> {
+        for (landed, branch) in branches.iter().enumerate() {
+            self.run(&["land", branch, "--yes", "--format", "json"])
+                .with_context(|| {
+                    format!(
+                        "landed {landed} of {} branches in the stack, then failed on `{branch}`",
+                        branches.len()
+                    )
+                })?;
+        }
+        self.status()
+    }
+
     /// Undoes the last operation, restoring the workspace's prior state — including
     /// uncommitted changes. Verified against 0.21.2: this always succeeds and prints
     /// nothing, silently doing nothing when there is no prior operation to undo, so the

@@ -419,6 +419,25 @@ fn draw_land_confirm(f: &mut Frame, app: &App, area: Rect) {
         Line::styled("  land onto target", theme::muted()),
         Line::raw(""),
     ];
+    // `but land` refuses a non-base branch outright when the lane is a stack — this lands
+    // every branch in it, base first, as one action (see `App::confirm_land`), so anyone
+    // about to press `M` on a stack should see that's what's about to happen, not discover
+    // it after the fact from a single "landed" notification that undersells it.
+    if let Some(col) = app.board.columns.get(app.col) {
+        if col.sections.len() > 1 {
+            body.push(Line::styled(
+                format!("  lands all {} branches, base first:", col.sections.len()),
+                theme::tone(crate::board::Tone::Accent),
+            ));
+            for section in col.sections.iter().rev() {
+                body.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(section.name.clone(), theme::muted()),
+                ]));
+            }
+            body.push(Line::raw(""));
+        }
+    }
     body.push(Line::from(vec![
         Span::raw("  "),
         Span::styled(
@@ -516,6 +535,11 @@ fn draw_landing(f: &mut Frame, app: &App, area: Rect) {
         return;
     };
     let frame = SPINNER[pending.spinner % SPINNER.len()];
+    let label = if pending.branch_count > 1 {
+        format!("landing {} branches onto the target…", pending.branch_count)
+    } else {
+        format!("landing {} onto the target…", pending.title)
+    };
 
     let body = vec![
         Line::raw(""),
@@ -523,10 +547,7 @@ fn draw_landing(f: &mut Frame, app: &App, area: Rect) {
             Span::raw("  "),
             Span::styled(frame.to_string(), theme::tone(crate::board::Tone::Accent)),
             Span::raw("  "),
-            Span::styled(
-                format!("landing {} onto the target…", pending.title),
-                theme::title(true),
-            ),
+            Span::styled(label, theme::title(true)),
         ]),
         Line::raw(""),
     ];

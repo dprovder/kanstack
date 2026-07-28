@@ -1494,3 +1494,95 @@ fn shift_arrows_page_lanes_and_skip_groups_through_the_app() {
     app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
     assert!(app.col > 1, "a plain Right would only ever move to column 1");
 }
+
+/// `but land` refuses a non-base branch outright on a stacked lane -- verified directly
+/// against the CLI: "Refusing to land `tip`: it is stacked on top of 1 other segment(s)
+/// (base) ... Land the bottom segment `base` (or the whole stack) instead," and there is no
+/// flag or stack-id argument that does that landing in one call (`but land <stack-id>`
+/// fails with "Expected a branch ID, got a stack"). So `M` on a stacked lane has to land
+/// every branch itself, base first. This drives that through a real three-branch stack via
+/// the App -- not `But::land_stack` directly -- and checks the whole stack actually lands,
+/// in the right order, as one `M` press.
+#[test]
+#[ignore = "requires the GitButler CLI"]
+fn landing_a_stacked_lane_lands_every_branch_base_first() {
+    if skip_if_no_but() {
+        return;
+    }
+    use kanstack::app::{App, Mode};
+    use kanstack::cmux::Cmux;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent};
+
+    let sb = Sandbox::new("cascadeland");
+    sb.branch_with_commit("base-work", "a.txt", "base work");
+    let but = But::discover(&sb.repo()).unwrap();
+    but.branch_new("mid-work", Some("base-work")).unwrap();
+    sb.write("b.txt", "mid\n");
+    let status = but.status().unwrap();
+    let id = status
+        .uncommitted_changes
+        .iter()
+        .find(|c| c.file_path == "b.txt")
+        .unwrap()
+        .cli_id
+        .clone();
+    but.rub(&id, "mid-work").unwrap();
+    but.commit("mid-work", "mid work").unwrap();
+    but.branch_new("tip-work", Some("mid-work")).unwrap();
+    sb.write("c.txt", "tip\n");
+    let status = but.status().unwrap();
+    let id = status
+        .uncommitted_changes
+        .iter()
+        .find(|c| c.file_path == "c.txt")
+        .unwrap()
+        .cli_id
+        .clone();
+    but.rub(&id, "tip-work").unwrap();
+    but.commit("tip-work", "tip work").unwrap();
+
+    // Confirm the CLI really does refuse the tip directly, so this test is exercising the
+    // refusal kanstack is meant to route around -- not a scenario that was never blocked.
+    let refused = But::discover(&sb.repo())
+        .unwrap()
+        .land("tip-work")
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("stacked"),
+        "expected the CLI's own stacked-branch refusal, got: {refused}"
+    );
+
+    let but = But::discover(&sb.repo()).unwrap();
+    let mut app = App::new(but, Cmux::discover()).expect("build the app");
+    let lane = app
+        .board
+        .columns
+        .iter()
+        .position(|c| c.branch_name.as_deref() == Some("tip-work"))
+        .expect("the stacked lane exists, named for its tip");
+    app.col = lane;
+
+    app.on_key(KeyEvent::from(KeyCode::Char('M')));
+    assert_eq!(app.mode, Mode::LandConfirm);
+    app.on_key(KeyEvent::from(KeyCode::Enter));
+    assert_eq!(app.mode, Mode::Landing);
+    let pending_branches = app.landing.as_ref().unwrap().branch_count;
+    assert_eq!(pending_branches, 3, "all three branches, not just the tip");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while app.mode == Mode::Landing {
+        assert!(std::time::Instant::now() < deadline, "stacked land never completed");
+        app.poll_land();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    assert_eq!(app.mode, Mode::Normal);
+    assert!(
+        app.board.columns.iter().all(|c| c.branch_name.as_deref() != Some("tip-work")),
+        "the whole stack should be gone from the workspace, landed onto the target"
+    );
+    let log = sb.git(&["log", "--oneline", "--all"]);
+    for expected in ["base work", "mid work", "tip work"] {
+        assert!(log.contains(expected), "{expected} missing from landed history:\n{log}");
+    }
+}
