@@ -29,10 +29,16 @@ pub struct Tutorial {
     pub finished: bool,
 }
 
+impl Default for Tutorial {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Tutorial {
-    pub fn new(seed_commits: usize) -> Self {
+    pub fn new() -> Self {
         Tutorial {
-            steps: steps(seed_commits),
+            steps: steps(),
             current: 0,
             finished: false,
         }
@@ -69,19 +75,6 @@ impl Tutorial {
     }
 }
 
-fn commits_in(app: &App, branch_name: &str) -> usize {
-    app.board
-        .columns
-        .iter()
-        .find(|c| c.branch_name.as_deref() == Some(branch_name))
-        .map_or(0, |c| {
-            c.cards
-                .iter()
-                .filter(|card| card.kind == crate::board::CardKind::Commit)
-                .count()
-        })
-}
-
 fn has_lane(app: &App, branch_name: &str) -> bool {
     app.board
         .columns
@@ -89,9 +82,8 @@ fn has_lane(app: &App, branch_name: &str) -> bool {
         .any(|c| c.branch_name.as_deref() == Some(branch_name))
 }
 
-/// Builds the scripted lesson. `seed_commits` is how many commits `practice` starts with
-/// (so the "commit something" step can watch for one more, whatever the starting count).
-pub fn steps(seed_commits: usize) -> Vec<Step> {
+/// Builds the scripted lesson.
+pub fn steps() -> Vec<Step> {
     vec![
         Step {
             prompt: "Welcome to kanstack! This is a real, throwaway practice repo — nothing here touches your projects. Press → to move to the \"practice\" lane.",
@@ -107,22 +99,17 @@ pub fn steps(seed_commits: usize) -> Vec<Step> {
             done: Box::new(|app| app.mode == crate::app::Mode::Diff),
         },
         Step {
-            prompt: "← goes back to the board. Then press m on the notes.txt card in \"unassigned\", → to reach \"practice\", and ⏎ to drop it there.",
+            prompt: "← goes back to the board. Then press m on the notes.txt card in \"unassigned\", → to reach \"practice\", and ⏎ to drop it there. \"practice\" already has a commit, so this amends notes.txt straight into it — no separate commit step needed.",
             done: Box::new(|app| {
                 app.board
                     .columns
                     .iter()
                     .find(|c| c.branch_name.as_deref() == Some("practice"))
-                    .is_some_and(|c| {
-                        c.cards.iter().any(|card| {
-                            card.title == "notes.txt" && card.kind == crate::board::CardKind::Change
-                        })
+                    .and_then(|c| c.cards.first())
+                    .is_some_and(|card| {
+                        card.subtitle.as_deref().is_some_and(|s| s.contains("notes.txt"))
                     })
             }),
-        },
-        Step {
-            prompt: "Press c, type a message, and ⏎ to commit what's staged there.",
-            done: Box::new(move |app| commits_in(app, "practice") > seed_commits),
         },
         Step {
             prompt: "Press M to preview landing this lane onto the target, then ⏎ / y to confirm.",
@@ -185,7 +172,7 @@ pub fn build_practice_repo() -> Result<PathBuf> {
     std::fs::write(root.join("README.md"), "practice repo\n")?;
     run("git", &["add", "."], &root)?;
     run("git", &["commit", "-qm", "base"], &root)?;
-    run("but", &["setup", "--init", "--format", "json"], &root)?;
+    run("but", &["setup", "--init", "--json"], &root)?;
 
     let but = But::discover(&root)?;
     but.branch_new("practice", None)?;
@@ -197,8 +184,7 @@ pub fn build_practice_repo() -> Result<PathBuf> {
         .find(|c| c.file_path == "warmup.txt")
         .map(|c| c.cli_id.clone())
         .context("seed file did not show up as uncommitted")?;
-    but.rub(&warmup_id, "practice")?;
-    but.commit("practice", "Warm up the board")?;
+    but.commit(&[warmup_id], "Warm up the board", "practice")?;
     std::fs::write(root.join("notes.txt"), "things to remember\n")?;
 
     Ok(root)
@@ -232,7 +218,7 @@ mod tests {
         let root = build_practice_repo().expect("seed the practice repo");
         let but = But::discover(&root).expect("discover but in the practice repo");
         let mut app = App::new(but, None).expect("build the app against the seeded repo");
-        app.tutorial = Some(Tutorial::new(1));
+        app.tutorial = Some(Tutorial::new());
 
         let total_steps = app.tutorial.as_ref().unwrap().steps.len();
 
@@ -246,7 +232,8 @@ mod tests {
         assert_eq!(app.tutorial.as_ref().unwrap().current, 2, "step 2 did not advance");
 
         // Step 3: ← back to the board, ← again to unassigned, m to pick up notes.txt,
-        // → to practice, ⏎ to drop it (staging it there).
+        // → to practice, ⏎ to drop it. "practice" already has a commit, so this amends
+        // straight into it — no separate commit step needed anymore.
         app.on_key(key(KeyCode::Left));
         app.on_key(key(KeyCode::Left));
         app.on_key(key(KeyCode::Char('m')));
@@ -255,18 +242,10 @@ mod tests {
         assert_eq!(
             app.tutorial.as_ref().unwrap().current,
             3,
-            "step 3 did not advance — staging notes.txt to practice failed"
+            "step 3 did not advance — amending notes.txt into practice failed"
         );
 
-        // Step 4: c, type a message, ⏎.
-        app.on_key(key(KeyCode::Char('c')));
-        for c in "Remember things".chars() {
-            app.on_key(key(KeyCode::Char(c)));
-        }
-        app.on_key(key(KeyCode::Enter));
-        assert_eq!(app.tutorial.as_ref().unwrap().current, 4, "step 4 did not advance");
-
-        // Step 5: M, then ⏎ to confirm landing onto the (fake, local) target. Landing runs
+        // Step 4: M, then ⏎ to confirm landing onto the (fake, local) target. Landing runs
         // on a background thread now, so the step only advances once `poll_land` picks up
         // the result — a step tied to `on_key` alone would never see it complete.
         app.on_key(key(KeyCode::Char('M')));
@@ -277,9 +256,9 @@ mod tests {
             app.poll_land();
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        assert_eq!(app.tutorial.as_ref().unwrap().current, 5, "step 5 did not advance");
+        assert_eq!(app.tutorial.as_ref().unwrap().current, 4, "step 4 did not advance");
 
-        // Step 6: z to undo the land.
+        // Step 5: z to undo the land.
         app.on_key(key(KeyCode::Char('z')));
         let t = app.tutorial.as_ref().unwrap();
         assert!(t.finished, "undo should have completed the final step");

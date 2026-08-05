@@ -5,7 +5,7 @@ A kanban-style terminal UI for [GitButler](https://gitbutler.com)'s `but` CLI.
 GitButler's whole premise is *parallel* stacks of work. Its built-in TUI renders them as a
 single vertical commit graph, which flattens the one axis that makes the model interesting.
 `kanstack` draws them as a board instead: one lane per stack, one card per commit, a backlog
-lane for unstaged work.
+lane for uncommitted work.
 
 ![kanstack board overview](docs/assets/overview.gif)
 
@@ -27,7 +27,7 @@ past a lower branch's own commits in a stacked lane:
 
 Two things are required first:
 
-1. **The [GitButler CLI](https://docs.gitbutler.com/cli-overview)**, `but` 0.21 or newer, on
+1. **The [GitButler CLI](https://docs.gitbutler.com/cli-overview)**, `but` 0.22 or newer, on
    your `PATH`.
 
    Just the CLI, no GUI app (macOS or Linux):
@@ -83,9 +83,9 @@ kanstack --tutorial
 ```
 
 Builds a real, throwaway GitButler workspace in a temp directory and walks through moving,
-diffing, staging, committing, and landing a change — each step only advances once you've
-actually done it, not on any keypress. Nothing it touches is one of your real projects; the
-practice repo is thrown away when you're done. `esc` or `q` leaves any time.
+diffing, committing, and landing a change — each step only advances once you've actually
+done it, not on any keypress. Nothing it touches is one of your real projects; the practice
+repo is thrown away when you're done. `esc` or `q` leaves any time.
 
 ## Keys
 
@@ -98,13 +98,13 @@ practice repo is thrown away when you're done. `esc` or `q` leaves any time.
 | `g` / `G` | first / last card |
 | `space` | select this card for a bulk move — again to deselect |
 | `m` | pick up the selection (or just this card), then `←/→` for a lane, `↑/↓` to drop on a card, `⏎` to confirm |
-| `u` | send this card back to the backlog — uncommit a commit, unstage a file |
+| `u` | send this card back to the backlog — uncommit a commit |
 | `d` | delete this lane — asks first |
 | `r` | rebase onto the updated target — shows what will happen |
 | `tab` | on the unassigned lane: group its cards by folder, or back to a flat list |
-| `⏎` | open the diff beside the board — `←` goes back, `m` stages one hunk |
-| `c` | commit the files staged to this lane (only what is staged) |
+| `⏎` | open the diff beside the board — `←` goes back, `m` commits or amends one hunk |
 | `b` | new branch — stacks on the selected lane, `tab` for a parallel lane |
+| `t` | send a task to this lane's cmux pane — spawns one first if it isn't open yet |
 | `s` | stack this whole lane onto another — rewrites history |
 | `p` | push this lane — shows what it will do first |
 | `M` | land this lane onto the target, no PR — shows what will happen first |
@@ -112,26 +112,26 @@ practice repo is thrown away when you're done. `esc` or `q` leaves any time.
 | `?` | help |
 | `q` | quit |
 
-Every move runs `but rub SOURCE TARGET`, and the footer spells out what will happen before
-you confirm — dropping a commit on the backlog lane is an *uncommit*, not a move, and that
-should never be a surprise.
+Nothing is ever "staged" ahead of a commit — GitButler 0.22 dropped that step entirely, so
+dropping a card onto a lane commits or amends it there immediately, and the footer spells
+out which before you confirm.
 
 | drop | result |
 |---|---|
 | commit → lane | move the commit to that branch |
 | commit → commit | squash them together |
 | commit → unassigned | uncommit it into the worktree |
-| file → lane | stage it to that branch |
+| file → empty lane | commit it there — prompts for a message |
+| file → lane with commits | amend it into the tip, no prompt |
 | file → commit | amend it into that commit |
-| file → unassigned | unstage it |
 
-Squash and amend are not separate features — they are the same `rub`, aimed at a card
-instead of a lane. `u` is the same again, aimed at the backlog.
+Squash and amend are not separate features from a plain move — they're the same drop
+gesture, aimed at a card instead of a lane. `u` is the mirror image, aimed at the backlog.
 
-**Committing takes only what is staged to the lane.** `but commit` otherwise sweeps in
-every unassigned change as well — documented, sensible for a command line, and wrong for a
-board, where putting cards in a lane is precisely how you say what belongs in the commit.
-kanstack always passes `--only`.
+**A drop always names the changes it commits explicitly.** `but commit` with no changes
+named sweeps in everything uncommitted — fine from a shell, wrong for a board, where
+dropping a card onto a lane is precisely how you say what belongs there. kanstack always
+passes the specific file or hunk id(s) being moved.
 
 ## No refresh key
 
@@ -145,7 +145,7 @@ is doing; the refresh it triggers runs on its own thread and never blocks input.
 Snapshot mode renders a captured payload offline, so a report needs no access to your repo:
 
 ```sh
-but status -f --format json > board.json
+but status -f --json > board.json
 kanstack --snapshot board.json --size 160x40
 ```
 
@@ -163,7 +163,7 @@ so they never touch your GitButler project registry or settings.
 
 ## Status
 
-Usable. Reading, moving, staging by hunk, committing, branching, stacking, deleting,
+Usable. Reading, moving, committing by hunk, amending, branching, stacking, deleting,
 pushing, rebasing, landing, and undo/redo all work and are covered by tests against the
 real CLI. Not yet built:
 
@@ -175,10 +175,10 @@ real CLI. Not yet built:
 - Flipping through adjacent cards' diffs without leaving the pane. `→` used to do this,
   but both arrows now close, which is the clearer rule; `n`/`p` or `[`/`]` would give the
   behaviour back without overloading the arrows.
-- Reordering commits within a lane. `but move <commit> <target> -a` does it; the open
-  question is the gesture, since dropping a card on a card already means squash.
+- Reordering commits within a lane. `but move <commit> --above/--below <target>` does it;
+  the open question is the gesture, since dropping a card on a card already means squash.
 
-## The diff pane, and hunk staging
+## The diff pane, and hunk-level commits
 
 `⏎` opens the diff **beside** the board rather than over it, so you keep your place. `←`
 goes back to the board — the diff sits to the right, so leaving it is a direction rather
@@ -189,13 +189,14 @@ widens it to full width when you want to read properly. This is the split
 Added and removed lines carry a `+` / `-` in a column of their own, next to the new-file
 line number. gitui relies on colour alone; a marker survives being read without it.
 
-The useful part is that `but diff --format json` emits **one entry per hunk**, each with its
-own id that `rub` accepts. So `m` inside the pane picks up the hunk under the cursor and
+The useful part is that `but diff --json` emits **one entry per hunk**, each with its own id
+that `commit`/`amend` accept. So `m` inside the pane picks up the hunk under the cursor and
 hands it to the same lane-targeting flow cards use — which means one file's hunks can go to
-different lanes. That is the only way to split a file that touches two unrelated things.
+different lanes, each becoming its own commit or amending into whatever's already there.
+That is the only way to split a file that touches two unrelated things.
 
-Committed hunks carry no id and are marked as such; history is not stageable. Staging a
-hunk renumbers the rest, so the pane closes after you stage one and re-opens fresh rather
+Committed hunks carry no id and are marked as such; history is not stageable. Committing a
+hunk renumbers the rest, so the pane closes after you commit one and re-opens fresh rather
 than trusting a now-stale list.
 
 ## Line counts
@@ -248,8 +249,8 @@ disagree.
 
 | state | meaning |
 |---|---|
-| empty | no commits, nothing staged |
-| uncommitted | staged work, not yet committed |
+| empty | no commits |
+| uncommitted | staged work, not yet committed — kept for the wire format, but unreachable in practice since 0.22: nothing is ever assigned to a lane ahead of a commit anymore |
 | unpushed | commits that have never reached the remote |
 | needs force | pushing would rewrite remote history |
 | pushed | everything is on the remote |
@@ -258,9 +259,9 @@ disagree.
 
 In a stack, every branch gets its own dot and word, not just the tip — but only the tip's
 dot is **filled** (`●`); every branch stacked below it gets a **hollow** one (`○`). That
-distinction carries real information: `c`/`p`/`M`/`z` always act on the tip, never on
-whichever branch's cards you happen to be scrolled into, and the hollow dot is there so a
-lower branch's header never reads as if it were the one those keys will act on.
+distinction carries real information: `p`/`M`/`z` always act on the tip, never on whichever
+branch's cards you happen to be scrolled into, and the hollow dot is there so a lower
+branch's header never reads as if it were the one those keys will act on.
 
 The current lane's own header is reverse-video highlighted too, so it's still obvious which
 lane is current once there's more than two or three on screen.
@@ -277,14 +278,14 @@ push status a bare directory doesn't have. `tab` again goes back to the flat lis
 `space` marks a card for a bulk move (`✓`), and the header counts how many are marked so
 the state is never just off-screen checkmarks you have to scroll back to remember. `m` with
 a marked selection picks up all of it — not just whatever the cursor happens to be sitting
-on — and drops the whole thing wherever you confirm, one `but rub` per card, same target
-for all of them.
+on — and drops the whole thing wherever you confirm, same target for all of them.
 
-A selection can mix commits and files, or span more than one lane; `but rub` doesn't care
-that the sources differ, only that the target does not, so the confirmation just says how
-many and where rather than naming one verb that would be wrong for half the selection.
-Cancelling with `esc` leaves the selection alone, so a bulk move can be retried at a
-different target — `esc` with nothing else pending is what actually clears it.
+A selection can mix commits and files, or span more than one lane. Sources are grouped by
+kind and each group becomes one combined `commit`/`amend`/`squash`/`move`/`uncommit` call
+rather than one call per card, so the confirmation just says how many and where rather than
+naming one verb that would be wrong for half the selection. Cancelling with `esc` leaves the
+selection alone, so a bulk move can be retried at a different target — `esc` with nothing
+else pending is what actually clears it.
 
 ## Restacking an existing branch
 

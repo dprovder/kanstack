@@ -122,6 +122,10 @@ pub struct App {
     pub target_card: Option<usize>,
     /// Commit message being typed, valid while `mode == Commit`.
     pub commit_input: TextInput,
+    /// A move that needs a message before it can run — dragging an uncommitted change onto
+    /// a lane with no commits yet. Set by `confirm_move`/`confirm_bulk_move`, consumed by
+    /// `confirm_commit`, valid while `mode == Commit`.
+    pending_commit_move: Option<PendingCommitMove>,
     /// Branch name being typed, valid while `mode == Branch`.
     pub branch_input: TextInput,
     /// Task description being typed, valid while `mode == Task`.
@@ -219,6 +223,51 @@ struct PendingCmuxPoll {
     rx: mpsc::Receiver<Result<HashMap<String, crate::cmux::PaneStatus>>>,
 }
 
+/// What a move actually does now that `but rub` is gone and every combination is its own
+/// command. Computed once by `pending_op` and used both to describe the move (`pending_action`)
+/// and to dispatch it (`confirm_move`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MoveOp {
+    /// Uncommitted change(s) onto a lane with no commits yet — needs a message; see
+    /// `PendingCommitMove`.
+    Commit,
+    /// Uncommitted change(s) onto a lane's tip, or a specific commit — no message needed,
+    /// the target's own message is kept.
+    Amend,
+    /// A whole commit onto a lane.
+    MoveToLane,
+    /// A commit onto another commit.
+    Squash,
+    /// A commit back to the backlog.
+    Uncommit,
+}
+
+impl MoveOp {
+    fn verb(self) -> &'static str {
+        match self {
+            MoveOp::Commit => "commit to",
+            MoveOp::Amend => "amend into",
+            MoveOp::MoveToLane => "move to",
+            MoveOp::Squash => "squash into",
+            MoveOp::Uncommit => "uncommit into",
+        }
+    }
+}
+
+/// A move parked mid-flight because it needs a commit message before it can run — see
+/// `MoveOp::Commit`. Holds everything `confirm_commit` needs to finish it.
+struct PendingCommitMove {
+    /// Uncommitted change ids (files or hunks) to commit.
+    changes: Vec<String>,
+    /// Branch to commit onto.
+    branch: String,
+    /// Whole-commit sources from the same bulk move, if any — applied with `move_commits`
+    /// right after the initial commit succeeds and the lane is no longer empty.
+    also_move: Vec<String>,
+    source_label: String,
+    target_label: String,
+}
+
 impl App {
     pub fn new(but: But, cmux: Option<Cmux>) -> Result<Self> {
         let mut commit_stats = HashMap::new();
@@ -260,6 +309,7 @@ impl App {
             origin_card: 0,
             target_card: None,
             commit_input: TextInput::default(),
+            pending_commit_move: None,
             branch_input: TextInput::default(),
             task_input: TextInput::default(),
             task_target: None,
@@ -302,6 +352,7 @@ impl App {
             origin_card: 0,
             target_card: None,
             commit_input: TextInput::default(),
+            pending_commit_move: None,
             branch_input: TextInput::default(),
             task_input: TextInput::default(),
             task_target: None,
@@ -811,11 +862,11 @@ impl App {
             .get(self.origin_card)
     }
 
-    /// Resolves the drop target into the CLI id to rub onto, plus a label for the footer.
+    /// Resolves the drop target into the CLI id to act on, plus a label for the footer.
     ///
-    /// Targeting the lane header rubs onto its branch; targeting a card rubs onto that
-    /// commit. Both are the same `but rub` call — only the target id differs, which is why
-    /// squash and amend need no code of their own.
+    /// Targeting the lane header names its branch (the `-b`/`-t` argument for a commit,
+    /// amend, or move); targeting a card names that commit (the `-t` argument for an amend
+    /// or squash).
     fn resolve_target(&self) -> Option<(String, String)> {
         let col = self.board.columns.get(self.col)?;
         match self.target_card {
@@ -827,27 +878,27 @@ impl App {
         }
     }
 
-    /// Describes what `but rub` will do, derived from its documented operations matrix.
-    /// Shown before committing to it, because "commit onto unassigned" is an uncommit and
-    /// "commit onto commit" is a squash, and neither should be a surprise.
+    /// Describes what confirming the move will do. Shown before committing to it, because
+    /// "commit onto unassigned" is an uncommit and "commit onto commit" is a squash, and
+    /// neither should be a surprise.
     pub fn pending_action(&self) -> Option<String> {
         if self.mode != Mode::Moving {
             return None;
         }
         let (_, target_label) = self.resolve_target()?;
-        // A bulk selection can mix commits and files, which take different verbs (stage
+        // A bulk selection can mix commits and files, which take different verbs (amend
         // vs. move, say) — rather than pick one that would be wrong for half the
         // selection, this just says how many and where, same for a lane or a card target.
         if !self.selected.is_empty() {
             return Some(format!("move {} selected → {target_label}", self.selected.len()));
         }
         let (_, source_label) = self.move_source_ref()?;
-        let verb = self.pending_verb()?;
-        Some(format!("{verb} {source_label} → {target_label}"))
+        let op = self.pending_op()?;
+        Some(format!("{} {source_label} → {target_label}", op.verb()))
     }
 
-    /// `None` when the combination is not a supported rub.
-    fn pending_verb(&self) -> Option<&'static str> {
+    /// `None` when the combination is not a supported move.
+    fn pending_op(&self) -> Option<MoveOp> {
         // A hunk picked from the diff pane behaves like any other working-tree change.
         let source_kind = if self.move_source.is_some() {
             CardKind::Change
@@ -856,18 +907,26 @@ impl App {
         };
         let col = self.board.columns.get(self.col)?;
         match self.target_card {
-            // Dropping on a lane: move or stage, per the matrix's Branch column.
-            None => Some(match (source_kind, col.kind) {
-                (CardKind::Change, ColumnKind::Unassigned) => "unstage",
-                (CardKind::Change, ColumnKind::Stack) => "stage to",
-                (CardKind::Commit, ColumnKind::Unassigned) => "uncommit into",
-                (CardKind::Commit, ColumnKind::Stack) => "move to",
-            }),
+            None => match (source_kind, col.kind) {
+                // Nothing is ever assigned to a lane pre-commit anymore, so a Change card
+                // only ever lives in the unassigned lane already — there is nothing to
+                // un-assign it from.
+                (CardKind::Change, ColumnKind::Unassigned) => None,
+                (CardKind::Change, ColumnKind::Stack) => Some(
+                    if col.state == Some(crate::board::LaneState::Empty) {
+                        MoveOp::Commit
+                    } else {
+                        MoveOp::Amend
+                    },
+                ),
+                (CardKind::Commit, ColumnKind::Unassigned) => Some(MoveOp::Uncommit),
+                (CardKind::Commit, ColumnKind::Stack) => Some(MoveOp::MoveToLane),
+            },
             // Dropping on a card: only commits are valid targets. The matrix has no
             // file-onto-file operation, so that combination is refused rather than guessed.
             Some(i) => match (source_kind, col.cards.get(i)?.kind) {
-                (CardKind::Commit, CardKind::Commit) => Some("squash into"),
-                (CardKind::Change, CardKind::Commit) => Some("amend into"),
+                (CardKind::Commit, CardKind::Commit) => Some(MoveOp::Squash),
+                (CardKind::Change, CardKind::Commit) => Some(MoveOp::Amend),
                 (_, CardKind::Change) => None,
             },
         }
@@ -940,15 +999,31 @@ impl App {
             return;
         }
 
-        let Some(verb) = self.pending_verb() else {
+        let Some(op) = self.pending_op() else {
             self.notify("that combination isn't a supported operation", Notice::Error);
             return;
         };
-        let verb = verb.to_string();
         let Some((target_id, target_label)) = self.resolve_target() else {
             self.mode = Mode::Normal;
             return;
         };
+
+        // A fresh commit needs a message before it can run — park it and switch to typing
+        // one, the same text-entry flow the old standalone commit key used.
+        if op == MoveOp::Commit {
+            self.pending_commit_move = Some(PendingCommitMove {
+                changes: vec![source_id],
+                branch: target_id,
+                also_move: Vec::new(),
+                source_label,
+                target_label,
+            });
+            self.move_source = None;
+            self.commit_input.clear();
+            self.mode = Mode::Commit;
+            return;
+        }
+
         self.mode = Mode::Normal;
         self.move_source = None;
 
@@ -957,42 +1032,161 @@ impl App {
             return;
         };
 
-        match but.rub(&source_id, &target_id) {
+        let result = match op {
+            MoveOp::Amend => but.amend(&[source_id], &target_id),
+            MoveOp::MoveToLane => but.move_commits(&[source_id], &target_id),
+            MoveOp::Squash => but.squash(&[source_id], &target_id),
+            MoveOp::Uncommit => but.uncommit(&[source_id]),
+            MoveOp::Commit => unreachable!("handled above"),
+        };
+        match result {
             Ok(status) => {
                 self.board = Self::board_from(but, &mut self.commit_stats, &status);
                 self.clamp();
-                self.notify(format!("{verb} {source_label} → {target_label}"), Notice::Success);
+                self.notify(
+                    format!("{} {source_label} → {target_label}", op.verb()),
+                    Notice::Success,
+                );
             }
             Err(e) => self.notify(format!("{e}"), Notice::Error),
         }
     }
 
     /// Moves the whole selection in one action — `space` a few cards, `m`, pick a target,
-    /// `⏎`. One `but rub` call per source, same target for all of them; the target can be
-    /// a lane (batch stage/move) or a card (batch amend/squash) exactly like a single
-    /// card's move can, since `but rub` itself doesn't care which — only the id passed in
-    /// does. See `pending_action` for why this doesn't try to name one exact verb the way
-    /// a single-card move does.
+    /// `⏎`. Sources are grouped by kind (a selection can mix commits and uncommitted
+    /// changes) so each group becomes one combined call rather than one call per source —
+    /// `but commit`/`amend`/`squash`/`move`/`uncommit` all accept several sources at once.
+    /// See `pending_action` for why this doesn't try to name one exact verb the way a
+    /// single-card move does.
     fn confirm_bulk_move(&mut self) {
         let Some((target_id, target_label)) = self.resolve_target() else {
             self.mode = Mode::Normal;
             return;
         };
-        self.mode = Mode::Normal;
         let sources: Vec<String> = self.selected.drain().collect();
         let n = sources.len();
+
+        let mut changes = Vec::new();
+        let mut commits = Vec::new();
+        for id in &sources {
+            let kind = self
+                .board
+                .columns
+                .iter()
+                .flat_map(|c| &c.cards)
+                .find(|c| &c.rub_id == id)
+                .map(|c| c.kind);
+            match kind {
+                Some(CardKind::Change) => changes.push(id.clone()),
+                Some(CardKind::Commit) => commits.push(id.clone()),
+                // A stale id from before the last refresh — nothing to do with it.
+                None => {}
+            }
+        }
+
+        let Some(col) = self.board.columns.get(self.col) else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        let target_is_card = self.target_card.is_some();
+        let col_kind = col.kind;
+        let lane_empty = col.state == Some(crate::board::LaneState::Empty);
+        self.mode = Mode::Normal;
+
+        // Handled before `but` is borrowed below: a batch with only changes dropped on the
+        // backlog has nothing to call `but` for at all — there's no un-assign anymore.
+        if !target_is_card && col_kind == ColumnKind::Unassigned {
+            if !changes.is_empty() {
+                self.notify(
+                    "files aren't assigned to lanes to unassign anymore",
+                    Notice::Info,
+                );
+            }
+            if commits.is_empty() {
+                return;
+            }
+        }
 
         let Some(but) = &self.but else {
             self.notify("snapshot is read-only", Notice::Info);
             return;
         };
-        match but.rub_many(&sources, &target_id) {
-            Ok(status) => {
-                self.board = Self::board_from(but, &mut self.commit_stats, &status);
-                self.clamp();
-                self.notify(format!("moved {n} → {target_label}"), Notice::Success);
+
+        if target_is_card {
+            // Dropped on a commit card: changes amend into it, commits squash into it.
+            let result = match (changes.is_empty(), commits.is_empty()) {
+                (true, true) => {
+                    self.notify("nothing to move", Notice::Info);
+                    return;
+                }
+                (false, true) => but.amend(&changes, &target_id),
+                (true, false) => but.squash(&commits, &target_id),
+                (false, false) => but
+                    .amend(&changes, &target_id)
+                    .and_then(|_| but.squash(&commits, &target_id)),
+            };
+            match result {
+                Ok(status) => {
+                    self.board = Self::board_from(but, &mut self.commit_stats, &status);
+                    self.clamp();
+                    self.notify(format!("moved {n} → {target_label}"), Notice::Success);
+                }
+                Err(e) => self.notify(format!("{e}"), Notice::Error),
             }
-            Err(e) => self.notify(format!("{e}"), Notice::Error),
+            return;
+        }
+
+        match col_kind {
+            ColumnKind::Unassigned => match but.uncommit(&commits) {
+                Ok(status) => {
+                    self.board = Self::board_from(but, &mut self.commit_stats, &status);
+                    self.clamp();
+                    self.notify(
+                        format!("uncommitted {} → {target_label}", commits.len()),
+                        Notice::Success,
+                    );
+                }
+                Err(e) => self.notify(format!("{e}"), Notice::Error),
+            },
+            ColumnKind::Stack if changes.is_empty() => match but.move_commits(&commits, &target_id) {
+                Ok(status) => {
+                    self.board = Self::board_from(but, &mut self.commit_stats, &status);
+                    self.clamp();
+                    self.notify(format!("moved {n} → {target_label}"), Notice::Success);
+                }
+                Err(e) => self.notify(format!("{e}"), Notice::Error),
+            },
+            // Changes onto an empty lane need a message before the first commit can be
+            // made — park the whole batch (including any commit sources, applied right
+            // after) and switch to typing one.
+            ColumnKind::Stack if lane_empty => {
+                self.pending_commit_move = Some(PendingCommitMove {
+                    changes,
+                    branch: target_id,
+                    also_move: commits,
+                    source_label: format!("{n} selected"),
+                    target_label,
+                });
+                self.commit_input.clear();
+                self.mode = Mode::Commit;
+            }
+            ColumnKind::Stack => {
+                let result = but.amend(&changes, &target_id).and_then(|status| {
+                    if commits.is_empty() {
+                        Ok(status)
+                    } else {
+                        but.move_commits(&commits, &target_id)
+                    }
+                });
+                match result {
+                    Ok(status) => {
+                        self.board = Self::board_from(but, &mut self.commit_stats, &status);
+                        self.clamp();
+                        self.notify(format!("moved {n} → {target_label}"), Notice::Success);
+                    }
+                    Err(e) => self.notify(format!("{e}"), Notice::Error),
+                }
+            }
         }
     }
 
@@ -1006,55 +1200,47 @@ impl App {
         Some((col.drop_target.clone(), col.title.clone()))
     }
 
-    fn begin_commit(&mut self) {
-        let Some((_, title)) = self.selected_branch() else {
-            self.notify(
-                "pick a lane to commit to — the backlog has no branch",
-                Notice::Info,
-            );
-            return;
-        };
-        let has_staged = self
-            .board
-            .columns
-            .get(self.col)
-            .is_some_and(|c| c.cards.iter().any(|k| k.kind == CardKind::Change));
-        if !has_staged {
-            self.notify(
-                format!("nothing staged to {title} — move a file there first"),
-                Notice::Info,
-            );
-            return;
-        }
-        self.commit_input.clear();
-        self.mode = Mode::Commit;
-    }
-
+    /// Finishes a move parked by `confirm_move`/`confirm_bulk_move` because it needed a
+    /// message first — see `MoveOp::Commit`. There is no longer a standalone "commit
+    /// whatever's staged" key: nothing is staged ahead of a commit anymore, so every commit
+    /// now originates from a move that just happened to need a message.
     fn confirm_commit(&mut self) {
         let message = self.commit_input.trimmed();
         if message.is_empty() {
             self.notify("a commit needs a message", Notice::Info);
             return;
         }
-        let Some((branch, title)) = self.selected_branch() else {
+        let Some(pending) = self.pending_commit_move.take() else {
             self.mode = Mode::Normal;
             return;
         };
         self.mode = Mode::Normal;
+        self.commit_input.clear();
 
         let Some(but) = &self.but else {
             self.notify("snapshot is read-only", Notice::Info);
             return;
         };
-        match but.commit(&branch, &message) {
+        let result = but
+            .commit(&pending.changes, &message, &pending.branch)
+            .and_then(|status| {
+                if pending.also_move.is_empty() {
+                    Ok(status)
+                } else {
+                    but.move_commits(&pending.also_move, &pending.branch)
+                }
+            });
+        match result {
             Ok(status) => {
                 self.board = Self::board_from(but, &mut self.commit_stats, &status);
                 self.clamp();
-                self.notify(format!("committed to {title}"), Notice::Success);
+                self.notify(
+                    format!("committed {} → {}", pending.source_label, pending.target_label),
+                    Notice::Success,
+                );
             }
             Err(e) => self.notify(format!("{e}"), Notice::Error),
         }
-        self.commit_input.clear();
     }
 
     /// Starts naming a new branch.
@@ -1425,20 +1611,24 @@ impl App {
             self.notify("already unassigned", Notice::Info);
             return;
         }
-        let verb = match card.kind {
-            CardKind::Commit => "uncommitted",
-            CardKind::Change => "unstaged",
-        };
+        // A Change card only ever lives in the unassigned lane itself under the current
+        // model (nothing is "assigned" pre-commit anymore), so this is reached only for a
+        // Commit card in practice — the guard above already refuses an already-unassigned
+        // selection.
+        if card.kind == CardKind::Change {
+            self.notify("nothing to unassign", Notice::Info);
+            return;
+        }
 
         let Some(but) = &self.but else {
             self.notify("snapshot is read-only", Notice::Info);
             return;
         };
-        match but.rub(&card.rub_id, crate::board::UNASSIGNED_TARGET) {
+        match but.uncommit(std::slice::from_ref(&card.rub_id)) {
             Ok(status) => {
                 self.board = Self::board_from(but, &mut self.commit_stats, &status);
                 self.clamp();
-                self.notify(format!("{verb} {}", card.cli_id), Notice::Success);
+                self.notify(format!("uncommitted {}", card.cli_id), Notice::Success);
             }
             Err(e) => self.notify(format!("{e}"), Notice::Error),
         }
@@ -1799,6 +1989,7 @@ impl App {
                 K::Esc => {
                     self.mode = Mode::Normal;
                     self.commit_input.clear();
+                    self.pending_commit_move = None;
                     self.notify("commit cancelled", Notice::Info);
                 }
                 K::Enter => self.confirm_commit(),
@@ -2047,7 +2238,6 @@ impl App {
             }
             K::Char(' ') if self.mode == Mode::Normal => self.toggle_selected(),
             K::Char('m') if self.mode == Mode::Normal => self.begin_move(),
-            K::Char('c') if self.mode == Mode::Normal => self.begin_commit(),
             K::Char('p') if self.mode == Mode::Normal => self.begin_push(),
             K::Char('M') if self.mode == Mode::Normal => self.begin_land(),
             K::Char('z') if self.mode == Mode::Normal => self.undo(),

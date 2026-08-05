@@ -26,7 +26,7 @@ usage:
 options:
   -C <path>          run against the repository at <path> (default: cwd)
   --tutorial         walk through the keys in a real, throwaway practice repo
-  --snapshot <file>  render captured `but status -f --format json` output and exit
+  --snapshot <file>  render captured `but status -f --json` output and exit
   --size <WxH>       terminal size for --snapshot (default: 160x30)
   -V, --version      print version
   -h, --help         print this help
@@ -44,7 +44,7 @@ environment:
                            previous lane instead of kanstack (default: `right`)
 
 capture a snapshot for a bug report:
-  but status -f --format json > board.json && kanstack --snapshot board.json
+  but status -f --json > board.json && kanstack --snapshot board.json
 
 requires the GitButler CLI: https://docs.gitbutler.com/cli-overview
 ";
@@ -107,7 +107,7 @@ fn main() -> Result<()> {
         anyhow::bail!(
             "not running in a terminal, so there is no board to draw.\n\
              To render a captured board non-interactively:\n\
-             \n    but status -f --format json > board.json && kanstack --snapshot board.json"
+             \n    but status -f --json > board.json && kanstack --snapshot board.json"
         );
     }
 
@@ -126,7 +126,7 @@ fn main() -> Result<()> {
     let cmux = Cmux::discover();
     let mut app = App::new(but, cmux)?;
     if tutorial_mode {
-        app.tutorial = Some(Tutorial::new(1));
+        app.tutorial = Some(Tutorial::new());
     }
 
     // A failed watch is not fatal: the board still works, it just stops following the

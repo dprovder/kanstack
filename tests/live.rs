@@ -43,7 +43,7 @@ impl Sandbox {
 
     fn new(name: &str) -> Sandbox {
         let sb = Sandbox::bare(name);
-        sb.but(&["setup", "--init", "--format", "json"]);
+        sb.but(&["setup", "--init", "--json"]);
         sb
     }
 
@@ -62,7 +62,7 @@ impl Sandbox {
             .unwrap();
         sb.git(&["remote", "add", "origin", remote.to_str().unwrap()]);
         sb.git(&["push", "-q", "origin", "HEAD:main"]);
-        sb.but(&["setup", "--init", "--format", "json"]);
+        sb.but(&["setup", "--init", "--json"]);
         sb
     }
 
@@ -148,7 +148,7 @@ impl Sandbox {
     fn branch_with_commit(&self, branch: &str, file: &str, message: &str) {
         self.write(file, "content\n");
         self.but(&["branch", "new", branch]);
-        self.but(&["commit", branch, "-m", message]);
+        self.but(&["commit", "-m", message, "-b", branch]);
     }
 }
 
@@ -230,7 +230,9 @@ fn moving_a_card_between_lanes_rubs_and_returns_fresh_state() {
     assert_eq!(commit.title, "Add auth middleware");
 
     // The single call both mutates and returns the refreshed workspace.
-    let after = Board::from_status(&but.rub(&commit.cli_id, &target).expect("rub"));
+    let after = Board::from_status(
+        &but.move_commits(std::slice::from_ref(&commit.cli_id), &target).expect("move"),
+    );
 
     let auth = after
         .columns
@@ -250,14 +252,18 @@ fn moving_a_card_between_lanes_rubs_and_returns_fresh_state() {
     );
 }
 
+/// Dropping an uncommitted file onto a lane with no commits yet has nothing to amend into,
+/// so it creates the lane's first commit instead — the case `App::confirm_move` parks for a
+/// message before running (`MoveOp::Commit`). Dropping onto a lane that already has a tip
+/// commit is the amend case, covered by `dropping_a_file_on_a_commit_amends_it`.
 #[test]
 #[ignore = "requires the GitButler CLI"]
-fn staging_a_backlog_file_moves_it_into_a_lane() {
+fn committing_a_backlog_file_onto_an_empty_lane() {
     if skip_if_no_but() {
         return;
     }
-    let sb = Sandbox::new("stage");
-    sb.branch_with_commit("feat-auth", "a.txt", "Add auth middleware");
+    let sb = Sandbox::new("commitempty");
+    sb.but(&["branch", "new", "feat-empty"]);
     sb.write("wip.txt", "scratch\n");
 
     let but = But::discover(&sb.repo()).unwrap();
@@ -265,16 +271,21 @@ fn staging_a_backlog_file_moves_it_into_a_lane() {
     let file = before.columns[0].cards[0].clone();
     let target = before.columns[1].drop_target.clone();
     assert_eq!(file.kind, CardKind::Change);
+    assert!(
+        before.columns[1].cards.is_empty(),
+        "the lane must start with no commits for this to exercise the Commit path"
+    );
 
-    let after = Board::from_status(&but.rub(&file.cli_id, &target).unwrap());
+    let after =
+        Board::from_status(&but.commit(std::slice::from_ref(&file.cli_id), "Start work", &target).unwrap());
     assert!(
         after.columns[0].cards.is_empty(),
-        "file left the backlog once staged"
+        "file left the backlog once committed"
     );
-    assert!(
-        after.columns[1].cards.iter().any(|c| c.title == "wip.txt"),
-        "staged file appears in the lane it was dropped on"
-    );
+    let lane = after.columns.iter().find(|c| c.title == "feat-empty").unwrap();
+    assert_eq!(lane.cards.len(), 1, "the file became the lane's first commit");
+    assert_eq!(lane.cards[0].title, "Start work");
+    assert_eq!(lane.cards[0].subtitle.as_deref(), Some("wip.txt"));
 }
 
 /// The claim that makes squash free: dropping a commit card onto another commit card is
@@ -288,17 +299,19 @@ fn dropping_a_commit_on_a_commit_squashes_them() {
     let sb = Sandbox::new("squash");
     sb.branch_with_commit("feat", "a.txt", "First commit");
     sb.write("b.txt", "more\n");
-    sb.but(&["commit", "feat", "-m", "Second commit"]);
+    sb.but(&["commit", "-m", "Second commit", "-b", "feat"]);
 
     let but = But::discover(&sb.repo()).unwrap();
     let before = Board::from_status(&but.status().unwrap());
     let lane = before.columns.iter().find(|c| c.title == "feat").unwrap();
     assert_eq!(lane.cards.len(), 2, "two commits before squashing");
 
-    // Newest is on top; rub it onto the one below.
+    // Newest is on top; squash it into the one below.
     let source = lane.cards[0].clone();
     let target = lane.cards[1].clone();
-    let after = Board::from_status(&but.rub(&source.cli_id, &target.cli_id).expect("rub"));
+    let after = Board::from_status(
+        &but.squash(std::slice::from_ref(&source.cli_id), &target.cli_id).expect("squash"),
+    );
 
     let lane = after.columns.iter().find(|c| c.title == "feat").unwrap();
     assert_eq!(
@@ -333,7 +346,9 @@ fn dropping_a_file_on_a_commit_amends_it() {
     assert_eq!(file.kind, CardKind::Change);
     assert_eq!(commit.kind, CardKind::Commit);
 
-    let after = Board::from_status(&but.rub(&file.cli_id, &commit.cli_id).expect("rub"));
+    let after = Board::from_status(
+        &but.amend(std::slice::from_ref(&file.cli_id), &commit.cli_id).expect("amend"),
+    );
     assert!(
         after.columns[0].cards.is_empty(),
         "the file left the backlog"
@@ -347,12 +362,9 @@ fn dropping_a_file_on_a_commit_amends_it() {
     );
 }
 
-/// Regression: `but commit` includes *all* unassigned changes unless `--only` is passed,
-/// so committing a lane used to empty the whole backlog into it.
-///
-/// The original test could not have caught this: it staged its only file, leaving nothing
-/// unassigned, so "commits the staged file" and "commits everything" looked identical.
-/// The leftover unassigned file below is the entire point of this test.
+/// `but commit` takes the changes to commit as explicit ids now (0.22 removed `--only` along
+/// with the whole "stage first, commit whatever's assigned" flow) — naming just one file's
+/// id must leave every other uncommitted file alone.
 #[test]
 #[ignore = "requires the GitButler CLI"]
 fn committing_a_lane_leaves_unassigned_changes_alone() {
@@ -373,9 +385,11 @@ fn committing_a_lane_leaves_unassigned_changes_alone() {
         .expect("staged.txt in backlog")
         .clone();
     let lane = before.columns.iter().find(|c| c.title == "feat").unwrap();
-    but.rub(&staged.rub_id, &lane.drop_target).unwrap();
 
-    let after = Board::from_status(&but.commit("feat", "Only the staged one").unwrap());
+    let after = Board::from_status(
+        &but.commit(std::slice::from_ref(&staged.rub_id), "Only the staged one", &lane.drop_target)
+            .unwrap(),
+    );
 
     let backlog: Vec<&str> = after.columns[0]
         .cards
@@ -411,9 +425,11 @@ fn committing_a_lane_turns_staged_files_into_a_commit() {
     let before = Board::from_status(&but.status().unwrap());
     let file = before.columns[0].cards[0].clone();
     let lane = before.columns.iter().find(|c| c.title == "feat").unwrap();
-    but.rub(&file.cli_id, &lane.drop_target).unwrap();
 
-    let after = Board::from_status(&but.commit("feat", "Second commit").expect("commit"));
+    let after = Board::from_status(
+        &but.commit(std::slice::from_ref(&file.cli_id), "Second commit", &lane.drop_target)
+            .expect("commit"),
+    );
     let lane = after.columns.iter().find(|c| c.title == "feat").unwrap();
     let titles: Vec<&str> = lane.cards.iter().map(|c| c.title.as_str()).collect();
     assert_eq!(titles, ["Second commit", "First"]);
@@ -673,9 +689,9 @@ fn restacking_moves_a_whole_lane_onto_another() {
     sb.branch_with_commit("feat-auth", "a.txt", "Auth work");
     sb.write("b.txt", "ui\n");
     sb.but(&["branch", "new", "feat-ui"]);
-    sb.but(&["commit", "feat-ui", "-m", "UI first"]);
+    sb.but(&["commit", "-m", "UI first", "-b", "feat-ui"]);
     sb.write("c.txt", "ui2\n");
-    sb.but(&["commit", "feat-ui", "-m", "UI second"]);
+    sb.but(&["commit", "-m", "UI second", "-b", "feat-ui"]);
 
     let but = But::discover(&sb.repo()).unwrap();
     let before = Board::from_status(&but.status().unwrap());
@@ -724,8 +740,8 @@ fn restacking_a_branch_onto_itself_is_refused() {
     assert!(format!("{err}").contains("cannot be stacked on itself"));
 }
 
-/// `u` is `rub <card> zz`. Confirms it is a true uncommit — the content comes back to the
-/// worktree rather than being discarded — since the rub matrix only calls it "Undo".
+/// `u` on a commit card is `but uncommit`. Confirms it is a true uncommit — the content
+/// comes back to the worktree rather than being discarded.
 #[test]
 #[ignore = "requires the GitButler CLI"]
 fn sending_a_commit_to_the_backlog_uncommits_without_losing_content() {
@@ -735,7 +751,7 @@ fn sending_a_commit_to_the_backlog_uncommits_without_losing_content() {
     let sb = Sandbox::new("uncommit");
     sb.write("a.txt", "hello\nworld\n");
     sb.but(&["branch", "new", "feat"]);
-    sb.but(&["commit", "feat", "-m", "Work"]);
+    sb.but(&["commit", "-m", "Work", "-b", "feat"]);
 
     let but = But::discover(&sb.repo()).unwrap();
     let before = Board::from_status(&but.status().unwrap());
@@ -747,8 +763,7 @@ fn sending_a_commit_to_the_backlog_uncommits_without_losing_content() {
         .cards[0]
         .clone();
 
-    let after =
-        Board::from_status(&but.rub(&commit.rub_id, kanstack::board::UNASSIGNED_TARGET).unwrap());
+    let after = Board::from_status(&but.uncommit(std::slice::from_ref(&commit.rub_id)).unwrap());
 
     let lane = after.columns.iter().find(|c| c.title == "feat").unwrap();
     assert!(lane.cards.is_empty(), "the commit is gone from the lane");
@@ -815,7 +830,7 @@ fn deleting_a_lone_branch_with_commits_is_undoable_not_refused() {
     );
 
     // `but undo` is the safety net now, so it had better work.
-    sb.but(&["undo", "--format", "json"]);
+    sb.but(&["undo", "--json"]);
     let restored = Board::from_status(&but.status().unwrap());
     let lane = restored.columns.iter().find(|c| c.title == "feat").expect("undo restores the lane");
     assert_eq!(lane.cards.len(), 1);
@@ -837,7 +852,7 @@ fn deleting_the_tip_of_a_stack_discards_only_its_own_commit() {
     sb.branch_with_commit("lower", "a.txt", "Lower work");
     sb.write("b.txt", "upper\n");
     sb.but(&["branch", "new", "upper", "--anchor", "lower"]);
-    sb.but(&["commit", "upper", "-m", "Upper work"]);
+    sb.but(&["commit", "-m", "Upper work", "-b", "upper"]);
 
     let but = But::discover(&sb.repo()).unwrap();
     but.branch_delete("upper").expect("delete the tip of a stack");
@@ -855,7 +870,7 @@ fn deleting_the_tip_of_a_stack_discards_only_its_own_commit() {
         "the branch below is untouched, but the tip's own commit is gone, got {titles:?}"
     );
 
-    sb.but(&["undo", "--format", "json"]);
+    sb.but(&["undo", "--json"]);
     let restored = Board::from_status(&but.status().unwrap());
     let titles: Vec<&str> = restored
         .columns
@@ -928,11 +943,11 @@ fn rebasing_brings_upstream_work_in() {
 }
 
 /// The point of the diff pane: `but diff` emits one entry per hunk with its own id, so a
-/// single file's hunks can be sent to different lanes. Whole-file staging could not do
+/// single file's hunks can be committed to different lanes. Whole-file commits could not do
 /// this, and it is what makes a mixed file reviewable in pieces.
 #[test]
 #[ignore = "requires the GitButler CLI"]
-fn hunks_of_one_file_can_be_staged_to_different_lanes() {
+fn hunks_of_one_file_can_be_committed_to_different_lanes() {
     if skip_if_no_but() {
         return;
     }
@@ -945,7 +960,7 @@ fn hunks_of_one_file_can_be_staged_to_different_lanes() {
     );
     sb.git(&["add", "."]);
     sb.git(&["commit", "-qm", "seed"]);
-    sb.but(&["setup", "--init", "--format", "json"]);
+    sb.but(&["setup", "--init", "--json"]);
     sb.but(&["branch", "new", "top"]);
     sb.but(&["branch", "new", "bottom"]);
     // Two edits far enough apart to be separate hunks.
@@ -964,9 +979,10 @@ fn hunks_of_one_file_can_be_staged_to_different_lanes() {
     );
 
     // Ids describe the current state, so the second hunk must be resolved *after* the
-    // first move — staging one renumbers whatever is left.
-    let first = view.entries[0].rub_id.clone().expect("stageable");
-    but.rub(&first, "top").expect("stage first hunk");
+    // first commit — committing one renumbers whatever is left. Both branches start with no
+    // commits, so each hunk becomes that branch's first commit.
+    let first = view.entries[0].rub_id.clone().expect("committable");
+    but.commit(&[first], "Top half", "top").expect("commit first hunk");
 
     let out = but.diff_uncommitted().expect("diff again");
     let view = kanstack::diff::DiffView::from_output("a.txt", &out);
@@ -974,21 +990,24 @@ fn hunks_of_one_file_can_be_staged_to_different_lanes() {
         .entries
         .iter()
         .find_map(|e| e.rub_id.clone())
-        .expect("the other hunk is still unassigned");
-    let board = Board::from_status(&but.rub(&remaining, "bottom").expect("stage second hunk"));
+        .expect("the other hunk is still uncommitted");
+    let board = Board::from_status(
+        &but.commit(&[remaining], "Bottom half", "bottom")
+            .expect("commit second hunk"),
+    );
 
-    let staged_in = |name: &str| -> bool {
+    let committed_in = |name: &str| -> bool {
         board
             .columns
             .iter()
             .find(|c| c.branch_name.as_deref() == Some(name))
-            .is_some_and(|c| c.cards.iter().any(|k| k.title == "a.txt"))
+            .is_some_and(|c| c.cards.iter().any(|k| k.kind == CardKind::Commit))
     };
-    assert!(staged_in("top"), "one hunk landed in top");
-    assert!(staged_in("bottom"), "the other landed in bottom");
+    assert!(committed_in("top"), "one hunk landed in top");
+    assert!(committed_in("bottom"), "the other landed in bottom");
     assert!(
         board.columns[0].cards.is_empty(),
-        "and nothing is left unassigned"
+        "and nothing is left uncommitted"
     );
 }
 
@@ -1027,7 +1046,7 @@ fn cards_carry_real_line_counts() {
     sb.write("a.txt", "one\ntwo\nthree\n");
     sb.git(&["add", "."]);
     sb.git(&["commit", "-qm", "seed"]);
-    sb.but(&["setup", "--init", "--format", "json"]);
+    sb.but(&["setup", "--init", "--json"]);
     // One line changed, two added: +3 -1.
     sb.write("a.txt", "ONE\ntwo\nthree\nfour\nfive\n");
 
@@ -1467,8 +1486,7 @@ fn shift_arrows_page_lanes_and_skip_groups_through_the_app() {
         .unwrap()
         .cli_id
         .clone();
-    but.rub(&id, "mid-work").unwrap();
-    but.commit("mid-work", "mid work").unwrap();
+    but.commit(&[id], "mid work", "mid-work").unwrap();
 
     // A separate, unrelated lane, so paging has more than one column to jump across.
     sb.branch_with_commit("other-work", "c.txt", "other work");
@@ -1526,8 +1544,7 @@ fn landing_a_stacked_lane_lands_every_branch_base_first() {
         .unwrap()
         .cli_id
         .clone();
-    but.rub(&id, "mid-work").unwrap();
-    but.commit("mid-work", "mid work").unwrap();
+    but.commit(&[id], "mid work", "mid-work").unwrap();
     but.branch_new("tip-work", Some("mid-work")).unwrap();
     sb.write("c.txt", "tip\n");
     let status = but.status().unwrap();
@@ -1538,8 +1555,7 @@ fn landing_a_stacked_lane_lands_every_branch_base_first() {
         .unwrap()
         .cli_id
         .clone();
-    but.rub(&id, "tip-work").unwrap();
-    but.commit("tip-work", "tip work").unwrap();
+    but.commit(&[id], "tip work", "tip-work").unwrap();
 
     // Confirm the CLI really does refuse the tip directly, so this test is exercising the
     // refusal kanstack is meant to route around -- not a scenario that was never blocked.
@@ -1639,28 +1655,39 @@ fn space_selecting_several_unassigned_files_then_m_moves_them_all_at_once() {
     }
     app.on_key(KeyEvent::from(KeyCode::Enter));
 
+    // "feat" has no commits yet, so the batch has nothing to amend into — it parks for a
+    // message (`MoveOp::Commit`) instead of landing immediately.
+    assert_eq!(app.mode, Mode::Commit, "an empty lane needs a message before it can commit");
+    for c in "Two files together".chars() {
+        app.on_key(KeyEvent::from(KeyCode::Char(c)));
+    }
+    app.on_key(KeyEvent::from(KeyCode::Enter));
+
     assert_eq!(app.mode, Mode::Normal);
     assert!(app.selected.is_empty(), "selection clears once the move lands");
 
     let but = But::discover(&sb.repo()).unwrap();
     let status = but.status().unwrap();
-    let assigned: Vec<&str> = status
-        .stacks
+    let feat = status.stacks.iter().find(|s| s.branches[0].name == "feat").unwrap();
+    assert_eq!(feat.branches[0].commits.len(), 1, "both files landed in one combined commit");
+    let committed: Vec<&str> = feat.branches[0].commits[0]
+        .changes
+        .as_deref()
+        .unwrap_or(&[])
         .iter()
-        .flat_map(|s| s.assigned_changes.iter())
         .map(|c| c.file_path.as_str())
         .collect();
-    assert!(assigned.contains(&"a.txt"), "a.txt should be staged to feat: {assigned:?}");
-    assert!(assigned.contains(&"b.txt"), "b.txt should be staged to feat: {assigned:?}");
-    let still_unassigned: Vec<&str> = status
+    assert!(committed.contains(&"a.txt"), "a.txt should be in the commit: {committed:?}");
+    assert!(committed.contains(&"b.txt"), "b.txt should be in the commit: {committed:?}");
+    let still_uncommitted: Vec<&str> = status
         .uncommitted_changes
         .iter()
         .map(|c| c.file_path.as_str())
         .collect();
     assert_eq!(
-        still_unassigned,
+        still_uncommitted,
         ["keep.txt"],
-        "only the file that was never selected should remain unassigned"
+        "only the file that was never selected should remain uncommitted"
     );
 }
 
@@ -1765,7 +1792,7 @@ fn the_headerless_workspace_commit_is_still_identified() {
     // Round-trip out of and back into GitButler mode, which is what produces the
     // header-less variant.
     sb.but(&["teardown"]);
-    sb.but(&["setup", "--init", "--format", "json"]);
+    sb.but(&["setup", "--init", "--json"]);
     let header_block = sb.git(&["cat-file", "-p", "HEAD"]);
     assert!(
         !header_block.contains("gitbutler-headers-version"),
