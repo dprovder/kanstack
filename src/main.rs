@@ -145,6 +145,12 @@ fn main() -> Result<()> {
     let mut terminal = ratatui::init();
     let result = run(&mut terminal, &mut app, &mut watcher);
     ratatui::restore();
+    // After the restore, so it lands on the real screen rather than the one being torn
+    // down. The teardown recovery reports what it did this way — it exits GitButler mode,
+    // so there is no board left to show it on.
+    if let Some(note) = &app.exit_note {
+        println!("{note}");
+    }
     result
 }
 

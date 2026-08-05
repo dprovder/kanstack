@@ -1663,3 +1663,129 @@ fn space_selecting_several_unassigned_files_then_m_moves_them_all_at_once() {
         "only the file that was never selected should remain unassigned"
     );
 }
+
+/// The failure mode that has to stop the board rather than be noted and shrugged off: a
+/// plain `git commit` landing on top of the workspace commit.
+///
+/// `but` then refuses *every* command — `undo` and `oplog restore` included — so a board
+/// that merely logged the failure and carried on would be showing a repository that had
+/// since moved, with no way to ever catch up, while still accepting keys that act on it.
+#[test]
+#[ignore = "requires the GitButler CLI"]
+fn a_commit_on_the_workspace_head_blocks_the_board_until_recovered() {
+    if skip_if_no_but() {
+        return;
+    }
+    use kanstack::app::{App, Mode};
+    use kanstack::but::is_workspace_block;
+    use kanstack::cmux::Cmux;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent};
+
+    let sb = Sandbox::new("blocked");
+    sb.branch_with_commit("feat-auth", "a.txt", "Add auth middleware");
+
+    // `--no-verify` because `but setup` installs a pre-commit hook that refuses exactly
+    // this. The hook is the first line of defence; what is being tested here is what
+    // happens when something gets past it — `--no-verify`, a `core.hooksPath` override,
+    // or a project set up before the hook existed.
+    sb.write("rogue.txt", "written without asking\n");
+    sb.git(&["add", "."]);
+    sb.git(&["commit", "-q", "--no-verify", "-m", "agent commit on the virtual head"]);
+
+    let but = But::discover(&sb.repo()).unwrap();
+    let err = but.status().expect_err("`but` refuses to read a workspace in this state");
+    assert!(is_workspace_block(&err.to_string()), "should be recognised, got: {err}");
+
+    // Startup opens into the modal rather than aborting. Bailing here printed one line of
+    // prose and vanished, which reads as a crash.
+    let mut app = App::new(But::discover(&sb.repo()).unwrap(), Cmux::discover())
+        .expect("a blocked workspace still starts the app");
+    assert_eq!(app.mode, Mode::Blocked);
+
+    let block = app.blocked.clone().expect("the block is diagnosed, not just reported");
+    assert_eq!(block.stray.len(), 1, "one commit is on top: {:?}", block.stray);
+    assert!(
+        block.stray[0].subject.contains("agent commit"),
+        "the stray commit is named: {:?}",
+        block.stray
+    );
+    assert!(
+        block.workspace_sha.is_some(),
+        "the workspace commit must be identifiable, or `r` cannot be offered"
+    );
+
+    // Keys that would act on the frozen board bounce off it.
+    for code in [KeyCode::Char('m'), KeyCode::Char('c'), KeyCode::Down, KeyCode::Enter] {
+        app.on_key(KeyEvent::from(code));
+        assert_eq!(app.mode, Mode::Blocked, "{code:?} must not escape the block");
+    }
+
+    // `r` resets back onto the workspace commit and the board comes back live.
+    app.on_key(KeyEvent::from(KeyCode::Char('r')));
+    assert_eq!(app.mode, Mode::Normal, "recovery returns to a working board");
+    assert!(app.blocked.is_none());
+
+    // Nothing was discarded: the stray commit's content is uncommitted work again.
+    let status = But::discover(&sb.repo()).unwrap().status().expect("readable again");
+    let unassigned: Vec<&str> = status
+        .uncommitted_changes
+        .iter()
+        .map(|c| c.file_path.as_str())
+        .collect();
+    assert!(
+        unassigned.contains(&"rogue.txt"),
+        "the commit's content comes back as uncommitted changes: {unassigned:?}"
+    );
+    assert_eq!(
+        status.stacks.len(),
+        1,
+        "and the lane that was there before survives untouched"
+    );
+}
+
+/// The same block, but against the *other* shape of workspace commit.
+///
+/// `but setup` writes a workspace commit carrying a `gitbutler-headers-version` header;
+/// the one left behind by `but teardown` followed by `but setup` is a merge commit with no
+/// header at all. Identifying the commit by that header alone silently failed on this
+/// second kind — the modal came up saying the workspace commit could not be found and
+/// withheld the reset, leaving teardown as the only way out of a state a reset would have
+/// fixed outright.
+#[test]
+#[ignore = "requires the GitButler CLI"]
+fn the_headerless_workspace_commit_is_still_identified() {
+    if skip_if_no_but() {
+        return;
+    }
+    use kanstack::but::is_workspace_block;
+
+    let sb = Sandbox::new("blocked-headerless");
+    sb.branch_with_commit("feat-auth", "a.txt", "Add auth middleware");
+
+    // Round-trip out of and back into GitButler mode, which is what produces the
+    // header-less variant.
+    sb.but(&["teardown"]);
+    sb.but(&["setup", "--init", "--format", "json"]);
+    let header_block = sb.git(&["cat-file", "-p", "HEAD"]);
+    assert!(
+        !header_block.contains("gitbutler-headers-version"),
+        "this variant is the point of the test; if it now carries a header the fixture is \
+         no longer exercising anything:\n{header_block}"
+    );
+
+    sb.write("rogue.txt", "written without asking\n");
+    sb.git(&["add", "."]);
+    sb.git(&["commit", "-q", "--no-verify", "-m", "agent commit on the virtual head"]);
+
+    let but = But::discover(&sb.repo()).unwrap();
+    let err = but.status().expect_err("`but` refuses this state");
+    assert!(is_workspace_block(&err.to_string()), "should be recognised, got: {err}");
+
+    let block = but.diagnose_workspace_block(err.to_string());
+    assert!(
+        block.workspace_sha.is_some(),
+        "a header-less workspace commit must still be identified, or the reset that would \
+         fix this is never offered"
+    );
+    assert_eq!(block.stray.len(), 1, "one commit is on top: {:?}", block.stray);
+}

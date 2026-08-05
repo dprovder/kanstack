@@ -87,6 +87,51 @@ need `but diff <sha>` *each*, which would be ruinous per refresh — except a co
 is fixed by its hash, so those results are cached by SHA and never expire. Only hashes never
 seen before cost anything, which after the first draw is usually none of them.
 
+## A commit on the workspace head locks everything
+
+If something commits onto `gitbutler/workspace` with plain Git, the workspace commit stops
+being HEAD and `but` refuses *every* subcommand until it is fixed — `undo` and
+`oplog restore` included, so the usual escape hatches are gone with the rest. Verified
+against 0.21.2, where the refusal reads:
+
+```text
+Error: GitButler mode exit required: please run `but teardown` to preserve your work.
+```
+
+It arrives as prose on stderr with an empty stdout, not as the structured `CliError` JSON
+that `But::run` prefers, so it is recognised by text (`but::is_workspace_block`). A second
+spelling is matched too: `but-workspace`'s `ref_info` carries an older wording that
+suggests `git reset --soft` directly. Both mean the same shape.
+
+This is why `Mode::Blocked` exists rather than a notification. Every refresh from here on
+fails identically, so a board that noted the error and carried on would sit frozen at its
+last good snapshot — still navigable, still accepting mutation keys — while describing a
+repository that had moved. Stale and confident is worse than stopped and honest.
+
+`but setup` installs a `pre-commit` hook that blocks this outright, so reaching it takes
+`--no-verify`, a `core.hooksPath` override (husky and friends), or a project set up before
+the hook existed.
+
+Both recoveries the modal offers work, and neither loses anything. `git reset --soft` is the
+default because it keeps GitButler mode on, so the board comes straight back; the stray
+commits' content returns as uncommitted changes and the commits stay in the reflog.
+`but teardown` is GitButler's own recommendation and does more (snapshot, uncommit, check
+out a real branch) but exits GitButler mode, so kanstack quits after it rather than
+pretending there is still a workspace to draw. `but setup` is deliberately left to the user.
+
+### The workspace commit has two shapes
+
+Identifying the commit to reset back onto cannot use `but`, since `but` is refusing
+everything, so it is a first-parent walk over `git log`. The trap: **there is more than one
+kind of workspace commit.** The one `but setup` writes carries a `gitbutler-headers-version`
+header; the one left by `but teardown` followed by `but setup` is a merge commit with no
+header at all. Matching on the header alone silently failed on the second kind — the modal
+came up saying the workspace commit could not be identified and withheld the reset, leaving
+teardown as the only way out of a state a reset would have fixed outright.
+
+Identification therefore needs the GitButler author *plus* either the subject or the header.
+Author alone is too loose, and either confirming signal can be absent.
+
 ## Undo/redo has no success signal
 
 `but undo`/`but redo` restore the entire prior workspace state, uncommitted changes

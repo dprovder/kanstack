@@ -69,6 +69,52 @@ impl Version {
     }
 }
 
+/// Author GitButler stamps on the workspace commit it manages.
+const GITBUTLER_AUTHOR: &str = "gitbutler@gitbutler.com";
+
+/// Subject line GitButler gives that commit. Stable across the variants seen, and paired
+/// with [`GITBUTLER_AUTHOR`] rather than trusted on its own — see
+/// [`But::diagnose_workspace_block`].
+const WORKSPACE_SUBJECT: &str = "GitButler Workspace Commit";
+
+/// Recognises the one `but` failure that locks the entire workspace: something committed
+/// onto `gitbutler/workspace` with plain Git, so the workspace commit is no longer HEAD.
+///
+/// This is worth singling out because it is unlike every other error the board can hit.
+/// `but` refuses *every* subcommand in this state — including `undo` and `oplog restore`,
+/// so the usual escape hatches are gone — which means a board that merely notes the failure
+/// and carries on is showing a snapshot of a repository that has since moved, with no way
+/// to ever catch up. Stale and confident is worse than stopped and honest.
+///
+/// Matched on text because `but` reports this as prose on stderr rather than as the
+/// structured `CliError` JSON that [`But::run`] prefers. Two spellings are accepted: 0.21
+/// emits the `teardown` wording, while `but-workspace`'s `ref_info` carries an older one
+/// that suggests `git reset --soft` directly. Both describe the same broken shape.
+pub fn is_workspace_block(msg: &str) -> bool {
+    msg.contains("GitButler mode exit required")
+        || msg.contains("commit(s) on top of the workspace commit")
+}
+
+/// A commit sitting on top of the workspace commit that has no business being there.
+#[derive(Debug, Clone)]
+pub struct StrayCommit {
+    /// Abbreviated, since this is only ever shown to a human.
+    pub sha: String,
+    pub subject: String,
+}
+
+/// Everything needed to explain a blocked workspace and offer a way out of it.
+#[derive(Debug, Clone)]
+pub struct WorkspaceBlock {
+    /// What `but` said, kept verbatim — it names the recovery GitButler itself recommends.
+    pub message: String,
+    /// The workspace commit to reset back onto. `None` when it could not be identified, in
+    /// which case the reset route is withheld rather than guessed at.
+    pub workspace_sha: Option<String>,
+    /// The commits above it, newest first.
+    pub stray: Vec<StrayCommit>,
+}
+
 pub struct But {
     bin: PathBuf,
     cwd: PathBuf,
@@ -171,6 +217,117 @@ impl But {
     pub fn status(&self) -> Result<WorkspaceStatus> {
         let raw = self.run(&["status", "-f", "--format", "json"])?;
         parse_status(&raw)
+    }
+
+    /// Read-only `git`, for the one situation `but` cannot answer questions about: a
+    /// workspace so broken that every `but` subcommand refuses (see [`is_workspace_block`]).
+    /// Identifying the commit to reset back onto has to come from somewhere, and with `but`
+    /// refusing, plain Git is the only thing left that can still read the repository.
+    fn git(&self, args: &[&str]) -> Result<String> {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(&self.cwd)
+            .output()
+            .with_context(|| format!("failed to spawn `git {}`", args.join(" ")))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            bail!("`git {}` failed: {}", args.join(" "), stderr.trim());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// Works out what is sitting on top of the workspace commit, so the block can be
+    /// explained in terms of the actual commits rather than just repeating `but`'s prose.
+    ///
+    /// Walks first-parent from HEAD looking for GitButler's own workspace commit.
+    ///
+    /// Identifying it needs two agreeing signals, because neither is sound alone. The
+    /// author is necessary but not sufficient — it is the one thing every workspace commit
+    /// observed has in common, but nothing stops an ordinary commit being authored under
+    /// the same identity. Confirmation then comes from *either* the subject or the
+    /// `gitbutler-headers-version` header, because GitButler does not always write both:
+    /// a workspace commit created by `but setup` carries the header, while the one left by
+    /// `but teardown` + `but setup` is a merge commit with no header at all. Requiring the
+    /// header (the first thing tried here) silently declined to identify the second kind.
+    ///
+    /// A miss is not fatal — [`WorkspaceBlock::workspace_sha`] is then `None` and only the
+    /// teardown route gets offered, which needs no sha.
+    pub fn diagnose_workspace_block(&self, message: String) -> WorkspaceBlock {
+        let mut block = WorkspaceBlock {
+            message,
+            workspace_sha: None,
+            stray: Vec::new(),
+        };
+        // One subprocess for the whole walk. The depth bound is a backstop against a
+        // repository where no workspace commit exists at all; in practice the answer is a
+        // handful of commits down at most.
+        let Ok(log) = self.git(&[
+            "log",
+            "--first-parent",
+            "-n",
+            "50",
+            "--format=%H%x1f%ae%x1f%s",
+            "HEAD",
+        ]) else {
+            return block;
+        };
+        let mut stray = Vec::new();
+        for line in log.lines() {
+            let mut fields = line.split('\x1f');
+            let (Some(sha), Some(email), Some(subject)) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                continue;
+            };
+            if email == GITBUTLER_AUTHOR
+                && (subject.starts_with(WORKSPACE_SUBJECT) || self.has_managed_header(sha))
+            {
+                block.workspace_sha = Some(sha.to_string());
+                block.stray = stray;
+                return block;
+            }
+            stray.push(StrayCommit {
+                sha: sha.chars().take(7).collect(),
+                subject: subject.to_string(),
+            });
+        }
+        // Falling out of the loop means no workspace commit was found within the bound, so
+        // `stray` is just the last N commits of an ordinary history rather than a list of
+        // anything wrong. Deliberately not reported: naming innocent commits as strays,
+        // next to an offer to reset past them, would be worse than saying nothing.
+        block
+    }
+
+    /// Whether a commit carries GitButler's own header block. Present on workspace commits
+    /// written by `but setup`, absent on the merge commit `but teardown` leaves behind —
+    /// hence a confirming signal rather than a required one. Headers sit above the blank
+    /// line separating them from the message, so only that leading run is examined.
+    fn has_managed_header(&self, sha: &str) -> bool {
+        self.git(&["cat-file", "-p", sha]).is_ok_and(|body| {
+            body.lines()
+                .take_while(|l| !l.is_empty())
+                .any(|l| l.starts_with("gitbutler-headers-version"))
+        })
+    }
+
+    /// Moves the branch ref back to the workspace commit, leaving the index and worktree
+    /// untouched — the stray commits' content comes back as uncommitted changes, ready to
+    /// be committed properly with `but commit`.
+    ///
+    /// Deliberately `--soft`: nothing is discarded, and the stray commits stay in the
+    /// reflog, so this is recoverable even if it turns out to be the wrong call.
+    pub fn reset_soft(&self, sha: &str) -> Result<()> {
+        self.git(&["reset", "--soft", sha])?;
+        Ok(())
+    }
+
+    /// Runs `but teardown`: GitButler's own recommended escape, which snapshots first,
+    /// uncommits the stray commits keeping their changes, and checks out a real branch.
+    ///
+    /// Output is captured rather than inherited, so this cannot scribble over the board
+    /// while the alternate screen is still up.
+    pub fn teardown(&self) -> Result<String> {
+        self.run(&["teardown"])
     }
 
     /// Runs `but rub SOURCE TARGET`, the CLI's combine primitive, and returns the
@@ -444,6 +601,34 @@ pub fn parse_status(raw: &str) -> Result<WorkspaceStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both spellings matter: 0.21 emits the `teardown` wording, while `but-workspace`'s
+    /// `ref_info` carries an older one that suggests `git reset --soft` directly. Missing
+    /// either would leave the board silently frozen instead of stopping.
+    #[test]
+    fn recognises_both_spellings_of_a_blocked_workspace() {
+        assert!(is_workspace_block(
+            "`but status -f --format json` failed: Error: GitButler mode exit required: \
+             please run `but teardown` to preserve your work."
+        ));
+        assert!(is_workspace_block(
+            "Found 2 commit(s) on top of the workspace commit.\n\n    git reset --soft abc123"
+        ));
+    }
+
+    /// Ordinary failures must stay ordinary failures. Escalating one of these to a modal
+    /// that offers to rewrite history would be its own bug.
+    #[test]
+    fn leaves_ordinary_failures_alone() {
+        for msg in [
+            "`but land` failed: Configured target branch has no push remote",
+            "could not run `but`. Install the GitButler CLI",
+            "rub succeeded but the workspace refresh failed: no such commit",
+            "`but commit` failed: changes depend on another branch",
+        ] {
+            assert!(!is_workspace_block(msg), "{msg:?} is not a workspace block");
+        }
+    }
 
     #[test]
     fn parses_version_strings() {

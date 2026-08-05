@@ -211,6 +211,20 @@ pub struct Board {
     pub conflicted_files: Vec<String>,
 }
 
+impl Board {
+    /// A board with nothing on it, for the one state that has no readable workspace behind
+    /// it: see `Mode::Blocked`. Deliberately empty rather than absent, so every renderer and
+    /// navigation path keeps working on a real `Board` instead of growing an `Option`.
+    pub fn empty() -> Board {
+        Board {
+            columns: Vec::new(),
+            base_short_id: String::new(),
+            behind: 0,
+            conflicted_files: Vec::new(),
+        }
+    }
+}
+
 /// Sums added/removed per file path. `but diff` emits one entry per hunk, so a file with
 /// several hunks appears several times and its counts accumulate.
 pub fn stats_by_path(diff: &DiffOutput) -> HashMap<String, (usize, usize)> {

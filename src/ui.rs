@@ -87,6 +87,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Mode::Landing => draw_landing(f, app, f.area()),
         Mode::DeleteConfirm => draw_delete_confirm(f, app, f.area()),
         Mode::RebaseConfirm => draw_rebase_confirm(f, app, f.area()),
+        Mode::Blocked => draw_blocked(f, app, f.area()),
         // The board keeps its half unless the diff is expanded, so reading a diff does not
         // cost you your place — the same split gitui uses, and for the same reason.
         Mode::Diff => {}
@@ -201,6 +202,119 @@ fn draw_diff(f: &mut Frame, app: &App, area: Rect) {
         0
     };
     f.render_widget(Paragraph::new(lines).scroll((scroll, 0)), chunks[1]);
+}
+
+/// The workspace is blocked and the board behind this cannot be trusted.
+///
+/// This one is not a confirm dialog with a cancel: there is nothing to go back to, so the
+/// options are the two recoveries and quitting. Both recoveries are spelled out as the
+/// commands they actually run, because a modal that rewrites history should be readable as
+/// exactly what a person would have typed themselves.
+fn draw_blocked(f: &mut Frame, app: &App, area: Rect) {
+    let Some(b) = &app.blocked else {
+        return;
+    };
+
+    let mut body = vec![
+        Line::styled("  workspace blocked", theme::tone(Tone::Bad)),
+        Line::raw(""),
+    ];
+    // `but`'s own words, wrapped rather than truncated. It names the recovery GitButler
+    // recommends, and paraphrasing it would only put a layer between the user and the
+    // thing they can search for.
+    for line in b.message.lines().filter(|l| !l.trim().is_empty()) {
+        for part in wrap(line.trim(), 68) {
+            body.push(Line::styled(format!("  {part}"), theme::muted()));
+        }
+    }
+
+    if !b.stray.is_empty() {
+        body.push(Line::raw(""));
+        body.push(Line::styled(
+            format!(
+                "  {} commit{} on top of the workspace commit",
+                b.stray.len(),
+                if b.stray.len() == 1 { "" } else { "s" }
+            ),
+            theme::title(true),
+        ));
+        for c in b.stray.iter().take(4) {
+            body.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(format!("{:<9}", c.sha), theme::faint()),
+                Span::styled(truncate(&c.subject, 52), theme::muted()),
+            ]));
+        }
+        if b.stray.len() > 4 {
+            body.push(Line::styled(
+                format!("    … and {} more", b.stray.len() - 4),
+                theme::faint(),
+            ));
+        }
+    }
+
+    body.push(Line::raw(""));
+    body.push(Line::styled("  the board above is frozen", theme::faint()));
+    body.push(Line::styled(
+        "  every `but` command refuses until this is fixed, undo included",
+        theme::faint(),
+    ));
+    body.push(Line::raw(""));
+
+    match &b.workspace_sha {
+        Some(sha) => {
+            body.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("r", theme::tone(Tone::Accent)),
+                Span::styled("  put the commits back as uncommitted changes", theme::title(true)),
+            ]));
+            body.push(Line::styled(
+                format!("     git reset --soft {}", &sha[..sha.len().min(12)]),
+                theme::faint(),
+            ));
+            body.push(Line::styled(
+                "     nothing is lost, and the board comes back",
+                theme::faint(),
+            ));
+        }
+        // Withheld rather than guessed: resetting onto the wrong commit is the one way
+        // this modal could do real damage.
+        None => body.push(Line::styled(
+            "  the workspace commit could not be identified, so reset is not offered",
+            theme::tone(Tone::Bad),
+        )),
+    }
+    body.push(Line::raw(""));
+    body.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("t", theme::tone(Tone::Accent)),
+        Span::styled("  leave GitButler mode and quit", theme::title(true)),
+    ]));
+    body.push(Line::styled("     but teardown", theme::faint()));
+    body.push(Line::styled(
+        "     snapshots first, then checks out a real branch",
+        theme::faint(),
+    ));
+    body.push(Line::raw(""));
+    body.push(Line::styled("  q  quit and change nothing", theme::faint()));
+
+    let w = 74.min(area.width.saturating_sub(4));
+    let h = (body.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, popup);
+    f.render_widget(
+        Paragraph::new(body).block(
+            Block::bordered()
+                .border_style(theme::tone(Tone::Bad))
+                .style(theme::selected_bg()),
+        ),
+        popup,
+    );
 }
 
 /// What rebasing onto the updated target would do, per lane.
@@ -684,7 +798,14 @@ fn draw_board(f: &mut Frame, app: &App, area: Rect) {
     if app.board.columns.is_empty() {
         f.render_widget(
             Paragraph::new(Line::styled(
-                "  no applied branches — create one with `but branch new <name>`",
+                // A blocked workspace also has no columns, but it is empty because nothing
+                // could be read — not because there is nothing there. Suggesting a command
+                // that `but` is currently refusing would be advice that cannot be followed.
+                if app.mode == Mode::Blocked {
+                    ""
+                } else {
+                    "  no applied branches — create one with `but branch new <name>`"
+                },
                 theme::faint(),
             )),
             area,
@@ -1171,7 +1292,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             );
         }
         Mode::PushConfirm | Mode::LandConfirm | Mode::DeleteConfirm | Mode::RebaseConfirm
-        | Mode::Landing => "",
+        | Mode::Landing | Mode::Blocked => "",
         Mode::Diff => {
             let stageable = app
                 .diff

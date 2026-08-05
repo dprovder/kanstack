@@ -72,6 +72,11 @@ pub enum Mode {
     /// Reading a diff, hunk by hunk.
     Diff,
     Help,
+    /// The workspace is broken in the one way that stops `but` answering anything at all
+    /// (see [`crate::but::is_workspace_block`]). Every key is swallowed except the two
+    /// recoveries and quit — the board behind this is a snapshot of a repository that has
+    /// since moved on, so acting on it would mean acting on a lie.
+    Blocked,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,6 +160,12 @@ pub struct App {
     pub move_source: Option<(String, String)>,
     pub message: Option<(String, Notice)>,
     pub should_quit: bool,
+    /// The workspace-wide block being shown, valid while `mode == Blocked`.
+    pub blocked: Option<crate::but::WorkspaceBlock>,
+    /// Printed on stdout after the terminal is restored, on the way out. Used by the
+    /// teardown recovery, whose whole point is to leave GitButler mode — there is no board
+    /// to come back to afterwards, so what it did has to survive the alternate screen.
+    pub exit_note: Option<String>,
     /// Present only under `kanstack --tutorial`. Checked after every keystroke; absent for
     /// ordinary runs, so the check costs nothing outside that mode.
     pub tutorial: Option<Tutorial>,
@@ -210,9 +221,18 @@ struct PendingCmuxPoll {
 
 impl App {
     pub fn new(but: But, cmux: Option<Cmux>) -> Result<Self> {
-        let status = but.status()?;
         let mut commit_stats = HashMap::new();
-        let board = Self::board_from(&but, &mut commit_stats, &status);
+        // A blocked workspace starts the app rather than aborting it. Bailing here printed
+        // one line of prose and vanished, which reads as a crash and leaves the user to
+        // work out the recovery themselves — the modal can explain and offer to run it.
+        let (board, blocked) = match but.status() {
+            Ok(status) => (Self::board_from(&but, &mut commit_stats, &status), None),
+            Err(e) if crate::but::is_workspace_block(&e.to_string()) => (
+                Board::empty(),
+                Some(but.diagnose_workspace_block(e.to_string())),
+            ),
+            Err(e) => return Err(e),
+        };
         let mut message = None;
         if but.is_untested_version() {
             message = Some((
@@ -231,7 +251,11 @@ impl App {
             board,
             col: 0,
             card: 0,
-            mode: Mode::Normal,
+            mode: if blocked.is_some() {
+                Mode::Blocked
+            } else {
+                Mode::Normal
+            },
             origin_col: 0,
             origin_card: 0,
             target_card: None,
@@ -251,6 +275,8 @@ impl App {
             commit_stats,
             message,
             should_quit: false,
+            blocked,
+            exit_note: None,
             tutorial: None,
             board_generation: 0,
             background_refresh: None,
@@ -291,6 +317,8 @@ impl App {
             commit_stats: HashMap::new(),
             message: None,
             should_quit: false,
+            blocked: None,
+            exit_note: None,
             tutorial: None,
             board_generation: 0,
             background_refresh: None,
@@ -405,8 +433,47 @@ impl App {
                 self.board = Self::board_from(but, &mut self.commit_stats, &s);
                 self.clamp();
             }
-            Err(e) => self.notify(format!("refresh failed: {e}"), Notice::Error),
+            Err(e) => self.note_refresh_failure(e),
         }
+    }
+
+    /// Routes a failed status read. Ordinary failures are a passing notice — the board is
+    /// still broadly true and the next refresh will probably work. The workspace-wide block
+    /// is not: nothing will work again until it is resolved, so it gets a mode of its own
+    /// rather than a message that scrolls away over a board quietly frozen in the past.
+    fn note_refresh_failure(&mut self, e: anyhow::Error) {
+        let msg = e.to_string();
+        if crate::but::is_workspace_block(&msg) {
+            self.enter_blocked(msg);
+        } else {
+            self.notify(format!("refresh failed: {msg}"), Notice::Error);
+        }
+    }
+
+    /// Stops the board and explains itself. Idempotent, because every refresh from here on
+    /// will keep failing the same way until the user acts.
+    fn enter_blocked(&mut self, message: String) {
+        if self.mode == Mode::Blocked {
+            return;
+        }
+        self.blocked = Some(match &self.but {
+            Some(but) => but.diagnose_workspace_block(message),
+            None => crate::but::WorkspaceBlock {
+                message,
+                workspace_sha: None,
+                stray: Vec::new(),
+            },
+        });
+        self.mode = Mode::Blocked;
+        // Drop anything half-finished. All of it targets a board that no longer describes
+        // the repository, so resuming it after a recovery would be acting on stale ids.
+        self.message = None;
+        self.diff = None;
+        self.push_preview = None;
+        self.land_check = None;
+        self.pull_preview = None;
+        self.move_source = None;
+        self.selected.clear();
     }
 
     /// Refresh driven by the filesystem watcher rather than by the user.
@@ -422,7 +489,7 @@ impl App {
                 self.board = Self::board_from(but, &mut self.commit_stats, &s);
                 self.clamp();
             }
-            Err(e) => self.notify(format!("refresh failed: {e}"), Notice::Error),
+            Err(e) => self.note_refresh_failure(e),
         }
     }
 
@@ -486,8 +553,67 @@ impl App {
             }
             Ok(Err(e)) => {
                 self.background_refresh = None;
-                self.notify(format!("refresh failed: {e}"), Notice::Error);
+                self.note_refresh_failure(e);
             }
+        }
+    }
+
+    /// Moves the branch ref back onto the workspace commit and picks the board back up.
+    ///
+    /// The surgical route, and the default one: it keeps GitButler mode on, so the board
+    /// comes straight back, and it discards nothing — the stray commits' changes return as
+    /// uncommitted work, ready to be committed properly, and the commits themselves stay in
+    /// the reflog.
+    fn recover_reset(&mut self) {
+        let Some(sha) = self.blocked.as_ref().and_then(|b| b.workspace_sha.clone()) else {
+            self.notify(
+                "could not identify the workspace commit here — use teardown instead",
+                Notice::Error,
+            );
+            return;
+        };
+        let Some(but) = self.but.clone() else { return };
+        if let Err(e) = but.reset_soft(&sha) {
+            self.notify(format!("reset failed: {e}"), Notice::Error);
+            return;
+        }
+        let strays = self.blocked.as_ref().map(|b| b.stray.len()).unwrap_or(0);
+        self.blocked = None;
+        self.mode = Mode::Normal;
+        // Straight back through the ordinary path, which re-enters `Blocked` by itself if
+        // the reset somehow did not take — better than assuming it worked.
+        self.refresh();
+        if self.mode == Mode::Normal {
+            self.notify(
+                format!(
+                    "workspace restored — {strays} commit{} back as uncommitted changes",
+                    if strays == 1 { "" } else { "s" }
+                ),
+                Notice::Success,
+            );
+        }
+    }
+
+    /// Runs `but teardown` and leaves.
+    ///
+    /// Quitting is not incidental here: teardown's whole purpose is to exit GitButler mode
+    /// and check out an ordinary branch, so there is deliberately no workspace left for the
+    /// board to draw afterwards. `but setup` is left to the user rather than chained on
+    /// automatically — re-entering GitButler mode is a second decision, and hiding it
+    /// behind the same keypress would be doing more than was asked.
+    fn recover_teardown(&mut self) {
+        let Some(but) = self.but.clone() else { return };
+        match but.teardown() {
+            Ok(out) => {
+                self.exit_note = Some(format!(
+                    "{}\n\
+                     GitButler mode is off, so there is no board to draw. To come back:\n\
+                     \n    but setup && kanstack\n",
+                    out.trim_end()
+                ));
+                self.should_quit = true;
+            }
+            Err(e) => self.notify(format!("teardown failed: {e}"), Notice::Error),
         }
     }
 
@@ -1651,6 +1777,21 @@ impl App {
         use ratatui::crossterm::event::KeyCode as K;
         use ratatui::crossterm::event::KeyModifiers;
 
+        // Checked before everything else, including the other modals: while the workspace
+        // is blocked there is no navigation, no editing and no cancelling back to a board
+        // worth trusting. Only the two recoveries and the way out. Neither runs on its own
+        // — both rewrite history, and a modal that acted before it was read would be a
+        // worse failure than the one it exists to report.
+        if self.mode == Mode::Blocked {
+            match key.code {
+                K::Char('r') => self.recover_reset(),
+                K::Char('t') => self.recover_teardown(),
+                K::Char('q') | K::Esc => self.should_quit = true,
+                _ => {}
+            }
+            return;
+        }
+
         // Typing a commit message swallows ordinary keys, so navigation bindings do not
         // eat the letters being typed.
         if self.mode == Mode::Commit {
@@ -2170,6 +2311,75 @@ mod tests {
 
     fn key(code: ratatui::crossterm::event::KeyCode) -> ratatui::crossterm::event::KeyEvent {
         ratatui::crossterm::event::KeyEvent::from(code)
+    }
+
+    /// Puts an app into the blocked state without needing a broken repository behind it.
+    fn blocked_app() -> App {
+        let mut app = App::from_board(board());
+        app.blocked = Some(crate::but::WorkspaceBlock {
+            message: "Error: GitButler mode exit required: please run `but teardown`".into(),
+            workspace_sha: Some("f6b543ef29e7a069c1b85c8039ac90d6c1130f8c".into()),
+            stray: vec![crate::but::StrayCommit {
+                sha: "ec92a93".into(),
+                subject: "agent commit on the virtual head".into(),
+            }],
+        });
+        app.mode = Mode::Blocked;
+        app
+    }
+
+    /// The whole point of the mode. Every key that would navigate, mutate or dismiss has to
+    /// bounce, because the board underneath describes a repository that has moved on.
+    #[test]
+    fn blocked_swallows_navigation_and_mutation_keys() {
+        use ratatui::crossterm::event::KeyCode as K;
+        let mut app = blocked_app();
+        app.col = 0;
+        app.card = 0;
+
+        for k in [
+            K::Down,
+            K::Char('j'),
+            K::Right,
+            K::Char('m'),
+            K::Char('c'),
+            K::Char('b'),
+            K::Char('d'),
+            K::Char('p'),
+            K::Char('z'),
+            K::Char(' '),
+            K::Enter,
+            K::Char('?'),
+        ] {
+            app.on_key(key(k));
+            assert_eq!(app.mode, Mode::Blocked, "{k:?} must not leave the blocked mode");
+        }
+        assert_eq!((app.col, app.card), (0, 0), "the cursor must not have moved");
+        assert!(app.selected.is_empty(), "nothing can be selected while blocked");
+        assert!(!app.should_quit, "none of those keys mean quit");
+    }
+
+    /// Esc means "cancel, go back" everywhere else, but there is nothing to go back to
+    /// here — so it leaves, and it leaves without touching the repository.
+    #[test]
+    fn blocked_quit_keys_exit_without_recovering() {
+        use ratatui::crossterm::event::KeyCode as K;
+        for k in [K::Char('q'), K::Esc] {
+            let mut app = blocked_app();
+            app.on_key(key(k));
+            assert!(app.should_quit, "{k:?} quits");
+            assert!(app.exit_note.is_none(), "{k:?} changed nothing, so it reports nothing");
+        }
+    }
+
+    /// Neither recovery may fire on its own: both rewrite history, and a modal that acted
+    /// before it was read would be a worse failure than the one it exists to report.
+    #[test]
+    fn blocked_never_recovers_without_a_keypress() {
+        let app = blocked_app();
+        assert_eq!(app.mode, Mode::Blocked);
+        assert!(!app.should_quit);
+        assert!(app.exit_note.is_none());
     }
 
     #[test]
