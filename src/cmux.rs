@@ -140,7 +140,14 @@ impl Cmux {
     /// Splits off the previous lane's pane (or kanstack's own, for the first lane), types
     /// the configured harness command into the fresh terminal with `cwd` as its working
     /// directory, then labels the tab `name` (e.g. the branch name).
-    pub fn spawn_harness(&mut self, cwd: &Path, name: &str) -> Result<()> {
+    ///
+    /// `initial_message`, if given, is appended to that same command line as a quoted
+    /// argument (e.g. `claude "fix the flaky login test"`) rather than sent as a second
+    /// `cmux send` afterwards — the harness needs a moment to start before it can receive
+    /// typed input, same problem `confirm_task_dispatch` works around by asking for a
+    /// second `t` press, and there's no "wait until ready" primitive to lean on here
+    /// either. Folding it into the launch line sidesteps the race instead of racing it.
+    pub fn spawn_harness(&mut self, cwd: &Path, name: &str, initial_message: Option<&str>) -> Result<()> {
         let (direction, anchor) = match &self.last_anchor {
             Some(anchor) => (self.chain_direction.clone(), Some(anchor.clone())),
             None => match self.occupant_in_direction(&self.direction) {
@@ -164,11 +171,16 @@ impl Cmux {
             .with_context(|| format!("`cmux new-split` did not report a surface: {split_out:?}"))?
             .to_string();
 
-        let launch = format!(
-            "cd {} && {}\n",
+        let mut launch = format!(
+            "cd {} && {}",
             shell_quote(&cwd.to_string_lossy()),
             self.harness
         );
+        if let Some(message) = initial_message {
+            launch.push(' ');
+            launch.push_str(&shell_quote(message));
+        }
+        launch.push('\n');
         self.run(&["send", "--surface", &surface_ref, &launch])?;
 
         self.run(&["rename-tab", "--surface", &surface_ref, name])?;

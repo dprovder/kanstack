@@ -66,6 +66,12 @@ pub enum Mode {
     Branch,
     /// Typing a task description to send into the selected lane's cmux pane.
     Task,
+    /// Typing an initial message to seed a harness pane that was just opened for a
+    /// branch created moments ago, in `b`'s create-parallel-lane flow. Distinct from
+    /// `Task`: that one targets an already-running pane, while this one folds the
+    /// message into the harness's own launch command — see
+    /// [`crate::cmux::Cmux::spawn_harness`].
+    HarnessMessage,
     /// A whole lane has been picked up, looking for a lane to stack onto.
     Restacking,
     /// Looking at what a push would do, before doing it.
@@ -149,6 +155,13 @@ pub struct App {
     /// in `begin_task_dispatch` rather than re-derived in `confirm_task_dispatch`, so it
     /// can't drift if the board reshuffles while the user is typing.
     task_target: Option<String>,
+    /// Initial message being typed to seed a just-opened harness pane, valid while
+    /// `mode == HarnessMessage`.
+    pub harness_message_input: TextInput,
+    /// Name of the branch a pending harness pane belongs to, valid while
+    /// `mode == HarnessMessage`. Set by `confirm_branch` right after creating a parallel
+    /// lane that wants a harness, consumed by `confirm_harness_message`.
+    harness_pane_target: Option<String>,
     /// While naming a branch: `Some(branch)` stacks the new one on top of it, `None` makes
     /// a parallel lane. Seeded from the selected lane and toggled with tab.
     pub stack_onto: Option<String>,
@@ -340,6 +353,8 @@ impl App {
             branch_input: TextInput::default(),
             task_input: TextInput::default(),
             task_target: None,
+            harness_message_input: TextInput::default(),
+            harness_pane_target: None,
             stack_onto: None,
             open_harness: true,
             push_preview: None,
@@ -385,6 +400,8 @@ impl App {
             branch_input: TextInput::default(),
             task_input: TextInput::default(),
             task_target: None,
+            harness_message_input: TextInput::default(),
+            harness_pane_target: None,
             stack_onto: None,
             open_harness: true,
             push_preview: None,
@@ -1345,7 +1362,6 @@ impl App {
             self.notify("snapshot is read-only", Notice::Info);
             return;
         };
-        let cwd = but.cwd().to_path_buf();
         match but.branch_new(&name, anchor.as_deref()) {
             Ok(status) => {
                 self.board = Self::board_from(but, &mut self.commit_stats, &status);
@@ -1369,18 +1385,51 @@ impl App {
                 }
                 // A stacked lane shares its base's tab; only a parallel lane is new work
                 // worth a harness of its own, and only when that wasn't opted out of with
-                // shift-tab.
-                if anchor.is_none() && self.open_harness {
-                    if let Some(cmux) = &mut self.cmux {
-                        if let Err(e) = cmux.spawn_harness(&cwd, &name) {
-                            self.notify(format!("cmux: {e}"), Notice::Error);
-                        }
-                    }
+                // shift-tab. Rather than spawning it here with nothing to say, hand off to
+                // a second prompt for an optional initial message — see
+                // `confirm_harness_message`.
+                if anchor.is_none() && self.open_harness && self.cmux.is_some() {
+                    self.harness_pane_target = Some(name.clone());
+                    self.harness_message_input.clear();
+                    self.mode = Mode::HarnessMessage;
+                    // `draw_footer` shows `self.message` in place of the mode's own input
+                    // line whenever one is set, and nothing clears it while sitting in
+                    // HarnessMessage (that only happens in the shared key-dispatch path,
+                    // which this mode's block returns before reaching) — so the "created
+                    // {name}" notice above would otherwise sit over the prompt forever,
+                    // making it look like there's nowhere to type.
+                    self.message = None;
                 }
             }
             Err(e) => self.notify(format!("{e}"), Notice::Error),
         }
         self.branch_input.clear();
+    }
+
+    /// Finishes the harness-message prompt `confirm_branch` starts right after opening a
+    /// parallel lane: spawns the harness, folding in `text` as its initial message when
+    /// non-empty. Also reached from `Esc` in `Mode::HarnessMessage` (with the input
+    /// cleared first) — by that point the branch already exists, so `Esc` only skips the
+    /// message, not the harness itself; opting out of the harness entirely is what
+    /// shift-tab during naming is for.
+    fn confirm_harness_message(&mut self) {
+        let text = self.harness_message_input.trimmed();
+        self.mode = Mode::Normal;
+        let Some(name) = self.harness_pane_target.take() else {
+            return;
+        };
+        self.harness_message_input.clear();
+        let Some(but) = &self.but else {
+            self.notify("snapshot is read-only", Notice::Info);
+            return;
+        };
+        let cwd = but.cwd().to_path_buf();
+        let Some(cmux) = &mut self.cmux else { return };
+        let message = if text.is_empty() { None } else { Some(text.as_str()) };
+        match cmux.spawn_harness(&cwd, &name, message) {
+            Ok(()) => self.notify(format!("opened a harness pane for {name}"), Notice::Success),
+            Err(e) => self.notify(format!("cmux: {e}"), Notice::Error),
+        }
     }
 
     /// The branch name identifying lane `col`'s cmux pane: whichever section already has
@@ -1439,7 +1488,7 @@ impl App {
             };
             let cwd = but.cwd().to_path_buf();
             let Some(cmux) = &mut self.cmux else { return };
-            match cmux.spawn_harness(&cwd, &branch) {
+            match cmux.spawn_harness(&cwd, &branch, None) {
                 Ok(()) => self.notify(
                     format!("opened a pane for {branch} — press t again once it's ready for the task"),
                     Notice::Info,
@@ -2254,6 +2303,27 @@ impl App {
                 K::Home => self.task_input.move_home(),
                 K::End => self.task_input.move_end(),
                 K::Char(c) => self.task_input.insert(c),
+                _ => {}
+            }
+            return;
+        }
+
+        if self.mode == Mode::HarnessMessage {
+            match key.code {
+                // Esc skips the message, not the harness itself — the branch (and the
+                // decision to open a pane for it) is already committed by this point.
+                K::Esc => {
+                    self.harness_message_input.clear();
+                    self.confirm_harness_message();
+                }
+                K::Enter => self.confirm_harness_message(),
+                K::Backspace => self.harness_message_input.backspace(),
+                K::Delete => self.harness_message_input.delete_forward(),
+                K::Left => self.harness_message_input.move_left(),
+                K::Right => self.harness_message_input.move_right(),
+                K::Home => self.harness_message_input.move_home(),
+                K::End => self.harness_message_input.move_end(),
+                K::Char(c) => self.harness_message_input.insert(c),
                 _ => {}
             }
             return;

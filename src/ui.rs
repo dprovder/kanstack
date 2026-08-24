@@ -1461,13 +1461,17 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             // The typed message with a block cursor between its two halves — not always
             // after the whole string — so the footer doubles as a real, editable input.
             let (before, after) = app.commit_input.split_at_cursor();
+            let prefix = "  message  ";
+            let hint = "   ⏎ commit · esc cancel";
+            let budget = footer_input_budget(area.width, prefix.chars().count(), hint.chars().count());
+            let (before, after) = scroll_input(before, after, budget);
             return f.render_widget(
                 Paragraph::new(Line::from(vec![
-                    Span::styled("  message  ", theme::faint()),
-                    Span::styled(before.to_string(), theme::title(true)),
+                    Span::styled(prefix, theme::faint()),
+                    Span::styled(before, theme::title(true)),
                     Span::styled("█", theme::tone(crate::board::Tone::Accent)),
-                    Span::styled(after.to_string(), theme::title(true)),
-                    Span::styled("   ⏎ commit · esc cancel", theme::faint()),
+                    Span::styled(after, theme::title(true)),
+                    Span::styled(hint, theme::faint()),
                 ])),
                 area,
             );
@@ -1476,38 +1480,59 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             // The pending action is named here for the same reason move mode names its
             // verb: stacking and adding a parallel lane are different things.
             let (before, after) = app.branch_input.split_at_cursor();
+            let prefix = "  branch  ";
+            let pending = app.pending_branch_action();
+            let hint = if app.cmux_available() {
+                "   ⏎ create · tab switch · shift-tab cmux · esc cancel"
+            } else {
+                "   ⏎ create · tab switch · esc cancel"
+            };
+            let suffix_len = 3 + pending.chars().count() + hint.chars().count();
+            let budget = footer_input_budget(area.width, prefix.chars().count(), suffix_len);
+            let (before, after) = scroll_input(before, after, budget);
             return f.render_widget(
                 Paragraph::new(Line::from(vec![
-                    Span::styled("  branch  ", theme::faint()),
-                    Span::styled(before.to_string(), theme::title(true)),
+                    Span::styled(prefix, theme::faint()),
+                    Span::styled(before, theme::title(true)),
                     Span::styled("█", theme::tone(crate::board::Tone::Accent)),
-                    Span::styled(after.to_string(), theme::title(true)),
+                    Span::styled(after, theme::title(true)),
                     Span::styled("   ", theme::faint()),
-                    Span::styled(
-                        app.pending_branch_action(),
-                        theme::tone(crate::board::Tone::Accent),
-                    ),
-                    Span::styled(
-                        if app.cmux_available() {
-                            "   ⏎ create · tab switch · shift-tab cmux · esc cancel"
-                        } else {
-                            "   ⏎ create · tab switch · esc cancel"
-                        },
-                        theme::faint(),
-                    ),
+                    Span::styled(pending, theme::tone(crate::board::Tone::Accent)),
+                    Span::styled(hint, theme::faint()),
                 ])),
                 area,
             );
         }
         Mode::Task => {
             let (before, after) = app.task_input.split_at_cursor();
+            let prefix = "  task  ";
+            let hint = "   ⏎ send · esc cancel";
+            let budget = footer_input_budget(area.width, prefix.chars().count(), hint.chars().count());
+            let (before, after) = scroll_input(before, after, budget);
             return f.render_widget(
                 Paragraph::new(Line::from(vec![
-                    Span::styled("  task  ", theme::faint()),
-                    Span::styled(before.to_string(), theme::title(true)),
+                    Span::styled(prefix, theme::faint()),
+                    Span::styled(before, theme::title(true)),
                     Span::styled("█", theme::tone(crate::board::Tone::Accent)),
-                    Span::styled(after.to_string(), theme::title(true)),
-                    Span::styled("   ⏎ send · esc cancel", theme::faint()),
+                    Span::styled(after, theme::title(true)),
+                    Span::styled(hint, theme::faint()),
+                ])),
+                area,
+            );
+        }
+        Mode::HarnessMessage => {
+            let (before, after) = app.harness_message_input.split_at_cursor();
+            let prefix = "  initial message  ";
+            let hint = "   ⏎ open harness · esc skip";
+            let budget = footer_input_budget(area.width, prefix.chars().count(), hint.chars().count());
+            let (before, after) = scroll_input(before, after, budget);
+            return f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(prefix, theme::faint()),
+                    Span::styled(before, theme::title(true)),
+                    Span::styled("█", theme::tone(crate::board::Tone::Accent)),
+                    Span::styled(after, theme::title(true)),
+                    Span::styled(hint, theme::faint()),
                 ])),
                 area,
             );
@@ -1577,6 +1602,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         help_row("⏎", "open the diff beside the board — ← goes back"),
         help_row("c", "commit the staged files in this lane"),
         help_row("b", "new branch — stacks on this lane, tab for parallel"),
+        help_row("  then ⏎", "a parallel lane with cmux enabled asks for an initial message"),
         help_row("t", "send a task to this lane's cmux pane — spawns one first if not open"),
         help_row("s", "stack this whole lane onto another — rewrites history"),
         help_row("p", "push this lane — shows what it will do first"),
@@ -1684,6 +1710,62 @@ fn wrap(s: &str, width: usize) -> Vec<String> {
     out
 }
 
+/// How many character cells a footer text input can use for its typed content: the
+/// area's width minus whatever fixed text flanks it (a label before, hints/status after)
+/// and one more for the cursor glyph itself.
+fn footer_input_budget(area_width: u16, prefix_chars: usize, suffix_chars: usize) -> usize {
+    (area_width as usize)
+        .saturating_sub(prefix_chars)
+        .saturating_sub(suffix_chars)
+        .saturating_sub(1)
+}
+
+/// Slides the cursor-split halves of a footer text input so the cursor stays visible
+/// within `budget` character cells.
+///
+/// The footer is a single fixed-height line (`Constraint::Length(1)`) that `Paragraph`
+/// never wraps, so once a `Commit`/`Branch`/`Task`/`HarnessMessage` input grew past the
+/// terminal's width, everything from that point on — including the cursor itself — used
+/// to run off the right edge and simply not be drawn, with no indication anything was
+/// being typed at all. This keeps a `budget`-wide window centred on the cursor instead,
+/// eliding whichever side(s) don't fit with `…`, the same signal `truncate` uses for card
+/// text — with one side handing its unused share to the other (typically `after`, which
+/// is empty while typing forward, so `before` gets the whole window rather than half of
+/// it going to waste).
+fn scroll_input(before: &str, after: &str, budget: usize) -> (String, String) {
+    if budget == 0 {
+        return (String::new(), String::new());
+    }
+    let before_len = before.chars().count();
+    let after_len = after.chars().count();
+    if before_len + after_len <= budget {
+        return (before.to_string(), after.to_string());
+    }
+
+    let after_cells = after_len.min(budget / 2);
+    let before_cells = before_len.min(budget - after_cells);
+    let after_cells = after_len.min(budget - before_cells);
+
+    let before_elided = before_cells < before_len;
+    let after_elided = after_cells < after_len;
+    // The ellipsis itself takes one of that side's own cells, so the total still fits.
+    let before_take = before_cells.saturating_sub(before_elided as usize);
+    let after_take = after_cells.saturating_sub(after_elided as usize);
+
+    let mut before_show = String::new();
+    if before_elided {
+        before_show.push('…');
+    }
+    before_show.extend(before.chars().skip(before_len - before_take));
+
+    let mut after_show: String = after.chars().take(after_take).collect();
+    if after_elided {
+        after_show.push('…');
+    }
+
+    (before_show, after_show)
+}
+
 fn truncate(s: &str, width: usize) -> String {
     if s.chars().count() <= width {
         return s.to_string();
@@ -1697,6 +1779,34 @@ fn truncate(s: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scroll_input_shows_everything_when_it_already_fits() {
+        assert_eq!(scroll_input("hello ", "world", 20), ("hello ".into(), "world".into()));
+    }
+
+    /// Typing forward with nothing after the cursor should use the whole window on
+    /// `before`, not split it evenly with an empty `after`.
+    #[test]
+    fn scroll_input_gives_an_empty_side_its_share_back() {
+        let (before, after) = scroll_input("a very long line of typed text", "", 10);
+        assert_eq!(before.chars().count() + after.chars().count(), 10);
+        assert!(after.is_empty());
+        assert!(before.starts_with('…'), "the clipped side must say so: {before:?}");
+        assert!(before.ends_with("text"), "the cursor-adjacent tail must stay visible: {before:?}");
+    }
+
+    /// Content on both sides of the cursor gets clipped independently, each marked with
+    /// its own ellipsis, and the cursor's own position (the boundary) is always shown.
+    #[test]
+    fn scroll_input_elides_both_sides_when_both_overflow() {
+        let (before, after) = scroll_input("nine chars", "ten chars!", 8);
+        assert_eq!(before.chars().count() + after.chars().count(), 8);
+        assert!(before.starts_with('…'));
+        assert!(before.ends_with("ars"), "got {before:?}");
+        assert!(after.ends_with('…'));
+        assert!(after.starts_with("ten"), "got {after:?}");
+    }
 
     #[test]
     fn wraps_on_word_boundaries() {
