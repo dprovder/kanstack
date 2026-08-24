@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 
-use crate::board::{Board, Card, CardKind, ColumnKind};
+use crate::board::{Board, Card, CardKind, ColumnKind, Unapplied};
 use crate::but::But;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -44,6 +44,17 @@ pub(crate) fn columns_that_fit(n: usize, area_width: u16) -> (u16, usize) {
     (width, fit)
 }
 
+/// Wall-clock now, in epoch milliseconds, for rendering branch ages.
+///
+/// Saturates to 0 rather than panicking if the system clock is set before 1970 — a broken
+/// clock should cost an age column, not the whole drawer.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Normal,
@@ -67,6 +78,10 @@ pub enum Mode {
     Landing,
     /// Confirming a lane deletion.
     DeleteConfirm,
+    /// The unapplied-branches drawer is open beside the board, and has the keys.
+    Branches,
+    /// Confirming that a lane — and the whole stack it belongs to — leaves the workspace.
+    UnapplyConfirm,
     /// Looking at what rebasing onto the updated target would do.
     RebaseConfirm,
     /// Reading a diff, hunk by hunk.
@@ -204,6 +219,18 @@ pub struct App {
     /// Wall-clock time of the last poll kickoff, so most ticks cost one comparison and
     /// nothing else. `None` until the first poll ever starts.
     cmux_poll_at: Option<std::time::Instant>,
+    /// Branches that exist but are not in the workspace, for the drawer.
+    ///
+    /// Empty until the drawer is first opened, and refetched every time it opens or after
+    /// an apply/unapply — never on the ordinary refresh path. `but status` cannot see these
+    /// at all, so they cost a second subprocess, and one that does per-branch merge checks;
+    /// paying that on every file save to populate a panel that is usually closed would be
+    /// a poor trade. The consequence is that a branch someone creates in another terminal
+    /// shows up when the drawer is next opened rather than instantly, which is the right
+    /// side of that trade for a panel you deliberately open.
+    pub unapplied: Unapplied,
+    /// Cursor within the drawer, valid while `mode == Branches`.
+    pub branch_sel: usize,
 }
 
 type RefreshResult = Result<(Board, HashMap<String, (usize, usize)>)>;
@@ -335,6 +362,8 @@ impl App {
             selected: HashSet::new(),
             cmux_poll: None,
             cmux_poll_at: None,
+            unapplied: Unapplied::default(),
+            branch_sel: 0,
         })
     }
 
@@ -378,6 +407,8 @@ impl App {
             selected: HashSet::new(),
             cmux_poll: None,
             cmux_poll_at: None,
+            unapplied: Unapplied::default(),
+            branch_sel: 0,
         }
     }
 
@@ -1588,6 +1619,186 @@ impl App {
         }
     }
 
+    // ---- unapplied branches: the drawer, apply, and unapply ----
+
+    /// Opens the drawer, fetching the branch list, or closes it if it is already open.
+    ///
+    /// The fetch is synchronous, unlike `land`'s background thread: `but branch list`
+    /// without `--review` is local work only — a merge check and a rev walk per branch,
+    /// measured at ~40ms — so it lands well inside a frame. `--review` is what would make
+    /// this a network call, and it is deliberately not passed (see `But::branch_list`).
+    fn toggle_branch_drawer(&mut self) {
+        if self.mode == Mode::Branches {
+            self.mode = Mode::Normal;
+            return;
+        }
+        let Some(but) = &self.but else {
+            self.notify("snapshot is read-only", Notice::Info);
+            return;
+        };
+        match but.branch_list() {
+            Ok(list) => {
+                self.unapplied = Unapplied::from_list(&list, now_ms());
+                // Keep the cursor in range across a refetch that shrank the list, the same
+                // way `clamp` does for the board.
+                self.branch_sel = self
+                    .branch_sel
+                    .min(self.unapplied.branches.len().saturating_sub(1));
+                self.mode = Mode::Branches;
+                if self.unapplied.is_empty() {
+                    self.notify("every branch is already applied", Notice::Info);
+                }
+            }
+            Err(e) => self.notify(format!("could not list branches: {e}"), Notice::Error),
+        }
+    }
+
+    /// Re-reads the branch list in place, without touching the mode.
+    ///
+    /// Called after an apply or unapply, both of which move a branch from one side of the
+    /// list to the other. Failing here is a notice rather than a mode change: the mutation
+    /// itself already succeeded, so a stale drawer is a cosmetic problem, not a wrong one.
+    fn refresh_branch_list(&mut self) {
+        let Some(but) = &self.but else { return };
+        match but.branch_list() {
+            Ok(list) => {
+                self.unapplied = Unapplied::from_list(&list, now_ms());
+                self.branch_sel = self
+                    .branch_sel
+                    .min(self.unapplied.branches.len().saturating_sub(1));
+            }
+            Err(e) => self.notify(format!("could not list branches: {e}"), Notice::Error),
+        }
+    }
+
+    pub fn selected_unapplied(&self) -> Option<&crate::board::UnappliedBranch> {
+        self.unapplied.branches.get(self.branch_sel)
+    }
+
+    /// Applies the highlighted branch, bringing it in as a new lane.
+    ///
+    /// Applies even when `mergesCleanly` is false rather than refusing: a conflicted apply
+    /// is a legitimate thing to want — it is how you find out what conflicts — and `but`
+    /// leaves the result recoverable. The row says so beforehand and the notice says so
+    /// afterwards, which is the honest version of a guardrail that would otherwise just
+    /// block a supported operation.
+    fn apply_selected_branch(&mut self) {
+        let Some(branch) = self.selected_unapplied().cloned() else {
+            return;
+        };
+        let Some(but) = &self.but else {
+            self.notify("snapshot is read-only", Notice::Info);
+            return;
+        };
+        match but.apply(&branch.name) {
+            Ok(()) => {
+                let name = branch.name.clone();
+                self.refresh_quietly();
+                self.refresh_branch_list();
+                // Land the cursor on what was just applied, so the lane you asked for is
+                // the one selected when the drawer closes — otherwise applying a branch
+                // leaves you looking at whichever lane you happened to be on before.
+                if let Some(i) = self
+                    .board
+                    .columns
+                    .iter()
+                    .position(|c| c.branch_name.as_deref() == Some(name.as_str()))
+                {
+                    self.col = i;
+                    self.card = 0;
+                }
+                // Not an unconditional assignment: the refresh above can discover a
+                // workspace-wide block and switch to `Blocked`, and that must win — it
+                // means the board behind this drawer no longer describes the repository.
+                if self.mode == Mode::Branches {
+                    self.mode = Mode::Normal;
+                }
+                if branch.merges_cleanly == Some(false) {
+                    self.notify(
+                        format!("applied {name} — it reported conflicts, check the lane"),
+                        Notice::Info,
+                    );
+                } else {
+                    self.notify(format!("applied {name}"), Notice::Success);
+                }
+            }
+            Err(e) => self.notify(format!("{e}"), Notice::Error),
+        }
+    }
+
+    /// Describes what unapplying the selected lane would do: the branch to name it by, and
+    /// what leaves the workspace with it.
+    ///
+    /// The detail spells out the whole-stack behaviour because that is the one part a user
+    /// cannot see coming — `but unapply` takes the stack containing the named branch, so on
+    /// a lane of three stacked branches, pressing `U` on the tip removes all three. Naming
+    /// them is the difference between a confirmation and a surprise.
+    pub fn pending_unapply(&self) -> Option<(String, String)> {
+        let col = self.board.columns.get(self.col)?;
+        let name = col.branch_name.clone()?;
+        // A lane with no commits anywhere in it is the one case where `a` will not bring it
+        // back: `but branch list` omits empty branches, so the drawer never offers it. The
+        // branch itself survives and `but apply` still works, but promising the drawer
+        // would be a lie — and this is reachable, since `b` creates exactly such a lane.
+        let commits: usize = col.sections.iter().map(|s| s.commits).sum();
+        let detail = if commits == 0 {
+            "it has no commits, so the drawer won't list it — `but apply` still brings it back"
+                .to_string()
+        } else {
+            match col.sections.len() {
+                0 | 1 => "leaves the workspace; re-apply it any time with `a`".to_string(),
+                n => format!(
+                    "unapplies the whole stack — all {n} branches: {}",
+                    col.sections
+                        .iter()
+                        .map(|s| s.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            }
+        };
+        Some((name, detail))
+    }
+
+    fn begin_unapply(&mut self) {
+        if self.pending_unapply().is_none() {
+            self.notify("the backlog is not a branch", Notice::Info);
+            return;
+        }
+        self.mode = Mode::UnapplyConfirm;
+    }
+
+    /// Unapplies the selected lane.
+    ///
+    /// Confirmed rather than immediate, unlike `u`/send-to-backlog: this reaches into the
+    /// working directory and takes the branch's changes off disk. Nothing is destroyed —
+    /// the branch survives unapplied, which is exactly what the drawer then lists — but a
+    /// working tree emptying out without warning is alarming enough to be worth a keypress.
+    fn confirm_unapply(&mut self) {
+        let Some((name, _)) = self.pending_unapply() else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        self.mode = Mode::Normal;
+
+        let Some(but) = &self.but else {
+            self.notify("snapshot is read-only", Notice::Info);
+            return;
+        };
+        match but.unapply(&name) {
+            Ok(()) => {
+                self.refresh_quietly();
+                // Only refetch a drawer that has already been populated: an unapply from
+                // the board should not pay for a branch list nobody has asked to see.
+                if !self.unapplied.is_empty() {
+                    self.refresh_branch_list();
+                }
+                self.notify(format!("unapplied {name} — `a` brings it back"), Notice::Success);
+            }
+            Err(e) => self.notify(format!("{e}"), Notice::Error),
+        }
+    }
+
     /// Sends the selected card back to the backlog.
     ///
     /// One key for what the rub matrix treats as one operation against the `zz` target: a
@@ -2135,6 +2346,37 @@ impl App {
             return;
         }
 
+        if self.mode == Mode::UnapplyConfirm {
+            match key.code {
+                K::Enter | K::Char('y') => self.confirm_unapply(),
+                K::Esc | K::Char('n') | K::Char('q') => {
+                    self.mode = Mode::Normal;
+                    self.notify("unapply cancelled", Notice::Info);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // The drawer takes the keys while it is open, so j/k walk the branch list rather
+        // than the cards behind it. The board stays drawn and stays where it was — this is
+        // a focus change, not a screen change.
+        if self.mode == Mode::Branches {
+            let n = self.unapplied.branches.len();
+            match key.code {
+                K::Esc | K::Char('q') | K::Char('a') => self.mode = Mode::Normal,
+                K::Down | K::Char('j') if n > 0 => {
+                    self.branch_sel = (self.branch_sel + 1).min(n - 1);
+                }
+                K::Up | K::Char('k') => self.branch_sel = self.branch_sel.saturating_sub(1),
+                K::Char('g') if n > 0 => self.branch_sel = 0,
+                K::Char('G') if n > 0 => self.branch_sel = n - 1,
+                K::Enter if n > 0 => self.apply_selected_branch(),
+                _ => {}
+            }
+            return;
+        }
+
         // Help swallows everything except the keys that dismiss it.
         if self.mode == Mode::Help {
             if matches!(key.code, K::Esc | K::Char('?') | K::Char('q')) {
@@ -2247,6 +2489,8 @@ impl App {
             K::Char('s') if self.mode == Mode::Normal => self.begin_restack(),
             K::Char('u') if self.mode == Mode::Normal => self.send_to_backlog(),
             K::Char('d') if self.mode == Mode::Normal => self.begin_delete(),
+            K::Char('a') if self.mode == Mode::Normal => self.toggle_branch_drawer(),
+            K::Char('U') if self.mode == Mode::Normal => self.begin_unapply(),
             K::Char('r') if self.mode == Mode::Normal => self.begin_rebase(),
             K::Tab if self.mode == Mode::Normal => self.toggle_unassigned_grouping(),
             K::Enter if self.mode == Mode::Normal => self.open_diff(),

@@ -18,6 +18,11 @@ use crate::theme;
 /// `Tone` just to describe how it's drawn — the same reason `LaneState`'s CI-badge sibling
 /// bakes its own label/tone in `board.rs` instead of leaning on `ui.rs`, just mirrored the
 /// other way since `PaneStatus` is the newer, ui-only-facing type.
+/// How wide the unapplied-branches drawer is, when there is room for it. Branch names run
+/// long, so this is wider than the board's own minimum lane; it is halved against the board
+/// area before use so a narrow terminal never gives the drawer more room than the lanes.
+const DRAWER_WIDTH: u16 = 34;
+
 fn pane_status_label(status: PaneStatus) -> &'static str {
     match status {
         PaneStatus::Busy => "● busy",
@@ -75,6 +80,22 @@ pub fn draw(f: &mut Frame, app: &App) {
         );
     } else if app.mode == Mode::Diff {
         draw_diff(f, app, board_area);
+    } else if app.mode == Mode::Branches {
+        // Beside the board, not over it, for the same reason the diff splits rather than
+        // covers: choosing what to apply is a decision made *against* the lanes already
+        // there, so hiding them to show the list would hide half the question.
+        //
+        // On the left, where the board's own reading order starts: an unapplied branch is
+        // upstream of every lane, so it belongs before them rather than after. The lanes
+        // shift right while it is open, which is also what makes the drawer's presence
+        // obvious without needing a border to announce it.
+        let w = DRAWER_WIDTH.min(board_area.width / 2);
+        let split = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(w), Constraint::Min(0)])
+            .split(board_area);
+        draw_branches(f, app, split[0]);
+        draw_board(f, app, split[1]);
     } else {
         draw_board(f, app, board_area);
     }
@@ -86,6 +107,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Mode::LandConfirm => draw_land_confirm(f, app, f.area()),
         Mode::Landing => draw_landing(f, app, f.area()),
         Mode::DeleteConfirm => draw_delete_confirm(f, app, f.area()),
+        Mode::UnapplyConfirm => draw_unapply_confirm(f, app, f.area()),
         Mode::RebaseConfirm => draw_rebase_confirm(f, app, f.area()),
         Mode::Blocked => draw_blocked(f, app, f.area()),
         // The board keeps its half unless the diff is expanded, so reading a diff does not
@@ -1192,6 +1214,217 @@ fn render_card(
     out
 }
 
+/// The unapplied-branches drawer.
+///
+/// A list, not a column of lanes, and deliberately so: `but` will not enumerate an
+/// unapplied branch's commits without applying it first, so there are no cards to draw.
+/// Rendering it as a lane would mean inventing the contents. What it shows instead is
+/// everything `but branch list` knows from the outside — chiefly whether applying would
+/// conflict, which is the one fact that decides whether to press ⏎.
+fn draw_branches(f: &mut Frame, app: &App, area: Rect) {
+    // A column of margin on each side. The right-hand one matters now that the board sits
+    // on that side: without it the rule under the header would run straight into the first
+    // lane, and the drawer would read as part of it rather than as its own panel.
+    let area = Rect {
+        x: area.x + 1,
+        width: area.width.saturating_sub(2),
+        ..area
+    };
+    let w = area.width as usize;
+    let n = app.unapplied.branches.len();
+
+    let mut fixed = vec![
+        Line::from(vec![
+            Span::styled("unapplied", theme::title(true)),
+            Span::styled(format!("  {n}"), theme::faint()),
+        ]),
+        Line::styled("─".repeat(w), theme::muted()),
+    ];
+    // Say so when the list is partial rather than presenting 20 branches as if they were
+    // all of them — `but branch list` truncates by default and reports that it did.
+    if app.unapplied.truncated {
+        fixed.push(Line::styled(
+            truncate("only the 20 most recent", w),
+            theme::tone(crate::board::Tone::Warn),
+        ));
+    }
+    let fixed_h = (fixed.len() as u16).min(area.height);
+    f.render_widget(
+        Paragraph::new(fixed),
+        Rect {
+            height: fixed_h,
+            ..area
+        },
+    );
+    if area.height <= fixed_h {
+        return;
+    }
+    let body = Rect {
+        y: area.y + fixed_h,
+        height: area.height - fixed_h,
+        ..area
+    };
+
+    if n == 0 {
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::raw(""),
+                Line::styled(
+                    truncate("every branch is already", w),
+                    theme::faint(),
+                ),
+                Line::styled(truncate("in the workspace.", w), theme::faint()),
+            ]),
+            body,
+        );
+        return;
+    }
+
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(n * ROWS_PER_BRANCH);
+    for (i, b) in app.unapplied.branches.iter().enumerate() {
+        lines.extend(render_unapplied(b, w, i == app.branch_sel));
+    }
+
+    // Scroll just far enough to keep the whole selected row on screen, the same rule the
+    // board uses for lanes — the meta line matters as much as the name, so the unit kept
+    // visible is the row, not its first line.
+    let sel_top = (app.branch_sel * ROWS_PER_BRANCH) as u16;
+    let sel_bottom = sel_top + ROWS_PER_BRANCH as u16;
+    let offset = sel_bottom.saturating_sub(body.height);
+    f.render_widget(Paragraph::new(lines).scroll((offset, 0)), body);
+}
+
+/// Lines per drawer row: name, metadata, and the blank that separates it from the next.
+/// Named because the scroll arithmetic above depends on it matching `render_unapplied`.
+const ROWS_PER_BRANCH: usize = 3;
+
+fn render_unapplied(
+    b: &crate::board::UnappliedBranch,
+    width: usize,
+    selected: bool,
+) -> Vec<Line<'static>> {
+    let pad = |mut line: Line<'static>| -> Line<'static> {
+        let used: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+        if used < width {
+            line.spans.push(Span::raw(" ".repeat(width - used)));
+        }
+        if selected {
+            line = line.style(theme::selected_bg());
+        }
+        line
+    };
+
+    // The dot carries the merge check, in the same colour language the lane headers use
+    // for push status: green is safe to apply, red will conflict, faint means unchecked.
+    let (dot_tone, verdict) = match b.merges_cleanly {
+        Some(true) => (crate::board::Tone::Good, "clean"),
+        Some(false) => (crate::board::Tone::Bad, "conflicts"),
+        None => (crate::board::Tone::Neutral, ""),
+    };
+
+    let mut out = Vec::with_capacity(ROWS_PER_BRANCH);
+    out.push(pad(Line::from(vec![
+        Span::styled("● ", theme::tone(dot_tone)),
+        Span::styled(
+            truncate(&b.name, width.saturating_sub(2)),
+            theme::title(selected),
+        ),
+    ])));
+
+    // The verdict keeps its tone; everything after it is one faint string truncated as a
+    // whole, so a long author name is dropped cleanly at a boundary instead of clipping
+    // mid-word at the drawer's edge.
+    let mut meta = vec![Span::raw("  ")];
+    let mut used = 2;
+    if !verdict.is_empty() {
+        meta.push(Span::styled(verdict, theme::tone(dot_tone)));
+        used += verdict.chars().count();
+    }
+    let mut tail = String::new();
+    if let Some(ahead) = b.commits_ahead {
+        tail.push_str(&format!("  ↑{ahead}"));
+    }
+    if !b.has_local {
+        tail.push_str("  remote");
+    }
+    if let Some(age) = &b.age {
+        tail.push_str(&format!("  {age}"));
+    }
+    if let Some(author) = &b.author {
+        tail.push_str(&format!("  {author}"));
+    }
+    if !tail.is_empty() {
+        meta.push(Span::styled(
+            truncate(&tail, width.saturating_sub(used)),
+            theme::faint(),
+        ));
+    }
+    out.push(pad(Line::from(meta)));
+
+    // Whitespace separates rows, as it does cards. Not padded: a highlighted blank line
+    // would stretch the selection a row further than the thing it marks.
+    out.push(Line::raw(""));
+    out
+}
+
+/// What unapplying is about to take out of the working directory.
+///
+/// Shown before it happens for the reason `d` is: the lane's changes come off disk. Unlike
+/// `d` nothing is discarded — hence the reassurance in the body, which is the whole point
+/// of confirming rather than refusing.
+fn draw_unapply_confirm(f: &mut Frame, app: &App, area: Rect) {
+    let Some((name, detail)) = app.pending_unapply() else {
+        return;
+    };
+    let w = 56.min(area.width.saturating_sub(4));
+    let inner = w.saturating_sub(4) as usize;
+    let mut body = vec![
+        Line::styled("  unapply lane", theme::muted()),
+        Line::raw(""),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(name, theme::title(true)),
+        ]),
+    ];
+    for l in wrap(&detail, inner) {
+        body.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(l, theme::muted()),
+        ]));
+    }
+    body.push(Line::raw(""));
+    body.push(Line::styled(
+        "  its changes leave the working directory.",
+        theme::faint(),
+    ));
+    body.push(Line::styled(
+        "  nothing is lost — the branch keeps its commits.",
+        theme::faint(),
+    ));
+    body.push(Line::raw(""));
+    body.push(Line::styled(
+        "  ⏎ / y  unapply      esc / n  cancel",
+        theme::faint(),
+    ));
+
+    let h = (body.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, popup);
+    f.render_widget(
+        Paragraph::new(body).block(
+            Block::bordered()
+                .border_style(theme::tone(crate::board::Tone::Warn))
+                .style(theme::selected_bg()),
+        ),
+        popup,
+    );
+}
+
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     if let Some((msg, kind)) = &app.message {
         let style = match kind {
@@ -1292,7 +1525,8 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             );
         }
         Mode::PushConfirm | Mode::LandConfirm | Mode::DeleteConfirm | Mode::RebaseConfirm
-        | Mode::Landing | Mode::Blocked => "",
+        | Mode::Landing | Mode::Blocked | Mode::UnapplyConfirm => "",
+        Mode::Branches => "  ↑/↓ branch · ⏎ apply into a new lane · a/esc close",
         Mode::Diff => {
             let stageable = app
                 .diff
@@ -1313,7 +1547,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         }
         Mode::Help => "  esc close",
         Mode::Normal => {
-            "  ←/→ lane · ↑/↓ card · m move · u unstage · c commit · b branch · t task · s stack · ⏎ diff · d delete · r rebase · p push · L land · z/Z undo/redo · ?"
+            "  ←/→ lane · ↑/↓ card · m move · u unstage · c commit · b branch · t task · s stack · ⏎ diff · a unapplied · U unapply · d delete · r rebase · p push · L land · z/Z undo/redo · ?"
         }
     };
     f.render_widget(Paragraph::new(Line::styled(keys, theme::faint())), area);
@@ -1335,6 +1569,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
         help_row("  then ⏎", "confirm · esc cancels, keeping the selection"),
         help_row("esc", "with a selection and nothing else to cancel: clears it"),
         help_row("u", "send this card back to the backlog — uncommit or unstage"),
+        help_row("a", "branches not in the workspace — ⏎ applies one as a new lane"),
+        help_row("U", "unapply this lane — its whole stack leaves, `a` brings it back"),
         help_row("d", "delete this lane — asks first"),
         help_row("r", "rebase onto the updated target — shows what will happen"),
         help_row("tab", "on unassigned: group its cards by folder, or back to flat"),
@@ -1365,6 +1601,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         help_row("○ hollow dot", "a branch stacked below the tip, along for the ride"),
         help_row("▸ folder", "a directory divider in unassigned, when grouped by folder"),
         help_row("● busy / ○ idle / ✕ pane closed", "a lane's cmux harness pane, if one is open"),
+        help_row("drawer ● green/red", "whether applying that branch would merge cleanly"),
         Line::raw(""),
         Line::styled(
             "  every drop is one `but rub SOURCE TARGET`.",

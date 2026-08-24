@@ -98,6 +98,207 @@ mod tests {
         plain(&to_ansi(t.backend().buffer()))
     }
 
+    /// Builds a board with the drawer open over the captured workspace.
+    fn drawer_app() -> App {
+        let status =
+            crate::but::parse_status(include_str!("../tests/fixtures/status.json")).unwrap();
+        let list: crate::model::BranchList =
+            serde_json::from_str(include_str!("../tests/fixtures/branch_list.json")).unwrap();
+        let mut app = App::from_board(Board::from_status(&status));
+        app.unapplied = crate::board::Unapplied::from_list(&list, 1_785_000_000_000);
+        app.mode = crate::app::Mode::Branches;
+        app
+    }
+
+    fn render_app(app: &App, w: u16, h: u16) -> String {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| crate::ui::draw(f, app)).unwrap();
+        plain(&to_ansi(t.backend().buffer()))
+    }
+
+    /// The drawer's job is to answer "what can I apply, and will it hurt" — so both branch
+    /// names and both merge verdicts have to survive the render, not just the names.
+    #[test]
+    fn the_drawer_lists_unapplied_branches_with_their_merge_verdict() {
+        let out = render_app(&drawer_app(), 160, 24);
+        assert!(out.contains("unapplied"), "missing the drawer header:\n{out}");
+        assert!(out.contains("feat-theme"), "missing the clean branch:\n{out}");
+        assert!(
+            out.contains("cmux-tab-on-(b)ranch"),
+            "missing the conflicting branch:\n{out}"
+        );
+        assert!(out.contains("clean"), "missing the clean verdict:\n{out}");
+        assert!(
+            out.contains("conflicts"),
+            "a branch that will not merge must say so before you apply it:\n{out}"
+        );
+    }
+
+    /// The drawer splits the board rather than covering it. Applying a branch is a choice
+    /// made against the lanes already open, so losing sight of them would hide half the
+    /// question — the same reason the diff pane splits.
+    #[test]
+    fn the_drawer_leaves_the_board_visible_beside_it() {
+        let out = render_app(&drawer_app(), 160, 24);
+        for lane in ["feat-auth", "feat-ui", "fix-flaky-tests"] {
+            assert!(out.contains(lane), "the drawer hid lane {lane}:\n{out}");
+        }
+    }
+
+    /// The drawer opens on the left, before the lanes. Pinned by column position rather
+    /// than trusted to the layout constraints: swapping the two `split` halves is a
+    /// one-character edit that nothing else here would catch.
+    #[test]
+    fn the_drawer_opens_on_the_left_of_the_lanes() {
+        let out = render_app(&drawer_app(), 160, 24);
+        let row = out
+            .lines()
+            .find(|l| l.contains("unapplied") && l.contains("unassigned"))
+            .expect("the drawer header and the first lane share a row");
+        assert!(
+            row.find("unapplied") < row.find("unassigned"),
+            "the drawer must sit left of the board:\n{row}"
+        );
+
+        // And it must not crowd them: a gap between the drawer's rule and the first lane
+        // is what keeps it reading as its own panel rather than as another column.
+        //
+        // Measured in character columns, not byte offsets — the rule is box-drawing and the
+        // lane headers start with `●`, both multi-byte, so `str::find` would report neither
+        // a column nor anything comparable between the two rows.
+        let col_of = |line: &str, needle: &str| -> usize {
+            let byte = line.find(needle).expect("needle is on this row");
+            line[..byte].chars().count()
+        };
+        let rule = out
+            .lines()
+            .find(|l| l.trim_start().starts_with('─'))
+            .expect("the drawer draws a rule under its header");
+        // The first unbroken run of `─` is the drawer's; the lanes draw their own further
+        // right, so this stops at the first gap rather than spanning the whole row.
+        let start = col_of(rule, "─");
+        let drawer_end = start + rule.chars().skip(start).take_while(|c| *c == '─').count();
+        let lane_start = col_of(row, "unassigned");
+        assert!(
+            lane_start > drawer_end + 1,
+            "drawer rule ends at column {drawer_end}, lane starts at {lane_start} — \
+             too tight to read as a separate panel:\n{out}"
+        );
+    }
+
+    /// A terminal too narrow to split must still render something coherent. The drawer is
+    /// capped at half the board area precisely so it can never squeeze the lanes out.
+    #[test]
+    fn the_drawer_does_not_panic_in_a_narrow_terminal() {
+        for w in [20, 30, 40, 60] {
+            let out = render_app(&drawer_app(), w, 12);
+            assert!(!out.is_empty());
+        }
+    }
+
+    /// An empty drawer says why it is empty. "No rows" and "could not read the branches"
+    /// look identical otherwise, and only one of them means there is nothing to do.
+    #[test]
+    fn an_empty_drawer_explains_itself() {
+        let mut app = drawer_app();
+        app.unapplied = crate::board::Unapplied::default();
+        let out = render_app(&app, 160, 24);
+        assert!(
+            out.contains("every branch is already"),
+            "an empty drawer must explain itself:\n{out}"
+        );
+    }
+
+    /// `but branch list` truncates to the 20 most recent by default. A drawer that quietly
+    /// showed a partial list as if it were complete would be lying by omission.
+    #[test]
+    fn a_truncated_branch_list_says_so() {
+        let mut app = drawer_app();
+        app.unapplied.truncated = true;
+        let out = render_app(&app, 160, 24);
+        assert!(
+            out.contains("only the 20 most recent"),
+            "a truncated list must admit it:\n{out}"
+        );
+    }
+
+    /// The confirmation for `U` has to name the whole-stack behaviour, because that is the
+    /// part the user cannot see coming: `but unapply` takes the entire stack containing the
+    /// named branch, so on a stacked lane one keypress removes several branches at once.
+    #[test]
+    fn the_unapply_confirmation_names_every_branch_that_would_leave() {
+        // Same construction `a_stacked_lane_renders_a_header_per_branch` uses: the captured
+        // workspace has three parallel lanes and no stacked one, so one branch is moved
+        // into another lane to make one.
+        let mut status =
+            crate::but::parse_status(include_str!("../tests/fixtures/status.json")).unwrap();
+        let extra = status.stacks.remove(2).branches.remove(0);
+        status.stacks[0].branches.push(extra);
+
+        let mut app = App::from_board(Board::from_status(&status));
+        // Land on the lane that now has more than one branch stacked in it.
+        let stacked = app
+            .board
+            .columns
+            .iter()
+            .position(|c| c.sections.len() > 1)
+            .expect("fixture has a stacked lane");
+        app.col = stacked;
+        let names: Vec<String> = app.board.columns[stacked]
+            .sections
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        app.mode = crate::app::Mode::UnapplyConfirm;
+
+        let out = render_app(&app, 160, 24);
+        assert!(out.contains("unapply lane"), "missing the title:\n{out}");
+        for n in &names {
+            assert!(
+                out.contains(n.as_str()),
+                "the confirmation must name {n}, which would also leave:\n{out}"
+            );
+        }
+        assert!(
+            out.contains("nothing is lost"),
+            "unapply is reversible and must say so, unlike delete:\n{out}"
+        );
+    }
+
+    /// The one lane `a` cannot bring back. `but branch list` omits branches with no
+    /// commits, so an empty lane — exactly what `b` creates — vanishes from the UI on `U`
+    /// unless the confirmation says otherwise. Pins the wording against the promise the
+    /// non-empty case makes, since the two must not be confused.
+    #[test]
+    fn unapplying_an_empty_lane_does_not_promise_the_drawer_will_offer_it_back() {
+        let status =
+            crate::but::parse_status(include_str!("../tests/fixtures/status.json")).unwrap();
+        let mut app = App::from_board(Board::from_status(&status));
+        let lane = app
+            .board
+            .columns
+            .iter()
+            .position(|c| c.branch_name.is_some())
+            .expect("fixture has a lane");
+        // Strip the lane back to an empty branch, the state `b` leaves behind.
+        app.board.columns[lane].cards.clear();
+        for s in &mut app.board.columns[lane].sections {
+            s.commits = 0;
+        }
+        app.col = lane;
+        app.mode = crate::app::Mode::UnapplyConfirm;
+
+        let out = render_app(&app, 160, 24);
+        assert!(
+            out.contains("no commits") && out.contains("but apply"),
+            "an empty lane must be told it comes back via `but apply`, not the drawer:\n{out}"
+        );
+        assert!(
+            !out.contains("re-apply it any time with"),
+            "and must not repeat the promise the non-empty case makes:\n{out}"
+        );
+    }
+
     /// GitHub issue #6: with a lot of loose files, a flat unassigned list stops being
     /// navigable by eye. Grouping is applied the same way `App::clamp` does it — as a
     /// post-process on the built board's backlog column — rather than reaching into

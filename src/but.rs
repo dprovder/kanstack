@@ -9,7 +9,9 @@ use std::process::Command;
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use crate::model::{CliError, DiffOutput, MergeCheck, PullPreview, PushPreview, WorkspaceStatus};
+use crate::model::{
+    BranchList, CliError, DiffOutput, MergeCheck, PullPreview, PushPreview, WorkspaceStatus,
+};
 
 /// Oldest `but` whose JSON shape this was verified against.
 ///
@@ -490,6 +492,50 @@ impl But {
     /// Deletes a branch from the workspace.
     pub fn branch_delete(&self, name: &str) -> Result<()> {
         self.run(&["branch", "delete", name, "--json"])?;
+        Ok(())
+    }
+
+    /// Lists every branch `but` knows about, applied and not.
+    ///
+    /// The only window onto branches outside the workspace — `status` reports applied
+    /// stacks and nothing else, so without this the board cannot even know a parked branch
+    /// exists. Deliberately *not* on the refresh path: the default listing runs a merge
+    /// check and an ahead-count per branch, which is far more work than a status read, so
+    /// this is called when the drawer opens rather than on every file save.
+    ///
+    /// `--review` is left off, which is what keeps that cost bounded to local work: it
+    /// would add a forge round-trip per branch. The default truncation (active + 20 most
+    /// recent) is likewise left in place and reported through `has_more_branches` rather
+    /// than pre-empted with `--all`, so the common case stays cheap and the uncommon one
+    /// is at least honest about what it is not showing.
+    pub fn branch_list(&self) -> Result<BranchList> {
+        let raw = self.run(&["branch", "list", "--json"])?;
+        serde_json::from_str(&raw)
+            .with_context(|| format!("could not parse `but branch list` output: {raw:.400}"))
+    }
+
+    /// Applies an unapplied branch, bringing it into the workspace as a parallel lane.
+    ///
+    /// This writes to the working directory — the branch's changes materialize on disk —
+    /// so it can fail on a dirty tree or produce conflicts. `apply` embeds no status in its
+    /// reply, so the caller refreshes separately, the same as `push` and `branch_delete`.
+    pub fn apply(&self, name: &str) -> Result<()> {
+        self.run(&["apply", name, "--json"])?;
+        Ok(())
+    }
+
+    /// Unapplies a branch, and with it the *entire stack* the branch belongs to.
+    ///
+    /// That whole-stack behaviour is `but unapply`'s own, documented and not negotiable
+    /// from here: "if a branch name is provided, the entire stack containing that branch
+    /// will be unapplied". It happens to match the board exactly — a lane *is* a stack —
+    /// so the unit the CLI acts on and the unit the user selected are the same thing. On a
+    /// lane of several stacked branches they are not, which is why the confirmation names
+    /// every branch that is about to leave rather than just the tip.
+    ///
+    /// Nothing is lost: the work becomes an unapplied branch and can be applied again.
+    pub fn unapply(&self, identifier: &str) -> Result<()> {
+        self.run(&["unapply", identifier, "--json"])?;
         Ok(())
     }
 

@@ -99,6 +99,8 @@ repo is thrown away when you're done. `esc` or `q` leaves any time.
 | `space` | select this card for a bulk move — again to deselect |
 | `m` | pick up the selection (or just this card), then `←/→` for a lane, `↑/↓` to drop on a card, `⏎` to confirm |
 | `u` | send this card back to the backlog — uncommit a commit |
+| `a` | branches that aren't in the workspace — `⏎` applies one as a new lane |
+| `U` | unapply this lane — its whole stack leaves, `a` brings it back |
 | `d` | delete this lane — asks first |
 | `r` | rebase onto the updated target — shows what will happen |
 | `tab` | on the unassigned lane: group its cards by folder, or back to a flat list |
@@ -220,6 +222,47 @@ turns red and says "rebase anyway" when either is true.
 
 Note `r` here is *rebase*, whereas GitButler's own TUI binds `r` to squash — worth knowing
 if you use both.
+
+## Branches that aren't on the board
+
+The board draws applied stacks, because that is all `but status` reports. A repository
+usually holds more than that — branches someone parked, branches a colleague pushed,
+branches from a PR you haven't picked up. None of them appear as lanes, and until you go
+looking they are invisible.
+
+`a` opens a drawer on the left of the board listing exactly those. `⏎` applies the highlighted one,
+which brings it in as a new parallel lane and drops the cursor on it. `U` on any lane does
+the reverse: the lane leaves the workspace and reappears in the drawer.
+
+Each row leads with a dot carrying the one fact that decides whether to apply: green means
+the branch merges cleanly into the target, red means applying it will conflict. That check
+is `but`'s, and it runs without applying anything — so the warning arrives before the
+decision rather than after it. Applying a red branch is still allowed; finding out what
+conflicts is a legitimate reason to apply one.
+
+Two things worth knowing:
+
+- **`U` unapplies the whole stack, not one branch.** That is `but unapply`'s own behaviour —
+  it acts on the stack containing the branch you name — and it happens to match the board
+  exactly, since a lane *is* a stack. On a lane with several branches stacked in it the
+  confirmation names every branch that would leave, because that is the part you cannot see
+  coming.
+- **Nothing is destroyed.** Unlike `d`, unapplying keeps the branch and its commits; only
+  the working-directory changes come off disk. That is why `U` confirms but does not warn
+  the way `d` does.
+- **An empty lane is the one that won't come back through the drawer.** `but branch list`
+  omits branches with no commits, so a lane you made with `b` and never committed to will
+  not be listed after `U`. The branch still exists — `but apply <name>` brings it back —
+  and the confirmation says so rather than promising `a` will.
+
+The drawer is fetched when you open it, not on every refresh. `but branch list` runs a
+merge check per branch, which is more work than a status read, and paying for it on every
+file save to populate a panel that is usually closed would be a poor trade. The practical
+consequence: a branch created in another terminal shows up the next time you open the
+drawer rather than instantly.
+
+`but branch list` also truncates to the 20 most recent branches by default. When it does,
+the drawer says so rather than presenting a partial list as the whole set.
 
 ## Deleting a lane
 

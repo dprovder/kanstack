@@ -391,6 +391,75 @@ pub struct MergeCheckResult {
     pub conflicting_files: Vec<String>,
 }
 
+/// Output of `but branch list --json`.
+///
+/// The one command that sees branches the board otherwise cannot: `but status` reports
+/// only *applied* stacks, so everything a user has parked — or has never applied at all —
+/// exists solely in this payload's `branches`. Kept as a separate call rather than folded
+/// into the refresh path because it is materially more expensive: by default it runs a
+/// merge check and an ahead-count per branch, so it is fetched on demand when the drawer
+/// opens, not on every file save.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchList {
+    #[serde(default)]
+    pub applied_stacks: Vec<AppliedStack>,
+    /// The unapplied branches. Named `branches` on the wire despite the applied ones
+    /// living in a sibling field, so this is not the whole set of branches — only the
+    /// half the board cannot already draw.
+    #[serde(default)]
+    pub branches: Vec<ListedBranch>,
+    /// True when the listing was truncated. `but branch list` shows the active branch plus
+    /// the 20 most recent by default; `--all` returns the rest. Surfaced rather than
+    /// silently swallowed, so a drawer that is not showing everything says so.
+    #[serde(default)]
+    pub has_more_branches: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppliedStack {
+    pub id: String,
+    #[serde(default)]
+    pub heads: Vec<ListedBranch>,
+}
+
+/// One row of `but branch list`. The same shape serves both applied heads and unapplied
+/// branches, but applied heads leave most of it blank — `lastCommitAt` arrives as `0` and
+/// `commitsAhead`/`lastAuthor` as null — which is why nearly every field here is optional.
+/// Only the unapplied half is ever read.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListedBranch {
+    pub name: String,
+    #[serde(default)]
+    pub reviews: Vec<serde_json::Value>,
+    /// Whether a local ref exists, as opposed to remote-only.
+    #[serde(default)]
+    pub has_local: Option<bool>,
+    /// Epoch *milliseconds*, not seconds — and `0` on an applied head, which reports none.
+    #[serde(default)]
+    pub last_commit_at: i64,
+    #[serde(default)]
+    pub commits_ahead: Option<usize>,
+    #[serde(default)]
+    pub last_author: Option<ListedAuthor>,
+    /// Whether it would merge cleanly into the upstream base target — *not* into your
+    /// workspace. Absent under `--no-check`. This is the field that makes applying a
+    /// branch predictable instead of a coin flip, so the drawer leads with it.
+    #[serde(default)]
+    pub merges_cleanly: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListedAuthor {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub email: Option<String>,
+}
+
 /// Structured error payload `but` emits on stdout in `--json` mode, e.g. when the
 /// current directory is not a GitButler project.
 #[derive(Debug, Clone, Deserialize)]
@@ -473,6 +542,48 @@ mod tests {
         let check: MergeCheck = serde_json::from_str(raw).unwrap();
         assert!(!check.merge_check.merges_cleanly);
         assert_eq!(check.merge_check.conflicting_files, ["src/app.rs"]);
+    }
+
+    /// Captured verbatim from `but branch list --json` on a real workspace (but 0.22.0).
+    ///
+    /// Both halves matter and they have different shapes: an *unapplied* branch fills in
+    /// every field, while an *applied* head reports `lastCommitAt: 0` and nulls for
+    /// `commitsAhead`/`lastAuthor` and omits `hasLocal`/`mergesCleanly` outright. That
+    /// asymmetry is the reason nearly everything on `ListedBranch` is optional, so the
+    /// fixture covers both rather than only the half the drawer reads.
+    const BRANCH_LIST: &str = include_str!("../tests/fixtures/branch_list.json");
+
+    #[test]
+    fn parses_real_branch_list_output() {
+        let l: BranchList = serde_json::from_str(BRANCH_LIST).expect("sample parses");
+        assert_eq!(l.branches.len(), 2, "two unapplied branches");
+        assert!(!l.has_more_branches);
+
+        let clean = &l.branches[0];
+        assert_eq!(clean.name, "feat-theme");
+        assert_eq!(clean.commits_ahead, Some(1));
+        assert_eq!(clean.merges_cleanly, Some(true));
+        assert_eq!(clean.has_local, Some(false));
+        assert_eq!(clean.last_commit_at, 1_784_992_235_000);
+        assert_eq!(clean.last_author.as_ref().unwrap().name.as_deref(), Some("dprovder"));
+
+        // The branch that would conflict. `but` reports this without applying anything,
+        // which is the whole reason the drawer can warn before you commit to an apply.
+        assert_eq!(l.branches[1].merges_cleanly, Some(false));
+    }
+
+    #[test]
+    fn an_applied_head_parses_despite_reporting_almost_nothing() {
+        let l: BranchList = serde_json::from_str(BRANCH_LIST).unwrap();
+        let head = &l.applied_stacks[0].heads[0];
+        assert_eq!(head.name, "new-landing-page");
+        // The fields that arrive null or absent on an applied head — each one a hard
+        // deserialization failure if its binding were non-optional.
+        assert_eq!(head.commits_ahead, None);
+        assert_eq!(head.merges_cleanly, None);
+        assert_eq!(head.has_local, None);
+        assert_eq!(head.last_commit_at, 0);
+        assert_eq!(head.last_author.as_ref().unwrap().name, None);
     }
 
     #[test]

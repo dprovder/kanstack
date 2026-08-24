@@ -778,6 +778,148 @@ fn sending_a_commit_to_the_backlog_uncommits_without_losing_content() {
     );
 }
 
+/// The round trip the drawer exists for: a branch leaves the workspace, shows up in the
+/// list of things that can come back, and comes back.
+///
+/// This is the one flow `but status` cannot verify on its own — an unapplied branch is
+/// absent from it entirely, which is exactly why it needs `branch_list` — so each stage
+/// asserts against both sources: gone from the board, present in the drawer, and back on
+/// the board afterwards.
+#[test]
+#[ignore = "requires the GitButler CLI"]
+fn unapplying_a_branch_moves_it_to_the_drawer_and_applying_brings_it_back() {
+    if skip_if_no_but() {
+        return;
+    }
+    let sb = Sandbox::new("applyunapply");
+    sb.branch_with_commit("feat-parked", "parked.txt", "work to park");
+
+    let but = But::discover(&sb.repo()).unwrap();
+    let on_board = |b: &Board| b.columns.iter().any(|c| c.branch_name.as_deref() == Some("feat-parked"));
+
+    assert!(on_board(&Board::from_status(&but.status().unwrap())), "starts applied");
+    assert!(
+        !but.branch_list().unwrap().branches.iter().any(|b| b.name == "feat-parked"),
+        "an applied branch must not also be offered as unapplied"
+    );
+
+    but.unapply("feat-parked").unwrap();
+    assert!(
+        !on_board(&Board::from_status(&but.status().unwrap())),
+        "unapply takes the lane off the board"
+    );
+    let listed = but.branch_list().unwrap();
+    let parked = listed
+        .branches
+        .iter()
+        .find(|b| b.name == "feat-parked")
+        .expect("the unapplied branch is what the drawer lists");
+    // The commit went with it rather than being lost — the promise the confirmation makes.
+    assert_eq!(parked.commits_ahead, Some(1));
+
+    but.apply("feat-parked").unwrap();
+    assert!(
+        on_board(&Board::from_status(&but.status().unwrap())),
+        "apply brings the lane back"
+    );
+    assert!(
+        !but.branch_list().unwrap().branches.iter().any(|b| b.name == "feat-parked"),
+        "and it stops being offered once it is applied again"
+    );
+}
+
+/// The file contents follow the branch, not just the ref. Unapply is described to the user
+/// as "its changes leave the working directory" and apply as bringing them back, so the
+/// worktree is the thing worth asserting on — a ref that moved while the files stayed put
+/// would satisfy every board-level check above and still be wrong.
+#[test]
+#[ignore = "requires the GitButler CLI"]
+fn unapply_takes_the_files_off_disk_and_apply_restores_them() {
+    if skip_if_no_but() {
+        return;
+    }
+    let sb = Sandbox::new("applyfiles");
+    sb.branch_with_commit("feat-files", "parked.txt", "work to park");
+    let path = sb.repo().join("parked.txt");
+    assert!(path.exists(), "the committed file starts on disk");
+
+    let but = But::discover(&sb.repo()).unwrap();
+    but.unapply("feat-files").unwrap();
+    assert!(!path.exists(), "unapply removes the branch's files from the worktree");
+
+    but.apply("feat-files").unwrap();
+    assert!(path.exists(), "apply puts them back");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "content\n");
+}
+
+/// `but unapply` takes the whole stack containing the named branch, not just that branch.
+/// `pending_unapply`'s confirmation text promises to name every branch that would leave,
+/// so this pins the upstream behaviour that promise is describing — if `but` ever narrowed
+/// it to a single branch, the confirmation would be overstating what it does.
+#[test]
+#[ignore = "requires the GitButler CLI"]
+fn unapplying_a_stacked_lane_takes_every_branch_in_it() {
+    if skip_if_no_but() {
+        return;
+    }
+    let sb = Sandbox::new("applystack");
+    sb.branch_with_commit("lower", "lower.txt", "lower work");
+    sb.write("upper.txt", "content\n");
+    sb.but(&["branch", "new", "upper", "--anchor", "lower"]);
+    sb.but(&["commit", "-m", "upper work", "-b", "upper"]);
+
+    let but = But::discover(&sb.repo()).unwrap();
+    let board = Board::from_status(&but.status().unwrap());
+    let lane = board
+        .columns
+        .iter()
+        .find(|c| c.sections.len() > 1)
+        .expect("the two branches share one lane");
+    assert_eq!(lane.sections.len(), 2);
+
+    // Named by the tip; the branch below it has to leave too.
+    but.unapply("upper").unwrap();
+    let after = Board::from_status(&but.status().unwrap());
+    for name in ["upper", "lower"] {
+        assert!(
+            after.columns.iter().all(|c| c.branch_name.as_deref() != Some(name)),
+            "{name} should have left with the stack"
+        );
+    }
+}
+
+/// `mergesCleanly` is the drawer's entire basis for warning before an apply, and it is
+/// computed without applying anything. A branch that genuinely conflicts must report
+/// `Some(false)` — if it silently reported `None` or `true`, the drawer would show a green
+/// dot on a branch that is about to conflict, which is worse than showing nothing.
+#[test]
+#[ignore = "requires the GitButler CLI"]
+fn a_conflicting_branch_is_flagged_before_it_is_applied() {
+    if skip_if_no_but() {
+        return;
+    }
+    let sb = Sandbox::with_remote("applyconflict");
+
+    // Both sides edit the same file, so the parked branch cannot merge into the base.
+    sb.branch_with_commit("feat-conflict", "shared.txt", "our side");
+    let but = But::discover(&sb.repo()).unwrap();
+    but.unapply("feat-conflict").unwrap();
+    sb.push_upstream_commit("shared.txt", "their side");
+    sb.but(&["pull"]);
+
+    let listed = but.branch_list().unwrap();
+    let parked = listed
+        .branches
+        .iter()
+        .find(|b| b.name == "feat-conflict")
+        .expect("still listed as unapplied");
+    assert_eq!(
+        parked.merges_cleanly,
+        Some(false),
+        "a branch that conflicts with the base must say so before it is applied"
+    );
+}
+
 /// `z`/`Z` are the safety net every other destructive action here now leans on (`d` in
 /// particular, since 0.21 stopped refusing an orphaning delete). Both must actually round
 /// trip: undo an operation, then redo it back, and land on the exact state each time.

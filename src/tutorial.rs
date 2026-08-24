@@ -112,6 +112,14 @@ pub fn steps() -> Vec<Step> {
             }),
         },
         Step {
+            prompt: "Every lane so far has been applied — in the workspace. Press U to unapply this one, then ⏎ / y to confirm. Watch it leave the board.",
+            done: Box::new(|app| !has_lane(app, "practice")),
+        },
+        Step {
+            prompt: "It isn't gone — it's just not in the workspace, so the board has nothing to draw. Most branches in a real repo are like this. Press a to open the drawer on the left, then ⏎ to apply \"practice\" back as a lane.",
+            done: Box::new(|app| has_lane(app, "practice")),
+        },
+        Step {
             prompt: "Press L to preview landing this lane onto the target, then ⏎ / y to confirm.",
             done: Box::new(|app| !has_lane(app, "practice")),
         },
@@ -245,7 +253,44 @@ mod tests {
             "step 3 did not advance — amending notes.txt into practice failed"
         );
 
-        // Step 4: L, then ⏎ to confirm landing onto the (fake, local) target. Landing runs
+        // Step 4: U then ⏎ unapplies the lane. No navigation first — the drop in step 3
+        // left the cursor on "practice", which is why the prompt does not ask for one.
+        assert_eq!(
+            app.board.columns[app.col].branch_name.as_deref(),
+            Some("practice"),
+            "step 3 should leave the cursor on practice, as step 4's prompt assumes"
+        );
+        app.on_key(key(KeyCode::Char('U')));
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.tutorial.as_ref().unwrap().current,
+            4,
+            "step 4 did not advance — unapplying practice failed"
+        );
+
+        // Step 5: a opens the drawer, ⏎ applies the branch under the cursor. The prompt
+        // names "practice" specifically, which only holds because it is the sole unapplied
+        // branch here — asserted rather than assumed, since a second entry would silently
+        // make ⏎ apply something else. This deliberately runs *before* the land: afterwards
+        // `practice` has no commits ahead of the target, and `but branch list` hides empty
+        // branches, so the drawer would be empty and the step impossible to complete.
+        app.on_key(key(KeyCode::Char('a')));
+        assert_eq!(app.mode, crate::app::Mode::Branches, "a should open the drawer");
+        let listed: Vec<&str> = app
+            .unapplied
+            .branches
+            .iter()
+            .map(|b| b.name.as_str())
+            .collect();
+        assert_eq!(listed, ["practice"], "the drawer must offer exactly one branch");
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.tutorial.as_ref().unwrap().current,
+            5,
+            "step 5 did not advance — applying practice back failed"
+        );
+
+        // Step 6: L, then ⏎ to confirm landing onto the (fake, local) target. Landing runs
         // on a background thread now, so the step only advances once `poll_land` picks up
         // the result — a step tied to `on_key` alone would never see it complete.
         app.on_key(key(KeyCode::Char('L')));
@@ -256,9 +301,9 @@ mod tests {
             app.poll_land();
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        assert_eq!(app.tutorial.as_ref().unwrap().current, 4, "step 4 did not advance");
+        assert_eq!(app.tutorial.as_ref().unwrap().current, 6, "step 6 did not advance");
 
-        // Step 5: z to undo the land.
+        // Step 7: z to undo the land.
         app.on_key(key(KeyCode::Char('z')));
         let t = app.tutorial.as_ref().unwrap();
         assert!(t.finished, "undo should have completed the final step");

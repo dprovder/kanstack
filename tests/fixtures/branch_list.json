@@ -1,0 +1,46 @@
+{
+  "appliedStacks": [
+    {
+      "id": "ee96be95-b14a-47f3-840d-51cea152906e",
+      "heads": [
+        {
+          "name": "new-landing-page",
+          "reviews": [],
+          "lastCommitAt": 0,
+          "commitsAhead": null,
+          "lastAuthor": {
+            "name": null,
+            "email": null
+          }
+        }
+      ]
+    }
+  ],
+  "branches": [
+    {
+      "name": "feat-theme",
+      "reviews": [],
+      "hasLocal": false,
+      "lastCommitAt": 1784992235000,
+      "commitsAhead": 1,
+      "lastAuthor": {
+        "name": "dprovder",
+        "email": "danielprovder@gmail.com"
+      },
+      "mergesCleanly": true
+    },
+    {
+      "name": "cmux-tab-on-(b)ranch",
+      "reviews": [],
+      "hasLocal": false,
+      "lastCommitAt": 1784964636000,
+      "commitsAhead": 1,
+      "lastAuthor": {
+        "name": "dprovder",
+        "email": "danielprovder@gmail.com"
+      },
+      "mergesCleanly": false
+    }
+  ],
+  "hasMoreBranches": false
+}

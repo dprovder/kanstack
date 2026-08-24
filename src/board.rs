@@ -16,7 +16,8 @@
 use std::collections::HashMap;
 
 use crate::model::{
-    Branch, BranchStatus, Ci, CiConclusion, CiStatus, DiffOutput, FileChange, WorkspaceStatus,
+    Branch, BranchList, BranchStatus, Ci, CiConclusion, CiStatus, DiffOutput, FileChange,
+    WorkspaceStatus,
 };
 
 /// The special `but` target meaning "unassigned".
@@ -223,6 +224,101 @@ impl Board {
             conflicted_files: Vec::new(),
         }
     }
+}
+
+/// A branch that exists in the repository but is not in the workspace.
+///
+/// Deliberately not a [`Column`]: an unapplied branch has no cards, no sections and no
+/// drop target, because `but` will not enumerate its commits without applying it first.
+/// Everything here is what `but branch list` is willing to say about a branch from the
+/// outside, and modelling it as a lane would mean inventing the rest.
+#[derive(Debug, Clone)]
+pub struct UnappliedBranch {
+    pub name: String,
+    pub commits_ahead: Option<usize>,
+    /// Whether applying it would merge cleanly into the upstream base. `Some(false)` is
+    /// the single most consequential thing on the row — it is the difference between a
+    /// quiet apply and a conflicted worktree — so the renderer gives it a tone rather than
+    /// burying it in text. `None` when `but` declined to check.
+    pub merges_cleanly: Option<bool>,
+    pub author: Option<String>,
+    /// Pre-rendered age, e.g. `4w ago`. Formatted here rather than in the renderer because
+    /// the list is built once per fetch and drawn many times per second.
+    pub age: Option<String>,
+    /// False for a branch that only exists on the remote.
+    pub has_local: bool,
+}
+
+/// What the drawer shows, built from one `but branch list` call.
+#[derive(Debug, Clone, Default)]
+pub struct Unapplied {
+    pub branches: Vec<UnappliedBranch>,
+    /// `but branch list` truncates to the active branch plus the 20 most recent. Carried
+    /// through so the drawer can say it is not showing everything, rather than presenting
+    /// a partial list as complete.
+    pub truncated: bool,
+}
+
+impl Unapplied {
+    /// `now_ms` is passed in rather than read from the clock so ages are testable and the
+    /// whole projection stays a pure function of its inputs.
+    pub fn from_list(list: &BranchList, now_ms: i64) -> Unapplied {
+        Unapplied {
+            branches: list
+                .branches
+                .iter()
+                .map(|b| UnappliedBranch {
+                    name: b.name.clone(),
+                    commits_ahead: b.commits_ahead,
+                    merges_cleanly: b.merges_cleanly,
+                    author: b
+                        .last_author
+                        .as_ref()
+                        .and_then(|a| a.name.clone())
+                        .filter(|n| !n.is_empty()),
+                    age: relative_age(b.last_commit_at, now_ms),
+                    has_local: b.has_local.unwrap_or(false),
+                })
+                .collect(),
+            truncated: list.has_more_branches,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.branches.is_empty()
+    }
+}
+
+/// Renders an epoch-*millisecond* timestamp as an approximate age, in the same vocabulary
+/// `but branch list` uses in its own human output (`4w ago`).
+///
+/// `None` for the `0` an applied head reports: that is an absence of a timestamp, not a
+/// branch last touched in 1970. A timestamp in the future (clock skew between machines,
+/// which is ordinary on shared remotes) reads as "just now" rather than going negative.
+fn relative_age(then_ms: i64, now_ms: i64) -> Option<String> {
+    if then_ms <= 0 {
+        return None;
+    }
+    let secs = (now_ms - then_ms) / 1000;
+    if secs < 60 {
+        return Some("just now".into());
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return Some(format!("{mins}m ago"));
+    }
+    let hours = mins / 60;
+    if hours < 24 {
+        return Some(format!("{hours}h ago"));
+    }
+    let days = hours / 24;
+    if days < 7 {
+        return Some(format!("{days}d ago"));
+    }
+    if days < 365 {
+        return Some(format!("{}w ago", days / 7));
+    }
+    Some(format!("{}y ago", days / 365))
 }
 
 /// Sums added/removed per file path. `but diff` emits one entry per hunk, so a file with
@@ -821,5 +917,62 @@ mod tests {
                 .any(|c| c.group.as_deref() == Some(extra_name.as_str())),
             "cards from a stacked branch are labelled with their branch"
         );
+    }
+
+    /// Epoch *milliseconds*, and a fixed `now`, so this pins the unit as much as the
+    /// wording — reading the field as seconds would put every branch decades in the past
+    /// and the bug would look like a formatting quirk rather than a unit error.
+    #[test]
+    fn ages_render_in_the_same_vocabulary_but_uses() {
+        const NOW: i64 = 1_785_000_000_000;
+        let ago = |ms: i64| relative_age(NOW - ms, NOW);
+        assert_eq!(ago(5_000).as_deref(), Some("just now"));
+        assert_eq!(ago(90 * 1_000).as_deref(), Some("1m ago"));
+        assert_eq!(ago(3 * 3_600 * 1_000).as_deref(), Some("3h ago"));
+        assert_eq!(ago(2 * 86_400 * 1_000).as_deref(), Some("2d ago"));
+        assert_eq!(ago(28 * 86_400 * 1_000).as_deref(), Some("4w ago"));
+        assert_eq!(ago(800 * 86_400 * 1_000).as_deref(), Some("2y ago"));
+    }
+
+    /// An applied head reports `lastCommitAt: 0`. That is "no timestamp", not "1970", and
+    /// rendering it as a 56-year-old branch would be worse than showing nothing at all.
+    #[test]
+    fn a_missing_timestamp_has_no_age_rather_than_a_wrong_one() {
+        assert_eq!(relative_age(0, 1_785_000_000_000), None);
+    }
+
+    /// Clocks on shared remotes disagree, so a commit timestamped slightly ahead of local
+    /// now is ordinary. It must not underflow into a nonsense age.
+    #[test]
+    fn a_future_timestamp_reads_as_just_now() {
+        const NOW: i64 = 1_785_000_000_000;
+        assert_eq!(relative_age(NOW + 60_000, NOW).as_deref(), Some("just now"));
+    }
+
+    #[test]
+    fn unapplied_projects_only_the_branches_outside_the_workspace() {
+        let list: crate::model::BranchList =
+            serde_json::from_str(include_str!("../tests/fixtures/branch_list.json")).unwrap();
+        let u = Unapplied::from_list(&list, 1_785_000_000_000);
+
+        // `appliedStacks` is not folded in: those lanes are already on the board, drawn
+        // from `but status`, and listing them again in the drawer would offer to apply
+        // branches that are applied.
+        assert_eq!(u.branches.len(), 2);
+        assert!(
+            !u.branches.iter().any(|b| b.name == "new-landing-page"),
+            "the applied head must not appear in the drawer"
+        );
+        assert!(!u.truncated);
+
+        let clean = &u.branches[0];
+        assert_eq!(clean.name, "feat-theme");
+        assert_eq!(clean.merges_cleanly, Some(true));
+        assert_eq!(clean.commits_ahead, Some(1));
+        assert_eq!(clean.author.as_deref(), Some("dprovder"));
+        assert!(clean.age.is_some());
+        assert!(!clean.has_local, "this one is remote-only");
+
+        assert_eq!(u.branches[1].merges_cleanly, Some(false));
     }
 }
