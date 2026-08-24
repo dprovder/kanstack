@@ -3440,4 +3440,20 @@ mod tests {
 
         assert_eq!(app.mode, Mode::Normal);
     }
+
+    /// `ui::draw` covers the whole screen with a `Dismiss` region while `mode == Diff`
+    /// (pushed last, so it wins over the board underneath in a split view) — this is what
+    /// lets a click, anywhere, leave the diff the same way `Esc` does.
+    #[test]
+    fn clicking_anywhere_leaves_the_diff() {
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+
+        let mut app = App::from_board(board());
+        app.mode = Mode::Diff;
+        app.hit_map = hits(&[(rect(0, 0), HitTarget::Dismiss)]);
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 0));
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.diff.is_none());
+    }
 }

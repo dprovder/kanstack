@@ -116,8 +116,10 @@ pub fn draw(f: &mut Frame, app: &App) -> HitMap {
             draw_branch_modal(f, app, f.area())
         }
         // The board keeps its half unless the diff is expanded, so reading a diff does not
-        // cost you your place — the same split gitui uses, and for the same reason.
-        Mode::Diff => {}
+        // cost you your place — the same split gitui uses, and for the same reason. A
+        // click anywhere still leaves it, though — pushed last so it wins over the board's
+        // own card/lane regions underneath, the same "topmost wins" rule a popup gets.
+        Mode::Diff => hits.push(f.area(), HitTarget::Dismiss),
         _ => {}
     }
 
@@ -1057,11 +1059,13 @@ fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect, hits: &mut HitM
     // cards, applied one level up.
     let header_is_target =
         app.mode == Mode::Moving && is_current && app.target_card.is_none();
+    let hovered =
+        app.mode == Mode::Normal && app.hover == Some(HitTarget::LaneHeader(idx));
     let mut header = Line::from(vec![
         Span::styled("● ", theme::status_dot(col.state)),
         Span::styled(
             truncate(&col.title, inner_w.saturating_sub(8)),
-            theme::title(is_current),
+            theme::title(is_current || hovered),
         ),
         Span::styled(format!("  {}", header_count(col)), theme::faint()),
     ]);
@@ -1076,8 +1080,6 @@ fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect, hits: &mut HitM
     }
     if header_is_target || is_current {
         header = header.style(theme::selected_bg());
-    } else if app.mode == Mode::Normal && app.hover == Some(HitTarget::LaneHeader(idx)) {
-        header = header.style(theme::hover_bg());
     }
 
     // The header, rule, and top-level badges are pinned — rendered separately from the
@@ -1335,8 +1337,6 @@ fn render_card(
         Some(theme::picked_bg())
     } else if selected {
         Some(theme::selected_bg())
-    } else if hovered {
-        Some(theme::hover_bg())
     } else {
         None
     };
@@ -1369,7 +1369,7 @@ fn render_card(
     out.push(pad(Line::from(id_spans)));
 
     for l in wrap(&card.title, width) {
-        out.push(pad(Line::from(Span::styled(l, theme::title(selected)))));
+        out.push(pad(Line::from(Span::styled(l, theme::title(selected || hovered)))));
     }
 
     if let Some(sub) = &card.subtitle {
@@ -1531,8 +1531,6 @@ fn render_unapplied(
         }
         if selected {
             line = line.style(theme::selected_bg());
-        } else if hovered {
-            line = line.style(theme::hover_bg());
         }
         line
     };
@@ -1550,7 +1548,7 @@ fn render_unapplied(
         Span::styled("● ", theme::tone(dot_tone)),
         Span::styled(
             truncate(&b.name, width.saturating_sub(2)),
-            theme::title(selected),
+            theme::title(selected || hovered),
         ),
     ])));
 
