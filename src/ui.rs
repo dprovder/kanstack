@@ -56,7 +56,7 @@ pub fn draw(f: &mut Frame, app: &App) -> HitMap {
         .constraints(constraints)
         .split(f.area());
 
-    draw_header(f, app, chunks[0]);
+    draw_header(f, app, chunks[0], &mut hits);
     let mut next = 1;
     if let Some(t) = &app.tutorial {
         draw_tutorial_banner(f, t, chunks[next]);
@@ -902,7 +902,7 @@ fn draw_landing(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn draw_header(f: &mut Frame, app: &App, area: Rect) {
+fn draw_header(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     let b = &app.board;
     let mut spans = vec![
         Span::styled("  workspace", theme::muted()),
@@ -975,6 +975,22 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
             format!("{} selected", app.selected.len()),
             theme::tone(crate::board::Tone::Accent),
         ));
+    }
+    // `a` already opens the drawer from anywhere in Normal mode; this is the same door for
+    // a mouse, which otherwise only ever gets to close the drawer (from its own back
+    // control) and never to open it. Styled to stand out, the same as the diff pane's `‹`,
+    // since it's the one clickable thing in the header. Placed last and measured by what's
+    // already in `spans` rather than reserved a fixed column, so it moves with whatever
+    // else the header happens to be showing instead of overlapping it.
+    if app.mode == Mode::Normal {
+        spans.push(Span::styled("  ·  ", theme::faint()));
+        let prefix_w: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
+        let label = "a  unapplied";
+        spans.push(Span::styled(label, theme::tone(crate::board::Tone::Accent)));
+        hits.push(
+            Rect { x: area.x + prefix_w, y: area.y, width: label.chars().count() as u16, height: 1 },
+            HitTarget::OpenBranches,
+        );
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }

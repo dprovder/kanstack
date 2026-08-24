@@ -21,6 +21,9 @@ pub enum HitTarget {
     LaneBody(usize),
     /// A row in the unapplied-branches drawer.
     BranchRow(usize),
+    /// The header's own entry point into the drawer — the mouse equivalent of `a`, for
+    /// opening it from the main board rather than only closing it once already inside.
+    OpenBranches,
     /// The "confirm" half of a confirm dialog's `⏎/y ... esc/n ...` hint line.
     DialogConfirm,
     /// The "cancel" half of the same line.

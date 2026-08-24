@@ -2333,6 +2333,9 @@ impl App {
                     Some(crate::hit::HitTarget::Dismiss) => {
                         self.handle_key(KeyEvent::from(KeyCode::Esc));
                     }
+                    Some(crate::hit::HitTarget::OpenBranches) if self.mode == Mode::Normal => {
+                        self.handle_key(KeyEvent::from(KeyCode::Char('a')));
+                    }
                     Some(crate::hit::HitTarget::BranchRow(i))
                         if self.mode == Mode::Branches && i < self.unapplied.branches.len() =>
                     {
@@ -3427,6 +3430,43 @@ mod tests {
 
         app.on_mouse(mouse(MouseEventKind::Moved, 50, 50));
         assert_eq!(app.hover, None, "moving off every hit region must clear the hover");
+    }
+
+    /// `a` already opens the drawer from the keyboard; before this there was nothing to
+    /// click for it anywhere in the main board view — only its own back control, once
+    /// already inside. This is the header's side of that door.
+    #[test]
+    fn clicking_the_headers_unapplied_control_opens_the_drawer() {
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+
+        let mut app = App::from_board(board());
+        app.hit_map = hits(&[(rect(0, 0), HitTarget::OpenBranches)]);
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 0));
+
+        // `App::from_board` has no `but` behind it, so `toggle_branch_drawer` can't
+        // actually fetch the list and switch modes — reaching this same "read-only"
+        // message is what proves the click took the `a` path at all, rather than a no-op.
+        assert!(
+            app.message.as_ref().is_some_and(|(m, _)| m.contains("read-only")),
+            "the click must have gone through toggle_branch_drawer: {:?}",
+            app.message
+        );
+    }
+
+    /// The control only exists in the header while `mode == Normal` (see `draw_header`),
+    /// but the guard belongs to `on_mouse` too — a stale hit shouldn't reopen the drawer,
+    /// or anything else, out from under an unrelated mode.
+    #[test]
+    fn the_open_drawer_control_is_inert_outside_normal_mode() {
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+
+        let mut app = App::from_board(board());
+        app.mode = Mode::Help;
+        app.hit_map = hits(&[(rect(0, 0), HitTarget::OpenBranches)]);
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 0));
+
+        assert_eq!(app.mode, Mode::Help);
+        assert!(app.message.is_none());
     }
 
     /// `ui::draw` gives the branches drawer the same `‹` back control as the diff pane,
