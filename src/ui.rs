@@ -1313,7 +1313,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         }
         Mode::Help => "  esc close",
         Mode::Normal => {
-            "  ←/→ lane · ↑/↓ card · m move · u unstage · c commit · b branch · t task · s stack · ⏎ diff · d delete · r rebase · p push · M land · z/Z undo/redo · ?"
+            "  ←/→ lane · ↑/↓ card · m move · u unstage · c commit · b branch · t task · s stack · ⏎ diff · d delete · r rebase · p push · L land · z/Z undo/redo · ?"
         }
     };
     f.render_widget(Paragraph::new(Line::styled(keys, theme::faint())), area);
@@ -1344,7 +1344,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         help_row("t", "send a task to this lane's cmux pane — spawns one first if not open"),
         help_row("s", "stack this whole lane onto another — rewrites history"),
         help_row("p", "push this lane — shows what it will do first"),
-        help_row("M", "land this lane onto the target — no PR, shows what will happen first"),
+        help_row("L", "land this lane onto the target — no PR, shows what will happen first"),
         help_row("z / Z", "undo / redo the last operation — fires immediately, no confirm"),
         help_row("? / esc", "toggle this help"),
         help_row("q", "quit"),

@@ -2239,7 +2239,7 @@ impl App {
             K::Char(' ') if self.mode == Mode::Normal => self.toggle_selected(),
             K::Char('m') if self.mode == Mode::Normal => self.begin_move(),
             K::Char('p') if self.mode == Mode::Normal => self.begin_push(),
-            K::Char('M') if self.mode == Mode::Normal => self.begin_land(),
+            K::Char('L') if self.mode == Mode::Normal => self.begin_land(),
             K::Char('z') if self.mode == Mode::Normal => self.undo(),
             K::Char('Z') if self.mode == Mode::Normal => self.redo(),
             K::Char('b') if self.mode == Mode::Normal => self.begin_branch(),

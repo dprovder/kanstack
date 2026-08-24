@@ -112,7 +112,7 @@ pub fn steps() -> Vec<Step> {
             }),
         },
         Step {
-            prompt: "Press M to preview landing this lane onto the target, then ⏎ / y to confirm.",
+            prompt: "Press L to preview landing this lane onto the target, then ⏎ / y to confirm.",
             done: Box::new(|app| !has_lane(app, "practice")),
         },
         Step {
@@ -245,10 +245,10 @@ mod tests {
             "step 3 did not advance — amending notes.txt into practice failed"
         );
 
-        // Step 4: M, then ⏎ to confirm landing onto the (fake, local) target. Landing runs
+        // Step 4: L, then ⏎ to confirm landing onto the (fake, local) target. Landing runs
         // on a background thread now, so the step only advances once `poll_land` picks up
         // the result — a step tied to `on_key` alone would never see it complete.
-        app.on_key(key(KeyCode::Char('M')));
+        app.on_key(key(KeyCode::Char('L')));
         app.on_key(key(KeyCode::Enter));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while app.mode == crate::app::Mode::Landing {

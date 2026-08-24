@@ -1257,7 +1257,7 @@ fn landing_through_the_app_runs_on_a_background_thread_and_updates_the_board() {
         .expect("the feat lane exists");
     app.col = lane;
 
-    app.on_key(KeyEvent::from(KeyCode::Char('M')));
+    app.on_key(KeyEvent::from(KeyCode::Char('L')));
     assert_eq!(app.mode, Mode::LandConfirm, "shows the preview before landing");
     app.on_key(KeyEvent::from(KeyCode::Enter));
     assert_eq!(
@@ -1578,7 +1578,7 @@ fn landing_a_stacked_lane_lands_every_branch_base_first() {
         .expect("the stacked lane exists, named for its tip");
     app.col = lane;
 
-    app.on_key(KeyEvent::from(KeyCode::Char('M')));
+    app.on_key(KeyEvent::from(KeyCode::Char('L')));
     assert_eq!(app.mode, Mode::LandConfirm);
     app.on_key(KeyEvent::from(KeyCode::Enter));
     assert_eq!(app.mode, Mode::Landing);
