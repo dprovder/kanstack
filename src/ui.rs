@@ -56,7 +56,7 @@ pub fn draw(f: &mut Frame, app: &App) -> HitMap {
         .constraints(constraints)
         .split(f.area());
 
-    draw_header(f, app, chunks[0], &mut hits);
+    draw_header(f, app, chunks[0]);
     let mut next = 1;
     if let Some(t) = &app.tutorial {
         draw_tutorial_banner(f, t, chunks[next]);
@@ -902,7 +902,7 @@ fn draw_landing(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn draw_header(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
+fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let b = &app.board;
     let mut spans = vec![
         Span::styled("  workspace", theme::muted()),
@@ -975,22 +975,6 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
             format!("{} selected", app.selected.len()),
             theme::tone(crate::board::Tone::Accent),
         ));
-    }
-    // `a` already opens the drawer from anywhere in Normal mode; this is the same door for
-    // a mouse, which otherwise only ever gets to close the drawer (from its own back
-    // control) and never to open it. Styled to stand out, the same as the diff pane's `‹`,
-    // since it's the one clickable thing in the header. Placed last and measured by what's
-    // already in `spans` rather than reserved a fixed column, so it moves with whatever
-    // else the header happens to be showing instead of overlapping it.
-    if app.mode == Mode::Normal {
-        spans.push(Span::styled("  ·  ", theme::faint()));
-        let prefix_w: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
-        let label = "a  unapplied";
-        spans.push(Span::styled(label, theme::tone(crate::board::Tone::Accent)));
-        hits.push(
-            Rect { x: area.x + prefix_w, y: area.y, width: label.chars().count() as u16, height: 1 },
-            HitTarget::OpenBranches,
-        );
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -1083,8 +1067,18 @@ fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect, hits: &mut HitM
         app.mode == Mode::Moving && is_current && app.target_card.is_none();
     let hovered =
         app.mode == Mode::Normal && app.hover == Some(HitTarget::LaneHeader(idx));
+    // The unassigned lane has no push status of its own for the dot to carry, which
+    // leaves it free to do something else: double as the door into the unapplied-branches
+    // drawer, the same `‹` the diff pane and the drawer's own header use for "there's a
+    // panel here." Only while the drawer is actually reachable from where the click would
+    // land — otherwise it's back to being an ordinary (faint, statusless) dot.
+    let is_drawer_door = col.kind == ColumnKind::Unassigned && app.mode == Mode::Normal;
     let mut header = Line::from(vec![
-        Span::styled("● ", theme::status_dot(col.state)),
+        if is_drawer_door {
+            Span::styled("‹ ", theme::tone(crate::board::Tone::Accent))
+        } else {
+            Span::styled("● ", theme::status_dot(col.state))
+        },
         Span::styled(
             truncate(&col.title, inner_w.saturating_sub(8)),
             theme::title(is_current || hovered),
@@ -1138,6 +1132,14 @@ fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect, hits: &mut HitM
     let header_rect = Rect { height: fixed_h, ..area };
     f.render_widget(Paragraph::new(fixed_lines), header_rect);
     hits.push(header_rect, HitTarget::LaneHeader(idx));
+    // Narrower and pushed after, so it wins the hit-test over the header it sits inside:
+    // clicking the `‹` itself opens the drawer rather than just selecting the lane.
+    if is_drawer_door {
+        hits.push(
+            Rect { x: area.x, y: area.y, width: 2, height: 1 },
+            HitTarget::OpenBranches,
+        );
+    }
     if area.height <= fixed_h {
         return;
     }
