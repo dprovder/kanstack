@@ -116,6 +116,53 @@ mod tests {
         plain(&to_ansi(t.backend().buffer()))
     }
 
+    /// The modal is a fixed 64-column box (see `draw_branch_modal`), so a message longer
+    /// than that must wrap onto as many lines as it needs — the whole thing stays visible
+    /// at once, unlike the footer's single scrolling line, which has to hide whatever
+    /// doesn't fit behind an ellipsis.
+    #[test]
+    fn branch_modal_wraps_a_message_longer_than_the_box_instead_of_hiding_it() {
+        let status =
+            crate::but::parse_status(include_str!("../tests/fixtures/status.json")).unwrap();
+        let mut app = App::from_board(Board::from_status(&status));
+        app.branch_ui = crate::app::BranchUi::Modal;
+        app.mode = crate::app::Mode::HarnessMessage;
+        let message = "please refactor the auth middleware to use the new session token format and update the tests accordingly";
+        for c in message.chars() {
+            app.harness_message_input.insert(c);
+        }
+        let out = render_app(&app, 160, 30);
+        assert!(
+            out.contains("please refactor the auth middleware"),
+            "the start of the message must still be visible, not scrolled away:\n{out}"
+        );
+        assert!(
+            out.contains("accordingly"),
+            "the end of the message, next to the cursor, must be visible too:\n{out}"
+        );
+        assert!(!out.contains('…'), "wrapping should mean nothing needs to be elided:\n{out}");
+    }
+
+    /// `KANSTACK_BRANCH_UI=modal` swaps `b`'s footer prompt for a dedicated dialog — this
+    /// pins that the dialog actually appears (and the footer stays blank under it) once
+    /// `branch_ui` is set, independent of whatever wiring gets `branch_ui` there in a real
+    /// run (see `BranchUi::from_env`, read once at startup from that env var).
+    #[test]
+    fn branch_ui_modal_shows_a_dialog_instead_of_the_footer_prompt() {
+        let status =
+            crate::but::parse_status(include_str!("../tests/fixtures/status.json")).unwrap();
+        let mut app = App::from_board(Board::from_status(&status));
+        app.branch_ui = crate::app::BranchUi::Modal;
+        app.mode = crate::app::Mode::Branch;
+        let out = render_app(&app, 160, 30);
+        assert!(out.contains("new branch"), "missing the modal's title:\n{out}");
+        assert!(out.contains("⏎ create"), "missing the modal's hint line:\n{out}");
+        assert!(
+            !out.contains("tab switch · shift-tab cmux · esc cancel"),
+            "the old footer-style hint text leaked through instead of the modal's own:\n{out}"
+        );
+    }
+
     /// The drawer's job is to answer "what can I apply, and will it hurt" — so both branch
     /// names and both merge verdicts have to survive the render, not just the names.
     #[test]

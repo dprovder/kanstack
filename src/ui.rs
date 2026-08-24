@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{columns_that_fit, App, Mode, Notice, COL_GAP};
+use crate::app::{columns_that_fit, App, BranchUi, Mode, Notice, COL_GAP};
 use crate::board::{Card, ColumnKind, Tone};
 use crate::cmux::PaneStatus;
 use crate::theme;
@@ -110,6 +110,9 @@ pub fn draw(f: &mut Frame, app: &App) {
         Mode::UnapplyConfirm => draw_unapply_confirm(f, app, f.area()),
         Mode::RebaseConfirm => draw_rebase_confirm(f, app, f.area()),
         Mode::Blocked => draw_blocked(f, app, f.area()),
+        Mode::Branch | Mode::HarnessMessage if app.branch_ui == BranchUi::Modal => {
+            draw_branch_modal(f, app, f.area())
+        }
         // The board keeps its half unless the diff is expanded, so reading a diff does not
         // cost you your place — the same split gitui uses, and for the same reason.
         Mode::Diff => {}
@@ -563,6 +566,130 @@ fn draw_push_confirm(f: &mut Frame, app: &App, area: Rect) {
                 })
                 .style(theme::selected_bg()),
         ),
+        popup,
+    );
+}
+
+/// Branch creation, as a modal — the `KANSTACK_BRANCH_UI=modal` alternative to the
+/// default one-line footer prompt (see `BranchUi`). Shows the name, the pending action,
+/// and — when one is coming — the initial harness message all at once instead of one
+/// field at a time, each with room a footer line never has. Covers `Mode::Branch` and
+/// `Mode::HarnessMessage` both, so the name stays visible (now fixed, no cursor) while
+/// the message field takes over — nothing about the flow changes from the footer version,
+/// only how much of it is on screen together.
+fn draw_branch_modal(f: &mut Frame, app: &App, area: Rect) {
+    let editing_message = app.mode == Mode::HarnessMessage;
+    let will_prompt = editing_message || app.will_prompt_for_harness_message();
+    let cursor = theme::tone(crate::board::Tone::Accent);
+
+    // Fixed ahead of the body so the name/message fields can be scrolled to fit it — the
+    // popup is sized to the body's line count, but its *width* never depends on their
+    // content, so there's no chicken-and-egg problem computing this first.
+    let w = 64.min(area.width.saturating_sub(4));
+    // Inside the block's border on each side.
+    let content_width = (w as usize).saturating_sub(2);
+
+    let mut body = vec![Line::styled("  new branch", theme::muted()), Line::raw("")];
+
+    let name_prefix = "  name     ";
+    if editing_message {
+        // Already handed off to `pending_branch` — fixed, no cursor of its own anymore,
+        // so no scrolling needed either; `truncate` (right-elided) is the right shape for
+        // a value that's just being displayed rather than actively edited.
+        let name = truncate(app.branch_modal_name(), content_width.saturating_sub(name_prefix.chars().count()));
+        body.push(Line::from(vec![
+            Span::styled(name_prefix, theme::faint()),
+            Span::styled(name, theme::title(true)),
+        ]));
+    } else {
+        let (before, after) = app.branch_input.split_at_cursor();
+        let budget = footer_input_budget(content_width as u16, name_prefix.chars().count(), 0);
+        let (before, after) = scroll_input(before, after, budget);
+        body.push(Line::from(vec![
+            Span::styled(name_prefix, theme::faint()),
+            Span::styled(before, theme::title(true)),
+            Span::styled("█", cursor),
+            Span::styled(after, theme::title(true)),
+        ]));
+    }
+
+    body.push(Line::from(vec![
+        Span::styled("  action   ", theme::faint()),
+        Span::styled(app.pending_branch_action(), theme::tone(crate::board::Tone::Accent)),
+    ]));
+
+    if will_prompt {
+        body.push(Line::raw(""));
+        if editing_message {
+            // Unlike the name field (a single-line git ref, scrolled horizontally) or the
+            // footer version of this same prompt (a fixed one-line strip), the modal has
+            // room to grow downward — so the message wraps across as many lines as it
+            // needs instead of scrolling one line sideways with older text hidden behind
+            // an ellipsis.
+            let message_prefix = "  message  ";
+            let prefix_width = message_prefix.chars().count();
+            let wrap_width = content_width.saturating_sub(prefix_width);
+            let text: Vec<char> = app.harness_message_input.as_str().chars().collect();
+            let ranges = wrap_ranges(&text, wrap_width);
+            let cursor_idx = app.harness_message_input.split_at_cursor().0.chars().count();
+            let cursor_line = ranges
+                .iter()
+                .position(|&(s, e)| cursor_idx >= s && cursor_idx < e)
+                .unwrap_or(ranges.len() - 1);
+            for (li, &(s, e)) in ranges.iter().enumerate() {
+                let label = if li == 0 {
+                    Span::styled(message_prefix, theme::faint())
+                } else {
+                    Span::raw(" ".repeat(prefix_width))
+                };
+                let line: String = text[s..e].iter().collect();
+                if li == cursor_line {
+                    let byte_at = line
+                        .char_indices()
+                        .nth(cursor_idx - s)
+                        .map(|(b, _)| b)
+                        .unwrap_or(line.len());
+                    let (before, after) = line.split_at(byte_at);
+                    body.push(Line::from(vec![
+                        label,
+                        Span::styled(before.to_string(), theme::title(true)),
+                        Span::styled("█", cursor),
+                        Span::styled(after.to_string(), theme::title(true)),
+                    ]));
+                } else {
+                    body.push(Line::from(vec![label, Span::styled(line, theme::title(true))]));
+                }
+            }
+        } else {
+            body.push(Line::styled(
+                "  message  (next: an optional initial message for the harness)",
+                theme::faint(),
+            ));
+        }
+    }
+
+    body.push(Line::raw(""));
+    let hint = if editing_message {
+        "  ⏎ open harness      esc cancel branch"
+    } else if will_prompt {
+        "  ⏎ next: message · tab switch · shift-tab cmux      esc cancel"
+    } else if app.cmux_available() {
+        "  ⏎ create · tab switch · shift-tab cmux      esc cancel"
+    } else {
+        "  ⏎ create · tab switch      esc cancel"
+    };
+    body.push(Line::styled(hint, theme::faint()));
+
+    let h = (body.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, popup);
+    f.render_widget(
+        Paragraph::new(body).block(Block::bordered().border_style(theme::faint()).style(theme::selected_bg())),
         popup,
     );
 }
@@ -1443,6 +1570,10 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     }
 
     let keys = match app.mode {
+        // The modal (`draw_branch_modal`) carries its own hints and is drawn over the
+        // board separately — see `draw`'s dispatch — so the footer stays blank rather
+        // than duplicating them under it.
+        Mode::Branch | Mode::HarnessMessage if app.branch_ui == BranchUi::Modal => "",
         Mode::Moving => {
             let action = app.pending_action().unwrap_or_default();
             return f.render_widget(
@@ -1482,10 +1613,14 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             let (before, after) = app.branch_input.split_at_cursor();
             let prefix = "  branch  ";
             let pending = app.pending_branch_action();
+            // A parallel lane opening a harness doesn't create anything on this Enter —
+            // it goes on to prompt for an initial message first, and `confirm_branch`
+            // doesn't touch `but` until that prompt confirms.
+            let verb = if app.will_prompt_for_harness_message() { "next" } else { "create" };
             let hint = if app.cmux_available() {
-                "   ⏎ create · tab switch · shift-tab cmux · esc cancel"
+                format!("   ⏎ {verb} · tab switch · shift-tab cmux · esc cancel")
             } else {
-                "   ⏎ create · tab switch · esc cancel"
+                format!("   ⏎ {verb} · tab switch · esc cancel")
             };
             let suffix_len = 3 + pending.chars().count() + hint.chars().count();
             let budget = footer_input_budget(area.width, prefix.chars().count(), suffix_len);
@@ -1523,7 +1658,10 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         Mode::HarnessMessage => {
             let (before, after) = app.harness_message_input.split_at_cursor();
             let prefix = "  initial message  ";
-            let hint = "   ⏎ open harness · esc skip";
+            // Nothing has been created yet at this point — see `App::confirm_branch` — so
+            // `esc` here cancels the branch outright rather than just skipping the
+            // message.
+            let hint = "   ⏎ open harness · esc cancel branch";
             let budget = footer_input_budget(area.width, prefix.chars().count(), hint.chars().count());
             let (before, after) = scroll_input(before, after, budget);
             return f.render_widget(
@@ -1766,6 +1904,41 @@ fn scroll_input(before: &str, after: &str, budget: usize) -> (String, String) {
     (before_show, after_show)
 }
 
+/// Word-wraps `chars` into line ranges — each an exclusive `[start, end)` back into
+/// `chars` — for a box that can grow downward, like the branch-modal message field.
+///
+/// Unlike `wrap`, which rebuilds the string and collapses whitespace runs to a single
+/// space, this preserves the exact original text and reports *where* each line falls in
+/// it, which a caller needs to locate a cursor position afterwards (`wrap`'s rebuilt
+/// string has no reliable mapping back to the source). Breaks at the last space that
+/// still fits a line, keeping that space at the line's end; a run with no space to break
+/// at (a single word longer than `width`) hard-splits at `width`, the same fallback
+/// `wrap` uses for a long path or URL.
+fn wrap_ranges(chars: &[char], width: usize) -> Vec<(usize, usize)> {
+    if width == 0 || chars.is_empty() {
+        return vec![(0, chars.len())];
+    }
+    let mut lines = Vec::new();
+    let mut start = 0;
+    while start < chars.len() {
+        let mut end = (start + width).min(chars.len());
+        if end < chars.len() {
+            if let Some(back) = chars[start..end].iter().rposition(|&c| c == ' ') {
+                let space_at = start + back;
+                // A space right at `start` is a leading space on this line, not a break
+                // point before it — falling through to the hard split at `width` avoids
+                // producing a zero-length line.
+                if space_at > start {
+                    end = space_at + 1;
+                }
+            }
+        }
+        lines.push((start, end));
+        start = end;
+    }
+    lines
+}
+
 fn truncate(s: &str, width: usize) -> String {
     if s.chars().count() <= width {
         return s.to_string();
@@ -1779,6 +1952,48 @@ fn truncate(s: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ranges_text(text: &str, ranges: &[(usize, usize)]) -> Vec<String> {
+        let chars: Vec<char> = text.chars().collect();
+        ranges.iter().map(|&(s, e)| chars[s..e].iter().collect()).collect()
+    }
+
+    #[test]
+    fn wrap_ranges_breaks_at_the_last_space_that_fits() {
+        let chars: Vec<char> = "the quick brown fox".chars().collect();
+        let ranges = wrap_ranges(&chars, 10);
+        assert_eq!(ranges_text("the quick brown fox", &ranges), ["the quick ", "brown fox"]);
+    }
+
+    /// A run with no space to break at (a single long token) hard-splits at `width`
+    /// rather than overflowing it, the same fallback `wrap` uses for a long path.
+    #[test]
+    fn wrap_ranges_hard_splits_a_token_with_no_space() {
+        let chars: Vec<char> = "aaaaaaaaaaaaaaaa".chars().collect(); // 16 chars, no spaces
+        let ranges = wrap_ranges(&chars, 6);
+        assert_eq!(ranges_text("aaaaaaaaaaaaaaaa", &ranges), ["aaaaaa", "aaaaaa", "aaaa"]);
+    }
+
+    #[test]
+    fn wrap_ranges_leaves_short_text_on_one_line() {
+        let chars: Vec<char> = "hi there".chars().collect();
+        assert_eq!(wrap_ranges(&chars, 20), [(0, 8)]);
+    }
+
+    /// The ranges are what a caller uses to place the cursor on the right wrapped line —
+    /// this pins that every character position in the original text is covered by
+    /// exactly one range, with no gaps or overlaps a cursor could fall into.
+    #[test]
+    fn wrap_ranges_cover_every_char_position_with_no_gaps() {
+        let text = "the quick brown fox jumps over the lazy dog and then some more";
+        let chars: Vec<char> = text.chars().collect();
+        let ranges = wrap_ranges(&chars, 12);
+        assert_eq!(ranges[0].0, 0);
+        assert_eq!(ranges.last().unwrap().1, chars.len());
+        for w in ranges.windows(2) {
+            assert_eq!(w[0].1, w[1].0, "ranges must be contiguous: {ranges:?}");
+        }
+    }
 
     #[test]
     fn scroll_input_shows_everything_when_it_already_fits() {

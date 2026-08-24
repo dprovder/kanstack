@@ -42,6 +42,10 @@ environment:
                            left, right, above, or below (default: `above`)
   KANSTACK_CMUX_CHAIN_DIRECTION  split direction for every lane after the first, off the
                            previous lane instead of kanstack (default: `right`)
+  KANSTACK_BRANCH_UI  how `b`'s branch-name/initial-message prompts are presented: `modal`
+                      (default), a dedicated box showing the name, the pending action, and
+                      the message all together, or `footer`, squeezed into the one-line
+                      footer like every other prompt
 
 capture a snapshot for a bug report:
   but status -f --json > board.json && kanstack --snapshot board.json
