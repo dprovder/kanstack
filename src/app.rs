@@ -275,6 +275,13 @@ pub struct App {
     pub unapplied: Unapplied,
     /// Cursor within the drawer, valid while `mode == Branches`.
     pub branch_sel: usize,
+    /// Where on screen everything from the last frame landed, for resolving the next mouse
+    /// event. Rebuilt every draw (see `ui::draw`) rather than kept in sync incrementally.
+    pub hit_map: crate::hit::HitMap,
+    /// The card under a left-button press, while it's still down and hasn't (yet) dragged
+    /// onto a different card or lane. `None` once a plain click is done, or once the press
+    /// has turned into a `Moving` drag (see `on_mouse`).
+    mouse_down_card: Option<(usize, usize)>,
 }
 
 type RefreshResult = Result<(Board, HashMap<String, (usize, usize)>)>;
@@ -411,6 +418,8 @@ impl App {
             cmux_poll_at: None,
             unapplied: Unapplied::default(),
             branch_sel: 0,
+            hit_map: crate::hit::HitMap::new(),
+            mouse_down_card: None,
         })
     }
 
@@ -459,6 +468,8 @@ impl App {
             cmux_poll_at: None,
             unapplied: Unapplied::default(),
             branch_sel: 0,
+            hit_map: crate::hit::HitMap::new(),
+            mouse_down_card: None,
         }
     }
 
@@ -2279,6 +2290,106 @@ impl App {
         }
     }
 
+    /// Handles a mouse event against `hit_map`, which reflects the frame that was on
+    /// screen when the event arrived (see `main::run`, which fills it in right after each
+    /// `terminal.draw`).
+    ///
+    /// Where an action already exists as a keystroke — confirming or cancelling a dialog,
+    /// dismissing help, scrolling — this synthesizes that keystroke through `handle_key`
+    /// rather than re-implementing per-mode dispatch a second time. Only clicking and
+    /// dragging on the board itself, which has no keyboard equivalent for jumping straight
+    /// to an arbitrary card, are handled directly.
+    pub fn on_mouse(&mut self, ev: ratatui::crossterm::event::MouseEvent) {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEventKind};
+
+        match ev.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.mouse_down_card = None;
+                match self.hit_map.hit_test(ev.column, ev.row) {
+                    Some(crate::hit::HitTarget::DialogConfirm) => {
+                        self.handle_key(KeyEvent::from(KeyCode::Enter));
+                    }
+                    Some(crate::hit::HitTarget::DialogCancel) => {
+                        self.handle_key(KeyEvent::from(KeyCode::Esc));
+                    }
+                    Some(crate::hit::HitTarget::Dismiss) => {
+                        self.handle_key(KeyEvent::from(KeyCode::Esc));
+                    }
+                    Some(crate::hit::HitTarget::BranchRow(i))
+                        if self.mode == Mode::Branches && i < self.unapplied.branches.len() =>
+                    {
+                        self.branch_sel = i;
+                    }
+                    Some(crate::hit::HitTarget::Card(col, card)) if self.mode == Mode::Normal => {
+                        self.col = col;
+                        self.card = card;
+                        self.mouse_down_card = Some((col, card));
+                    }
+                    Some(
+                        crate::hit::HitTarget::LaneHeader(col) | crate::hit::HitTarget::LaneBody(col),
+                    ) if self.mode == Mode::Normal => {
+                        self.col = col;
+                        let count = self.cards_in_current_column();
+                        self.card = if count == 0 { 0 } else { self.card.min(count - 1) };
+                    }
+                    _ => {}
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let Some(origin) = self.mouse_down_card else {
+                    return;
+                };
+                let target = self.hit_map.hit_test(ev.column, ev.row);
+                if self.mode == Mode::Normal {
+                    let moved_off = match target {
+                        Some(crate::hit::HitTarget::Card(c, ci)) => (c, Some(ci)) != (origin.0, Some(origin.1)),
+                        Some(
+                            crate::hit::HitTarget::LaneHeader(c) | crate::hit::HitTarget::LaneBody(c),
+                        ) => c != origin.0,
+                        _ => false,
+                    };
+                    if !moved_off {
+                        return;
+                    }
+                    // `begin_move` picks up whatever's under `self.col`/`self.card`, which
+                    // the `Down` handler already set to `origin` — same trick the keyboard
+                    // `m` binding relies on.
+                    self.begin_move();
+                    if self.mode != Mode::Moving {
+                        // Nothing to move (see `begin_move`'s own check) — nothing dragging.
+                        self.mouse_down_card = None;
+                        return;
+                    }
+                }
+                if self.mode == Mode::Moving {
+                    match target {
+                        Some(crate::hit::HitTarget::Card(c, ci)) => {
+                            self.col = c;
+                            self.target_card = Some(ci);
+                        }
+                        Some(
+                            crate::hit::HitTarget::LaneHeader(c) | crate::hit::HitTarget::LaneBody(c),
+                        ) => {
+                            self.col = c;
+                            self.target_card = None;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left)
+                if self.mouse_down_card.take().is_some() && self.mode == Mode::Moving =>
+            {
+                self.confirm_move();
+            }
+            MouseEventKind::ScrollDown => self.handle_key(KeyEvent::from(KeyCode::Down)),
+            MouseEventKind::ScrollUp => self.handle_key(KeyEvent::from(KeyCode::Up)),
+            _ => {}
+        }
+
+        self.check_tutorial_advance();
+    }
+
     fn handle_key(&mut self, key: ratatui::crossterm::event::KeyEvent) {
         use ratatui::crossterm::event::KeyCode as K;
         use ratatui::crossterm::event::KeyModifiers;
@@ -2635,6 +2746,8 @@ impl App {
 mod tests {
     use super::*;
     use crate::but::parse_status;
+    use crate::hit::{HitMap, HitTarget};
+    use ratatui::layout::Rect;
 
     /// Builds an App without spawning `but`. Only navigation is exercised here;
     /// anything that mutates needs the real CLI and is covered by hand.
@@ -3046,6 +3159,160 @@ mod tests {
         app.mode = Mode::Restacking;
         app.on_key(key(K::Esc));
         assert!(!app.should_quit);
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    fn mouse(
+        kind: ratatui::crossterm::event::MouseEventKind,
+        column: u16,
+        row: u16,
+    ) -> ratatui::crossterm::event::MouseEvent {
+        ratatui::crossterm::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: ratatui::crossterm::event::KeyModifiers::empty(),
+        }
+    }
+
+    /// Hand-built rather than produced by `ui::draw`, so these tests pin `on_mouse`'s
+    /// interpretation of a hit map against known coordinates without depending on the
+    /// board's actual layout.
+    fn hits(regions: &[(Rect, HitTarget)]) -> HitMap {
+        let mut map = HitMap::new();
+        for (rect, target) in regions {
+            map.push(*rect, *target);
+        }
+        map
+    }
+
+    fn rect(x: u16, y: u16) -> Rect {
+        Rect { x, y, width: 4, height: 1 }
+    }
+
+    #[test]
+    fn clicking_a_card_selects_it() {
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+
+        let mut app = App::from_board(board());
+        app.hit_map = hits(&[(rect(0, 0), HitTarget::Card(1, 0))]);
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 0));
+
+        assert_eq!((app.col, app.card), (1, 0));
+    }
+
+    #[test]
+    fn clicking_a_lane_header_selects_the_lane_and_clamps_the_card_cursor() {
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+
+        let mut app = App::from_board(board());
+        app.col = 1;
+        app.card = 1; // valid in feat-auth (2 cards), out of range in fix-flaky-tests (1)
+        app.hit_map = hits(&[(rect(0, 0), HitTarget::LaneHeader(3))]);
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 0));
+
+        assert_eq!(app.col, 3);
+        assert_eq!(app.card, 0, "the click must clamp, not point past the lane's last card");
+    }
+
+    /// The mouse equivalent of `m` (`begin_move`) followed by dropping on the target lane:
+    /// press on a card, drag onto a different lane's header, release. `App::from_board`
+    /// leaves `but` unset, so the drop resolves through the same "snapshot is read-only"
+    /// path a real single-card move takes once `but` itself is missing — which is enough
+    /// to prove the release actually reached `confirm_move`, without needing a real CLI.
+    #[test]
+    fn dragging_a_card_onto_another_lane_enters_moving_mode_and_confirms_on_release() {
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+
+        let mut app = App::from_board(board());
+        app.col = 0;
+        app.card = 0; // a working-tree file in the unassigned/backlog lane
+
+        let card_rect = rect(0, 0);
+        let header_rect = rect(20, 0);
+        app.hit_map = hits(&[
+            (card_rect, HitTarget::Card(0, 0)),
+            (header_rect, HitTarget::LaneHeader(1)),
+        ]);
+
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 0));
+        app.on_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 21, 0));
+        assert_eq!(app.mode, Mode::Moving, "dragging onto a different lane must pick the card up");
+        assert_eq!((app.origin_col, app.origin_card), (0, 0));
+        assert_eq!(app.col, 1, "the drop cursor follows the pointer, not just the drag start");
+        assert_eq!(app.target_card, None, "dropped on the header, not on one of its cards");
+
+        app.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 21, 0));
+        assert_eq!(app.mode, Mode::Normal, "releasing must resolve the move, not leave it pending");
+    }
+
+    /// A plain click — no drag in between — must not pick anything up; that would turn
+    /// ordinary selection into an accidental move the moment the pointer twitches.
+    #[test]
+    fn clicking_a_card_without_dragging_never_enters_moving_mode() {
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+
+        let mut app = App::from_board(board());
+        app.hit_map = hits(&[(rect(0, 0), HitTarget::Card(0, 0))]);
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 0));
+        app.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 1, 0));
+
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn scrolling_moves_the_card_cursor_like_the_arrow_keys() {
+        use ratatui::crossterm::event::MouseEventKind;
+
+        let mut app = App::from_board(board());
+        app.col = 0;
+        app.card = 0;
+
+        app.on_mouse(mouse(MouseEventKind::ScrollDown, 0, 0));
+        assert_eq!(app.card, 1, "scroll down must be Down, not left unhandled");
+
+        app.on_mouse(mouse(MouseEventKind::ScrollUp, 0, 0));
+        assert_eq!(app.card, 0);
+    }
+
+    /// Clicking either half of a confirm dialog's hint line must take exactly the path its
+    /// keyboard equivalent (`Esc`/`Enter`) would — reusing `handle_key` rather than a
+    /// second, parallel dispatch that could drift from it.
+    #[test]
+    fn clicking_a_confirm_dialogs_buttons_takes_the_same_paths_as_its_keys() {
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+
+        let mut app = App::from_board(board());
+        app.col = 1; // feat-auth: a real branch, so `pending_delete` is `Some`
+        let confirm_rect = rect(0, 0);
+        let cancel_rect = rect(20, 0);
+        app.hit_map = hits(&[
+            (confirm_rect, HitTarget::DialogConfirm),
+            (cancel_rect, HitTarget::DialogCancel),
+        ]);
+
+        app.begin_delete();
+        assert_eq!(app.mode, Mode::DeleteConfirm);
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 21, 0));
+        assert_eq!(app.mode, Mode::Normal, "the cancel half must act like Esc");
+        assert!(app.message.as_ref().is_some_and(|(m, _)| m.contains("cancelled")));
+
+        app.begin_delete();
+        assert_eq!(app.mode, Mode::DeleteConfirm);
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 0));
+        assert_eq!(app.mode, Mode::Normal, "the confirm half must act like Enter");
+        assert!(app.message.as_ref().is_some_and(|(m, _)| m.contains("read-only")));
+    }
+
+    #[test]
+    fn clicking_anywhere_dismisses_help() {
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+
+        let mut app = App::from_board(board());
+        app.mode = Mode::Help;
+        app.hit_map = hits(&[(rect(0, 0), HitTarget::Dismiss)]);
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 0));
+
         assert_eq!(app.mode, Mode::Normal);
     }
 }

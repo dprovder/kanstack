@@ -1300,7 +1300,9 @@ fn creating_a_branch_from_the_empty_unassigned_column_does_not_panic() {
 
     let mut press = |app: &mut App, code: KeyCode| {
         app.on_key(KeyEvent::from(code));
-        term.draw(|f| kanstack::ui::draw(f, app)).unwrap();
+        term.draw(|f| {
+            kanstack::ui::draw(f, app);
+        }).unwrap();
     };
     press(&mut app, KeyCode::Char('b'));
     for c in "first-branch".chars() {
@@ -1336,12 +1338,16 @@ fn creating_a_branch_from_unassigned_with_cards_and_a_moved_cursor_does_not_pani
     let but = But::discover(&sb.repo()).unwrap();
     let mut app = App::new(but, Cmux::discover()).expect("build the app against the workspace");
     let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
-    term.draw(|f| kanstack::ui::draw(f, &app)).unwrap();
+    term.draw(|f| {
+        kanstack::ui::draw(f, &app);
+    }).unwrap();
 
     assert_eq!(app.column_count(), 1);
     let mut press = |app: &mut App, code: KeyCode| {
         app.on_key(KeyEvent::from(code));
-        term.draw(|f| kanstack::ui::draw(f, app)).unwrap();
+        term.draw(|f| {
+            kanstack::ui::draw(f, app);
+        }).unwrap();
     };
 
     // Move the card cursor onto the second file before creating a branch.

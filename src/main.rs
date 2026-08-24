@@ -8,7 +8,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
-use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use ratatui::crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
+use ratatui::crossterm::execute;
 
 use kanstack::app::{App, Mode, Notice};
 use kanstack::but::But;
@@ -147,7 +148,11 @@ fn main() -> Result<()> {
     };
 
     let mut terminal = ratatui::init();
+    // Best-effort: a terminal that doesn't understand mouse reporting just never sends
+    // `Event::Mouse`, so the board still works with the keyboard alone if this fails.
+    let _ = execute!(std::io::stdout(), EnableMouseCapture);
     let result = run(&mut terminal, &mut app, &mut watcher);
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     // After the restore, so it lands on the real screen rather than the one being torn
     // down. The teardown recovery reports what it did this way — it exits GitButler mode,
@@ -168,7 +173,10 @@ fn run(
             // Read before drawing so Shift+←/→ paging always knows how many lanes the
             // frame it's reacting to actually showed.
             app.terminal_width = f.area().width;
-            ui::draw(f, app);
+            // Stashed so the next mouse event can be resolved against exactly what's on
+            // screen right now — `ui::draw` takes `&App`, so it hands the map back rather
+            // than recording it directly.
+            app.hit_map = ui::draw(f, app);
         })?;
 
         // Short timeout so the watcher gets looked at promptly; it is the thing that keeps
@@ -176,6 +184,7 @@ fn run(
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => app.on_key(key),
+                Event::Mouse(mouse) => app.on_mouse(mouse),
                 Event::Resize(_, _) => {}
                 _ => {}
             }

@@ -19,7 +19,9 @@ pub fn render_file(path: &str, width: u16, height: u16) -> Result<String> {
     let app = App::from_board(Board::from_status(&status));
 
     let mut terminal = Terminal::new(TestBackend::new(width, height))?;
-    terminal.draw(|f| crate::ui::draw(f, &app))?;
+    terminal.draw(|f| {
+        crate::ui::draw(f, &app);
+    })?;
     Ok(to_ansi(terminal.backend().buffer()))
 }
 
@@ -94,7 +96,9 @@ mod tests {
             crate::but::parse_status(include_str!("../tests/fixtures/status.json")).unwrap();
         let app = App::from_board(Board::from_status(&status));
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
-        t.draw(|f| crate::ui::draw(f, &app)).unwrap();
+        t.draw(|f| {
+            crate::ui::draw(f, &app);
+        }).unwrap();
         plain(&to_ansi(t.backend().buffer()))
     }
 
@@ -112,7 +116,9 @@ mod tests {
 
     fn render_app(app: &App, w: u16, h: u16) -> String {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
-        t.draw(|f| crate::ui::draw(f, app)).unwrap();
+        t.draw(|f| {
+            crate::ui::draw(f, app);
+        }).unwrap();
         plain(&to_ansi(t.backend().buffer()))
     }
 
@@ -359,7 +365,9 @@ mod tests {
 
         let flat = App::from_board(Board::from_status(&status));
         let mut t = Terminal::new(TestBackend::new(160, 24)).unwrap();
-        t.draw(|f| crate::ui::draw(f, &flat)).unwrap();
+        t.draw(|f| {
+            crate::ui::draw(f, &flat);
+        }).unwrap();
         let flat_out = plain(&to_ansi(t.backend().buffer()));
         assert!(
             !flat_out.contains("▸ "),
@@ -370,7 +378,9 @@ mod tests {
         crate::board::group_unassigned_by_folder(&mut board.columns[0]);
         let grouped = App::from_board(board);
         let mut t = Terminal::new(TestBackend::new(160, 24)).unwrap();
-        t.draw(|f| crate::ui::draw(f, &grouped)).unwrap();
+        t.draw(|f| {
+            crate::ui::draw(f, &grouped);
+        }).unwrap();
         let grouped_out = plain(&to_ansi(t.backend().buffer()));
         assert!(grouped_out.contains("▸ docs"), "missing the docs divider:\n{grouped_out}");
         assert!(
@@ -410,7 +420,9 @@ mod tests {
         let mut app = App::from_board(Board::from_status(&status));
         app.col = 3; // fix-flaky-tests, the last of four lanes
         let mut t = Terminal::new(TestBackend::new(60, 24)).unwrap();
-        t.draw(|f| crate::ui::draw(f, &app)).unwrap();
+        t.draw(|f| {
+            crate::ui::draw(f, &app);
+        }).unwrap();
         let out = plain(&to_ansi(t.backend().buffer()));
 
         assert!(
@@ -430,7 +442,9 @@ mod tests {
         let mut app = App::from_board(Board::from_status(&status));
         app.col = 2; // feat-ui, the third of four lanes
         let mut t = Terminal::new(TestBackend::new(160, 24)).unwrap();
-        t.draw(|f| crate::ui::draw(f, &app)).unwrap();
+        t.draw(|f| {
+            crate::ui::draw(f, &app);
+        }).unwrap();
         let out = plain(&to_ansi(t.backend().buffer()));
 
         assert!(out.contains("lane 3/4"), "expected a lane 3/4 readout in the header:\n{out}");
@@ -444,7 +458,9 @@ mod tests {
         app.col = 1; // feat-auth, two commits
         app.card = 1;
         let mut t = Terminal::new(TestBackend::new(160, 24)).unwrap();
-        t.draw(|f| crate::ui::draw(f, &app)).unwrap();
+        t.draw(|f| {
+            crate::ui::draw(f, &app);
+        }).unwrap();
         let out = plain(&to_ansi(t.backend().buffer()));
 
         assert!(out.contains("card 2/2"), "expected a card 2/2 readout in the header:\n{out}");
@@ -457,7 +473,9 @@ mod tests {
         let mut app = App::from_board(Board::from_status(&status));
         app.col = 3; // fix-flaky-tests, a single-commit lane
         let mut t = Terminal::new(TestBackend::new(160, 24)).unwrap();
-        t.draw(|f| crate::ui::draw(f, &app)).unwrap();
+        t.draw(|f| {
+            crate::ui::draw(f, &app);
+        }).unwrap();
         let out = plain(&to_ansi(t.backend().buffer()));
 
         assert!(!out.contains("card 1/1"), "a single card is not a position worth reporting:\n{out}");
@@ -503,7 +521,9 @@ mod tests {
         for _ in 0..29 {
             app.on_key(KeyEvent::from(KeyCode::Down));
         }
-        t.draw(|f| crate::ui::draw(f, &app)).unwrap();
+        t.draw(|f| {
+            crate::ui::draw(f, &app);
+        }).unwrap();
         let out = plain(&to_ansi(t.backend().buffer()));
 
         assert!(
@@ -527,7 +547,9 @@ mod tests {
 
         let app = App::from_board(Board::from_status(&status));
         let mut t = Terminal::new(TestBackend::new(150, 24)).unwrap();
-        t.draw(|f| crate::ui::draw(f, &app)).unwrap();
+        t.draw(|f| {
+            crate::ui::draw(f, &app);
+        }).unwrap();
         let out = plain(&to_ansi(t.backend().buffer()));
 
         assert!(out.contains("feat-auth +1"), "lane names the stack depth");
@@ -554,7 +576,9 @@ mod tests {
             crate::but::parse_status(include_str!("../tests/fixtures/status.json")).unwrap();
         let app = App::from_board(Board::from_status(&status)); // col defaults to 0
         let mut t = Terminal::new(TestBackend::new(160, 24)).unwrap();
-        t.draw(|f| crate::ui::draw(f, &app)).unwrap();
+        t.draw(|f| {
+            crate::ui::draw(f, &app);
+        }).unwrap();
         let buf = t.backend().buffer();
 
         // `selected_bg` is reverse video (`Modifier::REVERSED`), not a fixed background
@@ -602,7 +626,9 @@ mod tests {
         });
 
         let mut t = Terminal::new(TestBackend::new(120, 24)).unwrap();
-        t.draw(|f| crate::ui::draw(f, &app)).unwrap();
+        t.draw(|f| {
+            crate::ui::draw(f, &app);
+        }).unwrap();
         let out = plain(&to_ansi(t.backend().buffer()));
 
         assert!(out.contains("land onto target"));
@@ -637,7 +663,9 @@ mod tests {
         });
 
         let mut t = Terminal::new(TestBackend::new(120, 24)).unwrap();
-        t.draw(|f| crate::ui::draw(f, &app)).unwrap();
+        t.draw(|f| {
+            crate::ui::draw(f, &app);
+        }).unwrap();
         let out = plain(&to_ansi(t.backend().buffer()));
 
         assert!(out.contains("conflicts on land"));
@@ -667,7 +695,9 @@ mod tests {
         });
 
         let mut t = Terminal::new(TestBackend::new(120, 24)).unwrap();
-        t.draw(|f| crate::ui::draw(f, &app)).unwrap();
+        t.draw(|f| {
+            crate::ui::draw(f, &app);
+        }).unwrap();
         let first = plain(&to_ansi(t.backend().buffer()));
         assert!(first.contains("landing feat-auth onto the target"));
 
@@ -679,7 +709,9 @@ mod tests {
         assert_eq!(app.mode, Mode::Landing, "landing has no cancel key");
 
         app.landing.as_mut().unwrap().spinner += 1;
-        t.draw(|f| crate::ui::draw(f, &app)).unwrap();
+        t.draw(|f| {
+            crate::ui::draw(f, &app);
+        }).unwrap();
         let second = plain(&to_ansi(t.backend().buffer()));
         assert_ne!(first, second, "the spinner glyph should advance between frames");
     }
@@ -713,7 +745,9 @@ mod tests {
         let board = Board::from_status_diff_and_commits(&status, &diff, &commits);
         let app = App::from_board(board);
         let mut t = Terminal::new(TestBackend::new(120, 22)).unwrap();
-        t.draw(|f| crate::ui::draw(f, &app)).unwrap();
+        t.draw(|f| {
+            crate::ui::draw(f, &app);
+        }).unwrap();
         let out = plain(&to_ansi(t.backend().buffer()));
 
         assert!(out.contains("+2 -1"), "a working-tree card counts its own hunk:\n{out}");
@@ -756,7 +790,9 @@ mod tests {
         app.mode = crate::app::Mode::Diff;
 
         let mut t = Terminal::new(TestBackend::new(120, 20)).unwrap();
-        t.draw(|f| crate::ui::draw(f, &app)).unwrap();
+        t.draw(|f| {
+            crate::ui::draw(f, &app);
+        }).unwrap();
         let out = plain(&to_ansi(t.backend().buffer()));
 
         assert!(out.contains("hunk 1 of 2"), "which hunk is selected");
@@ -790,7 +826,9 @@ mod tests {
         app.mode = crate::app::Mode::Diff;
 
         let mut t = Terminal::new(TestBackend::new(80, 16)).unwrap();
-        t.draw(|f| crate::ui::draw(f, &app)).unwrap();
+        t.draw(|f| {
+            crate::ui::draw(f, &app);
+        }).unwrap();
         let out = plain(&to_ansi(t.backend().buffer()));
         assert!(out.contains("committed"), "the hunk is marked as history");
         assert!(
@@ -807,7 +845,9 @@ mod tests {
             "Refactor the entire authentication subsystem and its supporting middleware".into();
         let app = App::from_board(Board::from_status(&status));
         let mut t = Terminal::new(TestBackend::new(120, 24)).unwrap();
-        t.draw(|f| crate::ui::draw(f, &app)).unwrap();
+        t.draw(|f| {
+            crate::ui::draw(f, &app);
+        }).unwrap();
         let out = plain(&to_ansi(t.backend().buffer()));
         assert!(out.contains("Refactor the entire"));
         for line in out.lines() {

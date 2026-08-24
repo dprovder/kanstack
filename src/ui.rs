@@ -11,6 +11,7 @@ use ratatui::Frame;
 use crate::app::{columns_that_fit, App, BranchUi, Mode, Notice, COL_GAP};
 use crate::board::{Card, ColumnKind, Tone};
 use crate::cmux::PaneStatus;
+use crate::hit::{HitMap, HitTarget};
 use crate::theme;
 
 /// Label for a lane's cmux pane status, rendered alongside its ordinary badges. Kept here
@@ -41,7 +42,8 @@ fn pane_status_tone(status: PaneStatus) -> Tone {
     }
 }
 
-pub fn draw(f: &mut Frame, app: &App) {
+pub fn draw(f: &mut Frame, app: &App) -> HitMap {
+    let mut hits = HitMap::new();
     let mut constraints = vec![Constraint::Length(2)]; // header
     if app.tutorial.is_some() {
         constraints.push(Constraint::Length(4)); // tutorial banner
@@ -68,7 +70,7 @@ pub fn draw(f: &mut Frame, app: &App) {
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
             .split(board_area);
-        draw_board(f, app, split[0]);
+        draw_board(f, app, split[0], &mut hits);
         draw_diff(
             f,
             app,
@@ -94,21 +96,21 @@ pub fn draw(f: &mut Frame, app: &App) {
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(w), Constraint::Min(0)])
             .split(board_area);
-        draw_branches(f, app, split[0]);
-        draw_board(f, app, split[1]);
+        draw_branches(f, app, split[0], &mut hits);
+        draw_board(f, app, split[1], &mut hits);
     } else {
-        draw_board(f, app, board_area);
+        draw_board(f, app, board_area, &mut hits);
     }
     draw_footer(f, app, footer_area);
 
     match app.mode {
-        Mode::Help => draw_help(f, f.area()),
-        Mode::PushConfirm => draw_push_confirm(f, app, f.area()),
-        Mode::LandConfirm => draw_land_confirm(f, app, f.area()),
+        Mode::Help => draw_help(f, f.area(), &mut hits),
+        Mode::PushConfirm => draw_push_confirm(f, app, f.area(), &mut hits),
+        Mode::LandConfirm => draw_land_confirm(f, app, f.area(), &mut hits),
         Mode::Landing => draw_landing(f, app, f.area()),
-        Mode::DeleteConfirm => draw_delete_confirm(f, app, f.area()),
-        Mode::UnapplyConfirm => draw_unapply_confirm(f, app, f.area()),
-        Mode::RebaseConfirm => draw_rebase_confirm(f, app, f.area()),
+        Mode::DeleteConfirm => draw_delete_confirm(f, app, f.area(), &mut hits),
+        Mode::UnapplyConfirm => draw_unapply_confirm(f, app, f.area(), &mut hits),
+        Mode::RebaseConfirm => draw_rebase_confirm(f, app, f.area(), &mut hits),
         Mode::Blocked => draw_blocked(f, app, f.area()),
         Mode::Branch | Mode::HarnessMessage if app.branch_ui == BranchUi::Modal => {
             draw_branch_modal(f, app, f.area())
@@ -117,6 +119,41 @@ pub fn draw(f: &mut Frame, app: &App) {
         // cost you your place — the same split gitui uses, and for the same reason.
         Mode::Diff => {}
         _ => {}
+    }
+
+    hits
+}
+
+/// Splits a confirm dialog's last body line — `"  ⏎ / y  <verb>      esc / n  cancel"` —
+/// into two clickable halves at the word "esc", the one substring guaranteed not to appear
+/// in the verb half of any of these hints.
+fn confirm_hitboxes(hits: &mut HitMap, popup: Rect, body_len: usize, hint: &str) {
+    if popup.height < 2 {
+        return;
+    }
+    let row = popup.y + 1 + (body_len as u16 - 1);
+    if row + 1 >= popup.y + popup.height {
+        // The hint line itself was clipped out of a too-short popup; nothing to hit-test.
+        return;
+    }
+    let content_x = popup.x + 1;
+    let content_w = popup.width.saturating_sub(2);
+    let split = hint.find("esc").unwrap_or(hint.len()) as u16;
+    let confirm_w = split.min(content_w);
+    hits.push(
+        Rect { x: content_x, y: row, width: confirm_w, height: 1 },
+        HitTarget::DialogConfirm,
+    );
+    if confirm_w < content_w {
+        hits.push(
+            Rect {
+                x: content_x + confirm_w,
+                y: row,
+                width: content_w - confirm_w,
+                height: 1,
+            },
+            HitTarget::DialogCancel,
+        );
     }
 }
 
@@ -346,7 +383,7 @@ fn draw_blocked(f: &mut Frame, app: &App, area: Rect) {
 ///
 /// The per-branch outcome is the point: a lane that comes out `conflicted` is worth
 /// knowing about before anything moves, and an `integrated` one can be deleted afterwards.
-fn draw_rebase_confirm(f: &mut Frame, app: &App, area: Rect) {
+fn draw_rebase_confirm(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     use crate::model::PullStatus;
     let Some(p) = &app.pull_preview else {
         return;
@@ -415,15 +452,13 @@ fn draw_rebase_confirm(f: &mut Frame, app: &App, area: Rect) {
         ));
     }
 
+    let hint = if any_conflict {
+        "  ⏎ / y  rebase anyway      esc / n  cancel"
+    } else {
+        "  ⏎ / y  rebase      esc / n  cancel"
+    };
     body.push(Line::raw(""));
-    body.push(Line::styled(
-        if any_conflict {
-            "  ⏎ / y  rebase anyway      esc / n  cancel"
-        } else {
-            "  ⏎ / y  rebase      esc / n  cancel"
-        },
-        theme::faint(),
-    ));
+    body.push(Line::styled(hint, theme::faint()));
 
     let w = 62.min(area.width.saturating_sub(4));
     let h = (body.len() as u16 + 2).min(area.height.saturating_sub(2));
@@ -433,6 +468,7 @@ fn draw_rebase_confirm(f: &mut Frame, app: &App, area: Rect) {
         width: w,
         height: h,
     };
+    confirm_hitboxes(hits, popup, body.len(), hint);
     f.render_widget(Clear, popup);
     f.render_widget(
         Paragraph::new(body).block(
@@ -450,10 +486,11 @@ fn draw_rebase_confirm(f: &mut Frame, app: &App, area: Rect) {
 
 /// Deleting cannot lose commits — `but` refuses when it would orphan them — but it can
 /// dissolve a branch into the one above it, so the consequence is spelled out.
-fn draw_delete_confirm(f: &mut Frame, app: &App, area: Rect) {
+fn draw_delete_confirm(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     let Some((name, detail)) = app.pending_delete() else {
         return;
     };
+    let hint = "  ⏎ / y  delete      esc / n  cancel";
     let body = vec![
         Line::styled("  delete lane", theme::muted()),
         Line::raw(""),
@@ -466,7 +503,7 @@ fn draw_delete_confirm(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(detail, theme::muted()),
         ]),
         Line::raw(""),
-        Line::styled("  ⏎ / y  delete      esc / n  cancel", theme::faint()),
+        Line::styled(hint, theme::faint()),
     ];
 
     let w = 56.min(area.width.saturating_sub(4));
@@ -477,6 +514,7 @@ fn draw_delete_confirm(f: &mut Frame, app: &App, area: Rect) {
         width: w,
         height: h,
     };
+    confirm_hitboxes(hits, popup, body.len(), hint);
     f.render_widget(Clear, popup);
     f.render_widget(
         Paragraph::new(body).block(
@@ -490,7 +528,7 @@ fn draw_delete_confirm(f: &mut Frame, app: &App, area: Rect) {
 
 /// What a push is about to do. Shown before it happens because `but push` force-pushes by
 /// default, so the destination and the force flag need to be visible, not implied.
-fn draw_push_confirm(f: &mut Frame, app: &App, area: Rect) {
+fn draw_push_confirm(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     let Some(preview) = &app.push_preview else {
         return;
     };
@@ -538,14 +576,12 @@ fn draw_push_confirm(f: &mut Frame, app: &App, area: Rect) {
         body.push(Line::raw(""));
     }
 
-    body.push(Line::styled(
-        if any_force {
-            "  ⏎ / y  push anyway      esc / n  cancel"
-        } else {
-            "  ⏎ / y  push      esc / n  cancel"
-        },
-        theme::faint(),
-    ));
+    let hint = if any_force {
+        "  ⏎ / y  push anyway      esc / n  cancel"
+    } else {
+        "  ⏎ / y  push      esc / n  cancel"
+    };
+    body.push(Line::styled(hint, theme::faint()));
 
     let w = 64.min(area.width.saturating_sub(4));
     let h = (body.len() as u16 + 2).min(area.height.saturating_sub(2));
@@ -555,6 +591,7 @@ fn draw_push_confirm(f: &mut Frame, app: &App, area: Rect) {
         width: w,
         height: h,
     };
+    confirm_hitboxes(hits, popup, body.len(), hint);
     f.render_widget(Clear, popup);
     f.render_widget(
         Paragraph::new(body).block(
@@ -697,7 +734,7 @@ fn draw_branch_modal(f: &mut Frame, app: &App, area: Rect) {
 /// What landing the selected lane onto the target would do. `but land` has no
 /// `--dry-run`, so this is built from `branch show --check` instead — the commits that
 /// would land, and whether they land cleanly.
-fn draw_land_confirm(f: &mut Frame, app: &App, area: Rect) {
+fn draw_land_confirm(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     let Some(check) = &app.land_check else {
         return;
     };
@@ -780,15 +817,13 @@ fn draw_land_confirm(f: &mut Frame, app: &App, area: Rect) {
         theme::faint(),
     ));
 
+    let hint = if conflicted {
+        "  ⏎ / y  land anyway      esc / n  cancel"
+    } else {
+        "  ⏎ / y  land      esc / n  cancel"
+    };
     body.push(Line::raw(""));
-    body.push(Line::styled(
-        if conflicted {
-            "  ⏎ / y  land anyway      esc / n  cancel"
-        } else {
-            "  ⏎ / y  land      esc / n  cancel"
-        },
-        theme::faint(),
-    ));
+    body.push(Line::styled(hint, theme::faint()));
 
     let w = 62.min(area.width.saturating_sub(4));
     let h = (body.len() as u16 + 2).min(area.height.saturating_sub(2));
@@ -798,6 +833,7 @@ fn draw_land_confirm(f: &mut Frame, app: &App, area: Rect) {
         width: w,
         height: h,
     };
+    confirm_hitboxes(hits, popup, body.len(), hint);
     f.render_widget(Clear, popup);
     f.render_widget(
         Paragraph::new(body).block(
@@ -943,7 +979,7 @@ fn visible_columns(app: &App, area: Rect) -> (u16, usize, usize) {
     (width, first, fit)
 }
 
-fn draw_board(f: &mut Frame, app: &App, area: Rect) {
+fn draw_board(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     if app.board.columns.is_empty() {
         f.render_widget(
             Paragraph::new(Line::styled(
@@ -976,7 +1012,7 @@ fn draw_board(f: &mut Frame, app: &App, area: Rect) {
             width,
             height: area.height,
         };
-        draw_column(f, app, idx, col_area);
+        draw_column(f, app, idx, col_area, hits);
         x += width + COL_GAP;
     }
 
@@ -1003,10 +1039,15 @@ fn draw_board(f: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect) {
+fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect, hits: &mut HitMap) {
     let col = &app.board.columns[idx];
     let is_current = idx == app.col;
     let inner_w = area.width as usize;
+
+    // Lowest priority: clicking anywhere in the lane (its padding, an empty area below the
+    // last card) still selects the lane. More specific regions (header, individual cards)
+    // are pushed after this and so win the hit-test.
+    hits.push(area, HitTarget::LaneBody(idx));
 
     // Header: dot, name, count. While moving, the header is itself a drop position, so it
     // highlights when the drop cursor sits on it. Either way, the current lane's header
@@ -1068,10 +1109,9 @@ fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect) {
     }
 
     let fixed_h = (fixed_lines.len() as u16).min(area.height);
-    f.render_widget(
-        Paragraph::new(fixed_lines),
-        Rect { height: fixed_h, ..area },
-    );
+    let header_rect = Rect { height: fixed_h, ..area };
+    f.render_widget(Paragraph::new(fixed_lines), header_rect);
+    hits.push(header_rect, HitTarget::LaneHeader(idx));
     if area.height <= fixed_h {
         return;
     }
@@ -1088,6 +1128,10 @@ fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect) {
     let mut sel_start = 0usize;
     let mut sel_len = 0usize;
     let mut last_group: Option<&str> = None;
+    // Content-line range of each card, for turning a click on the scrolled `Paragraph`
+    // below back into a card index — there's no per-card `Rect` otherwise, since cards
+    // share one `Paragraph` and vary in height (wrapped titles, badges, group headers).
+    let mut card_spans: Vec<(usize, usize, usize)> = Vec::with_capacity(col.cards.len());
 
     // Folder counts for the unassigned lane's own group headers (GitHub issue #6) — cheap
     // and only built when there is a group to count, since `col.cards.len()` is at most a
@@ -1141,6 +1185,7 @@ fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect) {
             sel_start = start;
             sel_len = card_lines.len();
         }
+        card_spans.push((ci, start, card_lines.len()));
         lines.extend(card_lines);
     }
 
@@ -1166,6 +1211,28 @@ fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect) {
             .scroll((scroll, 0)),
         body_area,
     );
+
+    // Clip each card's content-line range to what `scroll` actually leaves on screen, then
+    // record the resulting strip as this card's clickable region. A card fully scrolled off
+    // (or only its blank trailing separator visible) contributes an empty/zero-height rect,
+    // which `HitMap::push` drops.
+    let visible = scroll as usize..scroll as usize + body_area.height as usize;
+    for (ci, start, len) in card_spans {
+        let lo = start.max(visible.start);
+        let hi = (start + len).min(visible.end);
+        if hi <= lo {
+            continue;
+        }
+        hits.push(
+            Rect {
+                x: body_area.x,
+                y: body_area.y + (lo - scroll as usize) as u16,
+                width: body_area.width,
+                height: (hi - lo) as u16,
+            },
+            HitTarget::Card(idx, ci),
+        );
+    }
 }
 
 /// The count shown next to a lane's name.
@@ -1348,7 +1415,7 @@ fn render_card(
 /// Rendering it as a lane would mean inventing the contents. What it shows instead is
 /// everything `but branch list` knows from the outside — chiefly whether applying would
 /// conflict, which is the one fact that decides whether to press ⏎.
-fn draw_branches(f: &mut Frame, app: &App, area: Rect) {
+fn draw_branches(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     // A column of margin on each side. The right-hand one matters now that the board sits
     // on that side: without it the rule under the header would run straight into the first
     // lane, and the drawer would read as part of it rather than as its own panel.
@@ -1419,6 +1486,24 @@ fn draw_branches(f: &mut Frame, app: &App, area: Rect) {
     let sel_bottom = sel_top + ROWS_PER_BRANCH as u16;
     let offset = sel_bottom.saturating_sub(body.height);
     f.render_widget(Paragraph::new(lines).scroll((offset, 0)), body);
+
+    for i in 0..n {
+        let top = (i * ROWS_PER_BRANCH) as u16;
+        let lo = top.max(offset);
+        let hi = (top + ROWS_PER_BRANCH as u16).min(offset + body.height);
+        if hi <= lo {
+            continue;
+        }
+        hits.push(
+            Rect {
+                x: body.x,
+                y: body.y + (lo - offset),
+                width: body.width,
+                height: hi - lo,
+            },
+            HitTarget::BranchRow(i),
+        );
+    }
 }
 
 /// Lines per drawer row: name, metadata, and the blank that separates it from the next.
@@ -1499,7 +1584,7 @@ fn render_unapplied(
 /// Shown before it happens for the reason `d` is: the lane's changes come off disk. Unlike
 /// `d` nothing is discarded — hence the reassurance in the body, which is the whole point
 /// of confirming rather than refusing.
-fn draw_unapply_confirm(f: &mut Frame, app: &App, area: Rect) {
+fn draw_unapply_confirm(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     let Some((name, detail)) = app.pending_unapply() else {
         return;
     };
@@ -1528,11 +1613,9 @@ fn draw_unapply_confirm(f: &mut Frame, app: &App, area: Rect) {
         "  nothing is lost — the branch keeps its commits.",
         theme::faint(),
     ));
+    let hint = "  ⏎ / y  unapply      esc / n  cancel";
     body.push(Line::raw(""));
-    body.push(Line::styled(
-        "  ⏎ / y  unapply      esc / n  cancel",
-        theme::faint(),
-    ));
+    body.push(Line::styled(hint, theme::faint()));
 
     let h = (body.len() as u16 + 2).min(area.height.saturating_sub(2));
     let popup = Rect {
@@ -1541,6 +1624,7 @@ fn draw_unapply_confirm(f: &mut Frame, app: &App, area: Rect) {
         width: w,
         height: h,
     };
+    confirm_hitboxes(hits, popup, body.len(), hint);
     f.render_widget(Clear, popup);
     f.render_widget(
         Paragraph::new(body).block(
@@ -1716,7 +1800,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(Line::styled(keys, theme::faint())), area);
 }
 
-fn draw_help(f: &mut Frame, area: Rect) {
+fn draw_help(f: &mut Frame, area: Rect, hits: &mut HitMap) {
     let body = vec![
         Line::styled("  keys", theme::muted()),
         Line::raw(""),
@@ -1786,6 +1870,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         height: h,
     };
 
+    hits.push(popup, HitTarget::Dismiss);
     f.render_widget(Clear, popup);
     f.render_widget(
         Paragraph::new(body).block(

@@ -9,6 +9,7 @@ pub mod board;
 pub mod but;
 pub mod cmux;
 pub mod diff;
+pub mod hit;
 pub mod model;
 pub mod snapshot;
 pub mod text_input;
