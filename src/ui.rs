@@ -114,7 +114,7 @@ pub fn draw(f: &mut Frame, app: &App) -> HitMap {
         Mode::RebaseConfirm => draw_rebase_confirm(f, app, f.area(), &mut hits),
         Mode::Blocked => draw_blocked(f, app, f.area()),
         Mode::Branch | Mode::HarnessMessage if app.branch_ui == BranchUi::Modal => {
-            draw_branch_modal(f, app, f.area())
+            draw_branch_modal(f, app, f.area(), &mut hits)
         }
         // The board keeps its half unless the diff is expanded, so reading a diff does not
         // cost you your place — the same split gitui uses, and for the same reason.
@@ -622,7 +622,7 @@ fn draw_push_confirm(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
 /// `Mode::HarnessMessage` both, so the name stays visible (now fixed, no cursor) while
 /// the message field takes over — nothing about the flow changes from the footer version,
 /// only how much of it is on screen together.
-fn draw_branch_modal(f: &mut Frame, app: &App, area: Rect) {
+fn draw_branch_modal(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     let editing_message = app.mode == Mode::HarnessMessage;
     let will_prompt = editing_message || app.will_prompt_for_harness_message();
     let cursor = theme::tone(crate::board::Tone::Accent);
@@ -732,6 +732,7 @@ fn draw_branch_modal(f: &mut Frame, app: &App, area: Rect) {
         width: w,
         height: h,
     };
+    confirm_hitboxes(hits, popup, body.len(), hint);
     f.render_widget(Clear, popup);
     f.render_widget(
         Paragraph::new(body).block(Block::bordered().border_style(theme::faint()).style(theme::selected_bg())),

@@ -3344,6 +3344,41 @@ mod tests {
         assert!(app.message.as_ref().is_some_and(|(m, _)| m.contains("read-only")));
     }
 
+    /// Same wiring, for `draw_branch_modal` (`ui::draw`'s `KANSTACK_BRANCH_UI=modal` dialog):
+    /// its hint line gets the same `confirm_hitboxes`/`Dialog{Confirm,Cancel}` treatment as
+    /// every other confirm dialog, so `Mode::Branch`'s own `Enter`/`Esc` handling — already
+    /// exercised by keyboard tests — is all a click needs to reach.
+    #[test]
+    fn clicking_the_branch_modals_buttons_takes_the_same_paths_as_its_keys() {
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+
+        let mut app = App::from_board(board());
+        let confirm_rect = rect(0, 0);
+        let cancel_rect = rect(20, 0);
+        app.hit_map = hits(&[
+            (confirm_rect, HitTarget::DialogConfirm),
+            (cancel_rect, HitTarget::DialogCancel),
+        ]);
+
+        app.mode = Mode::Branch;
+        for c in "feature".chars() {
+            app.branch_input.insert(c);
+        }
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 21, 0));
+        assert_eq!(app.mode, Mode::Normal, "the cancel half must act like Esc");
+        assert!(app.message.as_ref().is_some_and(|(m, _)| m.contains("cancelled")));
+
+        app.mode = Mode::Branch;
+        for c in "feature".chars() {
+            app.branch_input.insert(c);
+        }
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 0));
+        // `App::from_board` has no `cmux`, so this never detours through `HarnessMessage` —
+        // it goes straight to `create_branch`, which (with no `but` either) is read-only.
+        assert_eq!(app.mode, Mode::Normal, "the confirm half must act like Enter");
+        assert!(app.message.as_ref().is_some_and(|(m, _)| m.contains("read-only")));
+    }
+
     /// The unassigned lane holds loose files, not commits — clicking through several of
     /// them to build up a bulk move is the point of a mouse there, so a click doubles as
     /// `space` only in that one lane.
