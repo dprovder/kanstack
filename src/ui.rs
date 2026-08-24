@@ -1440,8 +1440,16 @@ fn draw_branches(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     let w = area.width as usize;
     let n = app.unapplied.branches.len();
 
+    // A close control at the start of the header, the same convention (and the same
+    // `Dismiss` target) the diff pane's own `‹` uses — one click closes whichever side
+    // panel has it, without the rest of the panel's clicks (selecting a row here, reading
+    // a diff there) being swallowed by an anywhere-closes rule.
+    let back = Rect { x: area.x, y: area.y, width: 2, height: 1 };
+    hits.push(back, HitTarget::Dismiss);
+
     let mut fixed = vec![
         Line::from(vec![
+            Span::styled("‹ ", theme::tone(crate::board::Tone::Accent)),
             Span::styled("unapplied", theme::title(true)),
             Span::styled(format!("  {n}"), theme::faint()),
         ]),

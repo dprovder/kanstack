@@ -3429,6 +3429,48 @@ mod tests {
         assert_eq!(app.hover, None, "moving off every hit region must clear the hover");
     }
 
+    /// `ui::draw` gives the branches drawer the same `‹` back control as the diff pane,
+    /// mapped to the same `Dismiss` target — so it closes the drawer without a click on a
+    /// row (selecting it) being swallowed by an anywhere-closes rule.
+    #[test]
+    fn clicking_the_drawers_back_control_closes_it() {
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+
+        let mut app = App::from_board(board());
+        app.mode = Mode::Branches;
+        app.hit_map = hits(&[(rect(0, 0), HitTarget::Dismiss)]);
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 0));
+
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    /// Clicking a row in the drawer selects it, the same as any other row click — it must
+    /// not also close the drawer out from under the click.
+    #[test]
+    fn clicking_a_branch_row_leaves_the_drawer_open() {
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+
+        let mut app = App::from_board(board());
+        app.mode = Mode::Branches;
+        let branch = |name: &str| crate::board::UnappliedBranch {
+            name: name.into(),
+            commits_ahead: None,
+            merges_cleanly: None,
+            author: None,
+            age: None,
+            has_local: true,
+        };
+        app.unapplied = crate::board::Unapplied {
+            branches: vec![branch("a"), branch("b")],
+            truncated: false,
+        };
+        app.hit_map = hits(&[(rect(0, 5), HitTarget::BranchRow(1))]);
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 5));
+
+        assert_eq!(app.mode, Mode::Branches);
+        assert_eq!(app.branch_sel, 1);
+    }
+
     #[test]
     fn clicking_anywhere_dismisses_help() {
         use ratatui::crossterm::event::{MouseButton, MouseEventKind};
