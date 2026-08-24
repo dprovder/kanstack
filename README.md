@@ -107,7 +107,7 @@ repo is thrown away when you're done. `esc` or `q` leaves any time.
 | `t` | send a task to this lane's cmux pane — spawns one first if it isn't open yet |
 | `s` | stack this whole lane onto another — rewrites history |
 | `p` | push this lane — shows what it will do first |
-| `M` | land this lane onto the target, no PR — shows what will happen first |
+| `L` | land this lane onto the target, no PR — shows what will happen first |
 | `z` / `Z` | undo / redo the last operation — fires immediately, no confirm |
 | `?` | help |
 | `q` | quit |
