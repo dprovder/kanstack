@@ -3434,9 +3434,10 @@ mod tests {
 
     /// `a` already opens the drawer from the keyboard; before this there was nothing to
     /// click for it anywhere in the main board view — only its own back control, once
-    /// already inside. This is the header's side of that door.
+    /// already inside. `‹` on the unassigned lane's own dot (see `draw_column`) is that
+    /// door for a mouse.
     #[test]
-    fn clicking_the_headers_unapplied_control_opens_the_drawer() {
+    fn clicking_the_unassigned_lanes_open_drawer_control_opens_it() {
         use ratatui::crossterm::event::{MouseButton, MouseEventKind};
 
         let mut app = App::from_board(board());
@@ -3453,9 +3454,9 @@ mod tests {
         );
     }
 
-    /// The control only exists in the header while `mode == Normal` (see `draw_header`),
-    /// but the guard belongs to `on_mouse` too — a stale hit shouldn't reopen the drawer,
-    /// or anything else, out from under an unrelated mode.
+    /// The control only exists on the unassigned lane's dot while `mode == Normal` (see
+    /// `draw_column`), but the guard belongs to `on_mouse` too — a stale hit shouldn't
+    /// reopen the drawer, or anything else, out from under an unrelated mode.
     #[test]
     fn the_open_drawer_control_is_inert_outside_normal_mode() {
         use ratatui::crossterm::event::{MouseButton, MouseEventKind};
