@@ -922,17 +922,6 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
             theme::faint(),
         ));
     }
-    // Same reasoning as the lane counter, one level down: a long stack already keeps its
-    // header pinned so the lane itself is never in doubt, but the card position within it
-    // scrolls out of view just as easily, and nothing else says where you are in it.
-    let card_count = b.columns.get(app.col).map_or(0, |c| c.cards.len());
-    if card_count > 1 {
-        spans.push(Span::styled("  ·  ", theme::faint()));
-        spans.push(Span::styled(
-            format!("card {}/{card_count}", app.card + 1),
-            theme::faint(),
-        ));
-    }
     // Working-tree cards only. Lane totals now include commits, but the word here is
     // "uncommitted", so counting those would make the header say something untrue.
     let totals = b
@@ -1074,6 +1063,12 @@ fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect, hits: &mut HitM
     // panel here." Only while the drawer is actually reachable from where the click would
     // land — otherwise it's back to being an ordinary (faint, statusless) dot.
     let is_drawer_door = col.kind == ColumnKind::Unassigned && app.mode == Mode::Normal;
+    // The count budget used to be a flat 8 (dot + "  " + up to a 2-digit total), but a
+    // `position/total` readout like "10/10" can run longer than that — reserve exactly as
+    // much as this lane's label actually needs so the title truncates first instead of the
+    // count getting clipped.
+    let count_label = lane_count_label(app, idx, col);
+    let count_budget = 4 + count_label.chars().count();
     let mut header = Line::from(vec![
         if is_drawer_door {
             Span::styled("‹ ", theme::tone(crate::board::Tone::Accent))
@@ -1081,10 +1076,10 @@ fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect, hits: &mut HitM
             Span::styled("● ", theme::status_dot(col.state))
         },
         Span::styled(
-            truncate(&col.title, inner_w.saturating_sub(8)),
+            truncate(&col.title, inner_w.saturating_sub(count_budget)),
             theme::title(is_current || hovered),
         ),
-        Span::styled(format!("  {}", header_count(col)), theme::faint()),
+        Span::styled(format!("  {count_label}"), theme::faint()),
     ]);
     if let Some((a, r)) = col.stats {
         header.push_span(Span::styled("  ", theme::faint()));
@@ -1279,6 +1274,21 @@ fn header_count(col: &crate::board::Column) -> usize {
     let below: usize = col.sections.iter().skip(1).map(|s| s.commits).sum();
     // Whatever is left is the tip's commits plus any changes staged to the stack.
     col.cards.len().saturating_sub(below)
+}
+
+/// The lane header's count: a plain total normally, but for the current lane a
+/// `position/total` — the card counter used to live in the app header, but a long stack
+/// already keeps its own header pinned while the cursor scrolls out of view within it, so
+/// this is the one place that still says where you are.
+fn lane_count_label(app: &App, idx: usize, col: &crate::board::Column) -> String {
+    // `app.card` indexes `col.cards` in full (every section, not just the tip), so the
+    // position it reports has to share that denominator rather than `header_count`'s
+    // tip-only total.
+    if idx == app.col && col.cards.len() > 1 {
+        format!("{}/{}", app.card + 1, col.cards.len())
+    } else {
+        header_count(col).to_string()
+    }
 }
 
 /// A branch header inside a lane, drawn like the lane header itself: dot, name, count,

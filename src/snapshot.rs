@@ -463,7 +463,10 @@ mod tests {
         }).unwrap();
         let out = plain(&to_ansi(t.backend().buffer()));
 
-        assert!(out.contains("card 2/2"), "expected a card 2/2 readout in the header:\n{out}");
+        assert!(
+            out.contains("feat-auth  2/2"),
+            "expected a 2/2 readout in the lane's own header:\n{out}"
+        );
     }
 
     #[test]
@@ -478,7 +481,40 @@ mod tests {
         }).unwrap();
         let out = plain(&to_ansi(t.backend().buffer()));
 
-        assert!(!out.contains("card 1/1"), "a single card is not a position worth reporting:\n{out}");
+        assert!(!out.contains("1/1"), "a single card is not a position worth reporting:\n{out}");
+    }
+
+    #[test]
+    fn a_double_digit_position_readout_is_not_clipped() {
+        // The title truncation used to reserve a flat budget sized for a plain one- or
+        // two-digit count; a "position/total" readout that runs to double digits both
+        // sides (e.g. "10/10") needs more room, or its tail gets clipped off the lane
+        // header instead of the title losing a character to it. A long branch name at the
+        // minimum column width is what pushes the title right up against that budget.
+        let status =
+            crate::but::parse_status(include_str!("../tests/fixtures/status.json")).unwrap();
+        let mut app = App::from_board(Board::from_status(&status));
+        app.col = 1;
+        app.board.columns[1].title = "a-rather-long-feature-branch-name".to_string();
+        app.board.columns[1].cards.truncate(1);
+        for i in 0..9 {
+            let mut card = app.board.columns[1].cards[0].clone();
+            card.cli_id = format!("c{i}");
+            app.board.columns[1].cards.push(card);
+        }
+        app.card = 9; // the 10th of 10 cards
+        // Narrow enough that the lane sits at the minimum column width, where a long
+        // title's truncation point actually meets the count budget.
+        let mut t = Terminal::new(TestBackend::new(110, 24)).unwrap();
+        t.draw(|f| {
+            crate::ui::draw(f, &app);
+        }).unwrap();
+        let out = plain(&to_ansi(t.backend().buffer()));
+
+        assert!(
+            out.contains("10/10"),
+            "expected the full 10/10 readout, not a clipped tail:\n{out}"
+        );
     }
 
     #[test]
