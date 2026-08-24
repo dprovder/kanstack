@@ -1076,6 +1076,8 @@ fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect, hits: &mut HitM
     }
     if header_is_target || is_current {
         header = header.style(theme::selected_bg());
+    } else if app.mode == Mode::Normal && app.hover == Some(HitTarget::LaneHeader(idx)) {
+        header = header.style(theme::hover_bg());
     }
 
     // The header, rule, and top-level badges are pinned — rendered separately from the
@@ -1180,7 +1182,9 @@ fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect, hits: &mut HitM
         };
         let start = lines.len();
         let checked = app.selected.contains(&card.rub_id);
-        let card_lines = render_card(card, inner_w, selected, picked, checked);
+        let hovered = app.mode == Mode::Normal
+            && app.hover == Some(HitTarget::Card(idx, ci));
+        let card_lines = render_card(card, inner_w, selected, picked, checked, hovered);
         if selected {
             sel_start = start;
             sel_len = card_lines.len();
@@ -1325,11 +1329,14 @@ fn render_card(
     selected: bool,
     picked: bool,
     checked: bool,
+    hovered: bool,
 ) -> Vec<Line<'static>> {
     let bg = if picked {
         Some(theme::picked_bg())
     } else if selected {
         Some(theme::selected_bg())
+    } else if hovered {
+        Some(theme::hover_bg())
     } else {
         None
     };
@@ -1476,7 +1483,8 @@ fn draw_branches(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
 
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(n * ROWS_PER_BRANCH);
     for (i, b) in app.unapplied.branches.iter().enumerate() {
-        lines.extend(render_unapplied(b, w, i == app.branch_sel));
+        let hovered = app.mode == Mode::Branches && app.hover == Some(HitTarget::BranchRow(i));
+        lines.extend(render_unapplied(b, w, i == app.branch_sel, hovered));
     }
 
     // Scroll just far enough to keep the whole selected row on screen, the same rule the
@@ -1514,6 +1522,7 @@ fn render_unapplied(
     b: &crate::board::UnappliedBranch,
     width: usize,
     selected: bool,
+    hovered: bool,
 ) -> Vec<Line<'static>> {
     let pad = |mut line: Line<'static>| -> Line<'static> {
         let used: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
@@ -1522,6 +1531,8 @@ fn render_unapplied(
         }
         if selected {
             line = line.style(theme::selected_bg());
+        } else if hovered {
+            line = line.style(theme::hover_bg());
         }
         line
     };
@@ -2143,7 +2154,7 @@ mod tests {
             kind: crate::board::CardKind::Commit,
             group: None,
         };
-        let lines = render_card(&card, 30, true, false, false);
+        let lines = render_card(&card, 30, true, false, false, false);
         for l in &lines {
             let w: usize = l.spans.iter().map(|s| s.content.chars().count()).sum();
             // The trailing spacer line is intentionally empty.

@@ -67,6 +67,15 @@ pub fn picked_bg() -> Style {
     Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
 }
 
+/// Highlight for whatever the mouse is currently over. Deliberately lighter than
+/// `selected_bg`'s reverse video — hovering is just where the pointer happens to be, not
+/// where the keyboard cursor is, so it should never be mistaken for the cursor moving.
+/// Underline keeps the same "name no color" property reverse video does, so it reads
+/// correctly in any theme.
+pub fn hover_bg() -> Style {
+    Style::default().add_modifier(Modifier::UNDERLINED)
+}
+
 /// Lane header dot. Takes the same [`LaneState`](crate::board::LaneState) the status badge
 /// prints, so the colour and the word can never disagree — they did once, and an empty
 /// lane came out the same green as a fully pushed one.

@@ -282,7 +282,21 @@ pub struct App {
     /// onto a different card or lane. `None` once a plain click is done, or once the press
     /// has turned into a `Moving` drag (see `on_mouse`).
     mouse_down_card: Option<(usize, usize)>,
+    /// Whatever the pointer is over right now, from the last `MouseEventKind::Moved` — kept
+    /// separate from `col`/`card` because hovering is where the mouse happens to sit, not
+    /// where the keyboard cursor is; `ui::draw` only paints it while `mode == Normal` or
+    /// `Branches`, wherever it was recorded from.
+    pub hover: Option<crate::hit::HitTarget>,
+    /// The card and moment of the last click, so a second click on the same one within
+    /// `DOUBLE_CLICK_WINDOW` opens its diff instead of registering as two ordinary selects
+    /// — crossterm reports each click as its own `Down`, with no double-click event of its
+    /// own to key off.
+    last_card_click: Option<((usize, usize), std::time::Instant)>,
 }
+
+/// How close together two clicks on the same card have to land to count as opening its
+/// diff (like a keyboard `Enter`) rather than two unrelated selects.
+const DOUBLE_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
 
 type RefreshResult = Result<(Board, HashMap<String, (usize, usize)>)>;
 
@@ -420,6 +434,8 @@ impl App {
             branch_sel: 0,
             hit_map: crate::hit::HitMap::new(),
             mouse_down_card: None,
+            hover: None,
+            last_card_click: None,
         })
     }
 
@@ -470,6 +486,8 @@ impl App {
             branch_sel: 0,
             hit_map: crate::hit::HitMap::new(),
             mouse_down_card: None,
+            hover: None,
+            last_card_click: None,
         }
     }
 
@@ -2321,9 +2339,25 @@ impl App {
                         self.branch_sel = i;
                     }
                     Some(crate::hit::HitTarget::Card(col, card)) if self.mode == Mode::Normal => {
+                        let double_click = self.last_card_click.is_some_and(|(at_card, at)| {
+                            at_card == (col, card) && at.elapsed() < DOUBLE_CLICK_WINDOW
+                        });
+                        self.last_card_click = Some(((col, card), std::time::Instant::now()));
                         self.col = col;
                         self.card = card;
-                        self.mouse_down_card = Some((col, card));
+                        if double_click {
+                            self.handle_key(KeyEvent::from(KeyCode::Enter));
+                        } else {
+                            self.mouse_down_card = Some((col, card));
+                            // The unassigned lane is the one place a click doubles as
+                            // `space`: its cards are loose files rather than commits, so
+                            // building up a bulk move by clicking through them is the
+                            // whole point of a mouse there.
+                            if self.board.columns.get(col).is_some_and(|c| c.kind == ColumnKind::Unassigned)
+                            {
+                                self.toggle_selected();
+                            }
+                        }
                     }
                     Some(
                         crate::hit::HitTarget::LaneHeader(col) | crate::hit::HitTarget::LaneBody(col),
@@ -2381,6 +2415,9 @@ impl App {
                 if self.mouse_down_card.take().is_some() && self.mode == Mode::Moving =>
             {
                 self.confirm_move();
+            }
+            MouseEventKind::Moved => {
+                self.hover = self.hit_map.hit_test(ev.column, ev.row);
             }
             MouseEventKind::ScrollDown => self.handle_key(KeyEvent::from(KeyCode::Down)),
             MouseEventKind::ScrollUp => self.handle_key(KeyEvent::from(KeyCode::Up)),
@@ -3302,6 +3339,94 @@ mod tests {
         app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 0));
         assert_eq!(app.mode, Mode::Normal, "the confirm half must act like Enter");
         assert!(app.message.as_ref().is_some_and(|(m, _)| m.contains("read-only")));
+    }
+
+    /// The unassigned lane holds loose files, not commits — clicking through several of
+    /// them to build up a bulk move is the point of a mouse there, so a click doubles as
+    /// `space` only in that one lane.
+    #[test]
+    fn clicking_a_card_in_the_unassigned_lane_toggles_its_bulk_selection_checkbox() {
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+
+        let mut app = App::from_board(board());
+        let id = app.board.columns[0].cards[0].rub_id.clone();
+        app.hit_map = hits(&[(rect(0, 0), HitTarget::Card(0, 0))]);
+
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 0));
+        assert!(app.selected.contains(&id), "the click must check the card, like space would");
+    }
+
+    /// A branch lane holds commits, not loose files — clicking through them must not build
+    /// up a bulk-move selection the way it does in the unassigned lane.
+    #[test]
+    fn clicking_a_card_outside_the_unassigned_lane_does_not_touch_bulk_selection() {
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+
+        let mut app = App::from_board(board());
+        app.hit_map = hits(&[(rect(0, 0), HitTarget::Card(1, 0))]);
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 0));
+
+        assert!(app.selected.is_empty());
+    }
+
+    /// Two rapid clicks on the same card open its diff, the same as pressing `Enter` —
+    /// checked here by the fact that `open_diff` takes the "snapshot is read-only" path
+    /// with no real `but` behind this app, which only happens if it actually ran. A single
+    /// click must not take that path at all.
+    #[test]
+    fn double_clicking_a_card_opens_its_diff() {
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+
+        let mut app = App::from_board(board());
+        app.col = 1;
+        app.hit_map = hits(&[(rect(0, 0), HitTarget::Card(1, 0))]);
+
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 0));
+        assert!(
+            app.message.is_none(),
+            "a single click must not have tried to open anything yet"
+        );
+
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 0));
+        assert!(
+            app.message.as_ref().is_some_and(|(m, _)| m.contains("read-only")),
+            "the second click must have gone through open_diff: {:?}",
+            app.message
+        );
+    }
+
+    /// A click on a different card, even a fast one, is two ordinary selects — not a
+    /// double-click on either card.
+    #[test]
+    fn clicking_two_different_cards_quickly_is_not_a_double_click() {
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+
+        let mut app = App::from_board(board());
+        app.col = 1;
+        app.hit_map = hits(&[
+            (rect(0, 0), HitTarget::Card(1, 0)),
+            (rect(20, 0), HitTarget::Card(1, 1)),
+        ]);
+
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 0));
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 21, 0));
+
+        assert!(app.message.is_none(), "neither click was a repeat, so neither opens a diff");
+        assert_eq!((app.col, app.card), (1, 1));
+    }
+
+    #[test]
+    fn moving_the_mouse_updates_hover_and_leaving_every_region_clears_it() {
+        use ratatui::crossterm::event::MouseEventKind;
+
+        let mut app = App::from_board(board());
+        app.hit_map = hits(&[(rect(0, 0), HitTarget::Card(2, 0))]);
+
+        app.on_mouse(mouse(MouseEventKind::Moved, 1, 0));
+        assert_eq!(app.hover, Some(HitTarget::Card(2, 0)));
+
+        app.on_mouse(mouse(MouseEventKind::Moved, 50, 50));
+        assert_eq!(app.hover, None, "moving off every hit region must clear the hover");
     }
 
     #[test]
