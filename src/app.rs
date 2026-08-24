@@ -3441,11 +3441,11 @@ mod tests {
         assert_eq!(app.mode, Mode::Normal);
     }
 
-    /// `ui::draw` covers the whole screen with a `Dismiss` region while `mode == Diff`
-    /// (pushed last, so it wins over the board underneath in a split view) — this is what
-    /// lets a click, anywhere, leave the diff the same way `Esc` does.
+    /// `ui::draw` puts a `Dismiss` region on the `‹` control in the diff pane's own header
+    /// — not over the whole pane, so clicking to read (or just clicking around) never
+    /// closes it out from under you the way an anywhere-click did at first.
     #[test]
-    fn clicking_anywhere_leaves_the_diff() {
+    fn clicking_the_diffs_back_control_leaves_it() {
         use ratatui::crossterm::event::{MouseButton, MouseEventKind};
 
         let mut app = App::from_board(board());
@@ -3455,5 +3455,19 @@ mod tests {
 
         assert_eq!(app.mode, Mode::Normal);
         assert!(app.diff.is_none());
+    }
+
+    /// The complement of the test above: reading the diff — clicking anywhere that isn't
+    /// the back control — must leave it open.
+    #[test]
+    fn clicking_inside_the_diff_but_not_its_back_control_leaves_it_open() {
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+
+        let mut app = App::from_board(board());
+        app.mode = Mode::Diff;
+        app.hit_map = hits(&[(rect(0, 0), HitTarget::Dismiss)]); // the back control, at x0-3
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 30, 5));
+
+        assert_eq!(app.mode, Mode::Diff, "a click well away from the back control must not close it");
     }
 }

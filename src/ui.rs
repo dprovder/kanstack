@@ -79,9 +79,10 @@ pub fn draw(f: &mut Frame, app: &App) -> HitMap {
                 width: split[1].width.saturating_sub(1),
                 ..split[1]
             },
+            &mut hits,
         );
     } else if app.mode == Mode::Diff {
-        draw_diff(f, app, board_area);
+        draw_diff(f, app, board_area, &mut hits);
     } else if app.mode == Mode::Branches {
         // Beside the board, not over it, for the same reason the diff splits rather than
         // covers: choosing what to apply is a decision made *against* the lanes already
@@ -116,10 +117,9 @@ pub fn draw(f: &mut Frame, app: &App) -> HitMap {
             draw_branch_modal(f, app, f.area())
         }
         // The board keeps its half unless the diff is expanded, so reading a diff does not
-        // cost you your place — the same split gitui uses, and for the same reason. A
-        // click anywhere still leaves it, though — pushed last so it wins over the board's
-        // own card/lane regions underneath, the same "topmost wins" rule a popup gets.
-        Mode::Diff => hits.push(f.area(), HitTarget::Dismiss),
+        // cost you your place — the same split gitui uses, and for the same reason.
+        // `draw_diff` already added its own close control above.
+        Mode::Diff => {}
         _ => {}
     }
 
@@ -183,7 +183,7 @@ fn draw_tutorial_banner(f: &mut Frame, t: &crate::tutorial::Tutorial, area: Rect
 /// Hunks are listed one after another with the cursor on one of them, because a hunk is
 /// the unit `but` will stage — pressing `m` here picks up exactly the hunk under the
 /// cursor, which is how one file ends up split across two lanes.
-fn draw_diff(f: &mut Frame, app: &App, area: Rect) {
+fn draw_diff(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     use crate::diff::LineKind;
     let Some(view) = &app.diff else { return };
 
@@ -193,10 +193,16 @@ fn draw_diff(f: &mut Frame, app: &App, area: Rect) {
         .constraints([Constraint::Length(2), Constraint::Min(1)])
         .split(area);
 
+    // A dedicated close control, rather than the whole pane: a click anywhere used to
+    // leave the diff, same as `Esc`, but that closed it on anyone just clicking to read —
+    // selecting text, or reflexively clicking the way you would in any other reader.
+    let back = Rect { x: chunks[0].x, y: chunks[0].y, width: 2, height: 1 };
+    hits.push(back, HitTarget::Dismiss);
+
     let (added, removed) = view.totals();
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::raw("  "),
+            Span::styled("‹ ", theme::tone(crate::board::Tone::Accent)),
             Span::styled(view.title.clone(), theme::title(true)),
             Span::styled("   ", theme::faint()),
             Span::styled(format!("+{added}"), theme::tone(crate::board::Tone::Good)),
