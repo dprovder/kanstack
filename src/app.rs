@@ -101,10 +101,20 @@ pub enum Mode {
 }
 
 /// A branch named in `Mode::Branch` but not yet created, waiting on
-/// `Mode::HarnessMessage`'s prompt — see `App::confirm_branch`.
+/// `Mode::HarnessMessage`'s prompt — see `App::advance_to_harness_message`.
 struct PendingBranch {
     name: String,
     anchor: Option<String>,
+}
+
+/// Which row of the branch-creation modal `Left`/`Right`/`Up`/`Down` currently act on —
+/// see `App::branch_modal_row_down`/`_up`. Top-to-bottom order matches the modal's own
+/// layout, `Cmux` included only when `App::branch_modal_cmux_row_visible` says it's shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchModalRow {
+    Name,
+    Action,
+    Cmux,
 }
 
 /// How the branch-naming/harness-message flow is presented: a dedicated modal (the
@@ -200,6 +210,12 @@ pub struct App {
     /// stacked branch, which never opens one regardless. Reset to `true` each time branch
     /// naming starts and toggled with shift-tab.
     pub open_harness: bool,
+    /// Which row of the branch-creation modal `Left`/`Right`/`Up`/`Down` currently act on,
+    /// valid while `mode == Branch` — see `BranchModalRow` and
+    /// `App::branch_modal_row_down`/`_up`. Reset to `Name` each time branch naming starts.
+    /// Meaningless (and unused) under the footer presentation (`BranchUi::Footer`), which
+    /// has no rows to move a cursor between — that's the whole reason the modal exists.
+    pub branch_modal_row: BranchModalRow,
     /// Footer or modal presentation for `Branch`/`HarnessMessage` — see [`BranchUi`].
     pub branch_ui: BranchUi,
     /// What a push would do, valid while `mode == PushConfirm`.
@@ -410,6 +426,7 @@ impl App {
             pending_branch: None,
             stack_onto: None,
             open_harness: true,
+            branch_modal_row: BranchModalRow::Name,
             branch_ui: BranchUi::from_env(),
             push_preview: None,
             land_check: None,
@@ -462,6 +479,7 @@ impl App {
             pending_branch: None,
             stack_onto: None,
             open_harness: true,
+            branch_modal_row: BranchModalRow::Name,
             branch_ui: BranchUi::from_env(),
             push_preview: None,
             land_check: None,
@@ -1367,6 +1385,7 @@ impl App {
             .get(self.col)
             .and_then(|c| c.branch_name.clone());
         self.open_harness = true;
+        self.branch_modal_row = BranchModalRow::Name;
         self.mode = Mode::Branch;
     }
 
@@ -1398,6 +1417,49 @@ impl App {
             return;
         }
         self.open_harness = !self.open_harness;
+    }
+
+    /// Whether the modal's cmux-checkbox row is shown at all right now — a stacked branch
+    /// never opens its own split (see `toggle_open_harness`), so the row that would toggle
+    /// it is left out entirely rather than shown disabled. Shared between the row
+    /// navigation below and `draw_branch_modal`'s own layout, so the two can't drift apart.
+    pub fn branch_modal_cmux_row_visible(&self) -> bool {
+        self.cmux_available() && self.stack_onto.is_none()
+    }
+
+    /// `Down` in the name step: moves the row cursor along Name → Action → Cmux (skipping
+    /// Cmux when `branch_modal_cmux_row_visible` says it isn't shown) → on to the optional
+    /// message step, the same top-to-bottom order the modal itself renders in.
+    fn branch_modal_row_down(&mut self) {
+        self.branch_modal_row = match self.branch_modal_row {
+            BranchModalRow::Name => BranchModalRow::Action,
+            BranchModalRow::Action if self.branch_modal_cmux_row_visible() => BranchModalRow::Cmux,
+            BranchModalRow::Action | BranchModalRow::Cmux => {
+                self.advance_to_harness_message();
+                return;
+            }
+        };
+    }
+
+    /// `Up` in the name step: the reverse of `branch_modal_row_down`, one row at a time —
+    /// a no-op already at the top row.
+    fn branch_modal_row_up(&mut self) {
+        self.branch_modal_row = match self.branch_modal_row {
+            BranchModalRow::Cmux => BranchModalRow::Action,
+            BranchModalRow::Action | BranchModalRow::Name => BranchModalRow::Name,
+        };
+    }
+
+    /// `Left`/`Right` on whichever row is focused: moves the name field's text cursor, or
+    /// toggles the action/cmux row exactly as `Tab`/`Shift-Tab` already do — direction
+    /// doesn't matter for a two-state toggle, so both keys reach the same handler.
+    fn branch_modal_row_left_right(&mut self, left: bool) {
+        match self.branch_modal_row {
+            BranchModalRow::Name if left => self.branch_input.move_left(),
+            BranchModalRow::Name => self.branch_input.move_right(),
+            BranchModalRow::Action => self.toggle_stack_onto(),
+            BranchModalRow::Cmux => self.toggle_open_harness(),
+        }
     }
 
     /// What `b` will do, in the same spirit as the move footer: say it before doing it.
@@ -1458,9 +1520,10 @@ impl App {
         self.create_branch(&name, anchor.as_deref(), None, open_harness);
     }
 
-    /// `Down` on the name field: moves on to the optional initial-message step instead of
-    /// creating the branch. A no-op when there's no such step (stacking, or no cmux to
-    /// open) — nothing to navigate to.
+    /// The last step of `branch_modal_row_down`'s descent through the name step's rows:
+    /// moves on to the optional initial-message step instead of creating the branch. A
+    /// no-op when there's no such step (stacking, or no cmux to open) — nothing to
+    /// navigate to.
     ///
     /// Nothing is created yet — `but branch new` doesn't run until
     /// `confirm_harness_message` or `confirm_branch`. Deferring it means `Esc` on the
@@ -1472,6 +1535,9 @@ impl App {
         }
         let name = self.branch_input.trimmed();
         if name.is_empty() {
+            // Drop the row cursor back on the name field — that's what the notice is
+            // asking the user to go fix.
+            self.branch_modal_row = BranchModalRow::Name;
             self.notify("a branch needs a name", Notice::Info);
             return;
         }
@@ -1483,14 +1549,20 @@ impl App {
     }
 
     /// `Up` on the message step: the reverse of `advance_to_harness_message` — restores
-    /// the name and stack target to the name field and goes back to `Mode::Branch`,
-    /// without creating anything (unlike `Esc` here, which cancels the branch outright).
+    /// the name and stack target to the name field and goes back to `Mode::Branch`, row
+    /// cursor on the last row before the message step, without creating anything (unlike
+    /// `Esc` here, which cancels the branch outright).
     fn back_to_branch_name(&mut self) {
         let Some(pending) = self.pending_branch.take() else { return };
         self.branch_input.set(pending.name);
         self.stack_onto = pending.anchor;
         self.harness_message_input.clear();
         self.mode = Mode::Branch;
+        self.branch_modal_row = if self.branch_modal_cmux_row_visible() {
+            BranchModalRow::Cmux
+        } else {
+            BranchModalRow::Action
+        };
     }
 
     /// Finishes the harness-message prompt `advance_to_harness_message` hands off to for a
@@ -2515,6 +2587,14 @@ impl App {
         }
 
         if self.mode == Mode::Branch {
+            // Row navigation (`Up`/`Down` between name/action/cmux, `Left`/`Right` toggling
+            // whichever row is focused) only makes sense where a row cursor is actually
+            // drawn — the modal. The footer is one line with nowhere to show it, so there
+            // `Left`/`Right` stay plain text-cursor movement and `Down` goes straight to
+            // the message step the way it always has, same as before row navigation
+            // existed.
+            let modal = self.branch_ui == BranchUi::Modal;
+            let on_name_row = !modal || self.branch_modal_row == BranchModalRow::Name;
             match key.code {
                 K::Esc => {
                     self.mode = Mode::Normal;
@@ -2522,16 +2602,20 @@ impl App {
                     self.notify("branch cancelled", Notice::Info);
                 }
                 K::Enter => self.confirm_branch(),
+                K::Down if modal => self.branch_modal_row_down(),
                 K::Down => self.advance_to_harness_message(),
-                K::Tab => self.toggle_stack_onto(),
-                K::BackTab => self.toggle_open_harness(),
-                K::Backspace => self.branch_input.backspace(),
-                K::Delete => self.branch_input.delete_forward(),
+                K::Up if modal => self.branch_modal_row_up(),
+                K::Left if modal => self.branch_modal_row_left_right(true),
+                K::Right if modal => self.branch_modal_row_left_right(false),
                 K::Left => self.branch_input.move_left(),
                 K::Right => self.branch_input.move_right(),
-                K::Home => self.branch_input.move_home(),
-                K::End => self.branch_input.move_end(),
-                K::Char(c) => self.branch_input.insert(c),
+                K::Tab => self.toggle_stack_onto(),
+                K::BackTab => self.toggle_open_harness(),
+                K::Backspace if on_name_row => self.branch_input.backspace(),
+                K::Delete if on_name_row => self.branch_input.delete_forward(),
+                K::Home if on_name_row => self.branch_input.move_home(),
+                K::End if on_name_row => self.branch_input.move_end(),
+                K::Char(c) if on_name_row => self.branch_input.insert(c),
                 _ => {}
             }
             return;
@@ -3441,12 +3525,12 @@ mod tests {
         assert!(app.message.as_ref().is_some_and(|(m, _)| m.contains("cmux is not configured")));
     }
 
-    /// `App::from_board` has no `cmux`, so there's never a message step to navigate to —
-    /// `Down` on the name field must be a quiet no-op rather than doing anything to the
-    /// input or the mode.
+    /// `Down` in the modal moves the row cursor one row at a time — name, then action —
+    /// rather than jumping straight past it to the message step.
     #[test]
-    fn down_on_the_branch_name_field_is_a_no_op_with_no_message_step_to_reach() {
+    fn down_moves_the_row_cursor_from_name_to_action_before_anything_else() {
         let mut app = App::from_board(board());
+        app.branch_ui = BranchUi::Modal;
         app.mode = Mode::Branch;
         for c in "feature".chars() {
             app.branch_input.insert(c);
@@ -3454,8 +3538,101 @@ mod tests {
 
         app.handle_key(key(ratatui::crossterm::event::KeyCode::Down));
 
-        assert_eq!(app.mode, Mode::Branch, "there's nowhere for Down to navigate to");
+        assert_eq!(app.mode, Mode::Branch, "still naming — no row to reach past action yet");
+        assert_eq!(app.branch_modal_row, BranchModalRow::Action);
         assert_eq!(app.branch_input.as_str(), "feature", "Down must not touch the input");
+    }
+
+    /// `App::from_board` has no `cmux`, so past the action row there's no cmux row and no
+    /// message step — a second `Down` must be a quiet no-op, not something that silently
+    /// wraps back to the top or drops into a mode with nothing to show for it.
+    #[test]
+    fn down_from_the_action_row_is_a_no_op_with_nothing_further_to_reach() {
+        let mut app = App::from_board(board());
+        app.branch_ui = BranchUi::Modal;
+        app.mode = Mode::Branch;
+        app.branch_modal_row = BranchModalRow::Action;
+
+        app.handle_key(key(ratatui::crossterm::event::KeyCode::Down));
+
+        assert_eq!(app.mode, Mode::Branch, "there's nowhere further for Down to go");
+        assert_eq!(app.branch_modal_row, BranchModalRow::Action, "the row cursor must stay put");
+    }
+
+    /// `Up` is the exact reverse of `Down` through the same rows.
+    #[test]
+    fn up_moves_the_row_cursor_from_action_back_to_name() {
+        let mut app = App::from_board(board());
+        app.branch_ui = BranchUi::Modal;
+        app.mode = Mode::Branch;
+        app.branch_modal_row = BranchModalRow::Action;
+
+        app.handle_key(key(ratatui::crossterm::event::KeyCode::Up));
+
+        assert_eq!(app.branch_modal_row, BranchModalRow::Name);
+    }
+
+    /// Once the row cursor has moved off the name field, `Left`/`Right` must act on
+    /// whichever row it's actually on — here, flipping the stack/parallel choice exactly
+    /// as `Tab` already does — rather than moving a text cursor the user can no longer see.
+    #[test]
+    fn left_right_on_the_action_row_toggles_the_stack_choice_not_the_text_cursor() {
+        let mut app = App::from_board(board());
+        app.branch_ui = BranchUi::Modal;
+        app.mode = Mode::Branch;
+        app.branch_modal_row = BranchModalRow::Action;
+        app.stack_onto = Some("main".to_string());
+        for c in "feature".chars() {
+            app.branch_input.insert(c);
+        }
+
+        app.handle_key(key(ratatui::crossterm::event::KeyCode::Left));
+        assert_eq!(app.stack_onto, None, "Left toggled the action row");
+        app.handle_key(key(ratatui::crossterm::event::KeyCode::Right));
+        assert_eq!(
+            app.stack_onto, None,
+            "the backlog (col 0) has no branch to stack on, so this toggle fails — but it must \
+             still have gone to the action row, not the text field"
+        );
+        assert_eq!(app.branch_input.as_str(), "feature", "the name field itself is untouched");
+    }
+
+    /// Typing while focused on a row other than the name field must not silently corrupt
+    /// the name the user can no longer see they'd be editing.
+    #[test]
+    fn typing_while_focused_on_the_action_row_does_not_touch_the_branch_name() {
+        let mut app = App::from_board(board());
+        app.branch_ui = BranchUi::Modal;
+        app.mode = Mode::Branch;
+        app.branch_modal_row = BranchModalRow::Action;
+        for c in "feature".chars() {
+            app.branch_input.insert(c);
+        }
+
+        app.handle_key(key(ratatui::crossterm::event::KeyCode::Char('x')));
+        app.handle_key(key(ratatui::crossterm::event::KeyCode::Backspace));
+
+        assert_eq!(app.branch_input.as_str(), "feature");
+    }
+
+    /// The footer presentation (`KANSTACK_BRANCH_UI=footer`) has no rows to show a cursor
+    /// moving between, so it keeps the pre-row-navigation behavior: `Left`/`Right` always
+    /// edit the text field, `Down` always goes straight to the message step, regardless of
+    /// `branch_modal_row` (which the footer never renders and so never sets deliberately).
+    #[test]
+    fn footer_mode_keeps_left_right_on_the_text_field_regardless_of_row_state() {
+        let mut app = App::from_board(board());
+        app.branch_ui = BranchUi::Footer;
+        app.mode = Mode::Branch;
+        app.branch_modal_row = BranchModalRow::Action;
+        for c in "feature".chars() {
+            app.branch_input.insert(c);
+        }
+
+        app.handle_key(key(ratatui::crossterm::event::KeyCode::Left));
+        app.handle_key(key(ratatui::crossterm::event::KeyCode::Char('!')));
+
+        assert_eq!(app.branch_input.as_str(), "featur!e", "Left moved the text cursor, not a row");
     }
 
     /// `Up` from the harness-message step is the non-cancelling way back to the name
@@ -3480,6 +3657,11 @@ mod tests {
         assert!(app.harness_message_input.is_empty(), "the abandoned message must not linger");
         assert!(app.pending_branch.is_none(), "nothing should still be pending — it's back on the name field");
         assert!(app.message.is_none(), "going back is not a cancel — no notice should fire");
+        assert_eq!(
+            app.branch_modal_row,
+            BranchModalRow::Action,
+            "no cmux row to land on without cmux configured, so the row before it"
+        );
     }
 
     /// The unassigned lane holds loose files, not commits — clicking through several of

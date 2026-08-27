@@ -637,6 +637,8 @@ fn hint_row(prefix: &str, value: &str, value_style: Style, hint: &str, content_w
 /// the message field takes over — nothing about the flow changes from the footer version,
 /// only how much of it is on screen together.
 fn draw_branch_modal(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
+    use crate::app::BranchModalRow;
+
     let editing_message = app.mode == Mode::HarnessMessage;
     let will_prompt = editing_message || app.will_prompt_for_harness_message();
     let cursor = theme::tone(crate::board::Tone::Accent);
@@ -650,7 +652,19 @@ fn draw_branch_modal(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
 
     let mut body = vec![Line::styled("  new branch", theme::muted()), Line::raw("")];
 
-    let name_prefix = "  name     ";
+    // The row `Up`/`Down` currently act on gets a `▸` in place of the usual leading
+    // spaces — same character count either way, so it doesn't disturb the column layout
+    // every row lines up on. Meaningless once past the name step (`editing_message`),
+    // which has just the one field.
+    let row_marker = |row: BranchModalRow| -> &'static str {
+        if !editing_message && app.branch_modal_row == row {
+            "▸ "
+        } else {
+            "  "
+        }
+    };
+
+    let name_prefix = format!("{}name     ", row_marker(BranchModalRow::Name));
     if editing_message {
         // Already handed off to `pending_branch` — fixed, no cursor of its own anymore,
         // so no scrolling needed either; `truncate` (right-elided) is the right shape for
@@ -673,21 +687,27 @@ fn draw_branch_modal(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     }
 
     body.push(hint_row(
-        "  action   ",
+        &format!("{}action   ", row_marker(BranchModalRow::Action)),
         &app.pending_branch_target(),
         theme::tone(crate::board::Tone::Accent),
-        "tab",
+        "←/→ tab",
         content_width,
     ));
     // A stacked branch never opens its own cmux split regardless of `open_harness`
     // (see `toggle_open_harness`), so the row that would toggle it is just noise there.
-    let cmux_row = if app.cmux_available() && app.stack_onto.is_none() {
+    let cmux_row = if app.branch_modal_cmux_row_visible() {
         let (glyph, style) = if app.open_harness {
             ("[x] open harness split", theme::tone(crate::board::Tone::Accent))
         } else {
             ("[ ] open harness split", theme::faint())
         };
-        body.push(hint_row("  cmux     ", glyph, style, "shift-tab", content_width));
+        body.push(hint_row(
+            &format!("{}cmux     ", row_marker(BranchModalRow::Cmux)),
+            glyph,
+            style,
+            "←/→ shift-tab",
+            content_width,
+        ));
         Some(body.len() - 1)
     } else {
         None
@@ -747,9 +767,9 @@ fn draw_branch_modal(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     let hint = if editing_message {
         "  ⏎ create with this message      ↑ back      esc cancel branch"
     } else if will_prompt {
-        "  ⏎ create now (skips message)      ↓ add a message      esc cancel"
+        "  ↑↓ row      ⏎ create now      esc cancel"
     } else {
-        "  ⏎ create      esc cancel"
+        "  ↑↓ row      ⏎ create      esc cancel"
     };
     body.push(Line::styled(hint, theme::faint()));
 
