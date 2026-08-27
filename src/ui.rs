@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{columns_that_fit, App, BranchUi, Mode, Notice, COL_GAP};
+use crate::app::{columns_that_fit, App, BranchPreview, BranchUi, Mode, Notice, COL_GAP};
 use crate::board::{Card, ColumnKind, Tone};
 use crate::cmux::PaneStatus;
 use crate::hit::{HitMap, HitTarget};
@@ -1542,13 +1542,91 @@ fn render_card(
     out
 }
 
+/// The drawer's detail view for one branch — what `⏎` opens from the list, and what `Esc`
+/// backs out of one level to return to it (see the `Mode::Branches` key handling in
+/// `App::handle_key`). Reads the same [`MergeCheck`](crate::model::MergeCheck) payload
+/// `draw_land_confirm` does for an applied lane's own land-preview: the branch's own
+/// commits, and, when it wouldn't merge cleanly, exactly which files collide and how many
+/// upstream commits they collide with — the detail the list's bare ●/✗ dot can't carry.
+fn draw_branch_preview(f: &mut Frame, preview: &BranchPreview, area: Rect) {
+    let w = area.width as usize;
+    let fixed = vec![
+        Line::from(vec![
+            Span::styled("‹ ", theme::tone(crate::board::Tone::Accent)),
+            Span::styled(
+                truncate(&preview.name, w.saturating_sub(2)),
+                theme::title(true),
+            ),
+        ]),
+        Line::styled("─".repeat(w), theme::muted()),
+    ];
+    let fixed_h = (fixed.len() as u16).min(area.height);
+    f.render_widget(
+        Paragraph::new(fixed),
+        Rect { height: fixed_h, ..area },
+    );
+    if area.height <= fixed_h {
+        return;
+    }
+    let body = Rect {
+        y: area.y + fixed_h,
+        height: area.height - fixed_h,
+        ..area
+    };
+
+    let check = &preview.check;
+    let mut lines: Vec<Line<'static>> = vec![Line::styled(
+        format!(
+            "{} commit{}",
+            check.commits_ahead,
+            if check.commits_ahead == 1 { "" } else { "s" }
+        ),
+        theme::title(false),
+    )];
+    for c in &check.commits {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{}  ", c.short_sha), theme::faint()),
+            Span::styled(truncate(c.subject(), w.saturating_sub(10)), theme::muted()),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    if check.merge_check.merges_cleanly {
+        lines.push(Line::styled(
+            "merges cleanly",
+            theme::tone(crate::board::Tone::Good),
+        ));
+    } else {
+        let n = check.merge_check.conflicting_files.len();
+        lines.push(Line::styled(
+            format!("{n} conflicting file{}", if n == 1 { "" } else { "s" }),
+            theme::tone(crate::board::Tone::Bad),
+        ));
+        for file in &check.merge_check.conflicting_files {
+            lines.push(Line::styled(
+                truncate(&file.path, w.saturating_sub(2)),
+                theme::muted(),
+            ));
+            if !file.upstream_commits.is_empty() {
+                let uc = file.upstream_commits.len();
+                lines.push(Line::styled(
+                    format!("  vs {uc} upstream commit{}", if uc == 1 { "" } else { "s" }),
+                    theme::faint(),
+                ));
+            }
+        }
+    }
+
+    f.render_widget(Paragraph::new(lines).scroll((preview.scroll, 0)), body);
+}
+
 /// The unapplied-branches drawer.
 ///
 /// A list, not a column of lanes, and deliberately so: `but` will not enumerate an
 /// unapplied branch's commits without applying it first, so there are no cards to draw.
 /// Rendering it as a lane would mean inventing the contents. What it shows instead is
 /// everything `but branch list` knows from the outside — chiefly whether applying would
-/// conflict, which is the one fact that decides whether to press ⏎.
+/// conflict, the one fact the row itself carries; `⏎` opens the full detail behind it (see
+/// `draw_branch_preview`).
 fn draw_branches(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     // A column of margin on each side. The right-hand one matters now that the board sits
     // on that side: without it the rule under the header would run straight into the first
@@ -1564,9 +1642,16 @@ fn draw_branches(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     // A close control at the start of the header, the same convention (and the same
     // `Dismiss` target) the diff pane's own `‹` uses — one click closes whichever side
     // panel has it, without the rest of the panel's clicks (selecting a row here, reading
-    // a diff there) being swallowed by an anywhere-closes rule.
+    // a diff there) being swallowed by an anywhere-closes rule. Shared by both the list and
+    // the detail view below: `Dismiss` just simulates `Esc`, and `Esc` already means
+    // "back one level" in whichever of the two is showing.
     let back = Rect { x: area.x, y: area.y, width: 2, height: 1 };
     hits.push(back, HitTarget::Dismiss);
+
+    if let Some(preview) = &app.branch_preview {
+        draw_branch_preview(f, preview, area);
+        return;
+    }
 
     let mut fixed = vec![
         Line::from(vec![
@@ -1950,7 +2035,10 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         }
         Mode::PushConfirm | Mode::LandConfirm | Mode::DeleteConfirm | Mode::RebaseConfirm
         | Mode::Landing | Mode::Blocked | Mode::UnapplyConfirm => "",
-        Mode::Branches => "  ↑/↓ branch · ⏎ apply into a new lane · d delete · a/esc close",
+        Mode::Branches if app.branch_preview.is_some() => {
+            "  ↑/↓ scroll · a apply into a new lane · esc back"
+        }
+        Mode::Branches => "  ↑/↓ branch · ⏎ preview · a apply · d delete · esc close",
         Mode::Diff => {
             let stageable = app
                 .diff
@@ -1993,7 +2081,8 @@ fn draw_help(f: &mut Frame, area: Rect, hits: &mut HitMap) {
         help_row("  then ⏎", "confirm · esc cancels, keeping the selection"),
         help_row("esc", "with a selection and nothing else to cancel: clears it"),
         help_row("u", "send this card back to the backlog — uncommit or unstage"),
-        help_row("a", "branches not in the workspace — ⏎ applies one as a new lane"),
+        help_row("a", "branches not in the workspace — a applies one as a new lane"),
+        help_row("  then ⏎", "preview its commits and conflicts before deciding"),
         help_row("  then d", "delete the selected one — asks first, stays in the drawer"),
         help_row("U", "unapply this lane — its whole stack leaves, `a` brings it back"),
         help_row("d", "delete this lane — asks first"),

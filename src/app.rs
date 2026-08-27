@@ -174,6 +174,25 @@ enum DeleteTarget {
     Unapplied,
 }
 
+/// The drawer's on-demand detail view for whichever branch was highlighted when `⏎` was
+/// pressed — the same `but branch show --check` the land-preview already runs, aimed at an
+/// unapplied branch instead. Its presence is what distinguishes the drawer's two
+/// sub-states, list and detail, both still under `Mode::Branches`: there's no separate
+/// `Mode` for it, the same way `Mode::Diff` doesn't get a second variant for "full width".
+pub struct BranchPreview {
+    pub name: String,
+    pub check: crate::model::MergeCheck,
+    /// Line offset into the rendered preview, for `j`/`k` — mirrors `DiffView`'s own
+    /// scroll rather than a cursor, since there's no per-line action to land a cursor on.
+    pub scroll: u16,
+}
+
+impl BranchPreview {
+    fn scroll_by(&mut self, delta: i32) {
+        self.scroll = (i32::from(self.scroll) + delta).clamp(0, i32::from(u16::MAX)) as u16;
+    }
+}
+
 pub struct App {
     /// `None` in snapshot mode, where a captured status is rendered read-only.
     /// `Arc` so `confirm_land` can hand a handle to the background thread it spawns.
@@ -304,6 +323,8 @@ pub struct App {
     pub branch_sel: usize,
     /// Which branch a pending `Mode::DeleteConfirm` targets. See [`DeleteTarget`].
     delete_target: DeleteTarget,
+    /// The drawer's detail view, when one is open. See [`BranchPreview`].
+    pub branch_preview: Option<BranchPreview>,
     /// Where on screen everything from the last frame landed, for resolving the next mouse
     /// event. Rebuilt every draw (see `ui::draw`) rather than kept in sync incrementally.
     pub hit_map: crate::hit::HitMap,
@@ -1953,6 +1974,7 @@ impl App {
                 self.branch_sel = self
                     .branch_sel
                     .min(self.unapplied.branches.len().saturating_sub(1));
+                self.branch_preview = None;
                 self.mode = Mode::Branches;
                 if self.unapplied.is_empty() {
                     self.notify("every branch is already applied", Notice::Info);
@@ -1984,6 +2006,33 @@ impl App {
         self.unapplied.branches.get(self.branch_sel)
     }
 
+    /// Opens the drawer's detail view for the highlighted branch: its own commits, and —
+    /// the thing the list's bare ●/✗ dot can't say — exactly which files would conflict
+    /// and against which upstream commits. Reuses `But::merge_check`, the same `but branch
+    /// show --check` call the land-preview already makes, just aimed at an unapplied
+    /// branch instead of the current lane.
+    ///
+    /// A synchronous subprocess call, deliberately gated behind `⏎` rather than fired as
+    /// the cursor moves — the same reasoning that keeps `--review` out of the list fetch:
+    /// paying a round trip per row you glance past would make browsing feel laggy for
+    /// detail most presses don't need.
+    fn open_branch_preview(&mut self) {
+        let Some(branch) = self.selected_unapplied() else {
+            return;
+        };
+        let name = branch.name.clone();
+        let Some(but) = &self.but else {
+            self.notify("snapshot is read-only", Notice::Info);
+            return;
+        };
+        match but.merge_check(&name) {
+            Ok(check) => {
+                self.branch_preview = Some(BranchPreview { name, check, scroll: 0 });
+            }
+            Err(e) => self.notify(format!("could not preview {name}: {e}"), Notice::Error),
+        }
+    }
+
     /// Applies the highlighted branch, bringing it in as a new lane.
     ///
     /// Applies even when `mergesCleanly` is false rather than refusing: a conflicted apply
@@ -1995,6 +2044,10 @@ impl App {
         let Some(branch) = self.selected_unapplied().cloned() else {
             return;
         };
+        // Whether this came from the list or from the detail view open on this same
+        // branch, the preview is either about to be gone (applied) or stale (the attempt
+        // failed and the list is what's shown again) — either way, drop it.
+        self.branch_preview = None;
         let Some(but) = &self.but else {
             self.notify("snapshot is read-only", Notice::Info);
             return;
@@ -2842,16 +2895,39 @@ impl App {
         // than the cards behind it. The board stays drawn and stays where it was — this is
         // a focus change, not a screen change.
         if self.mode == Mode::Branches {
+            // The detail view is a second layer inside the same mode (see `BranchPreview`)
+            // — its own small key set, mirroring `Mode::Diff`: j/k scroll the preview
+            // instead of walking the list, esc/q back out one level rather than closing
+            // the drawer outright, and `a` applies what's on screen either way.
+            if self.branch_preview.is_some() {
+                match key.code {
+                    K::Esc | K::Char('q') => self.branch_preview = None,
+                    K::Down | K::Char('j') => {
+                        if let Some(p) = &mut self.branch_preview {
+                            p.scroll_by(1);
+                        }
+                    }
+                    K::Up | K::Char('k') => {
+                        if let Some(p) = &mut self.branch_preview {
+                            p.scroll_by(-1);
+                        }
+                    }
+                    K::Char('a') => self.apply_selected_branch(),
+                    _ => {}
+                }
+                return;
+            }
             let n = self.unapplied.branches.len();
             match key.code {
-                K::Esc | K::Char('q') | K::Char('a') => self.mode = Mode::Normal,
+                K::Esc | K::Char('q') => self.mode = Mode::Normal,
                 K::Down | K::Char('j') if n > 0 => {
                     self.branch_sel = (self.branch_sel + 1).min(n - 1);
                 }
                 K::Up | K::Char('k') => self.branch_sel = self.branch_sel.saturating_sub(1),
                 K::Char('g') if n > 0 => self.branch_sel = 0,
                 K::Char('G') if n > 0 => self.branch_sel = n - 1,
-                K::Enter if n > 0 => self.apply_selected_branch(),
+                K::Enter if n > 0 => self.open_branch_preview(),
+                K::Char('a') if n > 0 => self.apply_selected_branch(),
                 K::Char('d') if n > 0 => self.begin_delete_unapplied(),
                 _ => {}
             }
@@ -3945,6 +4021,86 @@ mod tests {
             app.mode,
             Mode::Branches,
             "confirming a drawer-initiated delete should return to the drawer, not the board"
+        );
+    }
+
+    fn fake_check(clean: bool) -> crate::model::MergeCheck {
+        crate::model::MergeCheck {
+            commits_ahead: 1,
+            commits: vec![crate::model::MergeCheckCommit {
+                short_sha: "abc1234".into(),
+                message: "a commit".into(),
+            }],
+            merge_check: crate::model::MergeCheckResult {
+                merges_cleanly: clean,
+                conflicting_files: if clean {
+                    Vec::new()
+                } else {
+                    vec![crate::model::ConflictingFile {
+                        path: "src/app.rs".into(),
+                        branch_commits: Vec::new(),
+                        upstream_commits: Vec::new(),
+                    }]
+                },
+            },
+        }
+    }
+
+    /// `⏎` in the drawer's list opens the detail view rather than applying — applying is
+    /// `a`'s job now, and it has to work whether or not a preview happens to be open, the
+    /// same way `m` still moves a hunk while the diff pane is open.
+    #[test]
+    fn enter_previews_instead_of_applying_and_a_applies_from_either_view() {
+        use ratatui::crossterm::event::KeyCode as K;
+
+        let mut app = App::from_board(board());
+        app.mode = Mode::Branches;
+        app.unapplied = crate::board::Unapplied {
+            branches: vec![crate::board::UnappliedBranch {
+                name: "feat-x".into(),
+                commits_ahead: Some(1),
+                merges_cleanly: Some(false),
+                author: None,
+                age: None,
+                has_local: true,
+            }],
+            truncated: false,
+        };
+
+        // No live `but` (snapshot mode), so the fetch behind `⏎` fails — but it must have
+        // tried to preview, not applied outright.
+        app.handle_key(key(K::Enter));
+        assert_eq!(app.mode, Mode::Branches, "still in the drawer, not applied");
+        assert!(app.branch_preview.is_none(), "the fetch has no `but` to run against");
+        assert!(app.message.as_ref().is_some_and(|(m, _)| m.contains("read-only")));
+
+        // Fake a successful preview directly, bypassing the fetch, to exercise the detail
+        // view's own key handling.
+        app.branch_preview = Some(crate::app::BranchPreview {
+            name: "feat-x".into(),
+            check: fake_check(false),
+            scroll: 0,
+        });
+
+        app.handle_key(key(K::Esc));
+        assert_eq!(
+            app.mode,
+            Mode::Branches,
+            "esc from the detail view goes back to the list, not out of the drawer"
+        );
+        assert!(app.branch_preview.is_none());
+
+        // Re-open it and apply from inside it — `a` must work here too, not just from the
+        // list, and (since `but` is absent) at least attempts the apply rather than no-op.
+        app.branch_preview = Some(crate::app::BranchPreview {
+            name: "feat-x".into(),
+            check: fake_check(false),
+            scroll: 0,
+        });
+        app.handle_key(key(K::Char('a')));
+        assert!(
+            app.message.as_ref().is_some_and(|(m, _)| m.contains("read-only")),
+            "a from the detail view should have attempted to apply"
         );
     }
 

@@ -187,6 +187,61 @@ mod tests {
         );
     }
 
+    /// The drawer's detail view replaces the list in the same pane — the branch's own
+    /// commits, then exactly which files would conflict, since that's the whole reason
+    /// `⏎` exists: the list's dot says *whether*, the preview says *what*.
+    #[test]
+    fn the_branch_preview_shows_commits_and_conflicting_files() {
+        use crate::model::{ConflictingFile, MergeCheck, MergeCheckCommit, MergeCheckResult};
+
+        let mut app = drawer_app();
+        app.branch_preview = Some(crate::app::BranchPreview {
+            name: "cmux-tab-on-(b)ranch".into(),
+            check: MergeCheck {
+                commits_ahead: 1,
+                commits: vec![MergeCheckCommit {
+                    short_sha: "56b9641".into(),
+                    message: "Optional cmux-tui bridge".into(),
+                }],
+                merge_check: MergeCheckResult {
+                    merges_cleanly: false,
+                    conflicting_files: vec![ConflictingFile {
+                        path: "src/cmux.rs".into(),
+                        branch_commits: Vec::new(),
+                        upstream_commits: vec![MergeCheckCommit {
+                            short_sha: "def5678".into(),
+                            message: "unrelated change".into(),
+                        }],
+                    }],
+                },
+            },
+            scroll: 0,
+        });
+
+        let out = render_app(&app, 160, 24);
+        assert!(
+            out.contains("cmux-tab-on-(b)ranch"),
+            "missing the previewed branch's name:\n{out}"
+        );
+        assert!(out.contains("56b9641"), "missing its commit:\n{out}");
+        // The drawer is narrow enough at this width that the subject truncates — check a
+        // prefix rather than the whole sentence.
+        assert!(out.contains("Optional cmux"), "missing the subject:\n{out}");
+        assert!(
+            out.contains("src/cmux.rs"),
+            "missing the conflicting file:\n{out}"
+        );
+        assert!(
+            out.contains("vs 1 upstream commit"),
+            "missing the upstream-collision count:\n{out}"
+        );
+        // The list itself must be gone — this is a replacement, not an addition.
+        assert!(
+            !out.contains("feat-theme"),
+            "the list's other branch should not still be showing:\n{out}"
+        );
+    }
+
     /// A drawer mixing local and remote-only branches draws one divider between them,
     /// after every local row and before every remote-only one — not scattered per-branch
     /// "remote" tags with nothing grouping them.
@@ -306,6 +361,39 @@ mod tests {
     fn the_drawer_does_not_panic_in_a_narrow_terminal() {
         for w in [20, 30, 40, 60] {
             let out = render_app(&drawer_app(), w, 12);
+            assert!(!out.is_empty());
+        }
+    }
+
+    /// The detail view does its own width-dependent truncation (subject, conflicting
+    /// paths) independent of the list's — worth the same narrow-terminal sweep.
+    #[test]
+    fn the_branch_preview_does_not_panic_in_a_narrow_terminal() {
+        let mut app = drawer_app();
+        app.branch_preview = Some(crate::app::BranchPreview {
+            name: "cmux-tab-on-(b)ranch".into(),
+            check: crate::model::MergeCheck {
+                commits_ahead: 1,
+                commits: vec![crate::model::MergeCheckCommit {
+                    short_sha: "56b9641".into(),
+                    message: "Optional cmux-tui bridge".into(),
+                }],
+                merge_check: crate::model::MergeCheckResult {
+                    merges_cleanly: false,
+                    conflicting_files: vec![crate::model::ConflictingFile {
+                        path: "src/cmux.rs".into(),
+                        branch_commits: Vec::new(),
+                        upstream_commits: vec![crate::model::MergeCheckCommit {
+                            short_sha: "def5678".into(),
+                            message: "unrelated change".into(),
+                        }],
+                    }],
+                },
+            },
+            scroll: 0,
+        });
+        for w in [1, 5, 20, 30, 40, 60] {
+            let out = render_app(&app, w, 12);
             assert!(!out.is_empty());
         }
     }
