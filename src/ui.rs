@@ -1706,10 +1706,16 @@ fn draw_branches(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
         Line::styled("─".repeat(w), theme::muted()),
     ];
     // Say so when the list is partial rather than presenting 20 branches as if they were
-    // all of them — `but branch list` truncates by default and reports that it did.
+    // all of them — `but branch list` truncates by default and reports that it did. A
+    // second line rather than one long one crammed against `truncate`'s ellipsis: the
+    // drawer is only ~32 columns wide here, too narrow for both halves on one line.
     if app.unapplied.truncated {
         fixed.push(Line::styled(
             truncate("only the 20 most recent", w),
+            theme::tone(crate::board::Tone::Warn),
+        ));
+        fixed.push(Line::styled(
+            truncate("A loads all", w),
             theme::tone(crate::board::Tone::Warn),
         ));
     }
@@ -2090,6 +2096,9 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         Mode::Branches if app.branch_preview.is_some() => {
             "  ↑/↓ scroll · a apply into a new lane · esc/← back"
         }
+        Mode::Branches if app.unapplied.truncated => {
+            "  ↑/↓ branch · ⏎ preview · a apply · d delete · A load all · esc/← close"
+        }
         Mode::Branches => "  ↑/↓ branch · ⏎ preview · a apply · d delete · esc/← close",
         Mode::Diff => {
             let stageable = app
@@ -2136,6 +2145,7 @@ fn draw_help(f: &mut Frame, area: Rect, hits: &mut HitMap) {
         help_row("a", "branches not in the workspace — a applies one as a new lane"),
         help_row("  then ⏎", "preview its commits and conflicts before deciding"),
         help_row("  then d", "delete the selected one — asks first, stays in the drawer"),
+        help_row("  then A", "if truncated to the 20 most recent — loads all of them"),
         help_row("U", "unapply this lane — its whole stack leaves, `a` brings it back"),
         help_row("d", "delete this lane — asks first"),
         help_row("r", "rebase onto the updated target — shows what will happen"),

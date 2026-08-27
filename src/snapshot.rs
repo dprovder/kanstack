@@ -484,6 +484,10 @@ mod tests {
             out.contains("only the 20 most recent"),
             "a truncated list must admit it:\n{out}"
         );
+        assert!(
+            out.contains("A loads all"),
+            "a truncated list must also say how to see the rest:\n{out}"
+        );
     }
 
     /// The confirmation for `U` has to name the whole-stack behaviour, because that is the

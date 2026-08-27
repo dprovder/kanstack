@@ -1972,7 +1972,7 @@ impl App {
             self.notify("snapshot is read-only", Notice::Info);
             return;
         };
-        match but.branch_list() {
+        match but.branch_list(false) {
             Ok(list) => {
                 self.unapplied = Unapplied::from_list(&list, now_ms());
                 // Keep the cursor in range across a refetch that shrank the list, the same
@@ -1997,12 +1997,36 @@ impl App {
     /// itself already succeeded, so a stale drawer is a cosmetic problem, not a wrong one.
     fn refresh_branch_list(&mut self) {
         let Some(but) = &self.but else { return };
-        match but.branch_list() {
+        match but.branch_list(false) {
             Ok(list) => {
                 self.unapplied = Unapplied::from_list(&list, now_ms());
                 self.branch_sel = self
                     .branch_sel
                     .min(self.unapplied.branches.len().saturating_sub(1));
+            }
+            Err(e) => self.notify(format!("could not list branches: {e}"), Notice::Error),
+        }
+    }
+
+    /// Re-fetches with `--all`, past the default 20-most-recent-plus-active truncation —
+    /// the drawer's escape hatch for when what you're after is further back than that.
+    /// Reachable only while the list actually is truncated (see the `Mode::Branches` key
+    /// handling), so there's no way to pay this heavier fetch by accident.
+    fn load_all_branches(&mut self) {
+        let Some(but) = &self.but else {
+            self.notify("snapshot is read-only", Notice::Info);
+            return;
+        };
+        match but.branch_list(true) {
+            Ok(list) => {
+                self.unapplied = Unapplied::from_list(&list, now_ms());
+                self.branch_sel = self
+                    .branch_sel
+                    .min(self.unapplied.branches.len().saturating_sub(1));
+                self.notify(
+                    format!("loaded all {} branches", self.unapplied.branches.len()),
+                    Notice::Success,
+                );
             }
             Err(e) => self.notify(format!("could not list branches: {e}"), Notice::Error),
         }
@@ -2938,6 +2962,7 @@ impl App {
                 K::Enter if n > 0 => self.open_branch_preview(),
                 K::Char('a') if n > 0 => self.apply_selected_branch(),
                 K::Char('d') if n > 0 => self.begin_delete_unapplied(),
+                K::Char('A') if self.unapplied.truncated => self.load_all_branches(),
                 _ => {}
             }
             return;
@@ -4146,6 +4171,33 @@ mod tests {
 
         app.handle_key(key(K::Left));
         assert_eq!(app.mode, Mode::Normal, "left from the list closes the drawer");
+    }
+
+    /// `A` only does anything when the list is actually truncated — otherwise it's a
+    /// no-op, not a redundant re-fetch of what's already fully shown.
+    #[test]
+    fn a_shift_loads_all_branches_only_when_truncated() {
+        use ratatui::crossterm::event::KeyCode as K;
+
+        let mut app = App::from_board(board());
+        app.mode = Mode::Branches;
+        app.unapplied.truncated = false;
+
+        app.handle_key(key(K::Char('A')));
+        assert!(
+            app.message.is_none(),
+            "A should be a no-op when the list isn't truncated: {:?}",
+            app.message
+        );
+
+        app.unapplied.truncated = true;
+        app.handle_key(key(K::Char('A')));
+        assert!(
+            app.message.as_ref().is_some_and(|(m, _)| m.contains("read-only")),
+            "truncated should have attempted the --all re-fetch (and hit the no-`but` guard \
+             in this snapshot-mode app): {:?}",
+            app.message
+        );
     }
 
     #[test]

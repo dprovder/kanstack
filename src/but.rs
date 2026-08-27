@@ -505,11 +505,16 @@ impl But {
     ///
     /// `--review` is left off, which is what keeps that cost bounded to local work: it
     /// would add a forge round-trip per branch. The default truncation (active + 20 most
-    /// recent) is likewise left in place and reported through `has_more_branches` rather
-    /// than pre-empted with `--all`, so the common case stays cheap and the uncommon one
-    /// is at least honest about what it is not showing.
-    pub fn branch_list(&self) -> Result<BranchList> {
-        let raw = self.run(&["branch", "list", "--json"])?;
+    /// recent) is likewise left in place unless `all` is set — `has_more_branches` on the
+    /// default listing is what tells the drawer there's more to ask for, so the common case
+    /// stays cheap and the uncommon one is at least honest about what it is not showing.
+    pub fn branch_list(&self, all: bool) -> Result<BranchList> {
+        let mut args = vec!["branch", "list"];
+        if all {
+            args.push("--all");
+        }
+        args.push("--json");
+        let raw = self.run(&args)?;
         serde_json::from_str(&raw)
             .with_context(|| format!("could not parse `but branch list` output: {raw:.400}"))
     }
