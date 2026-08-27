@@ -187,6 +187,51 @@ mod tests {
         );
     }
 
+    /// A drawer mixing local and remote-only branches draws one divider between them,
+    /// after every local row and before every remote-only one — not scattered per-branch
+    /// "remote" tags with nothing grouping them.
+    #[test]
+    fn the_drawer_divides_local_branches_from_remote_only_ones() {
+        let branch = |name: &str, has_local: bool| crate::board::UnappliedBranch {
+            name: name.into(),
+            commits_ahead: None,
+            merges_cleanly: None,
+            author: None,
+            age: None,
+            has_local,
+        };
+        let mut app = drawer_app();
+        app.unapplied = crate::board::Unapplied {
+            branches: vec![
+                branch("local-one", true),
+                branch("remote-one", false),
+                branch("remote-two", false),
+            ],
+            truncated: false,
+        };
+        let out = render_app(&app, 160, 24);
+        assert!(out.contains("remote-only"), "missing the divider:\n{out}");
+
+        let local_row = out.lines().position(|l| l.contains("local-one")).unwrap();
+        let divider_row = out.lines().position(|l| l.contains("remote-only")).unwrap();
+        let remote_row = out.lines().position(|l| l.contains("remote-one")).unwrap();
+        assert!(
+            local_row < divider_row && divider_row < remote_row,
+            "the divider must sit between the local and remote-only rows:\n{out}"
+        );
+    }
+
+    /// An all-local or all-remote list has nothing to divide, so no divider should appear
+    /// — one side of it would always be empty.
+    #[test]
+    fn an_undivided_drawer_draws_no_divider() {
+        let out = render_app(&drawer_app(), 160, 24);
+        assert!(
+            !out.contains("remote-only"),
+            "both fixture branches are remote-only; there's nothing to divide:\n{out}"
+        );
+    }
+
     /// The drawer splits the board rather than covering it. Applying a branch is a choice
     /// made against the lanes already open, so losing sight of them would hide half the
     /// question — the same reason the diff pane splits.

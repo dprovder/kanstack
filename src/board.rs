@@ -263,23 +263,29 @@ impl Unapplied {
     /// `now_ms` is passed in rather than read from the clock so ages are testable and the
     /// whole projection stays a pure function of its inputs.
     pub fn from_list(list: &BranchList, now_ms: i64) -> Unapplied {
+        let mut branches: Vec<UnappliedBranch> = list
+            .branches
+            .iter()
+            .map(|b| UnappliedBranch {
+                name: b.name.clone(),
+                commits_ahead: b.commits_ahead,
+                merges_cleanly: b.merges_cleanly,
+                author: b
+                    .last_author
+                    .as_ref()
+                    .and_then(|a| a.name.clone())
+                    .filter(|n| !n.is_empty()),
+                age: relative_age(b.last_commit_at, now_ms),
+                has_local: b.has_local.unwrap_or(false),
+            })
+            .collect();
+        // Local branches first, remote-only ones after — a stable sort, so `but`'s own
+        // recency order survives within each half. Unlike the unassigned lane's
+        // folder-grouping this has no flat/grouped toggle: with only ever two buckets,
+        // there's nothing worth collapsing back out of.
+        branches.sort_by_key(|b| !b.has_local);
         Unapplied {
-            branches: list
-                .branches
-                .iter()
-                .map(|b| UnappliedBranch {
-                    name: b.name.clone(),
-                    commits_ahead: b.commits_ahead,
-                    merges_cleanly: b.merges_cleanly,
-                    author: b
-                        .last_author
-                        .as_ref()
-                        .and_then(|a| a.name.clone())
-                        .filter(|n| !n.is_empty()),
-                    age: relative_age(b.last_commit_at, now_ms),
-                    has_local: b.has_local.unwrap_or(false),
-                })
-                .collect(),
+            branches,
             truncated: list.has_more_branches,
         }
     }
@@ -974,5 +980,36 @@ mod tests {
         assert!(!clean.has_local, "this one is remote-only");
 
         assert_eq!(u.branches[1].merges_cleanly, Some(false));
+    }
+
+    /// Local branches sort ahead of remote-only ones, so the drawer can draw one divider
+    /// between the two rather than interleaving them — but the sort is stable, so `but`'s
+    /// own recency order still holds within each half.
+    #[test]
+    fn unapplied_sorts_local_branches_before_remote_only_ones() {
+        fn listed(name: &str, has_local: bool) -> crate::model::ListedBranch {
+            crate::model::ListedBranch {
+                name: name.into(),
+                reviews: Vec::new(),
+                has_local: Some(has_local),
+                last_commit_at: 0,
+                commits_ahead: None,
+                last_author: None,
+                merges_cleanly: None,
+            }
+        }
+        let list = crate::model::BranchList {
+            applied_stacks: Vec::new(),
+            branches: vec![
+                listed("remote-old", false),
+                listed("local-a", true),
+                listed("remote-new", false),
+                listed("local-b", true),
+            ],
+            has_more_branches: false,
+        };
+        let u = Unapplied::from_list(&list, 1_785_000_000_000);
+        let names: Vec<&str> = u.branches.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(names, ["local-a", "local-b", "remote-old", "remote-new"]);
     }
 }

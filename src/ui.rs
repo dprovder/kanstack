@@ -1616,8 +1616,26 @@ fn draw_branches(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
         return;
     }
 
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(n * ROWS_PER_BRANCH);
+    // `but branch list` already orders local branches before remote-only ones (see
+    // `Unapplied::from_list`), so the one boundary worth marking is wherever `has_local`
+    // first goes false — skipped entirely when the list is all one or the other, since a
+    // divider with nothing on one side of it is just noise.
+    let remote_count = app.unapplied.branches.iter().filter(|b| !b.has_local).count();
+    let mixed = remote_count > 0 && remote_count < n;
+
+    // Built alongside `lines` rather than derived from `ROWS_PER_BRANCH * i`: the divider
+    // makes rows non-uniform in height, so each row's start has to be tracked as it's
+    // rendered, the same way the board tracks `card_spans` for its own variable-height
+    // headers.
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(n * ROWS_PER_BRANCH + 2);
+    let mut row_starts: Vec<u16> = Vec::with_capacity(n);
+    let mut divider_drawn = false;
     for (i, b) in app.unapplied.branches.iter().enumerate() {
+        if mixed && !b.has_local && !divider_drawn {
+            lines.extend(remote_divider(remote_count, w));
+            divider_drawn = true;
+        }
+        row_starts.push(lines.len() as u16);
         let hovered = app.mode == Mode::Branches && app.hover == Some(HitTarget::BranchRow(i));
         lines.extend(render_unapplied(b, w, i == app.branch_sel, hovered));
     }
@@ -1625,13 +1643,12 @@ fn draw_branches(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     // Scroll just far enough to keep the whole selected row on screen, the same rule the
     // board uses for lanes — the meta line matters as much as the name, so the unit kept
     // visible is the row, not its first line.
-    let sel_top = (app.branch_sel * ROWS_PER_BRANCH) as u16;
+    let sel_top = row_starts[app.branch_sel];
     let sel_bottom = sel_top + ROWS_PER_BRANCH as u16;
     let offset = sel_bottom.saturating_sub(body.height);
     f.render_widget(Paragraph::new(lines).scroll((offset, 0)), body);
 
-    for i in 0..n {
-        let top = (i * ROWS_PER_BRANCH) as u16;
+    for (i, &top) in row_starts.iter().enumerate() {
         let lo = top.max(offset);
         let hi = (top + ROWS_PER_BRANCH as u16).min(offset + body.height);
         if hi <= lo {
@@ -1647,6 +1664,19 @@ fn draw_branches(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
             HitTarget::BranchRow(i),
         );
     }
+}
+
+/// The one-time boundary between local and remote-only branches in the drawer — the same
+/// "label, then a full-width rule" shape `folder_header` uses for the unassigned lane,
+/// toned down to a plain label since it's never itself a selectable row.
+fn remote_divider(count: usize, width: usize) -> Vec<Line<'static>> {
+    vec![
+        Line::from(vec![
+            Span::styled("remote-only", theme::faint()),
+            Span::styled(format!("  {count}"), theme::faint()),
+        ]),
+        Line::styled("─".repeat(width), theme::faint()),
+    ]
 }
 
 /// Lines per drawer row: name, metadata, and the blank that separates it from the next.
@@ -1998,6 +2028,7 @@ fn draw_help(f: &mut Frame, area: Rect, hits: &mut HitMap) {
         help_row("▸ folder", "a directory divider in unassigned, when grouped by folder"),
         help_row("● busy / ○ idle / ✕ pane closed", "a lane's cmux harness pane, if one is open"),
         help_row("drawer ● green/red", "whether applying that branch would merge cleanly"),
+        help_row("drawer remote-only", "divider — everything below has no local ref"),
         Line::raw(""),
         Line::styled(
             "  every drop is one `but rub SOURCE TARGET`.",
