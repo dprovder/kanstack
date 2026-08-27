@@ -35,6 +35,14 @@ impl TextInput {
         self.cursor = 0;
     }
 
+    /// Replaces the value outright, cursor at the end — for restoring a field from a
+    /// value that was handed off elsewhere (see `App::back_to_branch_name`), as opposed
+    /// to `insert`'s one-character-at-a-time typing.
+    pub fn set(&mut self, value: impl Into<String>) {
+        self.value = value.into();
+        self.cursor = self.char_count();
+    }
+
     fn char_count(&self) -> usize {
         self.value.chars().count()
     }

@@ -737,7 +737,7 @@ fn draw_branch_modal(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
             }
         } else {
             body.push(Line::styled(
-                "  message  (next: an optional initial message for the harness)",
+                "  message  (↓ to add an optional initial message for the harness)",
                 theme::faint(),
             ));
         }
@@ -745,9 +745,9 @@ fn draw_branch_modal(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
 
     body.push(Line::raw(""));
     let hint = if editing_message {
-        "  ⏎ open harness      esc cancel branch"
+        "  ⏎ create with this message      ↑ back      esc cancel branch"
     } else if will_prompt {
-        "  ⏎ next: message      esc cancel"
+        "  ⏎ create now (skips message)      ↓ add a message      esc cancel"
     } else {
         "  ⏎ create      esc cancel"
     };
@@ -1788,14 +1788,16 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             let (before, after) = app.branch_input.split_at_cursor();
             let prefix = "  branch  ";
             let pending = app.pending_branch_action();
-            // A parallel lane opening a harness doesn't create anything on this Enter —
-            // it goes on to prompt for an initial message first, and `confirm_branch`
-            // doesn't touch `but` until that prompt confirms.
-            let verb = if app.will_prompt_for_harness_message() { "next" } else { "create" };
-            let hint = if app.cmux_available() {
-                format!("   ⏎ {verb} · tab switch · shift-tab cmux · esc cancel")
+            // Enter always creates the branch right now, with no message — `Down` is what
+            // opts into the optional initial-message step instead (see
+            // `App::advance_to_harness_message`); nothing touches `but` until one or the
+            // other fires.
+            let hint = if app.will_prompt_for_harness_message() {
+                "   ⏎ create · ↓ message · tab switch · shift-tab cmux · esc cancel".to_string()
+            } else if app.cmux_available() {
+                "   ⏎ create · tab switch · shift-tab cmux · esc cancel".to_string()
             } else {
-                format!("   ⏎ {verb} · tab switch · esc cancel")
+                "   ⏎ create · tab switch · esc cancel".to_string()
             };
             let suffix_len = 3 + pending.chars().count() + hint.chars().count();
             let budget = footer_input_budget(area.width, prefix.chars().count(), suffix_len);
@@ -1833,10 +1835,11 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         Mode::HarnessMessage => {
             let (before, after) = app.harness_message_input.split_at_cursor();
             let prefix = "  initial message  ";
-            // Nothing has been created yet at this point — see `App::confirm_branch` — so
-            // `esc` here cancels the branch outright rather than just skipping the
-            // message.
-            let hint = "   ⏎ open harness · esc cancel branch";
+            // Nothing has been created yet at this point — see
+            // `App::advance_to_harness_message` — so `esc` here cancels the branch outright
+            // rather than just skipping the message; `↑` goes back to the name field
+            // instead, without cancelling.
+            let hint = "   ⏎ create · ↑ back · esc cancel branch";
             let budget = footer_input_budget(area.width, prefix.chars().count(), hint.chars().count());
             let (before, after) = scroll_input(before, after, budget);
             return f.render_widget(
@@ -1915,7 +1918,7 @@ fn draw_help(f: &mut Frame, area: Rect, hits: &mut HitMap) {
         help_row("⏎", "open the diff beside the board — ← goes back"),
         help_row("c", "commit the staged files in this lane"),
         help_row("b", "new branch — stacks on this lane, tab for parallel"),
-        help_row("  then ⏎", "a parallel lane with cmux enabled asks for an initial message"),
+        help_row("  then ⏎", "create now · ↓ (parallel + cmux) add an initial message first"),
         help_row("t", "send a task to this lane's cmux pane — spawns one first if not open"),
         help_row("s", "stack this whole lane onto another — rewrites history"),
         help_row("p", "push this lane — shows what it will do first"),
