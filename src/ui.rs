@@ -2055,9 +2055,9 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         Mode::PushConfirm | Mode::LandConfirm | Mode::DeleteConfirm | Mode::RebaseConfirm
         | Mode::Landing | Mode::Blocked | Mode::UnapplyConfirm => "",
         Mode::Branches if app.branch_preview.is_some() => {
-            "  ↑/↓ scroll · a apply into a new lane · esc back"
+            "  ↑/↓ scroll · a apply into a new lane · esc/← back"
         }
-        Mode::Branches => "  ↑/↓ branch · ⏎ preview · a apply · d delete · esc close",
+        Mode::Branches => "  ↑/↓ branch · ⏎ preview · a apply · d delete · esc/← close",
         Mode::Diff => {
             let stageable = app
                 .diff

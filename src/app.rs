@@ -2899,11 +2899,13 @@ impl App {
         if self.mode == Mode::Branches {
             // The detail view is a second layer inside the same mode (see `BranchPreview`)
             // — its own small key set, mirroring `Mode::Diff`: j/k scroll the preview
-            // instead of walking the list, esc/q back out one level rather than closing
-            // the drawer outright, and `a` applies what's on screen either way.
+            // instead of walking the list, esc/q/← back out one level rather than closing
+            // the drawer outright, and `a` applies what's on screen either way. Just ←, not
+            // both arrows the way the diff pane takes them — the drawer sits to the left of
+            // the board, so → still reads as "into the board" rather than also meaning back.
             if self.branch_preview.is_some() {
                 match key.code {
-                    K::Esc | K::Char('q') => self.branch_preview = None,
+                    K::Esc | K::Char('q') | K::Left => self.branch_preview = None,
                     K::Down | K::Char('j') => {
                         if let Some(p) = &mut self.branch_preview {
                             p.scroll_by(1);
@@ -2921,7 +2923,7 @@ impl App {
             }
             let n = self.unapplied.branches.len();
             match key.code {
-                K::Esc | K::Char('q') => self.mode = Mode::Normal,
+                K::Esc | K::Char('q') | K::Left => self.mode = Mode::Normal,
                 K::Down | K::Char('j') if n > 0 => {
                     self.branch_sel = (self.branch_sel + 1).min(n - 1);
                 }
@@ -4104,6 +4106,33 @@ mod tests {
             app.message.as_ref().is_some_and(|(m, _)| m.contains("read-only")),
             "a from the detail view should have attempted to apply"
         );
+    }
+
+    /// `←` backs out of the drawer one level at a time too, the same as `esc` — mirroring
+    /// `Mode::Diff`, where the diff similarly sits off to one side of the board and either
+    /// arrow already means "back" rather than "move within this view".
+    #[test]
+    fn left_arrow_backs_out_of_the_drawer_like_esc() {
+        use ratatui::crossterm::event::KeyCode as K;
+
+        let mut app = App::from_board(board());
+        app.mode = Mode::Branches;
+        app.branch_preview = Some(crate::app::BranchPreview {
+            name: "feat-x".into(),
+            check: fake_check(true),
+            scroll: 0,
+        });
+
+        app.handle_key(key(K::Left));
+        assert_eq!(
+            app.mode,
+            Mode::Branches,
+            "left from the detail view goes back to the list, not out of the drawer"
+        );
+        assert!(app.branch_preview.is_none(), "left should have closed the preview");
+
+        app.handle_key(key(K::Left));
+        assert_eq!(app.mode, Mode::Normal, "left from the list closes the drawer");
     }
 
     #[test]
