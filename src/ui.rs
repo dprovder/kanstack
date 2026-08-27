@@ -1028,11 +1028,13 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// Chooses a column width and the first visible column so the cursor stays on screen.
-fn visible_columns(app: &App, area: Rect) -> (u16, usize, usize) {
-    let (width, fit) = columns_that_fit(app.column_count(), area.width);
+/// Chooses a column width and the first visible position (an index into `indices`, not into
+/// `app.board.columns` itself) so the current column stays on screen.
+fn visible_columns(app: &App, indices: &[usize], area: Rect) -> (u16, usize, usize) {
+    let (width, fit) = columns_that_fit(indices.len(), area.width);
+    let pos = indices.iter().position(|&i| i == app.col).unwrap_or(0);
     // Scroll the window just far enough to include the selected column.
-    let first = if app.col < fit { 0 } else { app.col + 1 - fit };
+    let first = if pos < fit { 0 } else { pos + 1 - fit };
     (width, first, fit)
 }
 
@@ -1055,11 +1057,37 @@ fn draw_board(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
         return;
     }
 
-    let (width, first, fit) = visible_columns(app, area);
-    let last = (first + fit).min(app.board.columns.len());
+    // While the branches drawer is open, the unassigned lane isn't part of the decision
+    // being made (which branch to apply, judged against the lanes already there) — it's
+    // just uncommitted worktree changes with nothing to add to that call. Leaving it out
+    // hands its column of width back to the lanes that are actually relevant.
+    let indices: Vec<usize> = if app.mode == Mode::Branches {
+        app.board
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.kind != ColumnKind::Unassigned)
+            .map(|(i, _)| i)
+            .collect()
+    } else {
+        (0..app.board.columns.len()).collect()
+    };
+    if indices.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::styled(
+                "  no applied branches — create one with `but branch new <name>`",
+                theme::faint(),
+            )),
+            area,
+        );
+        return;
+    }
+
+    let (width, first, fit) = visible_columns(app, &indices, area);
+    let last = (first + fit).min(indices.len());
 
     let mut x = area.x + 1;
-    for idx in first..last {
+    for pos in first..last {
         if x + width > area.x + area.width {
             break;
         }
@@ -1069,7 +1097,7 @@ fn draw_board(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
             width,
             height: area.height,
         };
-        draw_column(f, app, idx, col_area, hits);
+        draw_column(f, app, indices[pos], col_area, hits);
         x += width + COL_GAP;
     }
 
@@ -1084,7 +1112,7 @@ fn draw_board(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
             let marker = Rect { x: area.x, y: row, width: 1, height: 1 };
             f.render_widget(Paragraph::new(Line::styled("‹", theme::faint())), marker);
         }
-        if last < app.board.columns.len() {
+        if last < indices.len() {
             let marker = Rect {
                 x: area.x + area.width.saturating_sub(1),
                 y: row,

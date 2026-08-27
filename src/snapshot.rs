@@ -204,12 +204,15 @@ mod tests {
     #[test]
     fn the_drawer_opens_on_the_left_of_the_lanes() {
         let out = render_app(&drawer_app(), 160, 24);
+        // The unassigned lane is hidden while the drawer is open (see
+        // `board_browsing_hides_the_unassigned_lane` below), so the first lane beside the
+        // drawer is the first real one — `fix-flaky-tests` in this fixture.
         let row = out
             .lines()
-            .find(|l| l.contains("unapplied") && l.contains("unassigned"))
+            .find(|l| l.contains("unapplied") && l.contains("fix-flaky-tests"))
             .expect("the drawer header and the first lane share a row");
         assert!(
-            row.find("unapplied") < row.find("unassigned"),
+            row.find("unapplied") < row.find("fix-flaky-tests"),
             "the drawer must sit left of the board:\n{row}"
         );
 
@@ -231,11 +234,24 @@ mod tests {
         // right, so this stops at the first gap rather than spanning the whole row.
         let start = col_of(rule, "─");
         let drawer_end = start + rule.chars().skip(start).take_while(|c| *c == '─').count();
-        let lane_start = col_of(row, "unassigned");
+        let lane_start = col_of(row, "fix-flaky-tests");
         assert!(
             lane_start > drawer_end + 1,
             "drawer rule ends at column {drawer_end}, lane starts at {lane_start} — \
              too tight to read as a separate panel:\n{out}"
+        );
+    }
+
+    /// Browsing unapplied branches is a decision made against the lanes already applied —
+    /// the unassigned lane (uncommitted worktree changes) has nothing to add to that call,
+    /// so it drops out of view while the drawer is open rather than eating a column of the
+    /// now-scarcer width.
+    #[test]
+    fn board_browsing_hides_the_unassigned_lane() {
+        let out = render_app(&drawer_app(), 160, 24);
+        assert!(
+            !out.contains("unassigned"),
+            "the unassigned lane should be hidden while the branches drawer is open:\n{out}"
         );
     }
 
