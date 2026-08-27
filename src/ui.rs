@@ -11,13 +11,13 @@ use ratatui::Frame;
 
 use crate::app::{columns_that_fit, App, BranchPreview, BranchUi, Mode, Notice, COL_GAP};
 use crate::board::{Card, ColumnKind, Tone};
-use crate::cmux::PaneStatus;
 use crate::hit::{HitMap, HitTarget};
+use crate::pane_status::PaneStatus;
 use crate::theme;
 
-/// Label for a lane's cmux pane status, rendered alongside its ordinary badges. Kept here
-/// rather than as a method on `PaneStatus` so `cmux` doesn't need to depend on `board`'s
-/// `Tone` just to describe how it's drawn — the same reason `LaneState`'s CI-badge sibling
+/// Label for a lane's split-pane status, rendered alongside its ordinary badges. Kept here
+/// rather than as a method on `PaneStatus` so `pane_status` doesn't need to depend on
+/// `board`'s `Tone` just to describe how it's drawn — the same reason `LaneState`'s CI-badge sibling
 /// bakes its own label/tone in `board.rs` instead of leaning on `ui.rs`, just mirrored the
 /// other way since `PaneStatus` is the newer, ui-only-facing type.
 /// How wide the unapplied-branches drawer is, when there is room for it. Branch names run
@@ -646,8 +646,8 @@ fn hint_row(prefix: &str, value: &str, value_style: Style, hint: &str, content_w
     ])
 }
 
-/// Branch creation, as a modal — the `KANSTACK_BRANCH_UI=modal` alternative to the
-/// default one-line footer prompt (see `BranchUi`). Shows the name, the pending action,
+/// Branch creation, as a modal — the default presentation (`KANSTACK_BRANCH_UI=footer`
+/// is the one-line alternative; see `BranchUi`). Shows the name, the pending action,
 /// and — when one is coming — the initial harness message all at once instead of one
 /// field at a time, each with room a footer line never has. Covers `Mode::Branch` and
 /// `Mode::HarnessMessage` both, so the name stays visible (now fixed, no cursor) while
@@ -710,16 +710,16 @@ fn draw_branch_modal(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
         "←/→ tab",
         content_width,
     ));
-    // A stacked branch never opens its own cmux split regardless of `open_harness`
-    // (see `toggle_open_harness`), so the row that would toggle it is just noise there.
-    let cmux_row = if app.branch_modal_cmux_row_visible() {
+    // A stacked branch never opens its own split regardless of `open_harness` (see
+    // `toggle_open_harness`), so the row that would toggle it is just noise there.
+    let split_row = if app.branch_modal_split_row_visible() {
         let (glyph, style) = if app.open_harness {
             ("[x] open harness split", theme::tone(crate::board::Tone::Accent))
         } else {
             ("[ ] open harness split", theme::faint())
         };
         body.push(hint_row(
-            &format!("{}cmux     ", row_marker(BranchModalRow::Cmux)),
+            &format!("{}{:<9}", row_marker(BranchModalRow::Split), app.splitter_label()),
             glyph,
             style,
             "←/→ shift-tab",
@@ -800,12 +800,12 @@ fn draw_branch_modal(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     confirm_hitboxes(hits, popup, body.len(), hint);
     // Mirrors `confirm_hitboxes`' own bounds check: skip the hitbox if a too-short popup
     // clipped this row out of view.
-    if let Some(idx) = cmux_row {
+    if let Some(idx) = split_row {
         let row = popup.y + 1 + idx as u16;
         if row + 1 < popup.y + popup.height {
             hits.push(
                 Rect { x: popup.x + 1, y: row, width: popup.width.saturating_sub(2), height: 1 },
-                HitTarget::BranchToggleCmux,
+                HitTarget::BranchToggleSplit,
             );
         }
     }
@@ -2019,9 +2019,12 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             // `App::advance_to_harness_message`); nothing touches `but` until one or the
             // other fires.
             let hint = if app.will_prompt_for_harness_message() {
-                "   ⏎ create · ↓ message · tab switch · shift-tab cmux · esc cancel".to_string()
-            } else if app.cmux_available() {
-                "   ⏎ create · tab switch · shift-tab cmux · esc cancel".to_string()
+                format!(
+                    "   ⏎ create · ↓ message · tab switch · shift-tab {} · esc cancel",
+                    app.splitter_label()
+                )
+            } else if app.splitter_available() {
+                format!("   ⏎ create · tab switch · shift-tab {} · esc cancel", app.splitter_label())
             } else {
                 "   ⏎ create · tab switch · esc cancel".to_string()
             };
@@ -2153,8 +2156,8 @@ fn draw_help(f: &mut Frame, area: Rect, hits: &mut HitMap) {
         help_row("⏎", "open the diff beside the board — ← goes back"),
         help_row("c", "commit the staged files in this lane"),
         help_row("b", "new branch — stacks on this lane, tab for parallel"),
-        help_row("  then ⏎", "create now · ↓ (parallel + cmux) add an initial message first"),
-        help_row("t", "send a task to this lane's cmux pane — spawns one first if not open"),
+        help_row("  then ⏎", "create now · ↓ (parallel + split) add an initial message first"),
+        help_row("t", "send a task to this lane's split pane — spawns one first if not open"),
         help_row("s", "stack this whole lane onto another — rewrites history"),
         help_row("p", "push this lane — shows what it will do first"),
         help_row("L", "land this lane onto the target — no PR, shows what will happen first"),
@@ -2177,7 +2180,7 @@ fn draw_help(f: &mut Frame, area: Rect, hits: &mut HitMap) {
         help_row("● filled dot", "a lane's tip branch — c/p/M/z always act here"),
         help_row("○ hollow dot", "a branch stacked below the tip, along for the ride"),
         help_row("▸ folder", "a directory divider in unassigned, when grouped by folder"),
-        help_row("● busy / ○ idle / ✕ pane closed", "a lane's cmux harness pane, if one is open"),
+        help_row("● busy / ○ idle / ✕ pane closed", "a lane's split harness pane (cmux or tmux), if one is open"),
         help_row("drawer ● green/red", "whether applying that branch would merge cleanly"),
         help_row("drawer remote-only", "divider — everything below has no local ref"),
         help_row("drawer stale", "old and no longer merges cleanly — a delete candidate"),

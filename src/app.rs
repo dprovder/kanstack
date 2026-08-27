@@ -15,9 +15,9 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 
-use crate::cmux::Cmux;
 use crate::diff::DiffView;
 use crate::model::{MergeCheck, PullPreview, PushPreview, WorkspaceStatus};
+use crate::splitter::Splitter;
 use crate::text_input::TextInput;
 use crate::tutorial::Tutorial;
 
@@ -64,13 +64,13 @@ pub enum Mode {
     Commit,
     /// Typing a new branch name.
     Branch,
-    /// Typing a task description to send into the selected lane's cmux pane.
+    /// Typing a task description to send into the selected lane's split pane.
     Task,
     /// Typing an initial message to seed the harness pane of a branch that does not exist
     /// yet, in `b`'s create-parallel-lane flow — see `App::advance_to_harness_message`.
     /// Distinct from `Task`: that one targets an already-running pane, while this one
     /// folds the message into the harness's own launch command — see
-    /// [`crate::cmux::Cmux::spawn_harness`].
+    /// [`crate::splitter::Splitter::spawn_harness`].
     HarnessMessage,
     /// A whole lane has been picked up, looking for a lane to stack onto.
     Restacking,
@@ -109,12 +109,13 @@ struct PendingBranch {
 
 /// Which row of the branch-creation modal `Left`/`Right`/`Up`/`Down` currently act on —
 /// see `App::branch_modal_row_down`/`_up`. Top-to-bottom order matches the modal's own
-/// layout, `Cmux` included only when `App::branch_modal_cmux_row_visible` says it's shown.
+/// layout, `Split` included only when `App::branch_modal_split_row_visible` says it's
+/// shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BranchModalRow {
     Name,
     Action,
-    Cmux,
+    Split,
 }
 
 /// How the branch-naming/harness-message flow is presented: a dedicated modal (the
@@ -201,8 +202,8 @@ pub struct App {
     /// `None` in snapshot mode, where a captured status is rendered read-only.
     /// `Arc` so `confirm_land` can hand a handle to the background thread it spawns.
     but: Option<Arc<But>>,
-    /// `None` outside cmux, or when `cmux-tui` is not installed. See [`crate::cmux`].
-    cmux: Option<Cmux>,
+    /// `None` when neither `cmux` nor `tmux` is usable — see [`crate::splitter::Splitter::discover`].
+    splitter: Option<Splitter>,
     pub board: Board,
     pub col: usize,
     pub card: usize,
@@ -239,9 +240,10 @@ pub struct App {
     /// a parallel lane. Seeded from the selected lane and toggled with tab.
     pub stack_onto: Option<String>,
     /// While naming a branch: whether a parallel lane (`stack_onto.is_none()`) should get
-    /// its own cmux split. Only meaningful when cmux is configured at all; irrelevant for a
-    /// stacked branch, which never opens one regardless. Reset to `true` each time branch
-    /// naming starts and toggled with shift-tab.
+    /// its own harness split (cmux or tmux). Only meaningful when a split backend is
+    /// configured at all; irrelevant for a stacked branch, which never opens one
+    /// regardless. Reset to `true` each time branch naming starts and toggled with
+    /// shift-tab.
     pub open_harness: bool,
     /// Which row of the branch-creation modal `Left`/`Right`/`Up`/`Down` currently act on,
     /// valid while `mode == Branch` — see `BranchModalRow` and
@@ -308,11 +310,12 @@ pub struct App {
     /// rather than scoped to one lane on purpose — nothing about `but rub` requires the
     /// sources to share a column, so there is no reason to make kanstack pretend they must.
     pub selected: HashSet<String>,
-    /// A cmux pane-liveness poll running on a background thread; see `maybe_begin_cmux_poll`.
-    cmux_poll: Option<PendingCmuxPoll>,
+    /// A split-pane-liveness poll running on a background thread; see
+    /// `maybe_begin_split_poll`.
+    split_poll: Option<PendingSplitPoll>,
     /// Wall-clock time of the last poll kickoff, so most ticks cost one comparison and
     /// nothing else. `None` until the first poll ever starts.
-    cmux_poll_at: Option<std::time::Instant>,
+    split_poll_at: Option<std::time::Instant>,
     /// Branches that exist but are not in the workspace, for the drawer.
     ///
     /// Empty until the drawer is first opened, and refetched every time it opens or after
@@ -363,10 +366,10 @@ struct PendingRefresh {
     generation: u64,
 }
 
-/// A cmux pane-liveness poll in flight on a background thread; see
-/// `App::maybe_begin_cmux_poll`.
-struct PendingCmuxPoll {
-    rx: mpsc::Receiver<Result<HashMap<String, crate::cmux::PaneStatus>>>,
+/// A split-pane-liveness poll in flight on a background thread; see
+/// `App::maybe_begin_split_poll`.
+struct PendingSplitPoll {
+    rx: mpsc::Receiver<Result<HashMap<String, crate::pane_status::PaneStatus>>>,
 }
 
 /// What a move actually does now that `but rub` is gone and every combination is its own
@@ -415,7 +418,7 @@ struct PendingCommitMove {
 }
 
 impl App {
-    pub fn new(but: But, cmux: Option<Cmux>) -> Result<Self> {
+    pub fn new(but: But, splitter: Option<Splitter>) -> Result<Self> {
         let mut commit_stats = HashMap::new();
         // A blocked workspace starts the app rather than aborting it. Bailing here printed
         // one line of prose and vanished, which reads as a crash and leaves the user to
@@ -442,7 +445,7 @@ impl App {
         }
         Ok(App {
             but: Some(Arc::new(but)),
-            cmux,
+            splitter,
             board,
             col: 0,
             card: 0,
@@ -483,8 +486,8 @@ impl App {
             unassigned_grouped_by_folder: false,
             terminal_width: 80,
             selected: HashSet::new(),
-            cmux_poll: None,
-            cmux_poll_at: None,
+            split_poll: None,
+            split_poll_at: None,
             unapplied: Unapplied::default(),
             branch_sel: 0,
             delete_target: DeleteTarget::Lane,
@@ -501,7 +504,7 @@ impl App {
     pub fn from_board(board: Board) -> Self {
         App {
             but: None,
-            cmux: None,
+            splitter: None,
             board,
             col: 0,
             card: 0,
@@ -538,8 +541,8 @@ impl App {
             unassigned_grouped_by_folder: false,
             terminal_width: 80,
             selected: HashSet::new(),
-            cmux_poll: None,
-            cmux_poll_at: None,
+            split_poll: None,
+            split_poll_at: None,
             unapplied: Unapplied::default(),
             branch_sel: 0,
             delete_target: DeleteTarget::Lane,
@@ -551,10 +554,17 @@ impl App {
         }
     }
 
-    /// Whether cmux was found at startup, i.e. whether shift-tab in branch mode does
-    /// anything. See [`crate::cmux`].
-    pub fn cmux_available(&self) -> bool {
-        self.cmux.is_some()
+    /// Whether a harness-split backend (cmux or tmux) was found at startup, i.e. whether
+    /// shift-tab in branch mode does anything. See [`crate::splitter::Splitter::discover`].
+    pub fn splitter_available(&self) -> bool {
+        self.splitter.is_some()
+    }
+
+    /// The active split backend's name (`"cmux"` or `"tmux"`), for UI copy that needs to
+    /// name it. Only meaningful when `splitter_available()` says there is one — falls back
+    /// to the generic "split" otherwise, though every caller already guards on that first.
+    pub fn splitter_label(&self) -> &'static str {
+        self.splitter.as_ref().map(Splitter::label).unwrap_or("split")
     }
 
     pub fn column_count(&self) -> usize {
@@ -591,15 +601,16 @@ impl App {
         self.sync_pane_statuses();
     }
 
-    /// Copies each tracked cmux pane's last known status onto the matching column/section,
-    /// so `Board::build` never needs to know cmux exists. Called from `clamp` after every
-    /// board rebuild, and again on its own after a background poll resolves (`poll_cmux`),
-    /// since a poll updates `self.cmux`'s cache without rebuilding the board at all.
+    /// Copies each tracked split pane's last known status onto the matching
+    /// column/section, so `Board::build` never needs to know a split backend exists.
+    /// Called from `clamp` after every board rebuild, and again on its own after a
+    /// background poll resolves (`poll_split`), since a poll updates `self.splitter`'s
+    /// cache without rebuilding the board at all.
     fn sync_pane_statuses(&mut self) {
-        let Some(cmux) = &self.cmux else { return };
+        let Some(splitter) = &self.splitter else { return };
         for col in &mut self.board.columns {
             for section in &mut col.sections {
-                section.pane_status = cmux.pane_status(&section.name);
+                section.pane_status = splitter.pane_status(&section.name);
             }
             col.pane_status = col.sections.first().and_then(|s| s.pane_status);
         }
@@ -838,55 +849,56 @@ impl App {
         }
     }
 
-    /// How often `maybe_begin_cmux_poll` is willing to start a new poll.
-    const CMUX_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+    /// How often `maybe_begin_split_poll` is willing to start a new poll.
+    const SPLIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 
-    /// Kicks off a background cmux liveness poll if one isn't already in flight, enough
-    /// time has passed since the last one, and there's at least one pane worth asking
-    /// about. Gated on `CMUX_SURFACE_ID` being present (kanstack itself running inside a
-    /// cmux pane) — the same guard `Cmux::occupant_in_direction` already uses, rather than
-    /// querying an ambiguous default scope when it isn't. Call this every tick, the same
-    /// as `begin_background_refresh`.
-    pub fn maybe_begin_cmux_poll(&mut self) {
-        let Some(cmux) = &self.cmux else { return };
-        if cmux.is_empty() || self.cmux_poll.is_some() {
+    /// Kicks off a background split-pane liveness poll if one isn't already in flight,
+    /// enough time has passed since the last one, and there's at least one pane worth
+    /// asking about. Gated on `Splitter::running_inside_host` — kanstack itself still
+    /// looking like it's running inside that backend's own pane — the same kind of guard
+    /// `Cmux::occupant_in_direction` uses for its own env-var check, rather than querying
+    /// an ambiguous default scope when it isn't. Call this every tick, the same as
+    /// `begin_background_refresh`.
+    pub fn maybe_begin_split_poll(&mut self) {
+        let Some(splitter) = &self.splitter else { return };
+        if splitter.is_empty() || self.split_poll.is_some() {
             return;
         }
-        if std::env::var_os("CMUX_SURFACE_ID").is_none() {
+        if !splitter.running_inside_host() {
             return;
         }
         if self
-            .cmux_poll_at
-            .is_some_and(|t| t.elapsed() < Self::CMUX_POLL_INTERVAL)
+            .split_poll_at
+            .is_some_and(|t| t.elapsed() < Self::SPLIT_POLL_INTERVAL)
         {
             return;
         }
-        self.cmux_poll_at = Some(std::time::Instant::now());
-        let snapshot = cmux.clone();
+        self.split_poll_at = Some(std::time::Instant::now());
+        let snapshot = splitter.clone();
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             let _ = tx.send(snapshot.poll_statuses());
         });
-        self.cmux_poll = Some(PendingCmuxPoll { rx });
+        self.split_poll = Some(PendingSplitPoll { rx });
     }
 
-    /// Non-blocking check on a poll started by `maybe_begin_cmux_poll`. Call every tick,
+    /// Non-blocking check on a poll started by `maybe_begin_split_poll`. Call every tick,
     /// the same as `poll_background_refresh`.
-    pub fn poll_cmux(&mut self) {
-        let Some(pending) = &self.cmux_poll else { return };
+    pub fn poll_split(&mut self) {
+        let Some(pending) = &self.split_poll else { return };
         match pending.rx.try_recv() {
             Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) => self.cmux_poll = None,
+            Err(mpsc::TryRecvError::Disconnected) => self.split_poll = None,
             Ok(Ok(statuses)) => {
-                self.cmux_poll = None;
-                if let Some(cmux) = &mut self.cmux {
-                    cmux.apply_statuses(statuses);
+                self.split_poll = None;
+                if let Some(splitter) = &mut self.splitter {
+                    splitter.apply_statuses(statuses);
                 }
                 self.sync_pane_statuses();
             }
-            // Transient — a `cmux` hiccup every few seconds shouldn't spam the footer the
-            // way a user-triggered action's failure should.
-            Ok(Err(_)) => self.cmux_poll = None,
+            // Transient — a hiccup every few seconds shouldn't spam the footer the way a
+            // user-triggered action's failure should.
+            Ok(Err(_)) => self.split_poll = None,
         }
     }
 
@@ -1446,12 +1458,12 @@ impl App {
         }
     }
 
-    /// Opts a parallel lane out of its cmux split for this one branch, without touching the
-    /// standing `KANSTACK_CMUX_*` config. No-op while stacking, since a stacked branch never
-    /// opens one to opt out of.
+    /// Opts a parallel lane out of its harness split for this one branch, without touching
+    /// the standing `KANSTACK_CMUX_*`/`KANSTACK_TMUX_*` config. No-op while stacking, since
+    /// a stacked branch never opens one to opt out of.
     fn toggle_open_harness(&mut self) {
-        if self.cmux.is_none() {
-            self.notify("cmux is not configured", Notice::Info);
+        if self.splitter.is_none() {
+            self.notify("no harness-split backend found (cmux or tmux)", Notice::Info);
             return;
         }
         if self.stack_onto.is_some() {
@@ -1460,22 +1472,22 @@ impl App {
         self.open_harness = !self.open_harness;
     }
 
-    /// Whether the modal's cmux-checkbox row is shown at all right now — a stacked branch
+    /// Whether the modal's split-checkbox row is shown at all right now — a stacked branch
     /// never opens its own split (see `toggle_open_harness`), so the row that would toggle
     /// it is left out entirely rather than shown disabled. Shared between the row
     /// navigation below and `draw_branch_modal`'s own layout, so the two can't drift apart.
-    pub fn branch_modal_cmux_row_visible(&self) -> bool {
-        self.cmux_available() && self.stack_onto.is_none()
+    pub fn branch_modal_split_row_visible(&self) -> bool {
+        self.splitter_available() && self.stack_onto.is_none()
     }
 
-    /// `Down` in the name step: moves the row cursor along Name → Action → Cmux (skipping
-    /// Cmux when `branch_modal_cmux_row_visible` says it isn't shown) → on to the optional
-    /// message step, the same top-to-bottom order the modal itself renders in.
+    /// `Down` in the name step: moves the row cursor along Name → Action → Split (skipping
+    /// Split when `branch_modal_split_row_visible` says it isn't shown) → on to the
+    /// optional message step, the same top-to-bottom order the modal itself renders in.
     fn branch_modal_row_down(&mut self) {
         self.branch_modal_row = match self.branch_modal_row {
             BranchModalRow::Name => BranchModalRow::Action,
-            BranchModalRow::Action if self.branch_modal_cmux_row_visible() => BranchModalRow::Cmux,
-            BranchModalRow::Action | BranchModalRow::Cmux => {
+            BranchModalRow::Action if self.branch_modal_split_row_visible() => BranchModalRow::Split,
+            BranchModalRow::Action | BranchModalRow::Split => {
                 self.advance_to_harness_message();
                 return;
             }
@@ -1486,20 +1498,20 @@ impl App {
     /// a no-op already at the top row.
     fn branch_modal_row_up(&mut self) {
         self.branch_modal_row = match self.branch_modal_row {
-            BranchModalRow::Cmux => BranchModalRow::Action,
+            BranchModalRow::Split => BranchModalRow::Action,
             BranchModalRow::Action | BranchModalRow::Name => BranchModalRow::Name,
         };
     }
 
     /// `Left`/`Right` on whichever row is focused: moves the name field's text cursor, or
-    /// toggles the action/cmux row exactly as `Tab`/`Shift-Tab` already do — direction
+    /// toggles the action/split row exactly as `Tab`/`Shift-Tab` already do — direction
     /// doesn't matter for a two-state toggle, so both keys reach the same handler.
     fn branch_modal_row_left_right(&mut self, left: bool) {
         match self.branch_modal_row {
             BranchModalRow::Name if left => self.branch_input.move_left(),
             BranchModalRow::Name => self.branch_input.move_right(),
             BranchModalRow::Action => self.toggle_stack_onto(),
-            BranchModalRow::Cmux => self.toggle_open_harness(),
+            BranchModalRow::Split => self.toggle_open_harness(),
         }
     }
 
@@ -1507,15 +1519,15 @@ impl App {
     pub fn pending_branch_action(&self) -> String {
         match &self.stack_onto {
             Some(anchor) => format!("stack on {anchor}"),
-            None if self.cmux.is_some() && self.open_harness => {
-                "new parallel lane · opens cmux".to_string()
+            None if self.splitter.is_some() && self.open_harness => {
+                format!("new parallel lane · opens {}", self.splitter.as_ref().unwrap().label())
             }
-            None if self.cmux.is_some() => "new parallel lane · no cmux".to_string(),
+            None if self.splitter.is_some() => "new parallel lane · no split".to_string(),
             None => "new parallel lane".to_string(),
         }
     }
 
-    /// The stack-vs-parallel half of `pending_branch_action`, without the cmux clause —
+    /// The stack-vs-parallel half of `pending_branch_action`, without the split clause —
     /// for the modal, which shows that clause as its own checkbox row instead of folding
     /// it into this sentence the way the single-line footer prompt has to.
     pub fn pending_branch_target(&self) -> String {
@@ -1529,9 +1541,10 @@ impl App {
     /// offer (`Down` on the name field, see `advance_to_harness_message`) — and, from
     /// `confirm_branch`, whether Enter there should open the harness too even without one.
     /// True only for a parallel lane (a stacked one shares its base's tab) that hasn't
-    /// opted out of cmux with shift-tab, and only when cmux is actually configured at all.
+    /// opted out of a split with shift-tab, and only when a split backend is actually
+    /// configured at all.
     pub fn will_prompt_for_harness_message(&self) -> bool {
-        self.stack_onto.is_none() && self.open_harness && self.cmux.is_some()
+        self.stack_onto.is_none() && self.open_harness && self.splitter.is_some()
     }
 
     /// The branch name to show in the branch-creation modal: the live `branch_input`
@@ -1563,7 +1576,7 @@ impl App {
 
     /// The last step of `branch_modal_row_down`'s descent through the name step's rows:
     /// moves on to the optional initial-message step instead of creating the branch. A
-    /// no-op when there's no such step (stacking, or no cmux to open) — nothing to
+    /// no-op when there's no such step (stacking, or no split backend to open) — nothing to
     /// navigate to.
     ///
     /// Nothing is created yet — `but branch new` doesn't run until
@@ -1599,8 +1612,8 @@ impl App {
         self.stack_onto = pending.anchor;
         self.harness_message_input.clear();
         self.mode = Mode::Branch;
-        self.branch_modal_row = if self.branch_modal_cmux_row_visible() {
-            BranchModalRow::Cmux
+        self.branch_modal_row = if self.branch_modal_split_row_visible() {
+            BranchModalRow::Split
         } else {
             BranchModalRow::Action
         };
@@ -1622,7 +1635,7 @@ impl App {
     }
 
     /// Creates `name` via `but branch new`, rebuilds the board, and — when `open_harness`
-    /// is set — spawns its cmux pane, optionally seeded with `initial_message`. Shared by
+    /// is set — spawns its split pane, optionally seeded with `initial_message`. Shared by
     /// `confirm_branch` (Enter on the name field — a stacked branch, or a parallel one
     /// created with no message) and `confirm_harness_message` (Enter after `Down` opted
     /// into typing one).
@@ -1657,10 +1670,11 @@ impl App {
                     self.card = 0;
                 }
                 if open_harness {
-                    if let Some(cmux) = &mut self.cmux {
-                        match cmux.spawn_harness(&cwd, name, initial_message) {
+                    if let Some(splitter) = &mut self.splitter {
+                        let label = splitter.label();
+                        match splitter.spawn_harness(&cwd, name, initial_message) {
                             Ok(()) => self.notify(format!("created {name} — harness open"), Notice::Success),
-                            Err(e) => self.notify(format!("cmux: {e}"), Notice::Error),
+                            Err(e) => self.notify(format!("{label}: {e}"), Notice::Error),
                         }
                     }
                 }
@@ -1669,16 +1683,16 @@ impl App {
         }
     }
 
-    /// The branch name identifying lane `col`'s cmux pane: whichever section already has
+    /// The branch name identifying lane `col`'s split pane: whichever section already has
     /// one tracked (the lane's original parallel branch, even once other branches have
     /// stacked on top of it — stacking never opens a second pane), or the tip branch if
     /// none has been opened yet, so a first dispatch spawns one labelled the way the lane
     /// reads today.
     fn pane_branch(&self, col: usize) -> Option<String> {
         let column = self.board.columns.get(col)?;
-        if let Some(cmux) = &self.cmux {
+        if let Some(splitter) = &self.splitter {
             for section in &column.sections {
-                if cmux.has_pane(&section.name) {
+                if splitter.has_pane(&section.name) {
                     return Some(section.name.clone());
                 }
             }
@@ -1686,10 +1700,10 @@ impl App {
         column.branch_name.clone()
     }
 
-    /// Starts typing a task description to send into the selected lane's cmux pane.
+    /// Starts typing a task description to send into the selected lane's split pane.
     fn begin_task_dispatch(&mut self) {
-        if self.cmux.is_none() {
-            self.notify("cmux is not configured", Notice::Info);
+        if self.splitter.is_none() {
+            self.notify("no harness-split backend found (cmux or tmux)", Notice::Info);
             return;
         }
         let Some(branch) = self.pane_branch(self.col) else {
@@ -1712,34 +1726,36 @@ impl App {
             return;
         };
 
-        let has_pane = self.cmux.as_ref().is_some_and(|c| c.has_pane(&branch));
+        let has_pane = self.splitter.as_ref().is_some_and(|s| s.has_pane(&branch));
         if !has_pane {
             // Deliberately does not send the just-typed text in the same action: a fresh
             // pane's shell needs a moment to launch the harness before it can receive a
-            // second line, and `cmux send` has no "wait until ready" primitive to lean on.
-            // Spawning now and asking the user to press `t` again is simpler and safer
+            // second line, and neither backend has a "wait until ready" primitive to lean
+            // on. Spawning now and asking the user to press `t` again is simpler and safer
             // than guessing a delay or racing the harness's own startup.
             let Some(but) = &self.but else {
                 self.notify("snapshot is read-only", Notice::Info);
                 return;
             };
             let cwd = but.cwd().to_path_buf();
-            let Some(cmux) = &mut self.cmux else { return };
-            match cmux.spawn_harness(&cwd, &branch, None) {
+            let Some(splitter) = &mut self.splitter else { return };
+            let label = splitter.label();
+            match splitter.spawn_harness(&cwd, &branch, None) {
                 Ok(()) => self.notify(
                     format!("opened a pane for {branch} — press t again once it's ready for the task"),
                     Notice::Info,
                 ),
-                Err(e) => self.notify(format!("cmux: {e}"), Notice::Error),
+                Err(e) => self.notify(format!("{label}: {e}"), Notice::Error),
             }
             self.task_input.clear();
             return;
         }
 
-        let Some(cmux) = &self.cmux else { return };
-        match cmux.send_task(&branch, &text) {
+        let Some(splitter) = &self.splitter else { return };
+        let label = splitter.label();
+        match splitter.send_task(&branch, &text) {
             Ok(()) => self.notify(format!("sent task to {branch}"), Notice::Success),
-            Err(e) => self.notify(format!("cmux: {e}"), Notice::Error),
+            Err(e) => self.notify(format!("{label}: {e}"), Notice::Error),
         }
         self.task_input.clear();
     }
@@ -2586,7 +2602,7 @@ impl App {
                     Some(crate::hit::HitTarget::DialogConfirm) => {
                         self.handle_key(KeyEvent::from(KeyCode::Enter));
                     }
-                    Some(crate::hit::HitTarget::BranchToggleCmux) => {
+                    Some(crate::hit::HitTarget::BranchToggleSplit) => {
                         self.handle_key(KeyEvent::from(KeyCode::BackTab));
                     }
                     Some(crate::hit::HitTarget::DialogCancel) => {
@@ -2735,7 +2751,7 @@ impl App {
         }
 
         if self.mode == Mode::Branch {
-            // Row navigation (`Up`/`Down` between name/action/cmux, `Left`/`Right` toggling
+            // Row navigation (`Up`/`Down` between name/action/split, `Left`/`Right` toggling
             // whichever row is focused) only makes sense where a row cursor is actually
             // drawn — the modal. The footer is one line with nowhere to show it, so there
             // `Left`/`Right` stay plain text-cursor movement and `Down` goes straight to
@@ -3683,27 +3699,28 @@ mod tests {
             app.branch_input.insert(c);
         }
         app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 0));
-        // `App::from_board` has no `cmux`, so this never detours through `HarnessMessage` —
-        // it goes straight to `create_branch`, which (with no `but` either) is read-only.
+        // `App::from_board` has no split backend, so this never detours through
+        // `HarnessMessage` — it goes straight to `create_branch`, which (with no `but`
+        // either) is read-only.
         assert_eq!(app.mode, Mode::Normal, "the confirm half must act like Enter");
         assert!(app.message.as_ref().is_some_and(|(m, _)| m.contains("read-only")));
     }
 
-    /// Unlike the confirm/cancel halves above, the modal's cmux row is a real checkbox, so
-    /// its click target synthesizes shift-tab (`toggle_open_harness`'s own key) rather than
-    /// Enter/Esc — same "reach the existing key handling" wiring, different key.
+    /// Unlike the confirm/cancel halves above, the modal's split row is a real checkbox,
+    /// so its click target synthesizes shift-tab (`toggle_open_harness`'s own key) rather
+    /// than Enter/Esc — same "reach the existing key handling" wiring, different key.
     #[test]
-    fn clicking_the_branch_modals_cmux_row_acts_like_shift_tab() {
+    fn clicking_the_branch_modals_split_row_acts_like_shift_tab() {
         use ratatui::crossterm::event::{MouseButton, MouseEventKind};
 
         let mut app = App::from_board(board());
         app.mode = Mode::Branch;
-        app.hit_map = hits(&[(rect(0, 0), HitTarget::BranchToggleCmux)]);
+        app.hit_map = hits(&[(rect(0, 0), HitTarget::BranchToggleSplit)]);
 
         app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 0));
-        // `App::from_board` has no `cmux`, so `toggle_open_harness` takes its
+        // `App::from_board` has no split backend, so `toggle_open_harness` takes its
         // not-configured branch — same as pressing shift-tab directly would.
-        assert!(app.message.as_ref().is_some_and(|(m, _)| m.contains("cmux is not configured")));
+        assert!(app.message.as_ref().is_some_and(|(m, _)| m.contains("no harness-split backend found")));
     }
 
     /// `Down` in the modal moves the row cursor one row at a time — name, then action —
@@ -3724,9 +3741,9 @@ mod tests {
         assert_eq!(app.branch_input.as_str(), "feature", "Down must not touch the input");
     }
 
-    /// `App::from_board` has no `cmux`, so past the action row there's no cmux row and no
-    /// message step — a second `Down` must be a quiet no-op, not something that silently
-    /// wraps back to the top or drops into a mode with nothing to show for it.
+    /// `App::from_board` has no split backend, so past the action row there's no split row
+    /// and no message step — a second `Down` must be a quiet no-op, not something that
+    /// silently wraps back to the top or drops into a mode with nothing to show for it.
     #[test]
     fn down_from_the_action_row_is_a_no_op_with_nothing_further_to_reach() {
         let mut app = App::from_board(board());
@@ -3841,7 +3858,7 @@ mod tests {
         assert_eq!(
             app.branch_modal_row,
             BranchModalRow::Action,
-            "no cmux row to land on without cmux configured, so the row before it"
+            "no split row to land on without a split backend configured, so the row before it"
         );
     }
 

@@ -799,7 +799,7 @@ fn unapplying_a_branch_moves_it_to_the_drawer_and_applying_brings_it_back() {
 
     assert!(on_board(&Board::from_status(&but.status().unwrap())), "starts applied");
     assert!(
-        !but.branch_list().unwrap().branches.iter().any(|b| b.name == "feat-parked"),
+        !but.branch_list(false).unwrap().branches.iter().any(|b| b.name == "feat-parked"),
         "an applied branch must not also be offered as unapplied"
     );
 
@@ -808,7 +808,7 @@ fn unapplying_a_branch_moves_it_to_the_drawer_and_applying_brings_it_back() {
         !on_board(&Board::from_status(&but.status().unwrap())),
         "unapply takes the lane off the board"
     );
-    let listed = but.branch_list().unwrap();
+    let listed = but.branch_list(false).unwrap();
     let parked = listed
         .branches
         .iter()
@@ -823,7 +823,7 @@ fn unapplying_a_branch_moves_it_to_the_drawer_and_applying_brings_it_back() {
         "apply brings the lane back"
     );
     assert!(
-        !but.branch_list().unwrap().branches.iter().any(|b| b.name == "feat-parked"),
+        !but.branch_list(false).unwrap().branches.iter().any(|b| b.name == "feat-parked"),
         "and it stops being offered once it is applied again"
     );
 }
@@ -907,7 +907,7 @@ fn a_conflicting_branch_is_flagged_before_it_is_applied() {
     sb.push_upstream_commit("shared.txt", "their side");
     sb.but(&["pull"]);
 
-    let listed = but.branch_list().unwrap();
+    let listed = but.branch_list(false).unwrap();
     let parked = listed
         .branches
         .iter()
@@ -1283,16 +1283,17 @@ fn creating_a_branch_from_the_empty_unassigned_column_does_not_panic() {
         return;
     }
     use kanstack::app::App;
-    use kanstack::cmux::Cmux;
+    use kanstack::splitter::Splitter;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyCode, KeyEvent};
     use ratatui::Terminal;
 
     let sb = Sandbox::new("newbranchcrash");
     let but = But::discover(&sb.repo()).unwrap();
-    // Real detection, not `None`: if `cmux` happens to be on PATH (as it is on the machine
-    // this was first reproduced on), the spawn-a-harness path actually runs.
-    let mut app = App::new(but, Cmux::discover()).expect("build the app against a fresh workspace");
+    // Real detection, not `None`: if `cmux` (or, failing that, `tmux`) happens to be
+    // usable (as `cmux` is on the machine this was first reproduced on), the
+    // spawn-a-harness path actually runs.
+    let mut app = App::new(but, Splitter::discover()).expect("build the app against a fresh workspace");
     let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
 
     assert_eq!(app.column_count(), 1, "only the backlog column exists yet");
@@ -1327,7 +1328,7 @@ fn creating_a_branch_from_unassigned_with_cards_and_a_moved_cursor_does_not_pani
         return;
     }
     use kanstack::app::App;
-    use kanstack::cmux::Cmux;
+    use kanstack::splitter::Splitter;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyCode, KeyEvent};
     use ratatui::Terminal;
@@ -1336,7 +1337,7 @@ fn creating_a_branch_from_unassigned_with_cards_and_a_moved_cursor_does_not_pani
     sb.write("a.txt", "a\n");
     sb.write("b.txt", "b\n");
     let but = But::discover(&sb.repo()).unwrap();
-    let mut app = App::new(but, Cmux::discover()).expect("build the app against the workspace");
+    let mut app = App::new(but, Splitter::discover()).expect("build the app against the workspace");
     let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
     term.draw(|f| {
         kanstack::ui::draw(f, &app);
@@ -1388,14 +1389,14 @@ fn landing_through_the_app_runs_on_a_background_thread_and_updates_the_board() {
     }
     use kanstack::app::{App, Mode};
     use kanstack::board::CardKind;
-    use kanstack::cmux::Cmux;
+    use kanstack::splitter::Splitter;
     use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
     let sb = Sandbox::new("threadedland");
     sb.branch_with_commit("feat", "a.txt", "Threaded landable");
 
     let but = But::discover(&sb.repo()).unwrap();
-    let mut app = App::new(but, Cmux::discover()).expect("build the app against the workspace");
+    let mut app = App::new(but, Splitter::discover()).expect("build the app against the workspace");
 
     let lane = app
         .board
@@ -1452,11 +1453,11 @@ fn background_refresh_picks_up_an_external_change_without_blocking() {
         return;
     }
     use kanstack::app::App;
-    use kanstack::cmux::Cmux;
+    use kanstack::splitter::Splitter;
 
     let sb = Sandbox::new("bgrefresh");
     let but = But::discover(&sb.repo()).unwrap();
-    let mut app = App::new(but, Cmux::discover()).expect("build the app");
+    let mut app = App::new(but, Splitter::discover()).expect("build the app");
     assert_eq!(app.column_count(), 1, "only the backlog column exists yet");
 
     // Stand in for a change made outside kanstack entirely -- another terminal, an editor,
@@ -1493,12 +1494,12 @@ fn a_stale_background_refresh_does_not_clobber_a_newer_mutation() {
         return;
     }
     use kanstack::app::App;
-    use kanstack::cmux::Cmux;
+    use kanstack::splitter::Splitter;
 
     let sb = Sandbox::new("bgrefreshstale");
     sb.branch_with_commit("feat", "a.txt", "first");
     let but = But::discover(&sb.repo()).unwrap();
-    let mut app = App::new(but, Cmux::discover()).expect("build the app");
+    let mut app = App::new(but, Splitter::discover()).expect("build the app");
     assert_eq!(app.column_count(), 2, "backlog plus the one lane so far");
 
     // Start a refresh as the watcher would, but don't poll it yet -- its result is still
@@ -1541,7 +1542,7 @@ fn tab_groups_the_unassigned_lane_by_folder_and_back() {
         return;
     }
     use kanstack::app::App;
-    use kanstack::cmux::Cmux;
+    use kanstack::splitter::Splitter;
     use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
     let sb = Sandbox::new("foldergroup");
@@ -1552,7 +1553,7 @@ fn tab_groups_the_unassigned_lane_by_folder_and_back() {
     sb.write("wip3.txt", "c\n");
 
     let but = But::discover(&sb.repo()).unwrap();
-    let mut app = App::new(but, Cmux::discover()).expect("build the app");
+    let mut app = App::new(but, Splitter::discover()).expect("build the app");
     assert_eq!(app.col, 0, "starts on the backlog lane");
     assert!(!app.unassigned_grouped_by_folder);
 
@@ -1585,13 +1586,13 @@ fn tab_from_a_stack_lane_explains_itself_instead_of_toggling() {
         return;
     }
     use kanstack::app::App;
-    use kanstack::cmux::Cmux;
+    use kanstack::splitter::Splitter;
     use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
     let sb = Sandbox::new("foldergroupwronglane");
     sb.branch_with_commit("feat", "a.txt", "work");
     let but = But::discover(&sb.repo()).unwrap();
-    let mut app = App::new(but, Cmux::discover()).expect("build the app");
+    let mut app = App::new(but, Splitter::discover()).expect("build the app");
 
     app.on_key(KeyEvent::from(KeyCode::Right)); // off the backlog, onto "feat"
     assert_eq!(app.col, 1);
@@ -1615,7 +1616,7 @@ fn shift_arrows_page_lanes_and_skip_groups_through_the_app() {
         return;
     }
     use kanstack::app::App;
-    use kanstack::cmux::Cmux;
+    use kanstack::splitter::Splitter;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     let sb = Sandbox::new("shiftarrows");
@@ -1640,7 +1641,7 @@ fn shift_arrows_page_lanes_and_skip_groups_through_the_app() {
     sb.branch_with_commit("other-work", "c.txt", "other work");
 
     let but = But::discover(&sb.repo()).unwrap();
-    let mut app = App::new(but, Cmux::discover()).expect("build the app");
+    let mut app = App::new(but, Splitter::discover()).expect("build the app");
     app.terminal_width = 60;
 
     // The stacked lane ("mid-work +1") sits after the backlog; land the cursor there and
@@ -1676,7 +1677,7 @@ fn landing_a_stacked_lane_lands_every_branch_base_first() {
         return;
     }
     use kanstack::app::{App, Mode};
-    use kanstack::cmux::Cmux;
+    use kanstack::splitter::Splitter;
     use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
     let sb = Sandbox::new("cascadeland");
@@ -1717,7 +1718,7 @@ fn landing_a_stacked_lane_lands_every_branch_base_first() {
     );
 
     let but = But::discover(&sb.repo()).unwrap();
-    let mut app = App::new(but, Cmux::discover()).expect("build the app");
+    let mut app = App::new(but, Splitter::discover()).expect("build the app");
     let lane = app
         .board
         .columns
@@ -1763,7 +1764,7 @@ fn space_selecting_several_unassigned_files_then_m_moves_them_all_at_once() {
         return;
     }
     use kanstack::app::{App, Mode};
-    use kanstack::cmux::Cmux;
+    use kanstack::splitter::Splitter;
     use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
     let sb = Sandbox::new("multiselect");
@@ -1774,7 +1775,7 @@ fn space_selecting_several_unassigned_files_then_m_moves_them_all_at_once() {
     but.branch_new("feat", None).unwrap();
 
     let but = But::discover(&sb.repo()).unwrap();
-    let mut app = App::new(but, Cmux::discover()).expect("build the app");
+    let mut app = App::new(but, Splitter::discover()).expect("build the app");
     assert_eq!(app.col, 0, "starts on the backlog");
     let backlog_names: Vec<&str> = app.board.columns[0]
         .cards
@@ -1853,7 +1854,7 @@ fn a_commit_on_the_workspace_head_blocks_the_board_until_recovered() {
     }
     use kanstack::app::{App, Mode};
     use kanstack::but::is_workspace_block;
-    use kanstack::cmux::Cmux;
+    use kanstack::splitter::Splitter;
     use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
     let sb = Sandbox::new("blocked");
@@ -1873,7 +1874,7 @@ fn a_commit_on_the_workspace_head_blocks_the_board_until_recovered() {
 
     // Startup opens into the modal rather than aborting. Bailing here printed one line of
     // prose and vanished, which reads as a crash.
-    let mut app = App::new(But::discover(&sb.repo()).unwrap(), Cmux::discover())
+    let mut app = App::new(But::discover(&sb.repo()).unwrap(), Splitter::discover())
         .expect("a blocked workspace still starts the app");
     assert_eq!(app.mode, Mode::Blocked);
 

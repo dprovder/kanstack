@@ -171,12 +171,12 @@ pub struct Section {
     /// Lines added and removed by this branch alone, so a stack shows a figure per branch
     /// rather than one lump for the whole lane.
     pub stats: Option<(usize, usize)>,
-    /// Last known status of this branch's cmux pane, if kanstack has ever tracked one for
-    /// it. Always `None` straight out of [`Board::build`] — this is not a function of
+    /// Last known status of this branch's harness-split pane (cmux or tmux), if kanstack
+    /// has ever tracked one for it. Always `None` straight out of [`Board::build`] — this is not a function of
     /// [`WorkspaceStatus`], it's set afterwards by the app, the same way
     /// `group_unassigned_by_folder` is reapplied post-build rather than threaded through
     /// `build` itself.
-    pub pane_status: Option<crate::cmux::PaneStatus>,
+    pub pane_status: Option<crate::pane_status::PaneStatus>,
 }
 
 #[derive(Debug, Clone)]
@@ -201,7 +201,7 @@ pub struct Column {
     pub branch_name: Option<String>,
     /// Mirrors the tip section's `pane_status`, so the column header can show it without
     /// the renderer reaching into `sections[0]` itself.
-    pub pane_status: Option<crate::cmux::PaneStatus>,
+    pub pane_status: Option<crate::pane_status::PaneStatus>,
 }
 
 #[derive(Debug, Clone)]

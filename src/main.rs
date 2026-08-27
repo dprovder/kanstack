@@ -13,7 +13,7 @@ use ratatui::crossterm::execute;
 
 use kanstack::app::{App, Mode, Notice};
 use kanstack::but::But;
-use kanstack::cmux::Cmux;
+use kanstack::splitter::Splitter;
 use kanstack::tutorial::{self, Tutorial};
 use kanstack::watch::Watcher;
 use kanstack::{snapshot, ui};
@@ -38,6 +38,15 @@ environment:
                      parallel lane (default: `cmux` on PATH if present; the integration is
                      silently skipped otherwise). Skip it for one branch with shift-tab
                      while naming it; stacking a branch never opens one to begin with.
+  KANSTACK_TMUX_BIN  path to `tmux`, used instead of cmux when cmux isn't found and
+                     kanstack is itself running inside a tmux pane (default: `tmux` on
+                     PATH if present and `$TMUX_PANE` is set; skipped otherwise, same as
+                     cmux). Splits off kanstack's own pane the same way cmux does.
+  KANSTACK_SPLIT_BACKEND  force which of the above is used: `cmux` or `tmux`, skipping
+                     detection of the other entirely rather than just reordering the
+                     fallback (default: unset — cmux if found, else tmux). Mainly for a
+                     machine with both binaries installed where cmux isn't actually the
+                     one kanstack is running inside right now.
   KANSTACK_HARNESS   command typed into that terminal (default: `claude`)
   KANSTACK_HARNESS_SYSTEM_FLAG  the harness's flag for appending to its own default
                      system prompt, e.g. `--append-system-prompt` (default: whatever's
@@ -57,6 +66,8 @@ environment:
                            left, right, above, or below (default: `above`)
   KANSTACK_CMUX_CHAIN_DIRECTION  split direction for every lane after the first, off the
                            previous lane instead of kanstack (default: `right`)
+  KANSTACK_TMUX_DIRECTION, KANSTACK_TMUX_CHAIN_DIRECTION  the tmux fallback's equivalents
+                           of the two above, same defaults
   KANSTACK_BRANCH_UI  how `b`'s branch-name/initial-message prompts are presented: `modal`
                       (default), a dedicated box showing the name, the pending action, and
                       the message all together, or `footer`, squeezed into the one-line
@@ -142,8 +153,8 @@ fn main() -> Result<()> {
     // Everything else that can fail with a readable message happens before the alternate
     // screen is entered, so errors are not wiped by the terminal restore.
     let but = But::discover(&cwd)?;
-    let cmux = Cmux::discover();
-    let mut app = App::new(but, cmux)?;
+    let splitter = Splitter::discover();
+    let mut app = App::new(but, splitter)?;
     if tutorial_mode {
         app.tutorial = Some(Tutorial::new());
     }
@@ -216,10 +227,10 @@ fn run(
         // own thread, so a save in another window never stalls navigation waiting on it.
         app.poll_background_refresh();
 
-        // Same pattern again for cmux pane liveness: apply a finished poll, then kick off
+        // Same pattern again for split-pane liveness: apply a finished poll, then kick off
         // the next one if it's due.
-        app.poll_cmux();
-        app.maybe_begin_cmux_poll();
+        app.poll_split();
+        app.maybe_begin_split_poll();
 
         // Don't yank the board out from under a move in progress.
         if app.mode != Mode::Moving {

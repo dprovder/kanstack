@@ -26,7 +26,7 @@ pub enum HitTarget {
     OpenBranches,
     /// The branch modal's `[x]/[ ] open harness split` row — the mouse equivalent of
     /// shift-tab, since it's a real checkbox rather than half of a confirm/cancel line.
-    BranchToggleCmux,
+    BranchToggleSplit,
     /// The "confirm" half of a confirm dialog's `⏎/y ... esc/n ...` hint line.
     DialogConfirm,
     /// The "cancel" half of the same line.
