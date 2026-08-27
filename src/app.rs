@@ -1411,6 +1411,16 @@ impl App {
         }
     }
 
+    /// The stack-vs-parallel half of `pending_branch_action`, without the cmux clause —
+    /// for the modal, which shows that clause as its own checkbox row instead of folding
+    /// it into this sentence the way the single-line footer prompt has to.
+    pub fn pending_branch_target(&self) -> String {
+        match &self.stack_onto {
+            Some(anchor) => format!("stack on {anchor}"),
+            None => "new parallel lane".to_string(),
+        }
+    }
+
     /// Whether naming a branch right now would go on to prompt for an initial harness
     /// message rather than creating the branch immediately: only a parallel lane (a
     /// stacked one shares its base's tab) that hasn't opted out of cmux with shift-tab,
@@ -2326,6 +2336,9 @@ impl App {
                 match self.hit_map.hit_test(ev.column, ev.row) {
                     Some(crate::hit::HitTarget::DialogConfirm) => {
                         self.handle_key(KeyEvent::from(KeyCode::Enter));
+                    }
+                    Some(crate::hit::HitTarget::BranchToggleCmux) => {
+                        self.handle_key(KeyEvent::from(KeyCode::BackTab));
                     }
                     Some(crate::hit::HitTarget::DialogCancel) => {
                         self.handle_key(KeyEvent::from(KeyCode::Esc));
@@ -3377,6 +3390,23 @@ mod tests {
         // it goes straight to `create_branch`, which (with no `but` either) is read-only.
         assert_eq!(app.mode, Mode::Normal, "the confirm half must act like Enter");
         assert!(app.message.as_ref().is_some_and(|(m, _)| m.contains("read-only")));
+    }
+
+    /// Unlike the confirm/cancel halves above, the modal's cmux row is a real checkbox, so
+    /// its click target synthesizes shift-tab (`toggle_open_harness`'s own key) rather than
+    /// Enter/Esc — same "reach the existing key handling" wiring, different key.
+    #[test]
+    fn clicking_the_branch_modals_cmux_row_acts_like_shift_tab() {
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+
+        let mut app = App::from_board(board());
+        app.mode = Mode::Branch;
+        app.hit_map = hits(&[(rect(0, 0), HitTarget::BranchToggleCmux)]);
+
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 0));
+        // `App::from_board` has no `cmux`, so `toggle_open_harness` takes its
+        // not-configured branch — same as pressing shift-tab directly would.
+        assert!(app.message.as_ref().is_some_and(|(m, _)| m.contains("cmux is not configured")));
     }
 
     /// The unassigned lane holds loose files, not commits — clicking through several of

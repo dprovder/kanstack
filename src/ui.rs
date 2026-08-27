@@ -4,6 +4,7 @@
 //! vertically on its own so a long lane never pushes its neighbours around.
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
@@ -615,6 +616,19 @@ fn draw_push_confirm(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     );
 }
 
+/// A label/value row with a key hint right-aligned to `content_width`, e.g.
+/// `"  action   new parallel lane                                   tab"`.
+fn hint_row(prefix: &str, value: &str, value_style: Style, hint: &str, content_width: usize) -> Line<'static> {
+    let used = prefix.chars().count() + value.chars().count() + hint.chars().count();
+    let pad = content_width.saturating_sub(used).max(1);
+    Line::from(vec![
+        Span::styled(prefix.to_string(), theme::faint()),
+        Span::styled(value.to_string(), value_style),
+        Span::raw(" ".repeat(pad)),
+        Span::styled(hint.to_string(), theme::faint()),
+    ])
+}
+
 /// Branch creation, as a modal — the `KANSTACK_BRANCH_UI=modal` alternative to the
 /// default one-line footer prompt (see `BranchUi`). Shows the name, the pending action,
 /// and — when one is coming — the initial harness message all at once instead of one
@@ -658,10 +672,26 @@ fn draw_branch_modal(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
         ]));
     }
 
-    body.push(Line::from(vec![
-        Span::styled("  action   ", theme::faint()),
-        Span::styled(app.pending_branch_action(), theme::tone(crate::board::Tone::Accent)),
-    ]));
+    body.push(hint_row(
+        "  action   ",
+        &app.pending_branch_target(),
+        theme::tone(crate::board::Tone::Accent),
+        "tab",
+        content_width,
+    ));
+    // A stacked branch never opens its own cmux split regardless of `open_harness`
+    // (see `toggle_open_harness`), so the row that would toggle it is just noise there.
+    let cmux_row = if app.cmux_available() && app.stack_onto.is_none() {
+        let (glyph, style) = if app.open_harness {
+            ("[x] open harness split", theme::tone(crate::board::Tone::Accent))
+        } else {
+            ("[ ] open harness split", theme::faint())
+        };
+        body.push(hint_row("  cmux     ", glyph, style, "shift-tab", content_width));
+        Some(body.len() - 1)
+    } else {
+        None
+    };
 
     if will_prompt {
         body.push(Line::raw(""));
@@ -717,11 +747,9 @@ fn draw_branch_modal(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     let hint = if editing_message {
         "  ⏎ open harness      esc cancel branch"
     } else if will_prompt {
-        "  ⏎ next: message · tab switch · shift-tab cmux      esc cancel"
-    } else if app.cmux_available() {
-        "  ⏎ create · tab switch · shift-tab cmux      esc cancel"
+        "  ⏎ next: message      esc cancel"
     } else {
-        "  ⏎ create · tab switch      esc cancel"
+        "  ⏎ create      esc cancel"
     };
     body.push(Line::styled(hint, theme::faint()));
 
@@ -733,6 +761,17 @@ fn draw_branch_modal(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
         height: h,
     };
     confirm_hitboxes(hits, popup, body.len(), hint);
+    // Mirrors `confirm_hitboxes`' own bounds check: skip the hitbox if a too-short popup
+    // clipped this row out of view.
+    if let Some(idx) = cmux_row {
+        let row = popup.y + 1 + idx as u16;
+        if row + 1 < popup.y + popup.height {
+            hits.push(
+                Rect { x: popup.x + 1, y: row, width: popup.width.saturating_sub(2), height: 1 },
+                HitTarget::BranchToggleCmux,
+            );
+        }
+    }
     f.render_widget(Clear, popup);
     f.render_widget(
         Paragraph::new(body).block(Block::bordered().border_style(theme::faint()).style(theme::selected_bg())),

@@ -24,6 +24,9 @@ pub enum HitTarget {
     /// The header's own entry point into the drawer — the mouse equivalent of `a`, for
     /// opening it from the main board rather than only closing it once already inside.
     OpenBranches,
+    /// The branch modal's `[x]/[ ] open harness split` row — the mouse equivalent of
+    /// shift-tab, since it's a real checkbox rather than half of a confirm/cancel line.
+    BranchToggleCmux,
     /// The "confirm" half of a confirm dialog's `⏎/y ... esc/n ...` hint line.
     DialogConfirm,
     /// The "cancel" half of the same line.
