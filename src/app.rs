@@ -185,6 +185,10 @@ pub struct BranchPreview {
     /// Line offset into the rendered preview, for `j`/`k` — mirrors `DiffView`'s own
     /// scroll rather than a cursor, since there's no per-line action to land a cursor on.
     pub scroll: u16,
+    /// Carried over from the drawer row's own [`UnappliedBranch::stale`] rather than
+    /// recomputed — the list has already done the age/merge-check math, and this is the
+    /// same branch, so there's nothing new to derive here.
+    pub stale: bool,
 }
 
 impl BranchPreview {
@@ -2023,13 +2027,14 @@ impl App {
             return;
         };
         let name = branch.name.clone();
+        let stale = branch.stale;
         let Some(but) = &self.but else {
             self.notify("snapshot is read-only", Notice::Info);
             return;
         };
         match but.merge_check(&name) {
             Ok(check) => {
-                self.branch_preview = Some(BranchPreview { name, check, scroll: 0 });
+                self.branch_preview = Some(BranchPreview { name, check, scroll: 0, stale });
             }
             Err(e) => self.notify(format!("could not preview {name}: {e}"), Notice::Error),
         }
@@ -3971,6 +3976,7 @@ mod tests {
             author: None,
             age: None,
             has_local: true,
+            stale: false,
         };
         app.unapplied = crate::board::Unapplied {
             branches: vec![branch("a"), branch("b")],
@@ -3999,6 +4005,7 @@ mod tests {
             author: None,
             age: None,
             has_local: true,
+            stale: false,
         };
         app.unapplied = crate::board::Unapplied {
             branches: vec![branch("a"), branch("stale-branch")],
@@ -4069,6 +4076,7 @@ mod tests {
                 author: None,
                 age: None,
                 has_local: true,
+                stale: false,
             }],
             truncated: false,
         };
@@ -4086,6 +4094,7 @@ mod tests {
             name: "feat-x".into(),
             check: fake_check(false),
             scroll: 0,
+            stale: false,
         });
 
         app.handle_key(key(K::Esc));
@@ -4102,6 +4111,7 @@ mod tests {
             name: "feat-x".into(),
             check: fake_check(false),
             scroll: 0,
+            stale: false,
         });
         app.handle_key(key(K::Char('a')));
         assert!(
@@ -4123,6 +4133,7 @@ mod tests {
             name: "feat-x".into(),
             check: fake_check(true),
             scroll: 0,
+            stale: false,
         });
 
         app.handle_key(key(K::Left));

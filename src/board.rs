@@ -247,6 +247,13 @@ pub struct UnappliedBranch {
     pub age: Option<String>,
     /// False for a branch that only exists on the remote.
     pub has_local: bool,
+    /// A heuristic, not a fact `but` reports: old enough (see `STALE_AGE_DAYS`) and no
+    /// longer merging cleanly. Both together are what an abandoned branch whose work
+    /// landed some other way looks like from the outside — a branch that's merely young,
+    /// or merely conflicting because it was rebased five minutes ago, doesn't clear it.
+    /// Surfaced as a nudge to go look, never acted on automatically: there is no reliable
+    /// way to tell "abandoned" from "deliberately parked" without a person deciding.
+    pub stale: bool,
 }
 
 /// What the drawer shows, built from one `but branch list` call.
@@ -257,6 +264,18 @@ pub struct Unapplied {
     /// through so the drawer can say it is not showing everything, rather than presenting
     /// a partial list as complete.
     pub truncated: bool,
+}
+
+/// How old a non-merging branch has to be before `UnappliedBranch::stale` flags it. Two
+/// weeks: long enough that a branch sitting untouched past it is very unlikely to still be
+/// active work rather than something whose ideas ended up landing another way.
+const STALE_AGE_DAYS: i64 = 14;
+
+/// Whether `then_ms` is at least `STALE_AGE_DAYS` before `now_ms`. `then_ms <= 0` is `but`
+/// reporting "no timestamp" (an applied head, per `ListedBranch`'s docs) rather than an
+/// actually-ancient commit, so that reads as not old.
+fn is_old(then_ms: i64, now_ms: i64) -> bool {
+    then_ms > 0 && (now_ms - then_ms) / 1000 / 60 / 60 / 24 >= STALE_AGE_DAYS
 }
 
 impl Unapplied {
@@ -277,6 +296,7 @@ impl Unapplied {
                     .filter(|n| !n.is_empty()),
                 age: relative_age(b.last_commit_at, now_ms),
                 has_local: b.has_local.unwrap_or(false),
+                stale: b.merges_cleanly == Some(false) && is_old(b.last_commit_at, now_ms),
             })
             .collect();
         // Local branches first, remote-only ones after — a stable sort, so `but`'s own
@@ -1011,5 +1031,42 @@ mod tests {
         let u = Unapplied::from_list(&list, 1_785_000_000_000);
         let names: Vec<&str> = u.branches.iter().map(|b| b.name.as_str()).collect();
         assert_eq!(names, ["local-a", "local-b", "remote-old", "remote-new"]);
+    }
+
+    /// `stale` needs both signals, not either alone — a branch that's merely old (say,
+    /// deliberately parked) or merely conflicting (rebased minutes ago) isn't the "probably
+    /// abandoned" shape this is meant to flag; only old *and* non-clean together are.
+    #[test]
+    fn unapplied_flags_old_non_merging_branches_as_stale() {
+        const NOW: i64 = 1_785_000_000_000;
+        const DAY_MS: i64 = 86_400_000;
+
+        fn listed(name: &str, age_days: i64, merges_cleanly: Option<bool>) -> crate::model::ListedBranch {
+            crate::model::ListedBranch {
+                name: name.into(),
+                reviews: Vec::new(),
+                has_local: Some(true),
+                last_commit_at: NOW - age_days * DAY_MS,
+                commits_ahead: Some(1),
+                last_author: None,
+                merges_cleanly,
+            }
+        }
+        let list = crate::model::BranchList {
+            applied_stacks: Vec::new(),
+            branches: vec![
+                listed("old-and-conflicting", 20, Some(false)),
+                listed("old-but-clean", 20, Some(true)),
+                listed("recent-and-conflicting", 1, Some(false)),
+                listed("old-but-unchecked", 20, None),
+            ],
+            has_more_branches: false,
+        };
+        let u = Unapplied::from_list(&list, NOW);
+        let stale = |name: &str| u.branches.iter().find(|b| b.name == name).unwrap().stale;
+        assert!(stale("old-and-conflicting"), "old + non-clean should flag as stale");
+        assert!(!stale("old-but-clean"), "clean branches aren't stale regardless of age");
+        assert!(!stale("recent-and-conflicting"), "conflicting alone isn't stale — could just be a fresh rebase");
+        assert!(!stale("old-but-unchecked"), "no merge check means no basis to call it stale");
     }
 }

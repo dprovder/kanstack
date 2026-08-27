@@ -1612,8 +1612,14 @@ fn draw_branch_preview(f: &mut Frame, preview: &BranchPreview, area: Rect) {
             ),
             theme::title(false),
         ),
-        Line::raw(""),
     ];
+    if preview.stale {
+        lines.push(Line::styled(
+            "looks stale — old, and no longer merges cleanly",
+            theme::tone(crate::board::Tone::Warn),
+        ));
+    }
+    lines.push(Line::raw(""));
     // Each commit gets the same shape a board card does: a short id, the subject wrapped
     // across as many lines as it needs rather than clipped to one, and a blank line to
     // separate it from the next — the layout already proven legible, just reused here.
@@ -1848,6 +1854,14 @@ fn render_unapplied(
     if !verdict.is_empty() {
         meta.push(Span::styled(verdict, theme::tone(dot_tone)));
         used += verdict.chars().count();
+    }
+    // A nudge, not a verdict of its own — `conflicts` already said the mechanical fact;
+    // this says the row is old enough on top of that to be worth a second look, rather
+    // than just a branch that got rebased five minutes ago.
+    if b.stale {
+        let label = " · stale";
+        meta.push(Span::styled(label, theme::tone(crate::board::Tone::Warn)));
+        used += label.chars().count();
     }
     let mut tail = String::new();
     if let Some(ahead) = b.commits_ahead {
@@ -2156,6 +2170,7 @@ fn draw_help(f: &mut Frame, area: Rect, hits: &mut HitMap) {
         help_row("● busy / ○ idle / ✕ pane closed", "a lane's cmux harness pane, if one is open"),
         help_row("drawer ● green/red", "whether applying that branch would merge cleanly"),
         help_row("drawer remote-only", "divider — everything below has no local ref"),
+        help_row("drawer stale", "old and no longer merges cleanly — a delete candidate"),
         Line::raw(""),
         Line::styled(
             "  every drop is one `but rub SOURCE TARGET`.",

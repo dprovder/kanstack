@@ -187,6 +187,54 @@ mod tests {
         );
     }
 
+    /// A branch flagged `stale` gets a visible nudge in the list row — distinct from the
+    /// plain `conflicts` verdict a fresh, merely-not-yet-merged branch also carries.
+    #[test]
+    fn a_stale_branch_is_marked_in_the_list_row() {
+        let mut app = drawer_app();
+        app.unapplied.branches[1].stale = true; // cmux-tab-on-(b)ranch, already conflicting
+        let out = render_app(&app, 160, 24);
+        assert!(out.contains("stale"), "the stale branch should be flagged:\n{out}");
+        // feat-theme (row 0) is left alone — only one branch was marked stale.
+        let stale_line = out.lines().find(|l| l.contains("stale")).unwrap();
+        assert!(
+            !stale_line.contains("feat-theme"),
+            "stale must mark the flagged row, not bleed into the other one:\n{out}"
+        );
+    }
+
+    /// The detail view repeats the same nudge, with the reasoning spelled out — the list's
+    /// one-word tag doesn't have room to say *why*.
+    #[test]
+    fn the_branch_preview_explains_a_stale_flag() {
+        use crate::model::{MergeCheck, MergeCheckCommit, MergeCheckResult};
+
+        let mut app = drawer_app();
+        app.branch_preview = Some(crate::app::BranchPreview {
+            name: "cmux-tab-on-(b)ranch".into(),
+            check: MergeCheck {
+                commits_ahead: 1,
+                commits: vec![MergeCheckCommit {
+                    short_sha: "56b9641".into(),
+                    message: "Optional cmux-tui bridge".into(),
+                    insertions: None,
+                    deletions: None,
+                }],
+                merge_check: MergeCheckResult {
+                    merges_cleanly: false,
+                    conflicting_files: Vec::new(),
+                },
+            },
+            scroll: 0,
+            stale: true,
+        });
+        let out = render_app(&app, 160, 24);
+        assert!(
+            out.contains("looks stale"),
+            "the preview should explain the stale flag, not just repeat the tag:\n{out}"
+        );
+    }
+
     /// The drawer's detail view replaces the list in the same pane — the branch's own
     /// commits, then exactly which files would conflict, since that's the whole reason
     /// `⏎` exists: the list's dot says *whether*, the preview says *what*.
@@ -213,11 +261,14 @@ mod tests {
                         upstream_commits: vec![MergeCheckCommit {
                             short_sha: "def5678".into(),
                             message: "unrelated change".into(),
+                            insertions: None,
+                            deletions: None,
                         }],
                     }],
                 },
             },
             scroll: 0,
+            stale: false,
         });
 
         let out = render_app(&app, 160, 24);
@@ -259,6 +310,7 @@ mod tests {
             author: None,
             age: None,
             has_local,
+            stale: false,
         };
         let mut app = drawer_app();
         app.unapplied = crate::board::Unapplied {
@@ -393,11 +445,14 @@ mod tests {
                         upstream_commits: vec![crate::model::MergeCheckCommit {
                             short_sha: "def5678".into(),
                             message: "unrelated change".into(),
+                            insertions: None,
+                            deletions: None,
                         }],
                     }],
                 },
             },
             scroll: 0,
+            stale: false,
         });
         for w in [1, 5, 20, 30, 40, 60] {
             let out = render_app(&app, w, 12);
