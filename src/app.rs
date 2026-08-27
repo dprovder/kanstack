@@ -164,6 +164,16 @@ pub struct PendingLand {
     pub spinner: usize,
 }
 
+/// Which branch `Mode::DeleteConfirm` is about to delete: the current lane's tip branch,
+/// or the drawer's selected unapplied branch. Both go through the same confirmation mode
+/// and the same `but branch delete`, but the mode alone can't say which is which — this
+/// is set when the confirm is entered and read back by `pending_delete`/`confirm_delete`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeleteTarget {
+    Lane,
+    Unapplied,
+}
+
 pub struct App {
     /// `None` in snapshot mode, where a captured status is rendered read-only.
     /// `Arc` so `confirm_land` can hand a handle to the background thread it spawns.
@@ -292,6 +302,8 @@ pub struct App {
     pub unapplied: Unapplied,
     /// Cursor within the drawer, valid while `mode == Branches`.
     pub branch_sel: usize,
+    /// Which branch a pending `Mode::DeleteConfirm` targets. See [`DeleteTarget`].
+    delete_target: DeleteTarget,
     /// Where on screen everything from the last frame landed, for resolving the next mouse
     /// event. Rebuilt every draw (see `ui::draw`) rather than kept in sync incrementally.
     pub hit_map: crate::hit::HitMap,
@@ -450,6 +462,7 @@ impl App {
             cmux_poll_at: None,
             unapplied: Unapplied::default(),
             branch_sel: 0,
+            delete_target: DeleteTarget::Lane,
             hit_map: crate::hit::HitMap::new(),
             mouse_down_card: None,
             hover: None,
@@ -503,6 +516,7 @@ impl App {
             cmux_poll_at: None,
             unapplied: Unapplied::default(),
             branch_sel: 0,
+            delete_target: DeleteTarget::Lane,
             hit_map: crate::hit::HitMap::new(),
             mouse_down_card: None,
             hover: None,
@@ -1817,7 +1831,7 @@ impl App {
     /// branch's commits upward and refused a lone branch with unpushed commits
     /// non-interactively, neither of which happens now). `but undo` is the safety net
     /// instead, so the confirmation says that rather than implying nothing can be lost.
-    pub fn pending_delete(&self) -> Option<(String, String)> {
+    fn pending_delete_lane(&self) -> Option<(String, String)> {
         let col = self.board.columns.get(self.col)?;
         let name = col.branch_name.clone()?;
         let commits = col
@@ -1836,11 +1850,53 @@ impl App {
         Some((name, detail))
     }
 
+    /// Describes what deleting the drawer's selected unapplied branch would do. Unlike a
+    /// lane, it isn't in the workspace at all, so there's no working-tree fallout — just
+    /// the branch and whatever commits are unique to it going away.
+    fn pending_delete_unapplied(&self) -> Option<(String, String)> {
+        let b = self.selected_unapplied()?;
+        let detail = match b.commits_ahead {
+            None | Some(0) => "it has no commits of its own".to_string(),
+            Some(n) => format!(
+                "discards {n} commit{} — recoverable with `but undo`",
+                if n == 1 { "" } else { "s" }
+            ),
+        };
+        Some((b.name.clone(), detail))
+    }
+
+    /// The name and consequence of whatever a pending `Mode::DeleteConfirm` is about to
+    /// delete. Dispatches on `delete_target` since the mode alone doesn't say whether `d`
+    /// was pressed on a lane or on the drawer's selected row.
+    pub fn pending_delete(&self) -> Option<(String, String)> {
+        match self.delete_target {
+            DeleteTarget::Lane => self.pending_delete_lane(),
+            DeleteTarget::Unapplied => self.pending_delete_unapplied(),
+        }
+    }
+
+    /// Whether the pending delete confirmation is for the drawer's selected branch rather
+    /// than the current lane — `ui::draw_delete_confirm` uses this to title the dialog.
+    pub fn deleting_unapplied(&self) -> bool {
+        self.delete_target == DeleteTarget::Unapplied
+    }
+
     fn begin_delete(&mut self) {
-        if self.pending_delete().is_none() {
+        if self.pending_delete_lane().is_none() {
             self.notify("the backlog is not a branch", Notice::Info);
             return;
         }
+        self.delete_target = DeleteTarget::Lane;
+        self.mode = Mode::DeleteConfirm;
+    }
+
+    /// Same confirmation, for the branch currently selected in the drawer rather than the
+    /// board — reached with `d` while `mode == Branches`.
+    fn begin_delete_unapplied(&mut self) {
+        if self.pending_delete_unapplied().is_none() {
+            return;
+        }
+        self.delete_target = DeleteTarget::Unapplied;
         self.mode = Mode::DeleteConfirm;
     }
 
@@ -1849,7 +1905,11 @@ impl App {
             self.mode = Mode::Normal;
             return;
         };
-        self.mode = Mode::Normal;
+        // A lane-delete drops you back on the board, same as before; a drawer-delete
+        // returns you to the drawer — you came from there, and deleting one stale branch
+        // is often the start of deleting several.
+        let from_drawer = self.deleting_unapplied();
+        self.mode = if from_drawer { Mode::Branches } else { Mode::Normal };
 
         let Some(but) = &self.but else {
             self.notify("snapshot is read-only", Notice::Info);
@@ -1857,7 +1917,11 @@ impl App {
         };
         match but.branch_delete(&name) {
             Ok(()) => {
-                self.refresh_quietly();
+                if from_drawer {
+                    self.refresh_branch_list();
+                } else {
+                    self.refresh_quietly();
+                }
                 self.notify(format!("deleted {name}"), Notice::Success);
             }
             Err(e) => self.notify(format!("{e}"), Notice::Error),
@@ -2748,7 +2812,13 @@ impl App {
             match key.code {
                 K::Enter | K::Char('y') => self.confirm_delete(),
                 K::Esc | K::Char('n') | K::Char('q') => {
-                    self.mode = Mode::Normal;
+                    // A drawer-initiated delete returns to the drawer it came from, same
+                    // as confirming it does — cancelling shouldn't drop you somewhere else.
+                    self.mode = if self.deleting_unapplied() {
+                        Mode::Branches
+                    } else {
+                        Mode::Normal
+                    };
                     self.notify("delete cancelled", Notice::Info);
                 }
                 _ => {}
@@ -2782,6 +2852,7 @@ impl App {
                 K::Char('g') if n > 0 => self.branch_sel = 0,
                 K::Char('G') if n > 0 => self.branch_sel = n - 1,
                 K::Enter if n > 0 => self.apply_selected_branch(),
+                K::Char('d') if n > 0 => self.begin_delete_unapplied(),
                 _ => {}
             }
             return;
@@ -3830,6 +3901,51 @@ mod tests {
 
         assert_eq!(app.mode, Mode::Branches);
         assert_eq!(app.branch_sel, 1);
+    }
+
+    /// `d` in the drawer confirms deleting the selected unapplied branch rather than the
+    /// current lane — and, since you came from the drawer, both confirming and cancelling
+    /// return you to it instead of dropping you on the board.
+    #[test]
+    fn d_in_the_drawer_targets_the_selected_branch_and_returns_to_it() {
+        use ratatui::crossterm::event::KeyCode as K;
+
+        let mut app = App::from_board(board());
+        app.mode = Mode::Branches;
+        let branch = |name: &str| crate::board::UnappliedBranch {
+            name: name.into(),
+            commits_ahead: Some(3),
+            merges_cleanly: None,
+            author: None,
+            age: None,
+            has_local: true,
+        };
+        app.unapplied = crate::board::Unapplied {
+            branches: vec![branch("a"), branch("stale-branch")],
+            truncated: false,
+        };
+        app.branch_sel = 1;
+
+        app.handle_key(key(K::Char('d')));
+        assert_eq!(app.mode, Mode::DeleteConfirm);
+        assert!(app.deleting_unapplied());
+        let (name, _) = app.pending_delete().expect("a branch is selected");
+        assert_eq!(name, "stale-branch");
+
+        app.handle_key(key(K::Esc));
+        assert_eq!(
+            app.mode,
+            Mode::Branches,
+            "cancelling a drawer-initiated delete should return to the drawer, not the board"
+        );
+
+        app.handle_key(key(K::Char('d')));
+        app.handle_key(key(K::Enter));
+        assert_eq!(
+            app.mode,
+            Mode::Branches,
+            "confirming a drawer-initiated delete should return to the drawer, not the board"
+        );
     }
 
     #[test]

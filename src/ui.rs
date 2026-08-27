@@ -500,8 +500,13 @@ fn draw_delete_confirm(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) 
         return;
     };
     let hint = "  ⏎ / y  delete      esc / n  cancel";
+    let title = if app.deleting_unapplied() {
+        "  delete branch"
+    } else {
+        "  delete lane"
+    };
     let body = vec![
-        Line::styled("  delete lane", theme::muted()),
+        Line::styled(title, theme::muted()),
         Line::raw(""),
         Line::from(vec![
             Span::raw("  "),
@@ -1915,7 +1920,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         }
         Mode::PushConfirm | Mode::LandConfirm | Mode::DeleteConfirm | Mode::RebaseConfirm
         | Mode::Landing | Mode::Blocked | Mode::UnapplyConfirm => "",
-        Mode::Branches => "  ↑/↓ branch · ⏎ apply into a new lane · a/esc close",
+        Mode::Branches => "  ↑/↓ branch · ⏎ apply into a new lane · d delete · a/esc close",
         Mode::Diff => {
             let stageable = app
                 .diff
@@ -1959,6 +1964,7 @@ fn draw_help(f: &mut Frame, area: Rect, hits: &mut HitMap) {
         help_row("esc", "with a selection and nothing else to cancel: clears it"),
         help_row("u", "send this card back to the backlog — uncommit or unstage"),
         help_row("a", "branches not in the workspace — ⏎ applies one as a new lane"),
+        help_row("  then d", "delete the selected one — asks first, stays in the drawer"),
         help_row("U", "unapply this lane — its whole stack leaves, `a` brings it back"),
         help_row("d", "delete this lane — asks first"),
         help_row("r", "rebase onto the updated target — shows what will happen"),
