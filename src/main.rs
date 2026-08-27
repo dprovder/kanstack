@@ -39,6 +39,20 @@ environment:
                      silently skipped otherwise). Skip it for one branch with shift-tab
                      while naming it; stacking a branch never opens one to begin with.
   KANSTACK_HARNESS   command typed into that terminal (default: `claude`)
+  KANSTACK_HARNESS_SYSTEM_FLAG  the harness's flag for appending to its own default
+                     system prompt, e.g. `--append-system-prompt` (default: whatever's
+                     known-good for KANSTACK_HARNESS — `--append-system-prompt` for
+                     `claude`/`pi`, Codex CLI's differently-shaped `-c
+                     developer_instructions=` config override for `codex`, and for
+                     anything else — including harnesses confirmed to have no such
+                     mechanism at all, like OpenCode, Kiro CLI, and Gemini CLI — falling
+                     back to folding the note directly into the initial message instead).
+                     Set explicitly to force a `<flag> <value>`
+                     style override for another harness, or to an empty string to opt out
+                     entirely. Every new parallel-lane harness is told it's running in a
+                     GitButler *virtual* branch this way, since `git status`/`git branch`
+                     only ever show the shared workspace checkout every lane sits on, not
+                     that branch specifically.
   KANSTACK_CMUX_DIRECTION  split direction for the first lane, off kanstack's own pane:
                            left, right, above, or below (default: `above`)
   KANSTACK_CMUX_CHAIN_DIRECTION  split direction for every lane after the first, off the
