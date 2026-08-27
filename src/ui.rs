@@ -864,6 +864,11 @@ fn draw_land_confirm(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
             Span::styled(format!("{}  ", c.short_sha), theme::faint()),
             Span::styled(truncate(c.subject(), 46), theme::muted()),
         ]));
+        if let Some(Line { spans, .. }) = commit_stat_line(c) {
+            let mut line = vec![Span::raw("      ")];
+            line.extend(spans);
+            body.push(Line::from(line));
+        }
     }
     if check.commits.len() > 6 {
         body.push(Line::styled(
@@ -1554,6 +1559,17 @@ fn render_card(
     out
 }
 
+/// A commit's `+insertions -deletions`, in the same tones `render_card` gives a lane
+/// card's own stats — `None` when `but` didn't compute a diffstat for this commit (true of
+/// every commit nested inside a `ConflictingFile`, only ever set on the top-level list).
+fn commit_stat_line(c: &crate::model::MergeCheckCommit) -> Option<Line<'static>> {
+    let (a, r) = (c.insertions?, c.deletions?);
+    Some(Line::from(vec![
+        Span::styled(format!("+{a}"), theme::tone(crate::board::Tone::Good)),
+        Span::styled(format!(" -{r}"), theme::tone(crate::board::Tone::Bad)),
+    ]))
+}
+
 /// The drawer's detail view for one branch — what `⏎` opens from the list, and what `Esc`
 /// backs out of one level to return to it (see the `Mode::Branches` key handling in
 /// `App::handle_key`). Reads the same [`MergeCheck`](crate::model::MergeCheck) payload
@@ -1605,6 +1621,9 @@ fn draw_branch_preview(f: &mut Frame, preview: &BranchPreview, area: Rect) {
         lines.push(Line::styled(c.short_sha.clone(), theme::id()));
         for l in wrap(c.subject(), w) {
             lines.push(Line::styled(l, theme::muted()));
+        }
+        if let Some(stats) = commit_stat_line(c) {
+            lines.push(stats);
         }
         lines.push(Line::raw(""));
     }

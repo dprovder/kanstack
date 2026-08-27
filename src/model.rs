@@ -377,6 +377,13 @@ pub struct MergeCheck {
 pub struct MergeCheckCommit {
     pub short_sha: String,
     pub message: String,
+    /// Present on the top-level `commits` entries; absent on the ones nested inside a
+    /// `ConflictingFile`'s `branch_commits`/`upstream_commits` — `but` doesn't compute a
+    /// diffstat for those, so both are `None` there rather than `Some(0)`.
+    #[serde(default)]
+    pub insertions: Option<usize>,
+    #[serde(default)]
+    pub deletions: Option<usize>,
 }
 
 impl MergeCheckCommit {

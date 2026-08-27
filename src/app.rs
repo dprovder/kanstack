@@ -4034,6 +4034,8 @@ mod tests {
             commits: vec![crate::model::MergeCheckCommit {
                 short_sha: "abc1234".into(),
                 message: "a commit".into(),
+                insertions: None,
+                deletions: None,
             }],
             merge_check: crate::model::MergeCheckResult {
                 merges_cleanly: clean,

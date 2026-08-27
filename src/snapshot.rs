@@ -202,6 +202,8 @@ mod tests {
                 commits: vec![MergeCheckCommit {
                     short_sha: "56b9641".into(),
                     message: "Optional cmux-tui bridge".into(),
+                    insertions: Some(242),
+                    deletions: Some(3),
                 }],
                 merge_check: MergeCheckResult {
                     merges_cleanly: false,
@@ -228,6 +230,8 @@ mod tests {
             out.contains("Optional cmux-tui bridge"),
             "the preview is wide enough (PREVIEW_WIDTH) that this shouldn't need truncating:\n{out}"
         );
+        assert!(out.contains("+242"), "missing the commit's insertion count:\n{out}");
+        assert!(out.contains("-3"), "missing the commit's deletion count:\n{out}");
         assert!(
             out.contains("src/cmux.rs"),
             "missing the conflicting file:\n{out}"
@@ -378,6 +382,8 @@ mod tests {
                 commits: vec![crate::model::MergeCheckCommit {
                     short_sha: "56b9641".into(),
                     message: "Optional cmux-tui bridge".into(),
+                    insertions: Some(242),
+                    deletions: Some(3),
                 }],
                 merge_check: crate::model::MergeCheckResult {
                     merges_cleanly: false,
@@ -804,6 +810,8 @@ mod tests {
             commits: vec![MergeCheckCommit {
                 short_sha: "67d01c0".into(),
                 message: "theme passthrough from parent terminal".into(),
+                insertions: Some(43),
+                deletions: Some(32),
             }],
             merge_check: MergeCheckResult {
                 merges_cleanly: true,
@@ -820,6 +828,8 @@ mod tests {
         assert!(out.contains("land onto target"));
         assert!(out.contains("67d01c0"));
         assert!(out.contains("theme passthrough from parent terminal"));
+        assert!(out.contains("+43"), "missing the commit's insertion count:\n{out}");
+        assert!(out.contains("-32"), "missing the commit's deletion count:\n{out}");
         assert!(out.contains("lands cleanly"));
         assert!(out.contains("⏎ / y  land"));
         assert!(!out.contains("land anyway"), "a clean land must not warn:\n{out}");
@@ -841,6 +851,8 @@ mod tests {
             commits: vec![MergeCheckCommit {
                 short_sha: "abc1234".into(),
                 message: "Touch a contested file".into(),
+                insertions: None,
+                deletions: None,
             }],
             merge_check: MergeCheckResult {
                 merges_cleanly: false,
