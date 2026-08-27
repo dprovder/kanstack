@@ -25,6 +25,13 @@ use crate::theme;
 /// area before use so a narrow terminal never gives the drawer more room than the lanes.
 const DRAWER_WIDTH: u16 = 34;
 
+/// How wide the drawer gets while showing a branch preview instead of the list — commit
+/// subjects and file paths need more room than branch names do to read as anything but a
+/// wall of ellipses. The same 56 columns the confirm dialogs already use for a commit list
+/// (`draw_land_confirm`, `draw_delete_confirm`), not a new number invented for this one
+/// panel; still halved against the board area, same as `DRAWER_WIDTH`.
+const PREVIEW_WIDTH: u16 = 56;
+
 fn pane_status_label(status: PaneStatus) -> &'static str {
     match status {
         PaneStatus::Busy => "● busy",
@@ -93,7 +100,12 @@ pub fn draw(f: &mut Frame, app: &App) -> HitMap {
         // upstream of every lane, so it belongs before them rather than after. The lanes
         // shift right while it is open, which is also what makes the drawer's presence
         // obvious without needing a border to announce it.
-        let w = DRAWER_WIDTH.min(board_area.width / 2);
+        let base_w = if app.branch_preview.is_some() {
+            PREVIEW_WIDTH
+        } else {
+            DRAWER_WIDTH
+        };
+        let w = base_w.min(board_area.width / 2);
         let split = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(w), Constraint::Min(0)])
@@ -1575,21 +1587,27 @@ fn draw_branch_preview(f: &mut Frame, preview: &BranchPreview, area: Rect) {
     };
 
     let check = &preview.check;
-    let mut lines: Vec<Line<'static>> = vec![Line::styled(
-        format!(
-            "{} commit{}",
-            check.commits_ahead,
-            if check.commits_ahead == 1 { "" } else { "s" }
+    let mut lines: Vec<Line<'static>> = vec![
+        Line::styled(
+            format!(
+                "{} commit{}",
+                check.commits_ahead,
+                if check.commits_ahead == 1 { "" } else { "s" }
+            ),
+            theme::title(false),
         ),
-        theme::title(false),
-    )];
+        Line::raw(""),
+    ];
+    // Each commit gets the same shape a board card does: a short id, the subject wrapped
+    // across as many lines as it needs rather than clipped to one, and a blank line to
+    // separate it from the next — the layout already proven legible, just reused here.
     for c in &check.commits {
-        lines.push(Line::from(vec![
-            Span::styled(format!("{}  ", c.short_sha), theme::faint()),
-            Span::styled(truncate(c.subject(), w.saturating_sub(10)), theme::muted()),
-        ]));
+        lines.push(Line::styled(c.short_sha.clone(), theme::id()));
+        for l in wrap(c.subject(), w) {
+            lines.push(Line::styled(l, theme::muted()));
+        }
+        lines.push(Line::raw(""));
     }
-    lines.push(Line::raw(""));
     if check.merge_check.merges_cleanly {
         lines.push(Line::styled(
             "merges cleanly",
@@ -1601,18 +1619,19 @@ fn draw_branch_preview(f: &mut Frame, preview: &BranchPreview, area: Rect) {
             format!("{n} conflicting file{}", if n == 1 { "" } else { "s" }),
             theme::tone(crate::board::Tone::Bad),
         ));
+        lines.push(Line::raw(""));
         for file in &check.merge_check.conflicting_files {
-            lines.push(Line::styled(
-                truncate(&file.path, w.saturating_sub(2)),
-                theme::muted(),
-            ));
+            for l in wrap(&file.path, w) {
+                lines.push(Line::styled(l, theme::title(false)));
+            }
             if !file.upstream_commits.is_empty() {
                 let uc = file.upstream_commits.len();
                 lines.push(Line::styled(
-                    format!("  vs {uc} upstream commit{}", if uc == 1 { "" } else { "s" }),
+                    format!("vs {uc} upstream commit{}", if uc == 1 { "" } else { "s" }),
                     theme::faint(),
                 ));
             }
+            lines.push(Line::raw(""));
         }
     }
 

@@ -224,9 +224,10 @@ mod tests {
             "missing the previewed branch's name:\n{out}"
         );
         assert!(out.contains("56b9641"), "missing its commit:\n{out}");
-        // The drawer is narrow enough at this width that the subject truncates — check a
-        // prefix rather than the whole sentence.
-        assert!(out.contains("Optional cmux"), "missing the subject:\n{out}");
+        assert!(
+            out.contains("Optional cmux-tui bridge"),
+            "the preview is wide enough (PREVIEW_WIDTH) that this shouldn't need truncating:\n{out}"
+        );
         assert!(
             out.contains("src/cmux.rs"),
             "missing the conflicting file:\n{out}"
