@@ -867,10 +867,10 @@ fn draw_land_confirm(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
             "  conflicts on land",
             theme::tone(crate::board::Tone::Bad),
         ));
-        for path in check.merge_check.conflicting_files.iter().take(6) {
+        for file in check.merge_check.conflicting_files.iter().take(6) {
             body.push(Line::from(vec![
                 Span::raw("    "),
-                Span::styled(truncate(path, 46), theme::muted()),
+                Span::styled(truncate(&file.path, 46), theme::muted()),
             ]));
         }
     } else {

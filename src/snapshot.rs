@@ -741,7 +741,7 @@ mod tests {
     #[test]
     fn land_confirm_names_conflicting_files() {
         use crate::app::Mode;
-        use crate::model::{MergeCheck, MergeCheckCommit, MergeCheckResult};
+        use crate::model::{ConflictingFile, MergeCheck, MergeCheckCommit, MergeCheckResult};
 
         let status =
             crate::but::parse_status(include_str!("../tests/fixtures/status.json")).unwrap();
@@ -755,7 +755,11 @@ mod tests {
             }],
             merge_check: MergeCheckResult {
                 merges_cleanly: false,
-                conflicting_files: vec!["src/app.rs".into()],
+                conflicting_files: vec![ConflictingFile {
+                    path: "src/app.rs".into(),
+                    branch_commits: Vec::new(),
+                    upstream_commits: Vec::new(),
+                }],
             },
         });
 

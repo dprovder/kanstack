@@ -356,9 +356,11 @@ pub enum PullStatus {
     Unknown,
 }
 
-/// Output of `but branch show <branch> --check --format json`: whether landing the branch
-/// onto the target would be clean, without doing it. The only preview `but land` itself
-/// offers — unlike push and pull, it takes no `--dry-run`.
+/// Output of `but branch show <branch> --check --json`: whether landing the branch onto
+/// the target would be clean, without doing it. The only preview `but land` itself
+/// offers — unlike push and pull, it takes no `--dry-run`. Also the source for the
+/// drawer's on-demand branch preview (see `App::open_branch_preview`), since it's the same
+/// call either way — just aimed at an unapplied branch instead of an applied one.
 ///
 /// Mixed wire casing, verified against 0.21.2: the top level and `mergeCheck` are
 /// camelCase, but each entry in `commits` is snake_case.
@@ -388,7 +390,21 @@ impl MergeCheckCommit {
 pub struct MergeCheckResult {
     pub merges_cleanly: bool,
     #[serde(default)]
-    pub conflicting_files: Vec<String>,
+    pub conflicting_files: Vec<ConflictingFile>,
+}
+
+/// One file `but` found touched on both sides of a would-be merge — verified against
+/// 0.22.0, where this is an object (path plus the colliding commits on each side), not the
+/// bare path string earlier `but` versions returned. Reusing `MergeCheckCommit` for the two
+/// commit lists is safe even though those objects carry more fields (`author_name`,
+/// `timestamp`, …) than it reads: unknown fields are ignored by default.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConflictingFile {
+    pub path: String,
+    #[serde(default)]
+    pub branch_commits: Vec<MergeCheckCommit>,
+    #[serde(default)]
+    pub upstream_commits: Vec<MergeCheckCommit>,
 }
 
 /// Output of `but branch list --json`.
@@ -510,7 +526,7 @@ mod tests {
 
     #[test]
     fn merge_check_handles_mixed_wire_casing() {
-        // Captured verbatim from `but branch show feat-theme --check --format json` (but 0.21.2):
+        // Captured verbatim from `but branch show feat-theme --check --json` (but 0.21.2):
         // the envelope is camelCase but each commit entry is snake_case.
         let raw = r#"{
             "branch": "feat-theme",
@@ -534,14 +550,26 @@ mod tests {
 
     #[test]
     fn merge_check_reports_conflicting_files() {
+        // `conflictingFiles` entries are objects (verified against 0.22.0), not bare path
+        // strings — each names the commits on both sides that touched the file.
         let raw = r#"{
             "commitsAhead": 2,
             "commits": [],
-            "mergeCheck": {"mergesCleanly": false, "conflictingFiles": ["src/app.rs"]}
+            "mergeCheck": {"mergesCleanly": false, "conflictingFiles": [{
+                "path": "src/app.rs",
+                "branch_commits": [{"short_sha": "abc1234", "message": "wip"}],
+                "upstream_commits": [
+                    {"short_sha": "def5678", "message": "unrelated change"},
+                    {"short_sha": "9990000", "message": "another one"}
+                ]
+            }]}
         }"#;
         let check: MergeCheck = serde_json::from_str(raw).unwrap();
         assert!(!check.merge_check.merges_cleanly);
-        assert_eq!(check.merge_check.conflicting_files, ["src/app.rs"]);
+        let file = &check.merge_check.conflicting_files[0];
+        assert_eq!(file.path, "src/app.rs");
+        assert_eq!(file.branch_commits.len(), 1);
+        assert_eq!(file.upstream_commits.len(), 2);
     }
 
     /// Captured verbatim from `but branch list --json` on a real workspace (but 0.22.0).
