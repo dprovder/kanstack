@@ -76,6 +76,20 @@ cargo install --path .
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how it talks to `but`, the wire-format
 notes, and the version-compatibility details a contributor would need.
 
+## Setup
+
+The very first time kanstack runs on a machine, it opens a short wizard before the board:
+it checks whether `but`, `cmux`, and `tmux` are found (and, for `cmux`, whether the required
+`but` version is installed), and lets you pick a harness command, a split backend
+(`auto`/`cmux`/`tmux`), and a branch-UI style. Saving remembers your choices in
+`$XDG_CONFIG_HOME/kanstack/env` (or `$HOME/.config/kanstack/env`), so you don't need to
+export the equivalent environment variables every session — an explicit environment
+variable always overrides what's saved there. Run it again any time with:
+
+```sh
+kanstack --setup
+```
+
 ## Tutorial
 
 ```sh

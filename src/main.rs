@@ -16,7 +16,7 @@ use kanstack::but::But;
 use kanstack::splitter::Splitter;
 use kanstack::tutorial::{self, Tutorial};
 use kanstack::watch::Watcher;
-use kanstack::{snapshot, ui};
+use kanstack::{config, setup, snapshot, ui};
 
 const HELP: &str = "\
 kanstack — a kanban-style TUI for the GitButler CLI
@@ -26,6 +26,10 @@ usage:
 
 options:
   -C <path>          run against the repository at <path> (default: cwd)
+  --setup            detect but/cmux/tmux and save harness/split-backend/branch-UI
+                     defaults, so they don't need exporting every session (also runs
+                     automatically before the board the very first time kanstack is run,
+                     until it has been through this once)
   --tutorial         walk through the keys in a real, throwaway practice repo
   --snapshot <file>  render captured `but status -f --json` output and exit
   --size <WxH>       terminal size for --snapshot (default: 160x30)
@@ -33,6 +37,11 @@ options:
   -h, --help         print this help
 
 environment:
+  Anything set with --setup is remembered in $XDG_CONFIG_HOME/kanstack/env (or
+  $HOME/.config/kanstack/env — KANSTACK_CONFIG_PATH to relocate it) and used as a default
+  the next time kanstack runs. An explicit environment variable always wins over the saved
+  file.
+
   KANSTACK_BUT_BIN   path to the `but` binary (default: `but` on PATH)
   KANSTACK_CMUX_BIN  path to the `cmux` CLI, to open a terminal split for each new
                      parallel lane (default: `cmux` on PATH if present; the integration is
@@ -80,14 +89,21 @@ requires the GitButler CLI: https://docs.gitbutler.com/cli-overview
 ";
 
 fn main() -> Result<()> {
+    // Before anything else reads an env var: fills in whatever `--setup` saved last time,
+    // for any var not already set in the real environment (which always wins — see the
+    // `environment:` note in HELP).
+    config::load_into_env();
+
     let mut cwd: Option<PathBuf> = None;
     let mut snapshot: Option<String> = None;
     let mut size = (160u16, 30u16);
     let mut tutorial_mode = false;
+    let mut setup_mode = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--tutorial" => tutorial_mode = true,
+            "--setup" => setup_mode = true,
             "--snapshot" => {
                 snapshot = Some(
                     args.next()
@@ -139,6 +155,16 @@ fn main() -> Result<()> {
              To render a captured board non-interactively:\n\
              \n    but status -f --json > board.json && kanstack --snapshot board.json"
         );
+    }
+
+    // The very first run on a machine — no config file yet, and neither --tutorial nor an
+    // explicit --setup already covers it — gets the wizard before the board, once.
+    let first_run = !setup_mode && !tutorial_mode && !config::exists();
+    if setup_mode || first_run {
+        setup::run()?;
+        if setup_mode {
+            return Ok(());
+        }
     }
 
     let cwd = if tutorial_mode {
