@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{anyhow, bail, Context, Result};
+use serde::Deserialize;
 
 use crate::model::{
     BranchList, CliError, DiffOutput, MergeCheck, PullPreview, PushPreview, WorkspaceStatus,
@@ -114,6 +115,24 @@ pub struct WorkspaceBlock {
     pub workspace_sha: Option<String>,
     /// The commits above it, newest first.
     pub stray: Vec<StrayCommit>,
+}
+
+/// `but skill check --json`'s reply: every GitButler coding-agent skill file found,
+/// installed locally and/or globally, and whether each is current for this `but` version.
+/// Field names are already snake_case on the wire (unlike most of `but`'s other JSON,
+/// which is camelCase — see `crate::model`), so this needs no `rename_all`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SkillCheck {
+    pub skills: Vec<SkillEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SkillEntry {
+    /// e.g. "Claude Code", "Codex", "OpenCode" — whatever coding agent this install is
+    /// shaped for.
+    pub format_name: String,
+    pub scope: String,
+    pub up_to_date: bool,
 }
 
 pub struct But {
@@ -519,6 +538,30 @@ impl But {
             .with_context(|| format!("could not parse `but branch list` output: {raw:.400}"))
     }
 
+    /// Whether a coding-agent skill file teaching `but` usage is installed anywhere (local
+    /// repo and/or global home directory) and current for this `but` version — see
+    /// `crate::setup`'s "install/update GitButler skill" action.
+    pub fn skill_check(&self) -> Result<SkillCheck> {
+        let raw = self.run(&["skill", "check", "--json"])?;
+        parse_skill_check(&raw)
+    }
+
+    /// Installs the skill fresh. In non-interactive mode (no tty on `self.run`'s stdin —
+    /// always true here, `but` is only ever spawned with piped/captured output) `but`
+    /// itself picks the format for whichever coding agent it detects installed, rather
+    /// than prompting.
+    pub fn skill_install_global(&self) -> Result<()> {
+        self.run(&["skill", "install", "--global", "--json"])?;
+        Ok(())
+    }
+
+    /// Refreshes every already-installed skill (local and global) that's behind the
+    /// current `but` version, in place.
+    pub fn skill_update(&self) -> Result<()> {
+        self.run(&["skill", "check", "--update", "--json"])?;
+        Ok(())
+    }
+
     /// Applies an unapplied branch, bringing it into the workspace as a parallel lane.
     ///
     /// This writes to the working directory — the branch's changes materialize on disk —
@@ -638,6 +681,13 @@ pub fn parse_status(raw: &str) -> Result<WorkspaceStatus> {
     Ok(status)
 }
 
+/// Split out, same as `parse_status`, so it can be tested against captured output without
+/// spawning anything.
+fn parse_skill_check(raw: &str) -> Result<SkillCheck> {
+    serde_json::from_str(raw.trim())
+        .with_context(|| format!("could not parse `but skill check` output: {raw:.400}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -712,5 +762,15 @@ mod tests {
         let raw = include_str!("../tests/fixtures/status.json");
         let s = parse_status(raw).unwrap();
         assert_eq!(s.stacks.len(), 3);
+    }
+
+    #[test]
+    fn parses_captured_skill_check() {
+        let raw = include_str!("../tests/fixtures/skill_check.json");
+        let check = parse_skill_check(raw).unwrap();
+        assert_eq!(check.skills.len(), 1);
+        assert_eq!(check.skills[0].format_name, "Claude Code");
+        assert_eq!(check.skills[0].scope, "global");
+        assert!(check.skills[0].up_to_date);
     }
 }

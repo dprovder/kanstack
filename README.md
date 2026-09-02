@@ -80,14 +80,28 @@ notes, and the version-compatibility details a contributor would need.
 
 The very first time kanstack runs on a machine, it opens a short wizard before the board:
 it checks whether `but`, `cmux`, and `tmux` are found (and, for `cmux`, whether the required
-`but` version is installed), and lets you pick a harness command, a split backend
-(`auto`/`cmux`/`tmux`), and a branch-UI style. Saving remembers your choices in
+`but` version is installed), and lets you pick a default harness — cycling with `←`/`→`
+through whichever known harnesses (`claude`, `codex`, `pi`, `opencode`, `kiro`, `gemini`)
+were actually found on `PATH`, or just typing a custom command — and a split backend
+(`auto`/`cmux`/`tmux`). Saving remembers your choices in
 `$XDG_CONFIG_HOME/kanstack/env` (or `$HOME/.config/kanstack/env`), so you don't need to
 export the equivalent environment variables every session — an explicit environment
-variable always overrides what's saved there. Run it again any time with:
+variable always overrides what's saved there. `esc` skips it without picking anything.
+
+Two more rows appear only when there's something to do: if `but` itself isn't found, an
+"install GitButler CLI" action (with a confirm first, since it runs GitButler's own
+`curl -fsSL https://gitbutler.com/install.sh | sh`); if `but` is found but has no
+up-to-date coding-agent skill installed (`but skill check`), an "install/update GitButler
+skill" action — the file that teaches whichever harness you spawn in a lane to use `but`
+instead of plain `git`. Neither row shows once there's nothing left to fix.
+
+Right after, first run also offers a one-time, equally skippable prompt to walk through
+the tutorial below. Neither the setup wizard nor the tutorial offer reappears once you've
+been through them once; run either again any time with:
 
 ```sh
 kanstack --setup
+kanstack --tutorial
 ```
 
 ## Tutorial

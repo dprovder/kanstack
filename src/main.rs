@@ -26,10 +26,14 @@ usage:
 
 options:
   -C <path>          run against the repository at <path> (default: cwd)
-  --setup            detect but/cmux/tmux and save harness/split-backend/branch-UI
-                     defaults, so they don't need exporting every session (also runs
-                     automatically before the board the very first time kanstack is run,
-                     until it has been through this once)
+  --setup            detect but/cmux/tmux and known harnesses on PATH, then save a default
+                     harness and split-backend, so they don't need exporting every session.
+                     Also offers to install the GitButler CLI itself if missing, and to
+                     install/update its coding-agent skill (teaches whichever harness you
+                     spawn to use `but` instead of plain git) if missing or outdated. Runs
+                     automatically before the board the very first time kanstack is
+                     run (skippable with esc), followed by a one-time, also-skippable offer
+                     to walk through the keys — neither reappears once you've been through it
   --tutorial         walk through the keys in a real, throwaway practice repo
   --snapshot <file>  render captured `but status -f --json` output and exit
   --size <WxH>       terminal size for --snapshot (default: 160x30)
@@ -158,12 +162,22 @@ fn main() -> Result<()> {
     }
 
     // The very first run on a machine — no config file yet, and neither --tutorial nor an
-    // explicit --setup already covers it — gets the wizard before the board, once.
+    // explicit --setup already covers it — gets the wizard, then a dismissible offer to
+    // walk through the keys, before the board. Both are skippable; skipping setup still
+    // marks first-run done (via the empty `save`) so neither reappears next launch.
     let first_run = !setup_mode && !tutorial_mode && !config::exists();
     if setup_mode || first_run {
-        setup::run()?;
+        let outcome = setup::run()?;
+        if first_run && outcome == setup::Outcome::Cancelled {
+            config::save(&[])?;
+        }
         if setup_mode {
             return Ok(());
+        }
+        // Skipped when `-C` named a specific repository: building a throwaway practice
+        // repo instead would silently ignore it.
+        if cwd.is_none() && tutorial::offer()? {
+            tutorial_mode = true;
         }
     }
 

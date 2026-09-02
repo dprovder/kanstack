@@ -9,9 +9,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result};
+use ratatui::layout::Rect;
+use ratatui::text::Line;
+use ratatui::widgets::{Block, Clear, Paragraph};
+use ratatui::Frame;
 
 use crate::app::App;
 use crate::but::But;
+use crate::theme;
 
 /// One step: what to tell the user, and how to tell whether they did it.
 pub struct Step {
@@ -128,6 +133,61 @@ pub fn steps() -> Vec<Step> {
             done: Box::new(|app| has_lane(app, "practice")),
         },
     ]
+}
+
+/// A one-time, dismissible offer shown right after first-run `--setup`, asking whether to
+/// walk through the keys now. `true` means yes. Owns its own terminal session — the same
+/// standalone pattern `crate::setup::run` uses — since asking this needs no repository or
+/// `App` yet; the practice repo is only built once the answer is yes.
+pub fn offer() -> Result<bool> {
+    let mut terminal = ratatui::init();
+    let result = offer_loop(&mut terminal);
+    ratatui::restore();
+    result
+}
+
+fn offer_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<bool> {
+    use ratatui::crossterm::event::{self, Event, KeyCode as K, KeyEventKind};
+    loop {
+        terminal.draw(draw_offer)?;
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        match key.code {
+            K::Char('y' | 'Y') | K::Enter => return Ok(true),
+            K::Char('n' | 'N') | K::Esc | K::Char('q') => return Ok(false),
+            _ => {}
+        }
+    }
+}
+
+fn draw_offer(f: &mut Frame) {
+    let area = f.area();
+    f.render_widget(Clear, area);
+    let body = vec![
+        Line::styled("  kanstack", theme::title(true)),
+        Line::raw(""),
+        Line::raw("  Want a quick interactive walkthrough of the keys, in a real,"),
+        Line::raw("  throwaway practice repo? Nothing here touches your real projects."),
+        Line::raw(""),
+        Line::raw("  y  yes, walk me through it      n / esc  skip, go straight to the board"),
+    ];
+    let w = 70.min(area.width.saturating_sub(4));
+    let h = (body.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, popup);
+    f.render_widget(
+        Paragraph::new(body).block(Block::bordered().border_style(theme::faint())),
+        popup,
+    );
 }
 
 /// Creates a temporary git repository, runs `but setup` in it, and seeds a small board: one

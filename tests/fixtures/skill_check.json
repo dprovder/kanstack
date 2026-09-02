@@ -1,0 +1,13 @@
+{
+  "cli_version": "0.22.0",
+  "skills": [
+    {
+      "path": "/Users/example/.claude/skills/gitbutler",
+      "format_name": "Claude Code",
+      "scope": "global",
+      "installed_version": "0.22.0",
+      "up_to_date": true
+    }
+  ],
+  "outdated_count": 0
+}
