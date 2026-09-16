@@ -1,3 +1,5 @@
 /target
 # Upstream clones kept locally for reference only; not part of this project.
 /reference
+# Local scratch notes on possible future work; not part of the shipped docs.
+/docs/FEATURE_IDEAS.md
