@@ -270,16 +270,16 @@ impl But {
         parse_status(&raw)
     }
 
-    /// 0.22.1 added `--status-after`, which folds a mutation and its resulting workspace
-    /// status into one call (`{"result":…,"status":…}`) instead of two. Tempting, but
-    /// deliberately *not* used here: verified live against 0.22.3, the status it appends is
-    /// never `-f`-detailed — commits in it always carry `"changes": null` — and every commit
-    /// card's file-name subtitle ([`board.rs`](crate::board), reading `commit.changes`)
-    /// depends on that detail being present on every refresh, not just the next background
-    /// one. There is no flag that asks the appended status for file lists, so adopting this
-    /// would trade a real round trip for a real (if brief) rendering regression. Left as a
-    /// plain note rather than removed from `but`'s vocabulary entirely, in case a future
-    /// `but` adds an `-f`-equivalent to `--status-after` and this becomes worth revisiting.
+    // 0.22.1 added `--status-after`, which folds a mutation and its resulting workspace
+    // status into one call (`{"result":…,"status":…}`) instead of two. Tempting, but
+    // deliberately *not* used here: verified live against 0.22.3, the status it appends is
+    // never `-f`-detailed — commits in it always carry `"changes": null` — and every commit
+    // card's file-name subtitle (board.rs, reading `commit.changes`) depends on that detail
+    // being present on every refresh, not just the next background one. There is no flag
+    // that asks the appended status for file lists, so adopting this would trade a real
+    // round trip for a real (if brief) rendering regression. Left as a plain note rather
+    // than removed from `but`'s vocabulary entirely, in case a future `but` adds an
+    // `-f`-equivalent to `--status-after` and this becomes worth revisiting.
 
     /// Read-only `git`, for the one situation `but` cannot answer questions about: a
     /// workspace so broken that every `but` subcommand refuses (see [`is_workspace_block`]).

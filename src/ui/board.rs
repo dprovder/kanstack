@@ -78,7 +78,7 @@ pub(super) fn draw_board(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap
     let last = (first + fit).min(indices.len());
 
     let mut x = area.x + 1;
-    for pos in first..last {
+    for pos in indices.iter().take(last).skip(first) {
         if x + width > area.x + area.width {
             break;
         }
@@ -88,7 +88,7 @@ pub(super) fn draw_board(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap
             width,
             height: area.height,
         };
-        draw_column(f, app, indices[pos], col_area, hits);
+        draw_column(f, app, *pos, col_area, hits);
         x += width + COL_GAP;
     }
 
