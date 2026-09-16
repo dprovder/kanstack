@@ -32,8 +32,8 @@ mod help;
 use board::draw_board;
 use branch_modal::draw_branch_modal;
 use confirms::{
-    draw_blocked, draw_delete_confirm, draw_land_confirm, draw_landing, draw_push_confirm,
-    draw_rebase_confirm,
+    draw_blocked, draw_delete_confirm, draw_land_confirm, draw_landing, draw_not_set_up,
+    draw_push_confirm, draw_rebase_confirm,
 };
 use diff::draw_diff;
 use drawer::{draw_branches, draw_unapply_confirm};
@@ -130,6 +130,7 @@ pub fn draw(f: &mut Frame, app: &App) -> HitMap {
         Mode::UnapplyConfirm => draw_unapply_confirm(f, app, f.area(), &mut hits),
         Mode::RebaseConfirm => draw_rebase_confirm(f, app, f.area(), &mut hits),
         Mode::Blocked => draw_blocked(f, app, f.area()),
+        Mode::SetupRequired => draw_not_set_up(f, app, f.area()),
         Mode::Branch | Mode::HarnessMessage if app.branch_ui == BranchUi::Modal => {
             draw_branch_modal(f, app, f.area(), &mut hits)
         }

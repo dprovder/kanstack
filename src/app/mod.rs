@@ -39,6 +39,7 @@ mod moving;
 mod push_land;
 mod rebase;
 mod restack;
+mod setup_required;
 mod task_dispatch;
 mod undo;
 
@@ -117,6 +118,10 @@ pub enum Mode {
     /// recoveries and quit — the board behind this is a snapshot of a repository that has
     /// since moved on, so acting on it would mean acting on a lie.
     Blocked,
+    /// This directory isn't a GitButler project yet — not broken, just never set up (see
+    /// [`crate::but::is_setup_required`]). Unlike `Blocked`, there's exactly one safe
+    /// recovery, so the only choices are running it or quitting.
+    SetupRequired,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -348,15 +353,21 @@ struct PendingCommitMove {
 impl App {
     pub fn new(but: But, splitter: Option<Splitter>) -> Result<Self> {
         let mut commit_stats = HashMap::new();
-        // A blocked workspace starts the app rather than aborting it. Bailing here printed
-        // one line of prose and vanished, which reads as a crash and leaves the user to
-        // work out the recovery themselves — the modal can explain and offer to run it.
+        // A blocked workspace, or one that was never set up at all, starts the app rather
+        // than aborting it. Bailing here printed one line of prose and vanished, which
+        // reads as a crash and leaves the user to work out the recovery themselves — the
+        // modal can explain and offer to run it.
+        let mut needs_setup = false;
         let (board, blocked) = match but.status() {
             Ok(status) => (Self::board_from(&but, &mut commit_stats, &status), None),
             Err(e) if crate::but::is_workspace_block(&e.to_string()) => (
                 Board::empty(),
                 Some(but.diagnose_workspace_block(e.to_string())),
             ),
+            Err(e) if crate::but::is_setup_required(&e.to_string()) => {
+                needs_setup = true;
+                (Board::empty(), None)
+            }
             Err(e) => return Err(e),
         };
         let mut message = None;
@@ -379,6 +390,8 @@ impl App {
             card: 0,
             mode: if blocked.is_some() {
                 Mode::Blocked
+            } else if needs_setup {
+                Mode::SetupRequired
             } else {
                 Mode::Normal
             },
@@ -605,6 +618,8 @@ impl App {
         let msg = e.to_string();
         if crate::but::is_workspace_block(&msg) {
             self.enter_blocked(msg);
+        } else if crate::but::is_setup_required(&msg) {
+            self.mode = Mode::SetupRequired;
         } else {
             self.notify(format!("refresh failed: {msg}"), Notice::Error);
         }
@@ -1110,6 +1125,7 @@ impl App {
         // swallows what it swallows.
         match self.mode {
             Mode::Blocked => return self.handle_key_blocked(key),
+            Mode::SetupRequired => return self.handle_key_setup_required(key),
             Mode::Commit => return self.handle_key_commit(key),
             Mode::Branch => return self.handle_key_branch(key),
             Mode::Task => return self.handle_key_task(key),
@@ -1563,6 +1579,68 @@ mod tests {
     fn blocked_never_recovers_without_a_keypress() {
         let app = blocked_app();
         assert_eq!(app.mode, Mode::Blocked);
+        assert!(!app.should_quit);
+        assert!(app.exit_note.is_none());
+    }
+
+    /// Puts an app into the not-set-up state without needing a real, unconfigured
+    /// repository behind it.
+    fn setup_required_app() -> App {
+        let mut app = App::from_board(board());
+        app.mode = Mode::SetupRequired;
+        app
+    }
+
+    /// Same point as `blocked_swallows_navigation_and_mutation_keys`: there is no board
+    /// here worth navigating or acting on yet.
+    #[test]
+    fn setup_required_swallows_navigation_and_mutation_keys() {
+        use ratatui::crossterm::event::KeyCode as K;
+        let mut app = setup_required_app();
+        app.col = 0;
+        app.card = 0;
+
+        for k in [
+            K::Down,
+            K::Char('j'),
+            K::Right,
+            K::Char('m'),
+            K::Char('c'),
+            K::Char('b'),
+            K::Char('d'),
+            K::Char('p'),
+            K::Char('z'),
+            K::Char(' '),
+            K::Enter,
+            K::Char('?'),
+        ] {
+            app.on_key(key(k));
+            assert_eq!(app.mode, Mode::SetupRequired, "{k:?} must not leave the mode");
+        }
+        assert_eq!((app.col, app.card), (0, 0), "the cursor must not have moved");
+        assert!(app.selected.is_empty(), "nothing can be selected here");
+        assert!(!app.should_quit, "none of those keys mean quit");
+    }
+
+    /// Esc means "cancel, go back" everywhere else, but there is nothing to go back to
+    /// here — so it leaves, and it leaves without touching the repository.
+    #[test]
+    fn setup_required_quit_keys_exit_without_recovering() {
+        use ratatui::crossterm::event::KeyCode as K;
+        for k in [K::Char('q'), K::Esc] {
+            let mut app = setup_required_app();
+            app.on_key(key(k));
+            assert!(app.should_quit, "{k:?} quits");
+            assert!(app.exit_note.is_none(), "{k:?} changed nothing, so it reports nothing");
+        }
+    }
+
+    /// The recovery may not fire on its own: it shells out to `but setup`, and a modal that
+    /// acted before it was read would be a worse surprise than the one it exists to report.
+    #[test]
+    fn setup_required_never_recovers_without_a_keypress() {
+        let app = setup_required_app();
+        assert_eq!(app.mode, Mode::SetupRequired);
         assert!(!app.should_quit);
         assert!(app.exit_note.is_none());
     }

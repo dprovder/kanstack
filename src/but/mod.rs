@@ -27,6 +27,7 @@ mod land;
 mod move_commits;
 mod push;
 mod rebase;
+mod setup;
 mod skill;
 mod undo;
 
@@ -111,6 +112,16 @@ const WORKSPACE_SUBJECT: &str = "GitButler Workspace Commit";
 pub fn is_workspace_block(msg: &str) -> bool {
     msg.contains("GitButler mode exit required")
         || msg.contains("commit(s) on top of the workspace commit")
+}
+
+/// Recognises the other special `but status` failure worth a dedicated recovery screen:
+/// the directory isn't a GitButler project. Two spellings, same fix: `setup_required` is
+/// `but`'s structured error code for an existing git repo that's never had `but setup` run
+/// (see `model::CliError`); "No git repository found" is its plain-text equivalent for a
+/// directory that isn't even a git repo yet. Both are fixed by the same command — see
+/// `But::run_setup` — so there's no need to tell them apart past this point.
+pub fn is_setup_required(msg: &str) -> bool {
+    msg.contains("setup_required") || msg.contains("No git repository found")
 }
 
 /// A commit sitting on top of the workspace commit that has no business being there.
@@ -409,6 +420,32 @@ mod tests {
             "`but commit` failed: changes depend on another branch",
         ] {
             assert!(!is_workspace_block(msg), "{msg:?} is not a workspace block");
+        }
+    }
+
+    /// Both spellings matter: the structured `setup_required` error code for an existing,
+    /// not-yet-`but setup` repo, and the plain-text "no git repository" wording for a
+    /// directory that isn't a repo at all. Both get the same recovery screen.
+    #[test]
+    fn recognises_both_spellings_of_setup_required() {
+        assert!(is_setup_required(
+            "setup_required: No GitButler project found at .\nhint: run `but setup` to configure the project"
+        ));
+        assert!(is_setup_required(
+            "`but status -f --json` failed: Error: No git repository found at .\nPlease run 'but setup' to initialize the project."
+        ));
+    }
+
+    /// Ordinary failures, including the *other* special case, must not be mistaken for this
+    /// one — escalating either into the wrong recovery screen would be its own bug.
+    #[test]
+    fn setup_required_leaves_other_failures_alone() {
+        for msg in [
+            "`but land` failed: Configured target branch has no push remote",
+            "could not run `but`. Install the GitButler CLI",
+            "Error: GitButler mode exit required: please run `but teardown` to preserve your work.",
+        ] {
+            assert!(!is_setup_required(msg), "{msg:?} is not a setup-required failure");
         }
     }
 

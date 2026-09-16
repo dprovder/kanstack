@@ -114,6 +114,46 @@ pub(super) fn draw_blocked(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+/// This directory isn't a GitButler project yet (see [`crate::app::Mode::SetupRequired`]) —
+/// never `but setup`, or not even a git repo. Deliberately calmer than `draw_blocked`: this
+/// isn't a broken or dangerous state, just a one-time step, so no red border and no
+/// `selected_bg` fill, same informational styling `setup.rs`'s wizard uses for its own
+/// popup.
+pub(super) fn draw_not_set_up(f: &mut Frame, _app: &App, area: Rect) {
+    let body = vec![
+        Line::styled("  not a GitButler project yet", theme::title(true)),
+        Line::raw(""),
+        Line::styled("  this directory hasn't had `but setup` run in it", theme::muted()),
+        Line::raw(""),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled("s", theme::tone(Tone::Accent)),
+            Span::styled("  set it up now", theme::title(true)),
+        ]),
+        Line::styled("     but setup --init", theme::faint()),
+        Line::styled(
+            "     configures GitButler here — creates a git repo first if there isn't one yet",
+            theme::faint(),
+        ),
+        Line::raw(""),
+        Line::styled("  q  quit and change nothing", theme::faint()),
+    ];
+
+    let w = 68.min(area.width.saturating_sub(4));
+    let h = (body.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, popup);
+    f.render_widget(
+        Paragraph::new(body).block(Block::bordered().border_style(theme::faint())),
+        popup,
+    );
+}
+
 /// What rebasing onto the updated target would do, per lane.
 ///
 /// The per-branch outcome is the point: a lane that comes out `conflicted` is worth

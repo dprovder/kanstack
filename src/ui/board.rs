@@ -32,10 +32,11 @@ pub(super) fn draw_board(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap
     if app.board.columns.is_empty() {
         f.render_widget(
             Paragraph::new(Line::styled(
-                // A blocked workspace also has no columns, but it is empty because nothing
-                // could be read — not because there is nothing there. Suggesting a command
-                // that `but` is currently refusing would be advice that cannot be followed.
-                if app.mode == Mode::Blocked {
+                // A blocked or not-yet-set-up workspace also has no columns, but it is
+                // empty because nothing could be read — not because there is nothing
+                // there. Suggesting a command that `but` is currently refusing (or
+                // doesn't understand yet) would be advice that cannot be followed.
+                if app.mode == Mode::Blocked || app.mode == Mode::SetupRequired {
                     ""
                 } else {
                     "  no applied branches — create one with `but branch new <name>`"
