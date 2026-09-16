@@ -19,7 +19,16 @@ impl App {
     fn recover_setup(&mut self) {
         let Some(but) = self.but.clone() else { return };
         if let Err(e) = but.run_setup() {
-            self.notify(format!("`but setup` failed: {e}"), Notice::Error);
+            let msg = e.to_string();
+            if crate::but::is_missing_git_identity(&msg) {
+                self.notify(
+                    "git has no identity configured — run `git config --global user.name \
+                     \"…\"` and `user.email \"…\"`, then press s again",
+                    Notice::Error,
+                );
+            } else {
+                self.notify(format!("`but setup` failed: {msg}"), Notice::Error);
+            }
             return;
         }
         self.mode = Mode::Normal;

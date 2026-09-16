@@ -124,6 +124,15 @@ pub fn is_setup_required(msg: &str) -> bool {
     msg.contains("setup_required") || msg.contains("No git repository found")
 }
 
+/// Recognises `but setup --init`'s one distinct, actionable failure: no git identity
+/// configured anywhere (confirmed live — no fallback identity, and no flag to supply one
+/// inline), so the empty commit it needs to create has no author. Worth a specific hint
+/// rather than a bare "setup failed", since the fix is a one-liner and unrelated to
+/// anything about the repository itself.
+pub fn is_missing_git_identity(msg: &str) -> bool {
+    msg.contains("Author identity is not configured")
+}
+
 /// A commit sitting on top of the workspace commit that has no business being there.
 #[derive(Debug, Clone)]
 pub struct StrayCommit {
@@ -447,6 +456,14 @@ mod tests {
         ] {
             assert!(!is_setup_required(msg), "{msg:?} is not a setup-required failure");
         }
+    }
+
+    /// Confirmed live: this is the exact (and only observed) wording `but setup --init`
+    /// produces with no git identity configured anywhere.
+    #[test]
+    fn recognises_a_missing_git_identity() {
+        assert!(is_missing_git_identity("Error: Author identity is not configured"));
+        assert!(!is_missing_git_identity("setup_required: No GitButler project found at ."));
     }
 
     #[test]
