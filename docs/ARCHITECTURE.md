@@ -4,6 +4,54 @@ This is contributor-facing detail that doesn't belong in the README: version-com
 internals, wire-format quirks, and the history behind a few design decisions. If you're just
 using `kanstack`, you don't need any of this — see [README.md](../README.md) instead.
 
+## Adding a feature
+
+`src/app/`, `src/ui/`, and `src/but/` are each split one file per feature area (branch
+creation, the drawer, push/land, rebase, and so on) instead of one giant `app.rs`/`ui.rs`/
+`but.rs`. The point is parallel work: two features being built at the same time should touch
+different files, not the same 4000-line one. A new feature should follow the same shape —
+its own `app/<name>.rs` (state + key handling), its own `ui/<name>.rs` (rendering), and, if it
+needs a new CLI call, its own `but/<name>.rs` — rather than growing an existing file or
+falling back into `mod.rs`.
+
+Concretely, adding a mode-driven feature (a new confirm dialog, a new drawer, a new
+in-app flow) touches:
+
+- **`src/app/mod.rs`**: one new `Mode` variant, one new field on `App` for whatever state
+  the feature needs while active, and one new `match self.mode` arm in `handle_key`
+  delegating to a `handle_key_<name>` method — everything else lives in the new file.
+- **`src/app/<name>.rs`** (new file): an `impl App` block with that mode's state
+  transitions (`begin_*`/`confirm_*` methods) and its `handle_key_<name>` method. Mark
+  methods called from `mod.rs` or another feature file `pub(super)` — private methods are
+  only visible within their own file plus its own descendants, not to siblings or the
+  parent, so anything reached from outside needs at least `pub(super)` (Rust's normal
+  privacy rule: a private item is visible in its defining module and that module's
+  descendants, nothing else). Anything called only from within the same file can stay
+  plain `fn`.
+- **`src/ui/mod.rs`**: one new `match app.mode` arm in `draw()` calling the new draw
+  function.
+- **`src/ui/<name>.rs`** (new file): the `draw_<name>` function and anything private to it.
+  Same `pub(super)` rule as above — it's only needed here since `draw()` calls in from the
+  parent module.
+- **`src/but/<name>.rs`** (new file, if the feature needs a new subcommand): an `impl But`
+  block with the wrapper method(s). No visibility changes needed — `pub fn` methods are
+  callable as `but.method(...)` from anywhere regardless of which file the `impl But` block
+  lives in, since method resolution goes through the type, not the defining module's path.
+
+A private item defined in `mod.rs` (a struct field, a helper method, a shared type) is
+already visible to every file in its directory without any extra visibility annotation —
+Rust grants descendant modules access to an ancestor's private items automatically. That's
+what keeps `use super::*;` at the top of every feature file enough to reach `App`, `Mode`,
+`Notice`, and the handful of small shared types (`MoveOp`, `PendingCommitMove`) that stay in
+`app/mod.rs` because more than one feature file needs them.
+
+Tests mostly live beside the code they exercise — a `#[cfg(test)] mod tests` per feature
+file rather than one shared block. The one exception is `app/mod.rs`'s own test module: most
+of `app`'s tests exercise navigation, mouse handling, and cross-mode interactions through
+shared helpers (`Nav`, `key()`, `mouse()`, `blocked_app()`), so splitting them per file would
+mean duplicating that harness rather than removing duplication. New tests for a genuinely
+new, self-contained feature should still go in that feature's own file.
+
 ## How it talks to GitButler
 
 `kanstack` links no GitButler code. It spawns the `but` binary you installed and reads its
