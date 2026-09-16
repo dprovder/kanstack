@@ -525,7 +525,18 @@ impl Board {
         Board {
             columns,
             base_short_id: s.merge_base.short_id().to_string(),
-            behind: s.upstream_state.behind,
+            // `but status`'s own `behind` count is observed to stick at its pre-merge value
+            // after a land/pull folds those very commits into the merge base — verified live
+            // against 0.22.0: `upstreamState.latestCommit` matches `mergeBase` exactly, yet
+            // `behind` still reports the count from before that merge. When the two commit
+            // ids agree there is by definition nothing left unintegrated, so that case
+            // overrides the raw count rather than showing a "still behind" that no amount of
+            // re-pulling can clear.
+            behind: if s.upstream_state.latest_commit.commit_id == s.merge_base.commit_id {
+                0
+            } else {
+                s.upstream_state.behind
+            },
             conflicted_files: s.conflicted_files.clone(),
         }
     }
@@ -627,6 +638,28 @@ mod tests {
             ["unassigned", "feat-auth", "feat-ui", "fix-flaky-tests"]
         );
         assert_eq!(b.columns[0].kind, ColumnKind::Unassigned);
+    }
+
+    #[test]
+    fn behind_count_is_clamped_to_zero_once_upstream_matches_the_merge_base() {
+        // Reproduces a live `but` 0.22.0 bug: after a land/pull folds upstream's commits
+        // into the merge base, `upstreamState.latestCommit` catches up to match it, but
+        // `upstreamState.behind` is observed to keep reporting the pre-merge count — no
+        // further pull ever clears it, since there is nothing left to fetch.
+        let mut status = sample();
+        status.upstream_state.behind = 2;
+        status.upstream_state.latest_commit = status.merge_base.clone();
+        let b = Board::from_status(&status);
+        assert_eq!(b.behind, 0);
+    }
+
+    #[test]
+    fn behind_count_passes_through_when_genuinely_behind() {
+        let mut status = sample();
+        status.upstream_state.behind = 2;
+        status.upstream_state.latest_commit.commit_id = "deadbeef".into();
+        let b = Board::from_status(&status);
+        assert_eq!(b.behind, 2);
     }
 
     #[test]
