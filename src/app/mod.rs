@@ -36,6 +36,7 @@ mod delete;
 mod diff;
 mod drawer;
 mod moving;
+mod pr;
 mod push_land;
 mod rebase;
 mod restack;
@@ -47,6 +48,7 @@ mod undo;
 // file — `ui`, `snapshot`, `tutorial` and the integration tests all reach them that way.
 pub use branch_modal::{BranchModalRow, BranchUi};
 pub use drawer::BranchPreview;
+pub use pr::{PendingPr, PrModalRow};
 pub use push_land::PendingLand;
 
 use branch_modal::PendingBranch;
@@ -102,6 +104,13 @@ pub enum Mode {
     /// swallowed here — a land in flight is not a state to navigate the board out from
     /// under, and there is nothing left to cancel once it has started pushing.
     Landing,
+    /// Filling out a PR's title and draft toggle before `but pr new` runs — see
+    /// [`PrModalRow`].
+    PrModal,
+    /// `but pr new` is running on a background thread; see [`PendingPr`]. Same reasoning
+    /// as `Landing`: input is swallowed, and there is no cancel once it may already be
+    /// pushing.
+    PrRunning,
     /// Confirming a lane deletion.
     DeleteConfirm,
     /// The unapplied-branches drawer is open beside the board, and has the keys.
@@ -193,6 +202,19 @@ pub struct App {
     pub land_check: Option<MergeCheck>,
     /// The `but land` call in flight, valid while `mode == Landing`.
     pub landing: Option<PendingLand>,
+    /// PR title being typed, valid while `mode == PrModal`.
+    pub pr_title_input: TextInput,
+    /// Whether the PR modal's draft toggle is on, valid while `mode == PrModal`. Reset to
+    /// `false` each time the modal opens.
+    pub pr_draft: bool,
+    /// Which row of the PR modal `Up`/`Down`/`Left`/`Right`/`Tab` currently act on, valid
+    /// while `mode == PrModal`. Reset to `Title` each time the modal opens.
+    pub pr_modal_row: PrModalRow,
+    /// The branch (and its lane title) a pending PR targets — set by `begin_pr`, consumed
+    /// by `confirm_pr`. Valid while `mode == PrModal`.
+    pr_target: Option<(String, String)>,
+    /// The `but pr new` call in flight, valid while `mode == PrRunning`.
+    pub pr_running: Option<PendingPr>,
     /// What a rebase onto the updated target would do, valid while `mode == RebaseConfirm`.
     pub pull_preview: Option<PullPreview>,
     /// The diff being read, valid while `mode == Diff`.
@@ -412,6 +434,11 @@ impl App {
             push_preview: None,
             land_check: None,
             landing: None,
+            pr_title_input: TextInput::default(),
+            pr_draft: false,
+            pr_modal_row: PrModalRow::Title,
+            pr_target: None,
+            pr_running: None,
             pull_preview: None,
             diff: None,
             diff_full: false,
@@ -467,6 +494,11 @@ impl App {
             push_preview: None,
             land_check: None,
             landing: None,
+            pr_title_input: TextInput::default(),
+            pr_draft: false,
+            pr_modal_row: PrModalRow::Title,
+            pr_target: None,
+            pr_running: None,
             pull_preview: None,
             diff: None,
             diff_full: false,
@@ -647,6 +679,7 @@ impl App {
         self.push_preview = None;
         self.land_check = None;
         self.pull_preview = None;
+        self.pr_target = None;
         self.move_source = None;
         self.selected.clear();
     }
@@ -1133,6 +1166,8 @@ impl App {
             Mode::PushConfirm => return self.handle_key_push_confirm(key),
             Mode::LandConfirm => return self.handle_key_land_confirm(key),
             Mode::Landing => return self.handle_key_landing(key),
+            Mode::PrModal => return self.handle_key_pr_modal(key),
+            Mode::PrRunning => return self.handle_key_pr_running(key),
             Mode::Diff => return self.handle_key_diff(key),
             Mode::RebaseConfirm => return self.handle_key_rebase_confirm(key),
             Mode::DeleteConfirm => return self.handle_key_delete_confirm(key),
@@ -1247,6 +1282,7 @@ impl App {
             K::Char('m') if self.mode == Mode::Normal => self.begin_move(),
             K::Char('p') if self.mode == Mode::Normal => self.begin_push(),
             K::Char('L') if self.mode == Mode::Normal => self.begin_land(),
+            K::Char('M') if self.mode == Mode::Normal => self.begin_pr(),
             K::Char('z') if self.mode == Mode::Normal => self.undo(),
             K::Char('Z') if self.mode == Mode::Normal => self.redo(),
             K::Char('b') if self.mode == Mode::Normal => self.begin_branch(),

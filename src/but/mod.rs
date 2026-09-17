@@ -25,11 +25,14 @@ mod branch;
 mod diff;
 mod land;
 mod move_commits;
+mod pr;
 mod push;
 mod rebase;
 mod setup;
 mod skill;
 mod undo;
+
+pub use pr::PrOptions;
 
 /// Oldest `but` whose JSON shape this was verified against.
 ///

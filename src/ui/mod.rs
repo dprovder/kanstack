@@ -28,6 +28,7 @@ mod drawer;
 mod footer;
 mod header;
 mod help;
+mod pr;
 
 use board::draw_board;
 use branch_modal::draw_branch_modal;
@@ -40,6 +41,7 @@ use drawer::{draw_branches, draw_unapply_confirm};
 use footer::draw_footer;
 use header::draw_header;
 use help::draw_help;
+use pr::{draw_pr_modal, draw_pr_running};
 
 /// How wide the unapplied-branches drawer is, when there is room for it. Branch names run
 /// long, so this is wider than the board's own minimum lane; it is halved against the board
@@ -126,6 +128,8 @@ pub fn draw(f: &mut Frame, app: &App) -> HitMap {
         Mode::PushConfirm => draw_push_confirm(f, app, f.area(), &mut hits),
         Mode::LandConfirm => draw_land_confirm(f, app, f.area(), &mut hits),
         Mode::Landing => draw_landing(f, app, f.area()),
+        Mode::PrModal => draw_pr_modal(f, app, f.area(), &mut hits),
+        Mode::PrRunning => draw_pr_running(f, app, f.area()),
         Mode::DeleteConfirm => draw_delete_confirm(f, app, f.area(), &mut hits),
         Mode::UnapplyConfirm => draw_unapply_confirm(f, app, f.area(), &mut hits),
         Mode::RebaseConfirm => draw_rebase_confirm(f, app, f.area(), &mut hits),

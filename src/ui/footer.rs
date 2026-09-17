@@ -143,7 +143,8 @@ pub(super) fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             );
         }
         Mode::PushConfirm | Mode::LandConfirm | Mode::DeleteConfirm | Mode::RebaseConfirm
-        | Mode::Landing | Mode::Blocked | Mode::SetupRequired | Mode::UnapplyConfirm => "",
+        | Mode::Landing | Mode::Blocked | Mode::SetupRequired | Mode::UnapplyConfirm
+        | Mode::PrModal | Mode::PrRunning => "",
         Mode::Branches if app.branch_preview.is_some() => {
             "  ↑/↓ scroll · a apply into a new lane · esc/← back"
         }
@@ -171,7 +172,7 @@ pub(super) fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         }
         Mode::Help => "  esc close",
         Mode::Normal => {
-            "  ←/→ lane · ↑/↓ card · m move · u unstage · c commit · b branch · t task · s stack · ⏎ diff · a unapplied · U unapply · d delete · r rebase · p push · L land · z/Z undo/redo · ?"
+            "  ←/→ lane · ↑/↓ card · m move · u unstage · c commit · b branch · t task · s stack · ⏎ diff · a unapplied · U unapply · d delete · r rebase · p push · L land · M pr · z/Z undo/redo · ?"
         }
     };
     f.render_widget(Paragraph::new(Line::styled(keys, theme::faint())), area);
