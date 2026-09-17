@@ -33,7 +33,7 @@ pub(super) fn draw_help(f: &mut Frame, area: Rect, hits: &mut HitMap) {
         help_row("s", "stack this whole lane onto another — rewrites history"),
         help_row("p", "push this lane — shows what it will do first"),
         help_row("L", "land this lane onto the target — no PR, shows what will happen first"),
-        help_row("M", "open a PR for this lane's branch — pushes it first if needed"),
+        help_row("M", "open a PR for this lane's branch — title, description, draft toggle"),
         help_row("z / Z", "undo / redo the last operation — fires immediately, no confirm"),
         help_row("? / esc", "toggle this help"),
         help_row("q", "quit"),

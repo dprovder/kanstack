@@ -1,14 +1,14 @@
 use super::*;
 use crate::app::PrModalRow;
-use crate::ui::branch_modal::hint_row;
+use crate::ui::branch_modal::{hint_row, wrap_ranges};
 
-/// Opening a PR, as a modal: a title field (empty falls back to `but pr new --default`,
-/// the branch's own commit message) and a draft toggle, both visible at once — the same
-/// shape `draw_branch_modal` uses for branch creation, just for the two fields `but pr new`
-/// needs instead of three.
+/// Opening a PR, as a modal: a title, a description that wraps downward as it grows (the
+/// same treatment `draw_branch_modal` gives its own harness-message field — one flat
+/// string, word-wrapped for display, no real newline in either one), and a draft toggle,
+/// all visible and editable at once before anything runs.
 pub(super) fn draw_pr_modal(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     let cursor = theme::tone(crate::board::Tone::Accent);
-    let w = 60.min(area.width.saturating_sub(4));
+    let w = 64.min(area.width.saturating_sub(4));
     let content_width = (w as usize).saturating_sub(2);
 
     let title_text = match app.pr_target_label() {
@@ -21,6 +21,8 @@ pub(super) fn draw_pr_modal(f: &mut Frame, app: &App, area: Rect, hits: &mut Hit
         if app.pr_modal_row == row { "▸ " } else { "  " }
     };
 
+    // Title: a single line, scrolled horizontally — the same treatment the branch modal
+    // gives its own name field.
     let title_prefix = format!("{}title    ", row_marker(PrModalRow::Title));
     let (before, after) = app.pr_title_input.split_at_cursor();
     let budget = footer_input_budget(content_width as u16, title_prefix.chars().count(), 0);
@@ -31,9 +33,59 @@ pub(super) fn draw_pr_modal(f: &mut Frame, app: &App, area: Rect, hits: &mut Hit
         Span::styled("█", cursor),
         Span::styled(after, theme::title(true)),
     ]));
-    if app.pr_title_input.is_empty() {
+
+    // Description: wraps downward across as many lines as it needs.
+    let message_prefix = "  message  ";
+    let prefix_width = message_prefix.chars().count();
+    let wrap_width = content_width.saturating_sub(prefix_width);
+    let on_message_row = app.pr_modal_row == PrModalRow::Message;
+    let text: Vec<char> = app.pr_message_input.as_str().chars().collect();
+    if text.is_empty() {
+        let label = format!("{}message  ", row_marker(PrModalRow::Message));
+        body.push(Line::from(vec![
+            Span::styled(label, theme::faint()),
+            if on_message_row {
+                Span::styled("█", cursor)
+            } else {
+                Span::styled("(optional)", theme::faint())
+            },
+        ]));
+    } else {
+        let ranges = wrap_ranges(&text, wrap_width.max(1));
+        let cursor_idx = app.pr_message_input.split_at_cursor().0.chars().count();
+        let cursor_line = ranges
+            .iter()
+            .position(|&(s, e)| cursor_idx >= s && cursor_idx < e)
+            .unwrap_or(ranges.len() - 1);
+        for (li, &(s, e)) in ranges.iter().enumerate() {
+            let label = if li == 0 {
+                Span::styled(format!("{}message  ", row_marker(PrModalRow::Message)), theme::faint())
+            } else {
+                Span::raw(" ".repeat(prefix_width))
+            };
+            let line: String = text[s..e].iter().collect();
+            if on_message_row && li == cursor_line {
+                let byte_at = line
+                    .char_indices()
+                    .nth(cursor_idx - s)
+                    .map(|(b, _)| b)
+                    .unwrap_or(line.len());
+                let (before, after) = line.split_at(byte_at);
+                body.push(Line::from(vec![
+                    label,
+                    Span::styled(before.to_string(), theme::title(true)),
+                    Span::styled("█", cursor),
+                    Span::styled(after.to_string(), theme::title(true)),
+                ]));
+            } else {
+                body.push(Line::from(vec![label, Span::styled(line, theme::title(true))]));
+            }
+        }
+    }
+
+    if app.pr_title_input.is_empty() && app.pr_message_input.is_empty() {
         body.push(Line::styled(
-            "           (empty uses the branch's own commit message)",
+            "             (leave both empty to use the branch's own commit message)",
             theme::faint(),
         ));
     }

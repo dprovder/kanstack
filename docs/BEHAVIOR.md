@@ -246,9 +246,16 @@ review before anything reaches trunk; `L` is the direct route for one that doesn
 
 Unlike push and land, this has no dry-run preview — there is nothing to show beforehand
 that isn't just "a PR gets opened" — so `M` goes straight to a modal instead of a confirm
-dialog: a title field (left empty, `but pr new --default` falls back to the branch's own
-commit message) and a draft toggle, both editable before anything runs. `↑`/`↓` moves
-between the two, `⏎` opens the PR, `esc` cancels without touching anything.
+dialog: a title, a description, and a draft toggle, all editable before anything runs.
+`↑`/`↓` moves between the three, `⏎` opens the PR, `esc` cancels without touching anything.
+
+The description is typed as one field that wraps downward across as many lines as it
+needs, the same treatment the branch-creation modal already gives its own initial-harness-
+message field — there is no real newline in either one, just word-wrapped display over one
+flat string; `but pr new -m "title\n\ndescription"` is what actually splits it into a title
+and a body. Leaving both fields empty runs `but pr new --default` instead, which falls back
+to the branch's own commit message — but a description with no title is refused rather than
+silently dropped, since `but pr new -m` needs a first line to be the title.
 
 Once confirmed, it runs on a background thread with the same spinner-and-no-cancel
 treatment as `L` — for the same reason: a push and a forge API call are both real network

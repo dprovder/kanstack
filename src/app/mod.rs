@@ -204,6 +204,8 @@ pub struct App {
     pub landing: Option<PendingLand>,
     /// PR title being typed, valid while `mode == PrModal`.
     pub pr_title_input: TextInput,
+    /// PR description being typed, valid while `mode == PrModal` — see [`PrModalRow::Message`].
+    pub pr_message_input: TextInput,
     /// Whether the PR modal's draft toggle is on, valid while `mode == PrModal`. Reset to
     /// `false` each time the modal opens.
     pub pr_draft: bool,
@@ -435,6 +437,7 @@ impl App {
             land_check: None,
             landing: None,
             pr_title_input: TextInput::default(),
+            pr_message_input: TextInput::default(),
             pr_draft: false,
             pr_modal_row: PrModalRow::Title,
             pr_target: None,
@@ -495,6 +498,7 @@ impl App {
             land_check: None,
             landing: None,
             pr_title_input: TextInput::default(),
+            pr_message_input: TextInput::default(),
             pr_draft: false,
             pr_modal_row: PrModalRow::Title,
             pr_target: None,
