@@ -62,6 +62,18 @@ Or grab a prebuilt binary for macOS (Apple Silicon or Intel) or Linux (x86_64 or
 from the [Releases page](https://github.com/dprovder/kanstack/releases) and put it on your
 `PATH`.
 
+Or, with Nix:
+
+```sh
+nix run github:dprovder/kanstack
+```
+
+Want it in your own flake instead? Add `kanstack.url = "github:dprovder/kanstack"` as
+an input, then `kanstack.packages.${system}.default` — the pinned `but`, `tmux`, and `git`
+(+`cmux` on Apple Silicon) come bundled, so nothing needs installing separately. The dev
+shell, packaging options, and per-device `but` provisioning are in
+[docs/NIX.md](docs/NIX.md).
+
 Then, from inside the repository you ran `but setup` in:
 
 ```sh
