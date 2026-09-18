@@ -107,18 +107,31 @@
             sha256 = "sha256-MVoL554hxmzXJ4XuR3Xq0Z2qqZKhsixJAiBg/olYHus=";
           };
         };
-        butFromSource = craneLib.buildPackage {
+        butArgs = {
           pname = "but";
           version = gitbutler-src.rev or butVersion;
           src = gitbutler-src;
           cargoLock = "${gitbutler-src}/Cargo.lock";
           cargoExtraArgs = "-p but";
+          # git2's vendored-openssl builds OpenSSL from source (`openssl-src`),
+          # whose `./Configure` is a perl script.
+          nativeBuildInputs = [pkgs.perl pkgs.pkg-config];
+          buildInputs = [pkgs.curl];
           doCheck = false;
           meta = {
             license = pkgs.lib.licenses.fsl11Mit;
             description = "GitButler's official CLI";
           };
         };
+        butFromSource = craneLib.buildPackage (butArgs
+          // {
+            # `but --version` reads a compile-time VERSION env var
+            # (crates/but/src/lib.rs), defaulting to "dev"; kanstack needs a
+            # parseable >= 0.22 version. Kept off `butArgs` so the deps build is
+            # unchanged and its cache is reused.
+            env = {VERSION = butVersion;};
+            cargoArtifacts = craneLib.buildDepsOnly butArgs;
+          });
         but =
           if builtins.hasAttr system butSources
           then

@@ -52,6 +52,12 @@ The Linux binaries are pinned (`butRelease = "0.22.3-3234"` in `flake.nix`,
 with fixed SRI hashes). `cmux` is macOS-only software and kanstack falls back to
 `tmux` without it, so the Linux dev shell simply does not include it.
 
+The Apple Silicon build is slow the first time — it compiles `but` from
+source (~800 crates plus OpenSSL and libcurl) and there is no
+cache.nixos.org prebuild for this path, only for the Linux binaries.
+Subsequent builds reuse the Nix store, so only the first `nix run` pays
+for it; expect several minutes.
+
 ### Updating `but`
 
 kanstack is verified through 0.22.3 (`src/but/mod.rs`), so this is currently

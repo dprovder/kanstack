@@ -68,6 +68,9 @@ Or, with Nix:
 nix run github:dprovder/kanstack
 ```
 
+> On Apple Silicon the first run builds `but` from source and takes a few
+> minutes; it's cached afterwards.
+
 Want it in your own flake instead? Add `kanstack.url = "github:dprovder/kanstack"` as
 an input, then `kanstack.packages.${system}.default` — the pinned `but`, `tmux`, and `git`
 (+`cmux` on Apple Silicon) come bundled, so nothing needs installing separately. The dev
