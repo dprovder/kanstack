@@ -44,7 +44,6 @@ gets a 0.22+ `but` two ways, all in `flake.nix`, no global installs:
 | system | `but` source | why |
 |---|---|---|
 | `x86_64-linux` | prebuilt, from GitButler's official CDN | raw `but` binaries are published for Linux |
-| `aarch64-linux` | prebuilt, from the same CDN | same |
 | `aarch64-darwin` | built from source (`release/0.22.3`) | macOS only ships a self-extracting `but-installer`, not a fetchable binary |
 | `x86_64-darwin` | unsupported on nixpkgs-unstable | 26.11 dropped Intel macs; see below |
 
@@ -91,5 +90,5 @@ evaluate there. Options:
 The Linux `but` fetch-and-patchelf derivation in `flake.nix` is modelled on
 [kmdtaufik/nix4gitbutler](https://github.com/kmdtaufik/nix4gitbutler), which
 serves the same prebuilt Linux binaries. It is kept in-tree (and in one file)
-because that flake only supports `x86_64-linux`; this one also needs
-`aarch64-linux` and a source-built macOS path.
+because that flake only supports `x86_64-linux`; this one serves that plus a
+source-built macOS path.

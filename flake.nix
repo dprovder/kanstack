@@ -33,7 +33,9 @@
   }:
     flake-utils.lib.eachSystem [
       "aarch64-darwin"
-      "aarch64-linux"
+      # Leave commented until tested
+      # Also update docs after
+      # "aarch64-linux"
       "x86_64-linux"
     ] (
       system: let
@@ -102,10 +104,11 @@
             url = "https://releases.gitbutler.com/releases/release/${butRelease}/linux/x86_64/but";
             sha256 = "sha256-P09UOmzNkxzmyGxIQFjb5eKUOVl9AB9qCpwo2eUz6hg=";
           };
-          aarch64-linux = {
-            url = "https://releases.gitbutler.com/releases/release/${butRelease}/linux/aarch64/but";
-            sha256 = "sha256-MVoL554hxmzXJ4XuR3Xq0Z2qqZKhsixJAiBg/olYHus=";
-          };
+          # Leave commented until tested
+          # aarch64-linux = {
+          #   url = "https://releases.gitbutler.com/releases/release/${butRelease}/linux/aarch64/but";
+          #   sha256 = "sha256-MVoL554hxmzXJ4XuR3Xq0Z2qqZKhsixJAiBg/olYHus=";
+          # };
         };
         butArgs = {
           pname = "but";
