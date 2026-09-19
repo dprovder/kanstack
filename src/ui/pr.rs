@@ -24,15 +24,40 @@ pub(super) fn draw_pr_modal(f: &mut Frame, app: &App, area: Rect, hits: &mut Hit
     // Title: a single line, scrolled horizontally — the same treatment the branch modal
     // gives its own name field.
     let title_prefix = format!("{}title    ", row_marker(PrModalRow::Title));
-    let (before, after) = app.pr_title_input.split_at_cursor();
-    let budget = footer_input_budget(content_width as u16, title_prefix.chars().count(), 0);
-    let (before, after) = scroll_input(before, after, budget);
-    body.push(Line::from(vec![
-        Span::styled(title_prefix, theme::faint()),
-        Span::styled(before, theme::title(true)),
-        Span::styled("█", cursor),
-        Span::styled(after, theme::title(true)),
-    ]));
+    // A description with no title is the one combination `confirm_pr` refuses — the title
+    // is the first line of `but pr new -m` — so an empty title is flagged in place exactly
+    // when that's the state, rather than only via a footer notice after the fact.
+    let title_missing = app.pr_title_input.is_empty() && !app.pr_message_input.is_empty();
+    let title_focused = app.pr_modal_row == PrModalRow::Title;
+    if title_missing {
+        let mut spans = vec![Span::styled(title_prefix, theme::faint())];
+        if title_focused {
+            spans.push(Span::styled("█", cursor));
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(
+            "required — a description needs a title",
+            theme::tone(crate::board::Tone::Bad),
+        ));
+        body.push(Line::from(spans));
+    } else if title_focused {
+        let (before, after) = app.pr_title_input.split_at_cursor();
+        let budget = footer_input_budget(content_width as u16, title_prefix.chars().count(), 0);
+        let (before, after) = scroll_input(before, after, budget);
+        body.push(Line::from(vec![
+            Span::styled(title_prefix, theme::faint()),
+            Span::styled(before, theme::title(true)),
+            Span::styled("█", cursor),
+            Span::styled(after, theme::title(true)),
+        ]));
+    } else {
+        // Another row has focus: no text cursor, just the value, right-elided to fit.
+        let title = truncate(app.pr_title_input.as_str(), content_width.saturating_sub(title_prefix.chars().count()));
+        body.push(Line::from(vec![
+            Span::styled(title_prefix, theme::faint()),
+            Span::styled(title, theme::title(true)),
+        ]));
+    }
 
     // Description: wraps downward across as many lines as it needs.
     let message_prefix = "  message  ";

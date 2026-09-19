@@ -193,6 +193,10 @@ pub struct App {
     /// Meaningless (and unused) under the footer presentation (`BranchUi::Footer`), which
     /// has no rows to move a cursor between — that's the whole reason the modal exists.
     pub branch_modal_row: BranchModalRow,
+    /// Set when Enter/`Down` was refused for an empty branch name, so the modal can mark
+    /// the name field itself as the problem — the notice alone lands in the footer, away
+    /// from where the eye is. Cleared on the next edit and when naming starts.
+    pub branch_name_missing: bool,
     /// Footer or modal presentation for `Branch`/`HarnessMessage` — see [`BranchUi`].
     pub branch_ui: BranchUi,
     /// What a push would do, valid while `mode == PushConfirm`.
@@ -432,6 +436,7 @@ impl App {
             stack_onto: None,
             open_harness: true,
             branch_modal_row: BranchModalRow::Name,
+            branch_name_missing: false,
             branch_ui: BranchUi::from_env(),
             push_preview: None,
             land_check: None,
@@ -493,6 +498,7 @@ impl App {
             stack_onto: None,
             open_harness: true,
             branch_modal_row: BranchModalRow::Name,
+            branch_name_missing: false,
             branch_ui: BranchUi::from_env(),
             push_preview: None,
             land_check: None,
@@ -2124,6 +2130,25 @@ mod tests {
             BranchModalRow::Action,
             "no split row to land on without a split backend configured, so the row before it"
         );
+    }
+
+    /// A refused submit flags the name field and pulls focus back to it, wherever it came
+    /// from; typing into it clears the flag again.
+    #[test]
+    fn enter_with_no_name_flags_the_name_field_and_refocuses_it() {
+        let mut app = App::from_board(board());
+        app.branch_ui = BranchUi::Modal;
+        app.mode = Mode::Branch;
+        app.branch_modal_row = BranchModalRow::Action;
+
+        app.handle_key(key(ratatui::crossterm::event::KeyCode::Enter));
+
+        assert_eq!(app.mode, Mode::Branch, "nothing must be created");
+        assert!(app.branch_name_missing);
+        assert_eq!(app.branch_modal_row, BranchModalRow::Name);
+
+        app.handle_key(key(ratatui::crossterm::event::KeyCode::Char('a')));
+        assert!(!app.branch_name_missing);
     }
 
     /// `Ctrl-U` clears the focused field only — and must not type a `u`.

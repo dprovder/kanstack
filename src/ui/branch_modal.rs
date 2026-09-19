@@ -50,10 +50,11 @@ pub(super) fn draw_branch_modal(f: &mut Frame, app: &App, area: Rect, hits: &mut
     };
 
     let name_prefix = format!("{}name     ", row_marker(BranchModalRow::Name));
-    if editing_message {
-        // Already handed off to `pending_branch` — fixed, no cursor of its own anymore,
-        // so no scrolling needed either; `truncate` (right-elided) is the right shape for
-        // a value that's just being displayed rather than actively edited.
+    if editing_message || app.branch_modal_row != BranchModalRow::Name {
+        // Not the field being edited — already handed off to `pending_branch`, or the row
+        // cursor is on another row — so no text cursor, and no scrolling around one either;
+        // `truncate` (right-elided) is the right shape for a value that's just being
+        // displayed rather than actively edited.
         let name = truncate(app.branch_modal_name(), content_width.saturating_sub(name_prefix.chars().count()));
         body.push(Line::from(vec![
             Span::styled(name_prefix, theme::faint()),
@@ -69,6 +70,23 @@ pub(super) fn draw_branch_modal(f: &mut Frame, app: &App, area: Rect, hits: &mut
             Span::styled("█", cursor),
             Span::styled(after, theme::title(true)),
         ]));
+    }
+    // Required, and empty: say so where the eye already is. Overwrites the plain line just
+    // pushed above rather than threading a placeholder through both of its branches.
+    if app.branch_input.is_empty() && !editing_message {
+        let focused = app.branch_modal_row == BranchModalRow::Name;
+        let (text, style) = if app.branch_name_missing {
+            ("required — type a branch name", theme::tone(crate::board::Tone::Bad))
+        } else {
+            ("required", theme::faint())
+        };
+        let mut spans = vec![Span::styled(format!("{}name     ", row_marker(BranchModalRow::Name)), theme::faint())];
+        if focused {
+            spans.push(Span::styled("█", cursor));
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(text, style));
+        *body.last_mut().unwrap() = Line::from(spans);
     }
 
     body.push(hint_row(

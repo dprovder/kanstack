@@ -58,7 +58,17 @@ impl App {
             .and_then(|c| c.branch_name.clone());
         self.open_harness = true;
         self.branch_modal_row = BranchModalRow::Name;
+        self.branch_name_missing = false;
         self.mode = Mode::Branch;
+    }
+
+    /// Refuses to go on without a branch name: says so in the footer notice *and* flags
+    /// the name field itself (see `branch_name_missing`), putting the row cursor back on it
+    /// since that is what needs fixing.
+    fn refuse_missing_name(&mut self) {
+        self.branch_modal_row = BranchModalRow::Name;
+        self.branch_name_missing = true;
+        self.notify("a branch needs a name", Notice::Info);
     }
 
     /// Flips between stacking on the selected lane and creating a parallel one.
@@ -183,7 +193,7 @@ impl App {
     pub(super) fn confirm_branch(&mut self) {
         let name = self.branch_input.trimmed();
         if name.is_empty() {
-            self.notify("a branch needs a name", Notice::Info);
+            self.refuse_missing_name();
             return;
         }
         let anchor = self.stack_onto.clone();
@@ -216,10 +226,7 @@ impl App {
         }
         let name = self.branch_input.trimmed();
         if name.is_empty() {
-            // Drop the row cursor back on the name field — that's what the notice is
-            // asking the user to go fix.
-            self.branch_modal_row = BranchModalRow::Name;
-            self.notify("a branch needs a name", Notice::Info);
+            self.refuse_missing_name();
             return;
         }
         let anchor = self.stack_onto.clone();
@@ -339,7 +346,9 @@ impl App {
             K::Tab => self.toggle_stack_onto(),
             K::BackTab => self.toggle_open_harness(),
             _ if on_name_row => {
-                self.branch_input.handle_key(key);
+                if self.branch_input.handle_key(key) {
+                    self.branch_name_missing = false;
+                }
             }
             _ => {}
         }
