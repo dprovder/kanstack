@@ -61,10 +61,13 @@ impl App {
             let Some(splitter) = &mut self.splitter else { return };
             let label = splitter.label();
             match splitter.spawn_harness(&cwd, &branch, None) {
-                Ok(()) => self.notify(
-                    format!("opened a pane for {branch} — press t again once it's ready for the task"),
-                    Notice::Info,
-                ),
+                Ok(pane) => {
+                    crate::workstream::record_spawn(&cwd, &branch, &pane, None);
+                    self.notify(
+                        format!("opened a pane for {branch} — press t again once it's ready for the task"),
+                        Notice::Info,
+                    );
+                }
                 Err(e) => self.notify(format!("{label}: {e}"), Notice::Error),
             }
             self.task_input.clear();

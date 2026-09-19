@@ -34,7 +34,9 @@ use std::process::{Command, Output};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
-use crate::harness_launch::{build_launch_command, resolve_note_delivery, NoteDelivery};
+use crate::harness_launch::{
+    build_launch_command, resolve_note_delivery, resolve_note_delivery_for_override, NoteDelivery,
+};
 pub use crate::pane_status::PaneStatus;
 use crate::pane_status::CPU_BUSY_THRESHOLD_PERCENT;
 
@@ -144,7 +146,21 @@ impl Cmux {
     /// `git status`/`git branch` would recognize — also goes out on this same launch
     /// line, via whichever delivery `note_delivery` resolved to for this harness; see
     /// [`NoteDelivery`] and `build_launch_command`.
-    pub fn spawn_harness(&mut self, cwd: &Path, name: &str, initial_message: Option<&str>) -> Result<()> {
+    pub fn spawn_harness(&mut self, cwd: &Path, name: &str, initial_message: Option<&str>) -> Result<String> {
+        self.spawn_harness_with(cwd, name, initial_message, None)
+    }
+
+    /// [`Self::spawn_harness`] with `harness` overriding the configured one for just this
+    /// pane (`kanstack spawn --agent`), including which delivery the branch-context note
+    /// uses — that depends on the harness, not on what was configured. Returns the new
+    /// surface's ref, for a caller that needs to find it again from another process.
+    pub fn spawn_harness_with(
+        &mut self,
+        cwd: &Path,
+        name: &str,
+        initial_message: Option<&str>,
+        harness: Option<&str>,
+    ) -> Result<String> {
         let (direction, anchor) = match &self.last_anchor {
             Some(anchor) => (self.chain_direction.clone(), Some(anchor.clone())),
             None => match self.occupant_in_direction(&self.direction) {
@@ -168,7 +184,11 @@ impl Cmux {
             .with_context(|| format!("`cmux new-split` did not report a surface: {split_out:?}"))?
             .to_string();
 
-        let launch = build_launch_command(cwd, &self.harness, &self.note_delivery, name, initial_message);
+        let (harness, note_delivery) = match harness {
+            Some(h) if h != self.harness => (h, resolve_note_delivery_for_override(h)),
+            Some(_) | None => (self.harness.as_str(), self.note_delivery.clone()),
+        };
+        let launch = build_launch_command(cwd, harness, &note_delivery, name, initial_message);
         self.run(&["send", "--surface", &surface_ref, &launch])?;
 
         self.run(&["rename-tab", "--surface", &surface_ref, name])?;
@@ -179,7 +199,60 @@ impl Cmux {
                 status: PaneStatus::Unknown,
             },
         );
-        self.last_anchor = Some(surface_ref);
+        self.last_anchor = Some(surface_ref.clone());
+        Ok(surface_ref)
+    }
+
+    /// Starts tracking a surface some other process opened, so `send_task`,
+    /// `poll_statuses`, `focus` and `stop` work on it.
+    pub fn adopt(&mut self, branch: &str, surface_ref: &str) {
+        self.panes.insert(
+            branch.to_string(),
+            PaneHandle { surface_ref: surface_ref.to_string(), status: PaneStatus::Unknown },
+        );
+    }
+
+    /// Makes the next spawn split off `surface_ref` rather than kanstack's own pane, the
+    /// way consecutive spawns within one process already chain.
+    pub fn set_anchor(&mut self, surface_ref: &str) {
+        self.last_anchor = Some(surface_ref.to_string());
+    }
+
+    /// The ref of `branch`'s tracked surface.
+    pub fn pane_id(&self, branch: &str) -> Option<String> {
+        self.panes.get(branch).map(|p| p.surface_ref.clone())
+    }
+
+    /// Brings `branch`'s surface to the front and gives it keyboard focus. cmux's
+    /// "panel" refs are the same `surface:N` refs `new-split` reports.
+    pub fn focus(&self, branch: &str) -> Result<()> {
+        let Some(pane) = self.panes.get(branch) else {
+            bail!("no cmux pane open for {branch} yet");
+        };
+        self.run(&["focus-panel", "--panel", &pane.surface_ref])?;
+        Ok(())
+    }
+
+    /// Closes `branch`'s surface, ending whatever harness is running in it, and stops
+    /// tracking it. Already gone counts as stopped.
+    pub fn stop(&mut self, branch: &str) -> Result<()> {
+        let Some(pane) = self.panes.remove(branch) else {
+            bail!("no cmux pane open for {branch} yet");
+        };
+        if self.last_anchor.as_deref() == Some(pane.surface_ref.as_str()) {
+            self.last_anchor = None;
+        }
+        // Whether an already-closed surface is an error here isn't documented; a surface
+        // that no longer appears in `pane.list` is the state `stop` is after either way.
+        if self.run(&["close-surface", "--surface", &pane.surface_ref]).is_err() {
+            let still_there = self
+                .run(&["rpc", "pane.list"])
+                .map(|out| out.contains(&pane.surface_ref))
+                .unwrap_or(true);
+            if still_there {
+                bail!("`cmux close-surface` failed for {}", pane.surface_ref);
+            }
+        }
         Ok(())
     }
 

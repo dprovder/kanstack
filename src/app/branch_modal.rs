@@ -308,7 +308,10 @@ impl App {
                     if let Some(splitter) = &mut self.splitter {
                         let label = splitter.label();
                         match splitter.spawn_harness(&cwd, name, initial_message) {
-                            Ok(()) => self.notify(format!("created {name} — harness open"), Notice::Success),
+                            Ok(pane) => {
+                                crate::workstream::record_spawn(&cwd, name, &pane, None);
+                                self.notify(format!("created {name} — harness open"), Notice::Success);
+                            }
                             Err(e) => self.notify(format!("{label}: {e}"), Notice::Error),
                         }
                     }

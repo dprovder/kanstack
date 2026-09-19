@@ -26,7 +26,9 @@ use std::process::{Command, Output};
 
 use anyhow::{bail, Context, Result};
 
-use crate::harness_launch::{build_launch_command, resolve_note_delivery, NoteDelivery};
+use crate::harness_launch::{
+    build_launch_command, resolve_note_delivery, resolve_note_delivery_for_override, NoteDelivery,
+};
 use crate::pane_status::{PaneStatus, CPU_BUSY_THRESHOLD_PERCENT};
 
 #[derive(Debug, Clone)]
@@ -116,7 +118,21 @@ impl Tmux {
     ///
     /// See `build_launch_command`/[`crate::harness_launch`] for `initial_message` and the
     /// branch-context note, identical to `Cmux::spawn_harness`'s own handling of both.
-    pub fn spawn_harness(&mut self, cwd: &Path, name: &str, initial_message: Option<&str>) -> Result<()> {
+    pub fn spawn_harness(&mut self, cwd: &Path, name: &str, initial_message: Option<&str>) -> Result<String> {
+        self.spawn_harness_with(cwd, name, initial_message, None)
+    }
+
+    /// [`Self::spawn_harness`] with `harness` overriding the configured one for just this
+    /// pane (`kanstack spawn --agent`), including which delivery the branch-context note
+    /// uses — that depends on the harness, not on what was configured. Returns the new
+    /// pane's id, for a caller that needs to find it again from another process.
+    pub fn spawn_harness_with(
+        &mut self,
+        cwd: &Path,
+        name: &str,
+        initial_message: Option<&str>,
+        harness: Option<&str>,
+    ) -> Result<String> {
         let (direction, anchor) = match &self.last_anchor {
             Some(anchor) => (self.chain_direction.as_str(), anchor.as_str()),
             None => (self.direction.as_str(), self.own_pane.as_str()),
@@ -131,14 +147,61 @@ impl Tmux {
             bail!("`tmux split-window` did not report a pane id");
         }
 
-        let launch = build_launch_command(cwd, &self.harness, &self.note_delivery, name, initial_message);
+        let (harness, note_delivery) = match harness {
+            Some(h) if h != self.harness => (h, resolve_note_delivery_for_override(h)),
+            Some(_) | None => (self.harness.as_str(), self.note_delivery.clone()),
+        };
+        let launch = build_launch_command(cwd, harness, &note_delivery, name, initial_message);
         self.type_and_submit(&pane_id, launch.trim_end_matches('\n'))?;
 
         let _ = self.run(&["select-pane", "-t", &pane_id, "-T", name]);
 
         self.panes.insert(name.to_string(), PaneHandle { pane_id: pane_id.clone(), status: PaneStatus::Unknown });
-        self.last_anchor = Some(pane_id);
+        self.last_anchor = Some(pane_id.clone());
+        Ok(pane_id)
+    }
+
+    /// Starts tracking a pane some other process opened, so `send_task`, `poll_statuses`,
+    /// `focus` and `stop` work on it.
+    pub fn adopt(&mut self, branch: &str, pane_id: &str) {
+        self.panes.insert(branch.to_string(), PaneHandle { pane_id: pane_id.to_string(), status: PaneStatus::Unknown });
+    }
+
+    /// Makes the next spawn split off `pane_id` rather than kanstack's own pane, the way
+    /// consecutive spawns within one process already chain.
+    pub fn set_anchor(&mut self, pane_id: &str) {
+        self.last_anchor = Some(pane_id.to_string());
+    }
+
+    /// The id of `branch`'s tracked pane.
+    pub fn pane_id(&self, branch: &str) -> Option<String> {
+        self.panes.get(branch).map(|p| p.pane_id.clone())
+    }
+
+    /// Brings `branch`'s pane to the front and gives it keyboard focus. `select-window`
+    /// first, since `select-pane` alone leaves a pane in another window out of sight.
+    pub fn focus(&self, branch: &str) -> Result<()> {
+        let Some(pane) = self.panes.get(branch) else {
+            bail!("no tmux pane open for {branch} yet");
+        };
+        self.run(&["select-window", "-t", &pane.pane_id])?;
+        self.run(&["select-pane", "-t", &pane.pane_id])?;
         Ok(())
+    }
+
+    /// Closes `branch`'s pane, ending whatever harness is running in it, and stops
+    /// tracking it. Already gone counts as stopped.
+    pub fn stop(&mut self, branch: &str) -> Result<()> {
+        let Some(pane) = self.panes.remove(branch) else {
+            bail!("no tmux pane open for {branch} yet");
+        };
+        if self.last_anchor.as_deref() == Some(pane.pane_id.as_str()) {
+            self.last_anchor = None;
+        }
+        match self.run(&["kill-pane", "-t", &pane.pane_id]) {
+            Err(e) if !e.to_string().contains("can't find pane") => Err(e),
+            _ => Ok(()),
+        }
     }
 
     /// Sends `text` followed by Enter into `branch`'s tracked pane — the same

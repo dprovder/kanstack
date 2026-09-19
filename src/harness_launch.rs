@@ -104,6 +104,21 @@ pub fn resolve_note_delivery(harness: &str) -> NoteDelivery {
         Ok(flag) => return NoteDelivery::Flag(flag),
         Err(_) => {}
     }
+    delivery_for_harness(harness)
+}
+
+/// [`resolve_note_delivery`] for a harness other than the configured one
+/// (`kanstack spawn --agent`): `KANSTACK_HARNESS_SYSTEM_FLAG` describes the configured
+/// harness, so a flag set there isn't applied to a different one — it would be an unknown
+/// option to it. Only the explicit opt-out (`""`) carries over.
+pub fn resolve_note_delivery_for_override(harness: &str) -> NoteDelivery {
+    match std::env::var("KANSTACK_HARNESS_SYSTEM_FLAG") {
+        Ok(flag) if flag.is_empty() => NoteDelivery::Disabled,
+        _ => delivery_for_harness(harness),
+    }
+}
+
+fn delivery_for_harness(harness: &str) -> NoteDelivery {
     let program = harness.split_whitespace().next().unwrap_or(harness);
     let name = Path::new(program).file_name().and_then(|n| n.to_str()).unwrap_or(program);
     match name {

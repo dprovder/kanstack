@@ -6,6 +6,7 @@
 
 pub mod app;
 pub mod board;
+pub mod cli;
 pub mod but;
 pub mod cmux;
 pub mod config;
@@ -23,6 +24,7 @@ pub mod tmux;
 pub mod tutorial;
 pub mod ui;
 pub mod watch;
+pub mod workstream;
 
 /// Serializes tests, across `cmux.rs`/`tmux.rs`/`splitter.rs`, that mutate process-wide
 /// env vars each backend's `discover` reads (`PATH`, `KANSTACK_CMUX_BIN`,

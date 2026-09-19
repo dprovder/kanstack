@@ -19,13 +19,22 @@ use kanstack::but::But;
 use kanstack::splitter::Splitter;
 use kanstack::tutorial::{self, Tutorial};
 use kanstack::watch::Watcher;
-use kanstack::{config, setup, snapshot, ui};
+use kanstack::workstream::Registry;
+use kanstack::{cli, config, setup, snapshot, ui};
 
 const HELP: &str = "\
 kanstack — a kanban-style TUI for the GitButler CLI
 
 usage:
   kanstack [options]
+  kanstack spawn|send|status|focus|stop ...   drive harness panes without the board:
+
+  kanstack spawn <branch> [--agent <name>] [--prompt \"...\"]
+  kanstack send <branch|session> \"...\"
+  kanstack status
+  kanstack focus <branch|session>
+  kanstack stop <branch|session>
+  (kanstack spawn --help for details)
 
 options:
   -C <path>          run against the repository at <path> (default: cwd)
@@ -106,9 +115,19 @@ fn main() -> Result<()> {
     let mut size = (160u16, 30u16);
     let mut tutorial_mode = false;
     let mut setup_mode = false;
+    let mut subcommand: Option<cli::Command> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            name if cli::SUBCOMMANDS.contains(&name) => {
+                match cli::parse(name, args.by_ref().collect())? {
+                    Some(command) => subcommand = Some(command),
+                    None => {
+                        print!("{}", cli::HELP);
+                        return Ok(());
+                    }
+                }
+            }
             "--tutorial" => tutorial_mode = true,
             "--setup" => setup_mode = true,
             "--snapshot" => {
@@ -142,6 +161,16 @@ fn main() -> Result<()> {
             }
             other => anyhow::bail!("unknown argument {other:?}\n\n{HELP}"),
         }
+    }
+
+    // Headless: no board, no first-run wizard, no terminal needed — so this comes before
+    // every check below that assumes one.
+    if let Some(command) = subcommand {
+        let cwd = match cwd {
+            Some(p) => p,
+            None => std::env::current_dir()?,
+        };
+        return cli::run(command, &cwd, &mut std::io::stdout());
     }
 
     if let Some(path) = snapshot {
@@ -196,7 +225,13 @@ fn main() -> Result<()> {
     // Everything else that can fail with a readable message happens before the alternate
     // screen is entered, so errors are not wiped by the terminal restore.
     let but = But::discover(&cwd)?;
-    let splitter = Splitter::discover();
+    let mut splitter = Splitter::discover();
+    // Panes the subcommands (or an earlier run of the board) opened: track them too, so
+    // their status shows and `t` reaches them. A registry that won't load isn't worth
+    // refusing to start the board over.
+    if let (Some(splitter), Ok(registry)) = (splitter.as_mut(), Registry::load(&cwd)) {
+        registry.adopt_into(splitter);
+    }
     let mut app = App::new(but, splitter)?;
     if tutorial_mode {
         app.tutorial = Some(Tutorial::new());

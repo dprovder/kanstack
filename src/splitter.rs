@@ -80,10 +80,59 @@ impl Splitter {
         }
     }
 
-    pub fn spawn_harness(&mut self, cwd: &Path, name: &str, initial_message: Option<&str>) -> Result<()> {
+    pub fn spawn_harness(&mut self, cwd: &Path, name: &str, initial_message: Option<&str>) -> Result<String> {
+        self.spawn_harness_with(cwd, name, initial_message, None)
+    }
+
+    /// [`Self::spawn_harness`] running `harness` in place of the configured one. Returns the
+    /// new pane's backend-specific id.
+    pub fn spawn_harness_with(
+        &mut self,
+        cwd: &Path,
+        name: &str,
+        initial_message: Option<&str>,
+        harness: Option<&str>,
+    ) -> Result<String> {
         match self {
-            Splitter::Cmux(c) => c.spawn_harness(cwd, name, initial_message),
-            Splitter::Tmux(t) => t.spawn_harness(cwd, name, initial_message),
+            Splitter::Cmux(c) => c.spawn_harness_with(cwd, name, initial_message, harness),
+            Splitter::Tmux(t) => t.spawn_harness_with(cwd, name, initial_message, harness),
+        }
+    }
+
+    /// Starts tracking a pane another process opened — see `crate::workstream::Registry`.
+    pub fn adopt(&mut self, branch: &str, pane_id: &str) {
+        match self {
+            Splitter::Cmux(c) => c.adopt(branch, pane_id),
+            Splitter::Tmux(t) => t.adopt(branch, pane_id),
+        }
+    }
+
+    /// Makes the next spawn split off `pane_id` instead of the caller's own pane.
+    pub fn set_anchor(&mut self, pane_id: &str) {
+        match self {
+            Splitter::Cmux(c) => c.set_anchor(pane_id),
+            Splitter::Tmux(t) => t.set_anchor(pane_id),
+        }
+    }
+
+    pub fn pane_id(&self, branch: &str) -> Option<String> {
+        match self {
+            Splitter::Cmux(c) => c.pane_id(branch),
+            Splitter::Tmux(t) => t.pane_id(branch),
+        }
+    }
+
+    pub fn focus(&self, branch: &str) -> Result<()> {
+        match self {
+            Splitter::Cmux(c) => c.focus(branch),
+            Splitter::Tmux(t) => t.focus(branch),
+        }
+    }
+
+    pub fn stop(&mut self, branch: &str) -> Result<()> {
+        match self {
+            Splitter::Cmux(c) => c.stop(branch),
+            Splitter::Tmux(t) => t.stop(branch),
         }
     }
 

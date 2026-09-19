@@ -185,6 +185,27 @@ named sweeps in everything uncommitted — fine from a shell, wrong for a board,
 dropping a card onto a lane is precisely how you say what belongs there. kanstack always
 passes the specific file or hunk id(s) being moved.
 
+## Driving panes from a script or an agent
+
+Everything the board does to a harness pane is also available without the board, so an
+agent in one pane can start and talk to others. Run these inside the cmux or tmux the panes
+live in:
+
+```sh
+kanstack spawn <branch> [--agent codex] [--prompt "..."]   # creates <branch> if it doesn't exist
+kanstack send <branch|session> "..."
+kanstack status
+kanstack focus <branch|session>
+kanstack stop <branch|session>                             # closes the pane, ends its harness
+```
+
+`<session>` is a pane id as `kanstack status` prints it. `--agent` runs that harness instead
+of `$KANSTACK_HARNESS` for this one pane.
+
+Each command is its own process, so panes are tracked in a per-repository registry under
+`$XDG_STATE_HOME/kanstack` (`~/.local/state/kanstack`; `KANSTACK_STATE_PATH` relocates it).
+The board records into it too, and picks up panes the commands opened.
+
 ## No refresh key
 
 A filesystem watcher follows the worktree and `.git`, so the board tracks changes made in
