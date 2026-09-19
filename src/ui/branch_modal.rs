@@ -50,10 +50,11 @@ pub(super) fn draw_branch_modal(f: &mut Frame, app: &App, area: Rect, hits: &mut
     };
 
     let name_prefix = format!("{}name     ", row_marker(BranchModalRow::Name));
-    if editing_message {
-        // Already handed off to `pending_branch` — fixed, no cursor of its own anymore,
-        // so no scrolling needed either; `truncate` (right-elided) is the right shape for
-        // a value that's just being displayed rather than actively edited.
+    if editing_message || app.branch_modal_row != BranchModalRow::Name {
+        // Not the field being edited — already handed off to `pending_branch`, or the row
+        // cursor is on another row — so no text cursor, and no scrolling around one either;
+        // `truncate` (right-elided) is the right shape for a value that's just being
+        // displayed rather than actively edited.
         let name = truncate(app.branch_modal_name(), content_width.saturating_sub(name_prefix.chars().count()));
         body.push(Line::from(vec![
             Span::styled(name_prefix, theme::faint()),
@@ -69,6 +70,23 @@ pub(super) fn draw_branch_modal(f: &mut Frame, app: &App, area: Rect, hits: &mut
             Span::styled("█", cursor),
             Span::styled(after, theme::title(true)),
         ]));
+    }
+    // Required, and empty: say so where the eye already is. Overwrites the plain line just
+    // pushed above rather than threading a placeholder through both of its branches.
+    if app.branch_input.is_empty() && !editing_message {
+        let focused = app.branch_modal_row == BranchModalRow::Name;
+        let (text, style) = if app.branch_name_missing {
+            ("required — type a branch name", theme::tone(crate::board::Tone::Bad))
+        } else {
+            ("required", theme::faint())
+        };
+        let mut spans = vec![Span::styled(format!("{}name     ", row_marker(BranchModalRow::Name)), theme::faint())];
+        if focused {
+            spans.push(Span::styled("█", cursor));
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(text, style));
+        *body.last_mut().unwrap() = Line::from(spans);
     }
 
     body.push(hint_row(
@@ -100,16 +118,23 @@ pub(super) fn draw_branch_modal(f: &mut Frame, app: &App, area: Rect, hits: &mut
 
     if will_prompt {
         body.push(Line::raw(""));
-        if editing_message {
+        let text: Vec<char> = app.harness_message_input.as_str().chars().collect();
+        if text.is_empty() && !editing_message {
+            body.push(Line::styled(
+                "  message  (↓ to add an optional initial message for the harness)",
+                theme::faint(),
+            ));
+        } else {
             // Unlike the name field (a single-line git ref, scrolled horizontally) or the
             // footer version of this same prompt (a fixed one-line strip), the modal has
             // room to grow downward — so the message wraps across as many lines as it
             // needs instead of scrolling one line sideways with older text hidden behind
-            // an ellipsis.
+            // an ellipsis. Shown the same way, minus the cursor, once focus has moved off
+            // it (`Up` back to the name step keeps what was typed — see
+            // `App::back_to_branch_name`), so leaving the field never looks like losing it.
             let message_prefix = "  message  ";
             let prefix_width = message_prefix.chars().count();
             let wrap_width = content_width.saturating_sub(prefix_width);
-            let text: Vec<char> = app.harness_message_input.as_str().chars().collect();
             let ranges = wrap_ranges(&text, wrap_width);
             let cursor_idx = app.harness_message_input.split_at_cursor().0.chars().count();
             let cursor_line = ranges
@@ -123,7 +148,7 @@ pub(super) fn draw_branch_modal(f: &mut Frame, app: &App, area: Rect, hits: &mut
                     Span::raw(" ".repeat(prefix_width))
                 };
                 let line: String = text[s..e].iter().collect();
-                if li == cursor_line {
+                if editing_message && li == cursor_line {
                     let byte_at = line
                         .char_indices()
                         .nth(cursor_idx - s)
@@ -140,11 +165,6 @@ pub(super) fn draw_branch_modal(f: &mut Frame, app: &App, area: Rect, hits: &mut
                     body.push(Line::from(vec![label, Span::styled(line, theme::title(true))]));
                 }
             }
-        } else {
-            body.push(Line::styled(
-                "  message  (↓ to add an optional initial message for the harness)",
-                theme::faint(),
-            ));
         }
     }
 
@@ -194,27 +214,49 @@ pub(super) fn draw_branch_modal(f: &mut Frame, app: &App, area: Rect, hits: &mut
 /// still fits a line, keeping that space at the line's end; a run with no space to break
 /// at (a single word longer than `width`) hard-splits at `width`, the same fallback
 /// `wrap` uses for a long path or URL.
+///
+/// A `\n` in `chars` is a hard break: it ends the line it's on and is the last character
+/// of that line's range, so a caller drawing the line strips it. Text ending in one gets a
+/// final empty range, which is where a cursor sitting after it belongs.
 pub(super) fn wrap_ranges(chars: &[char], width: usize) -> Vec<(usize, usize)> {
     if width == 0 || chars.is_empty() {
         return vec![(0, chars.len())];
     }
     let mut lines = Vec::new();
-    let mut start = 0;
-    while start < chars.len() {
-        let mut end = (start + width).min(chars.len());
-        if end < chars.len() {
-            if let Some(back) = chars[start..end].iter().rposition(|&c| c == ' ') {
-                let space_at = start + back;
-                // A space right at `start` is a leading space on this line, not a break
-                // point before it — falling through to the hard split at `width` avoids
-                // producing a zero-length line.
-                if space_at > start {
-                    end = space_at + 1;
+    let mut seg_start = 0;
+    loop {
+        let newline = chars[seg_start..].iter().position(|&c| c == '\n').map(|i| seg_start + i);
+        let seg_end = newline.unwrap_or(chars.len());
+        let first = lines.len();
+
+        let mut start = seg_start;
+        while start < seg_end {
+            let mut end = (start + width).min(seg_end);
+            if end < seg_end {
+                if let Some(back) = chars[start..end].iter().rposition(|&c| c == ' ') {
+                    let space_at = start + back;
+                    // A space right at `start` is a leading space on this line, not a break
+                    // point before it — falling through to the hard split at `width` avoids
+                    // producing a zero-length line.
+                    if space_at > start {
+                        end = space_at + 1;
+                    }
                 }
             }
+            lines.push((start, end));
+            start = end;
         }
-        lines.push((start, end));
-        start = end;
+        // A blank line, or the empty one after a trailing newline.
+        if lines.len() == first {
+            lines.push((seg_start, seg_start));
+        }
+        match newline {
+            Some(i) => {
+                lines.last_mut().unwrap().1 = i + 1;
+                seg_start = i + 1;
+            }
+            None => break,
+        }
     }
     lines
 }
@@ -242,6 +284,23 @@ mod tests {
         let chars: Vec<char> = "aaaaaaaaaaaaaaaa".chars().collect(); // 16 chars, no spaces
         let ranges = wrap_ranges(&chars, 6);
         assert_eq!(ranges_text("aaaaaaaaaaaaaaaa", &ranges), ["aaaaaa", "aaaaaa", "aaaa"]);
+    }
+
+    #[test]
+    fn wrap_ranges_breaks_at_newlines_and_keeps_blank_lines() {
+        let text = "one\n\ntwo three\n";
+        let chars: Vec<char> = text.chars().collect();
+        let ranges = wrap_ranges(&chars, 40);
+        assert_eq!(ranges_text(text, &ranges), ["one\n", "\n", "two three\n", ""]);
+        assert_eq!(ranges.last(), Some(&(chars.len(), chars.len())), "room for a cursor after the last newline");
+    }
+
+    #[test]
+    fn wrap_ranges_still_wraps_long_lines_between_newlines() {
+        let text = "the quick brown fox\nover";
+        let chars: Vec<char> = text.chars().collect();
+        let ranges = wrap_ranges(&chars, 10);
+        assert_eq!(ranges_text(text, &ranges), ["the quick ", "brown fox\n", "over"]);
     }
 
     #[test]

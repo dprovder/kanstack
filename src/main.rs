@@ -8,7 +8,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
-use ratatui::crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
+use ratatui::crossterm::event::{
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    KeyEventKind,
+};
 use ratatui::crossterm::execute;
 
 use kanstack::app::{App, Mode, Notice};
@@ -216,7 +219,12 @@ fn main() -> Result<()> {
     // Best-effort: a terminal that doesn't understand mouse reporting just never sends
     // `Event::Mouse`, so the board still works with the keyboard alone if this fails.
     let _ = execute!(std::io::stdout(), EnableMouseCapture);
+    // Also best-effort. Without it a paste arrives as one key press per character, so a
+    // newline in it is an Enter that submits the form mid-paste; with it, the paste is one
+    // `Event::Paste`. A terminal that ignores this simply keeps the old behavior.
+    let _ = execute!(std::io::stdout(), EnableBracketedPaste);
     let result = run(&mut terminal, &mut app, &mut watcher);
+    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     // After the restore, so it lands on the real screen rather than the one being torn
@@ -250,6 +258,7 @@ fn run(
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => app.on_key(key),
                 Event::Mouse(mouse) => app.on_mouse(mouse),
+                Event::Paste(text) => app.on_paste(&text),
                 Event::Resize(_, _) => {}
                 _ => {}
             }

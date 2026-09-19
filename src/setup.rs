@@ -390,11 +390,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Outcome> {
             }
             K::Right if wizard.row == Row::Harness => wizard.cycle_harness(true),
             K::Left if wizard.row == Row::Harness => wizard.cycle_harness(false),
-            K::Home if wizard.row == Row::Harness => wizard.harness.move_home(),
-            K::End if wizard.row == Row::Harness => wizard.harness.move_end(),
-            K::Backspace if wizard.row == Row::Harness => wizard.harness.backspace(),
-            K::Delete if wizard.row == Row::Harness => wizard.harness.delete_forward(),
-            K::Char(c) if wizard.row == Row::Harness => wizard.harness.insert(c),
+            _ if wizard.row == Row::Harness && wizard.harness.handle_key(key) => {}
             K::Char('q') => return Ok(Outcome::Cancelled),
             _ => {}
         }

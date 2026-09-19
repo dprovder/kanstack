@@ -59,14 +59,9 @@ impl App {
                 self.notify("commit cancelled", Notice::Info);
             }
             K::Enter => self.confirm_commit(),
-            K::Backspace => self.commit_input.backspace(),
-            K::Delete => self.commit_input.delete_forward(),
-            K::Left => self.commit_input.move_left(),
-            K::Right => self.commit_input.move_right(),
-            K::Home => self.commit_input.move_home(),
-            K::End => self.commit_input.move_end(),
-            K::Char(c) => self.commit_input.insert(c),
-            _ => {}
+            _ => {
+                self.commit_input.handle_key(key);
+            }
         }
     }
 }

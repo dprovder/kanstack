@@ -50,6 +50,7 @@ impl App {
     /// so neither choice requires navigating somewhere else first.
     pub(super) fn begin_branch(&mut self) {
         self.branch_input.clear();
+        self.harness_message_input.clear();
         self.stack_onto = self
             .board
             .columns
@@ -57,7 +58,17 @@ impl App {
             .and_then(|c| c.branch_name.clone());
         self.open_harness = true;
         self.branch_modal_row = BranchModalRow::Name;
+        self.branch_name_missing = false;
         self.mode = Mode::Branch;
+    }
+
+    /// Refuses to go on without a branch name: says so in the footer notice *and* flags
+    /// the name field itself (see `branch_name_missing`), putting the row cursor back on it
+    /// since that is what needs fixing.
+    fn refuse_missing_name(&mut self) {
+        self.branch_modal_row = BranchModalRow::Name;
+        self.branch_name_missing = true;
+        self.notify("a branch needs a name", Notice::Info);
     }
 
     /// Flips between stacking on the selected lane and creating a parallel one.
@@ -175,21 +186,29 @@ impl App {
         }
     }
 
-    /// Enter's one job on the name field: create the branch right now, with no initial
-    /// harness message. `Down` (`advance_to_harness_message`) is the way to add one —
+    /// Enter's one job on the name field: create the branch right now. `Down`
+    /// (`advance_to_harness_message`) is the way to write an initial harness message —
     /// keeping Enter here from ever meaning "navigate" instead of "create" is the reason
     /// that split exists.
     pub(super) fn confirm_branch(&mut self) {
         let name = self.branch_input.trimmed();
         if name.is_empty() {
-            self.notify("a branch needs a name", Notice::Info);
+            self.refuse_missing_name();
             return;
         }
         let anchor = self.stack_onto.clone();
         let open_harness = self.will_prompt_for_harness_message();
+        // The modal shows a message kept from an earlier visit to the message step (see
+        // `back_to_branch_name`) right there on the name step, so Enter uses it rather than
+        // silently dropping what's on screen. The footer has nowhere to show it, so there
+        // Enter stays "create with no message".
+        let message = (open_harness && self.branch_ui == BranchUi::Modal)
+            .then(|| self.harness_message_input.trimmed())
+            .filter(|m| !m.is_empty());
         self.branch_input.clear();
+        self.harness_message_input.clear();
         self.mode = Mode::Normal;
-        self.create_branch(&name, anchor.as_deref(), None, open_harness);
+        self.create_branch(&name, anchor.as_deref(), message.as_deref(), open_harness);
     }
 
     /// The last step of `branch_modal_row_down`'s descent through the name step's rows:
@@ -207,28 +226,26 @@ impl App {
         }
         let name = self.branch_input.trimmed();
         if name.is_empty() {
-            // Drop the row cursor back on the name field — that's what the notice is
-            // asking the user to go fix.
-            self.branch_modal_row = BranchModalRow::Name;
-            self.notify("a branch needs a name", Notice::Info);
+            self.refuse_missing_name();
             return;
         }
         let anchor = self.stack_onto.clone();
         self.branch_input.clear();
         self.pending_branch = Some(PendingBranch { name, anchor });
-        self.harness_message_input.clear();
         self.mode = Mode::HarnessMessage;
     }
 
     /// `Up` on the message step: the reverse of `advance_to_harness_message` — restores
     /// the name and stack target to the name field and goes back to `Mode::Branch`, row
     /// cursor on the last row before the message step, without creating anything (unlike
-    /// `Esc` here, which cancels the branch outright).
+    /// `Esc` here, which cancels the branch outright). Whatever was typed as the message
+    /// is kept, so `Down` again finds it where it was left — navigating between fields
+    /// must never throw away what's in them; `begin_branch` and the cancel/confirm paths
+    /// are what reset it.
     pub(super) fn back_to_branch_name(&mut self) {
         let Some(pending) = self.pending_branch.take() else { return };
         self.branch_input.set(pending.name);
         self.stack_onto = pending.anchor;
-        self.harness_message_input.clear();
         self.mode = Mode::Branch;
         self.branch_modal_row = if self.branch_modal_split_row_visible() {
             BranchModalRow::Split
@@ -328,11 +345,11 @@ impl App {
             K::Right => self.branch_input.move_right(),
             K::Tab => self.toggle_stack_onto(),
             K::BackTab => self.toggle_open_harness(),
-            K::Backspace if on_name_row => self.branch_input.backspace(),
-            K::Delete if on_name_row => self.branch_input.delete_forward(),
-            K::Home if on_name_row => self.branch_input.move_home(),
-            K::End if on_name_row => self.branch_input.move_end(),
-            K::Char(c) if on_name_row => self.branch_input.insert(c),
+            _ if on_name_row => {
+                if self.branch_input.handle_key(key) {
+                    self.branch_name_missing = false;
+                }
+            }
             _ => {}
         }
     }
@@ -352,14 +369,9 @@ impl App {
             }
             K::Enter => self.confirm_harness_message(),
             K::Up => self.back_to_branch_name(),
-            K::Backspace => self.harness_message_input.backspace(),
-            K::Delete => self.harness_message_input.delete_forward(),
-            K::Left => self.harness_message_input.move_left(),
-            K::Right => self.harness_message_input.move_right(),
-            K::Home => self.harness_message_input.move_home(),
-            K::End => self.harness_message_input.move_end(),
-            K::Char(c) => self.harness_message_input.insert(c),
-            _ => {}
+            _ => {
+                self.harness_message_input.handle_key(key);
+            }
         }
     }
 }

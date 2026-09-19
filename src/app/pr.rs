@@ -188,17 +188,13 @@ impl App {
             K::Left => self.pr_modal_row_left_right(true),
             K::Right => self.pr_modal_row_left_right(false),
             K::Tab => self.toggle_pr_draft(),
-            K::Backspace if self.pr_modal_row == PrModalRow::Title => self.pr_title_input.backspace(),
-            K::Delete if self.pr_modal_row == PrModalRow::Title => self.pr_title_input.delete_forward(),
-            K::Home if self.pr_modal_row == PrModalRow::Title => self.pr_title_input.move_home(),
-            K::End if self.pr_modal_row == PrModalRow::Title => self.pr_title_input.move_end(),
-            K::Char(c) if self.pr_modal_row == PrModalRow::Title => self.pr_title_input.insert(c),
-            K::Backspace if self.pr_modal_row == PrModalRow::Message => self.pr_message_input.backspace(),
-            K::Delete if self.pr_modal_row == PrModalRow::Message => self.pr_message_input.delete_forward(),
-            K::Home if self.pr_modal_row == PrModalRow::Message => self.pr_message_input.move_home(),
-            K::End if self.pr_modal_row == PrModalRow::Message => self.pr_message_input.move_end(),
-            K::Char(c) if self.pr_modal_row == PrModalRow::Message => self.pr_message_input.insert(c),
-            _ => {}
+            _ => {
+                match self.pr_modal_row {
+                    PrModalRow::Title => self.pr_title_input.handle_key(key),
+                    PrModalRow::Message => self.pr_message_input.handle_key(key),
+                    PrModalRow::Draft => false,
+                };
+            }
         }
     }
 

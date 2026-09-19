@@ -7,6 +7,8 @@
 //! typing was append-only and the arrow keys did nothing. One implementation shared by
 //! both, rather than two copies of insert/delete/move logic that would drift apart.
 
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
 #[derive(Debug, Clone, Default)]
 pub struct TextInput {
     value: String,
@@ -53,6 +55,66 @@ impl TextInput {
             .nth(char_idx)
             .map(|(b, _)| b)
             .unwrap_or(self.value.len())
+    }
+
+    /// Applies an editing key — typing, `Backspace`/`Delete`, `Left`/`Right`/`Home`/`End`,
+    /// and `Ctrl-U` (clear the whole field) — and reports whether it was one. Callers try
+    /// their own navigation keys first and hand whatever's left to this, so the six text
+    /// fields don't each carry their own copy of this match.
+    ///
+    /// A `Ctrl`-modified character is consumed without being typed: terminals deliver
+    /// `Ctrl-U` as `Char('u')` plus a modifier, so matching on the char alone would insert
+    /// a literal `u` for every control chord.
+    pub fn handle_key(&mut self, key: KeyEvent) -> bool {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            if let KeyCode::Char(c) = key.code {
+                if c.eq_ignore_ascii_case(&'u') {
+                    self.clear();
+                }
+                return true;
+            }
+        }
+        match key.code {
+            KeyCode::Backspace => self.backspace(),
+            KeyCode::Delete => self.delete_forward(),
+            KeyCode::Left => self.move_left(),
+            KeyCode::Right => self.move_right(),
+            KeyCode::Home => self.move_home(),
+            KeyCode::End => self.move_end(),
+            KeyCode::Char(c) => self.insert(c),
+            _ => return false,
+        }
+        true
+    }
+
+    /// Inserts pasted text at the cursor.
+    ///
+    /// A terminal that isn't in bracketed-paste mode delivers a paste as keystrokes, so a
+    /// newline in it arrives as Enter and submits the form; with it on (see `main.rs`),
+    /// the whole paste comes through as one string, handled here instead. Line endings are
+    /// normalised to `\n`, and trailing ones dropped (copying a line usually grabs its
+    /// newline too). A `multiline` field keeps the rest as real line breaks; a single-line
+    /// one folds each run of them into one space. Tabs become spaces and other control
+    /// characters are dropped either way.
+    pub fn paste(&mut self, text: &str, multiline: bool) {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        let mut after_break = false;
+        for c in text.trim_end_matches('\n').chars() {
+            match c {
+                '\n' if multiline => self.insert('\n'),
+                '\n' => {
+                    if !after_break {
+                        self.insert(' ');
+                    }
+                    after_break = true;
+                    continue;
+                }
+                '\t' => self.insert(' '),
+                c if c.is_control() => {}
+                c => self.insert(c),
+            }
+            after_break = false;
+        }
     }
 
     pub fn insert(&mut self, c: char) {
@@ -155,6 +217,69 @@ mod tests {
         let (before, after) = t.split_at_cursor();
         assert_eq!(before, "hé");
         assert_eq!(after, "llo");
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn ctrl_u_clears_the_whole_field_wherever_the_cursor_is() {
+        let mut t = TextInput::default();
+        t.set("hello world");
+        t.move_home();
+        t.move_right();
+        assert!(t.handle_key(ctrl('u')));
+        assert_eq!(t.as_str(), "");
+        t.insert('x');
+        assert_eq!(t.as_str(), "x", "the cursor must be reset along with the text");
+    }
+
+    #[test]
+    fn other_ctrl_chords_are_swallowed_not_typed() {
+        let mut t = TextInput::default();
+        t.set("abc");
+        assert!(t.handle_key(ctrl('w')));
+        assert_eq!(t.as_str(), "abc");
+    }
+
+    #[test]
+    fn handle_key_leaves_keys_it_does_not_own_to_the_caller() {
+        let mut t = TextInput::default();
+        assert!(!t.handle_key(KeyEvent::from(KeyCode::Up)));
+        assert!(!t.handle_key(KeyEvent::from(KeyCode::Enter)));
+    }
+
+    #[test]
+    fn paste_lands_at_the_cursor() {
+        let mut t = TextInput::default();
+        t.set("ad");
+        t.move_left();
+        t.paste("bc", false);
+        assert_eq!(t.as_str(), "abcd");
+        t.insert('!');
+        assert_eq!(t.as_str(), "abc!d", "the cursor ends up after what was pasted");
+    }
+
+    #[test]
+    fn a_single_line_paste_folds_line_breaks_into_one_space() {
+        let mut t = TextInput::default();
+        t.paste("first\r\n\r\nsecond\tthird\n", false);
+        assert_eq!(t.as_str(), "first second third");
+    }
+
+    #[test]
+    fn a_multiline_paste_keeps_its_line_breaks_but_not_a_trailing_one() {
+        let mut t = TextInput::default();
+        t.paste("one\r\n\r\ntwo\nthree\n\n", true);
+        assert_eq!(t.as_str(), "one\n\ntwo\nthree");
+    }
+
+    #[test]
+    fn paste_drops_other_control_characters() {
+        let mut t = TextInput::default();
+        t.paste("a\x1b[31mb\x07", true);
+        assert_eq!(t.as_str(), "a[31mb");
     }
 
     #[test]
