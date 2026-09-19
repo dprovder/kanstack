@@ -59,15 +59,19 @@ pub(super) fn draw_pr_modal(f: &mut Frame, app: &App, area: Rect, hits: &mut Hit
         ]));
     }
 
-    // Description: wraps downward across as many lines as it needs.
+    // Description: wraps downward across as many lines as it needs, honoring any real line
+    // breaks in it (a pasted multi-paragraph body).
     let message_prefix = "  message  ";
     let prefix_width = message_prefix.chars().count();
     let wrap_width = content_width.saturating_sub(prefix_width);
     let on_message_row = app.pr_modal_row == PrModalRow::Message;
     let text: Vec<char> = app.pr_message_input.as_str().chars().collect();
+    let both_empty = app.pr_title_input.is_empty() && text.is_empty();
+    let mut message_lines: Vec<Line<'static>> = Vec::new();
+    let mut cursor_line = 0;
     if text.is_empty() {
         let label = format!("{}message  ", row_marker(PrModalRow::Message));
-        body.push(Line::from(vec![
+        message_lines.push(Line::from(vec![
             Span::styled(label, theme::faint()),
             if on_message_row {
                 Span::styled("█", cursor)
@@ -78,7 +82,7 @@ pub(super) fn draw_pr_modal(f: &mut Frame, app: &App, area: Rect, hits: &mut Hit
     } else {
         let ranges = wrap_ranges(&text, wrap_width.max(1));
         let cursor_idx = app.pr_message_input.split_at_cursor().0.chars().count();
-        let cursor_line = ranges
+        cursor_line = ranges
             .iter()
             .position(|&(s, e)| cursor_idx >= s && cursor_idx < e)
             .unwrap_or(ranges.len() - 1);
@@ -88,7 +92,10 @@ pub(super) fn draw_pr_modal(f: &mut Frame, app: &App, area: Rect, hits: &mut Hit
             } else {
                 Span::raw(" ".repeat(prefix_width))
             };
-            let line: String = text[s..e].iter().collect();
+            // A hard break is the last character of its line's range — it ends the line, it
+            // isn't drawn, and the cursor index math is unaffected since nothing before it
+            // moves.
+            let line: String = text[s..e].iter().filter(|&&c| c != '\n').collect();
             if on_message_row && li == cursor_line {
                 let byte_at = line
                     .char_indices()
@@ -96,19 +103,47 @@ pub(super) fn draw_pr_modal(f: &mut Frame, app: &App, area: Rect, hits: &mut Hit
                     .map(|(b, _)| b)
                     .unwrap_or(line.len());
                 let (before, after) = line.split_at(byte_at);
-                body.push(Line::from(vec![
+                message_lines.push(Line::from(vec![
                     label,
                     Span::styled(before.to_string(), theme::title(true)),
                     Span::styled("█", cursor),
                     Span::styled(after.to_string(), theme::title(true)),
                 ]));
             } else {
-                body.push(Line::from(vec![label, Span::styled(line, theme::title(true))]));
+                message_lines.push(Line::from(vec![label, Span::styled(line, theme::title(true))]));
             }
         }
     }
 
-    if app.pr_title_input.is_empty() && app.pr_message_input.is_empty() {
+    // The popup can't be taller than the screen, and a long paste would otherwise push the
+    // draft row and the key hints off the bottom of it. Show a window of the description
+    // around the cursor instead, and say when lines are hidden either side.
+    let trailing = 3 + both_empty as usize; // hint line if both empty, draft row, blank, key hint
+    let avail = (area.height as usize)
+        .saturating_sub(4) // border and margin, as in `h` below
+        .saturating_sub(body.len() + trailing)
+        .max(1);
+    if message_lines.len() > avail {
+        let start = cursor_line.saturating_sub(avail / 2).min(message_lines.len() - avail);
+        let end = start + avail;
+        let hidden_above = start > 0;
+        let hidden_below = end < message_lines.len();
+        let mut window: Vec<Line<'static>> = message_lines.drain(start..end).collect();
+        let marker = |line: &mut Line<'static>, glyph: &str| {
+            line.spans[0] = Span::styled(format!("  {glyph}{}", " ".repeat(prefix_width - 3)), theme::faint());
+        };
+        if hidden_above {
+            marker(&mut window[0], "↑");
+        }
+        if hidden_below {
+            let last = window.len() - 1;
+            marker(&mut window[last], "↓");
+        }
+        message_lines = window;
+    }
+    body.extend(message_lines);
+
+    if both_empty {
         body.push(Line::styled(
             "             (leave both empty to use the branch's own commit message)",
             theme::faint(),

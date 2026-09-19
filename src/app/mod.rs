@@ -1020,6 +1020,29 @@ impl App {
         self.check_tutorial_advance();
     }
 
+    /// A bracketed paste (see `main.rs`): the whole pasted string at once, rather than a key
+    /// press per character. Goes to whichever text field has focus and nowhere else — in any
+    /// other mode it is dropped, where as keystrokes it would have fired a hotkey per
+    /// character. Only the PR description keeps line breaks (see `TextInput::paste`); Enter
+    /// submits every other field, so a newline there would be a form submission in disguise.
+    pub fn on_paste(&mut self, text: &str) {
+        match self.mode {
+            Mode::Commit => self.commit_input.paste(text, false),
+            Mode::Task => self.task_input.paste(text, false),
+            Mode::HarnessMessage => self.harness_message_input.paste(text, false),
+            Mode::Branch if self.branch_ui == BranchUi::Footer || self.branch_modal_row == BranchModalRow::Name => {
+                self.branch_input.paste(text, false);
+                self.branch_name_missing = false;
+            }
+            Mode::PrModal => match self.pr_modal_row {
+                PrModalRow::Title => self.pr_title_input.paste(text, false),
+                PrModalRow::Message => self.pr_message_input.paste(text, true),
+                PrModalRow::Draft => {}
+            },
+            _ => {}
+        }
+    }
+
     /// Under `--tutorial`, checks whether the current step is now satisfied.
     ///
     /// Not folded into `on_key` alone: a land now finishes on a background thread (see
@@ -2149,6 +2172,42 @@ mod tests {
 
         app.handle_key(key(ratatui::crossterm::event::KeyCode::Char('a')));
         assert!(!app.branch_name_missing);
+    }
+
+    /// A paste with line breaks in it must not submit anything (that was the bug: each
+    /// newline arrived as Enter), and only the PR description may keep them.
+    #[test]
+    fn pasting_multiple_lines_never_submits_and_only_the_pr_description_keeps_the_breaks() {
+        let mut app = App::from_board(board());
+        app.mode = Mode::PrModal;
+        app.pr_modal_row = PrModalRow::Title;
+        app.on_paste("a title\nwith a break");
+        assert_eq!(app.pr_title_input.as_str(), "a title with a break");
+
+        app.pr_modal_row = PrModalRow::Message;
+        app.on_paste("para one\n\npara two\n");
+        assert_eq!(app.pr_message_input.as_str(), "para one\n\npara two");
+        assert_eq!(app.mode, Mode::PrModal, "still filling it in — nothing was submitted");
+
+        app.pr_modal_row = PrModalRow::Draft;
+        app.on_paste("ignored");
+        assert_eq!(app.pr_title_input.as_str(), "a title with a break");
+
+        app.mode = Mode::HarnessMessage;
+        app.on_paste("first\nsecond");
+        assert_eq!(app.harness_message_input.as_str(), "first second");
+        assert_eq!(app.mode, Mode::HarnessMessage);
+    }
+
+    /// Outside a text field a paste is dropped, not replayed as hotkeys.
+    #[test]
+    fn pasting_on_the_board_does_nothing() {
+        let mut app = App::from_board(board());
+        let (col, card) = (app.col, app.card);
+        app.on_paste("qqq\nlll");
+        assert!(!app.should_quit, "a pasted q must not quit");
+        assert_eq!((app.col, app.card), (col, card));
+        assert_eq!(app.mode, Mode::Normal);
     }
 
     /// `Ctrl-U` clears the focused field only — and must not type a `u`.

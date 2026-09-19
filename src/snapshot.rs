@@ -616,6 +616,39 @@ mod tests {
         assert_eq!(out.matches('█').count(), 1, "one cursor, on the message:\n{out}");
     }
 
+    #[test]
+    fn pr_modal_shows_real_line_breaks_in_the_description() {
+        let mut app = modal_app();
+        app.mode = crate::app::Mode::PrModal;
+        app.pr_modal_row = crate::app::PrModalRow::Message;
+        app.pr_title_input.set("title");
+        app.pr_message_input.paste("first paragraph\n\nsecond paragraph", true);
+        let out = render_app(&app, 100, 30);
+        let lines: Vec<&str> = out.lines().collect();
+        let at = |needle: &str| lines.iter().position(|l| l.contains(needle)).expect(needle);
+        assert_eq!(at("second paragraph"), at("first paragraph") + 2, "a blank line between:\n{out}");
+        assert_eq!(out.matches('█').count(), 1, "one cursor:\n{out}");
+    }
+
+    /// A paste taller than the terminal must not push the draft row and key hints off the
+    /// bottom of the popup: the description scrolls around the cursor and says so.
+    #[test]
+    fn pr_modal_scrolls_a_description_taller_than_the_screen() {
+        let mut app = modal_app();
+        app.mode = crate::app::Mode::PrModal;
+        app.pr_modal_row = crate::app::PrModalRow::Message;
+        app.pr_title_input.set("title");
+        let body: Vec<String> = (1..=60).map(|i| format!("line {i}")).collect();
+        app.pr_message_input.paste(&body.join("\n"), true);
+
+        let out = render_app(&app, 100, 20);
+        assert!(out.contains("line 60█"), "the cursor's line stays in view:\n{out}");
+        assert!(!out.contains("line 1 ") && !out.contains("line 1\n"), "the top is scrolled away:\n{out}");
+        assert!(out.contains("[ ] draft"), "the draft row must stay on screen:\n{out}");
+        assert!(out.contains("esc cancel"), "so must the key hints:\n{out}");
+        assert!(out.contains('↑'), "hidden lines above are flagged:\n{out}");
+    }
+
     /// GitHub issue #6: with a lot of loose files, a flat unassigned list stops being
     /// navigable by eye. Grouping is applied the same way `App::clamp` does it — as a
     /// post-process on the built board's backlog column — rather than reaching into

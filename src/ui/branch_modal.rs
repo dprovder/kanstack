@@ -214,27 +214,49 @@ pub(super) fn draw_branch_modal(f: &mut Frame, app: &App, area: Rect, hits: &mut
 /// still fits a line, keeping that space at the line's end; a run with no space to break
 /// at (a single word longer than `width`) hard-splits at `width`, the same fallback
 /// `wrap` uses for a long path or URL.
+///
+/// A `\n` in `chars` is a hard break: it ends the line it's on and is the last character
+/// of that line's range, so a caller drawing the line strips it. Text ending in one gets a
+/// final empty range, which is where a cursor sitting after it belongs.
 pub(super) fn wrap_ranges(chars: &[char], width: usize) -> Vec<(usize, usize)> {
     if width == 0 || chars.is_empty() {
         return vec![(0, chars.len())];
     }
     let mut lines = Vec::new();
-    let mut start = 0;
-    while start < chars.len() {
-        let mut end = (start + width).min(chars.len());
-        if end < chars.len() {
-            if let Some(back) = chars[start..end].iter().rposition(|&c| c == ' ') {
-                let space_at = start + back;
-                // A space right at `start` is a leading space on this line, not a break
-                // point before it — falling through to the hard split at `width` avoids
-                // producing a zero-length line.
-                if space_at > start {
-                    end = space_at + 1;
+    let mut seg_start = 0;
+    loop {
+        let newline = chars[seg_start..].iter().position(|&c| c == '\n').map(|i| seg_start + i);
+        let seg_end = newline.unwrap_or(chars.len());
+        let first = lines.len();
+
+        let mut start = seg_start;
+        while start < seg_end {
+            let mut end = (start + width).min(seg_end);
+            if end < seg_end {
+                if let Some(back) = chars[start..end].iter().rposition(|&c| c == ' ') {
+                    let space_at = start + back;
+                    // A space right at `start` is a leading space on this line, not a break
+                    // point before it — falling through to the hard split at `width` avoids
+                    // producing a zero-length line.
+                    if space_at > start {
+                        end = space_at + 1;
+                    }
                 }
             }
+            lines.push((start, end));
+            start = end;
         }
-        lines.push((start, end));
-        start = end;
+        // A blank line, or the empty one after a trailing newline.
+        if lines.len() == first {
+            lines.push((seg_start, seg_start));
+        }
+        match newline {
+            Some(i) => {
+                lines.last_mut().unwrap().1 = i + 1;
+                seg_start = i + 1;
+            }
+            None => break,
+        }
     }
     lines
 }
@@ -262,6 +284,23 @@ mod tests {
         let chars: Vec<char> = "aaaaaaaaaaaaaaaa".chars().collect(); // 16 chars, no spaces
         let ranges = wrap_ranges(&chars, 6);
         assert_eq!(ranges_text("aaaaaaaaaaaaaaaa", &ranges), ["aaaaaa", "aaaaaa", "aaaa"]);
+    }
+
+    #[test]
+    fn wrap_ranges_breaks_at_newlines_and_keeps_blank_lines() {
+        let text = "one\n\ntwo three\n";
+        let chars: Vec<char> = text.chars().collect();
+        let ranges = wrap_ranges(&chars, 40);
+        assert_eq!(ranges_text(text, &ranges), ["one\n", "\n", "two three\n", ""]);
+        assert_eq!(ranges.last(), Some(&(chars.len(), chars.len())), "room for a cursor after the last newline");
+    }
+
+    #[test]
+    fn wrap_ranges_still_wraps_long_lines_between_newlines() {
+        let text = "the quick brown fox\nover";
+        let chars: Vec<char> = text.chars().collect();
+        let ranges = wrap_ranges(&chars, 10);
+        assert_eq!(ranges_text(text, &ranges), ["the quick ", "brown fox\n", "over"]);
     }
 
     #[test]

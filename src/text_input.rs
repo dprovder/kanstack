@@ -87,6 +87,36 @@ impl TextInput {
         true
     }
 
+    /// Inserts pasted text at the cursor.
+    ///
+    /// A terminal that isn't in bracketed-paste mode delivers a paste as keystrokes, so a
+    /// newline in it arrives as Enter and submits the form; with it on (see `main.rs`),
+    /// the whole paste comes through as one string, handled here instead. Line endings are
+    /// normalised to `\n`, and trailing ones dropped (copying a line usually grabs its
+    /// newline too). A `multiline` field keeps the rest as real line breaks; a single-line
+    /// one folds each run of them into one space. Tabs become spaces and other control
+    /// characters are dropped either way.
+    pub fn paste(&mut self, text: &str, multiline: bool) {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        let mut after_break = false;
+        for c in text.trim_end_matches('\n').chars() {
+            match c {
+                '\n' if multiline => self.insert('\n'),
+                '\n' => {
+                    if !after_break {
+                        self.insert(' ');
+                    }
+                    after_break = true;
+                    continue;
+                }
+                '\t' => self.insert(' '),
+                c if c.is_control() => {}
+                c => self.insert(c),
+            }
+            after_break = false;
+        }
+    }
+
     pub fn insert(&mut self, c: char) {
         let at = self.byte_offset(self.cursor);
         self.value.insert(at, c);
@@ -218,6 +248,38 @@ mod tests {
         let mut t = TextInput::default();
         assert!(!t.handle_key(KeyEvent::from(KeyCode::Up)));
         assert!(!t.handle_key(KeyEvent::from(KeyCode::Enter)));
+    }
+
+    #[test]
+    fn paste_lands_at_the_cursor() {
+        let mut t = TextInput::default();
+        t.set("ad");
+        t.move_left();
+        t.paste("bc", false);
+        assert_eq!(t.as_str(), "abcd");
+        t.insert('!');
+        assert_eq!(t.as_str(), "abc!d", "the cursor ends up after what was pasted");
+    }
+
+    #[test]
+    fn a_single_line_paste_folds_line_breaks_into_one_space() {
+        let mut t = TextInput::default();
+        t.paste("first\r\n\r\nsecond\tthird\n", false);
+        assert_eq!(t.as_str(), "first second third");
+    }
+
+    #[test]
+    fn a_multiline_paste_keeps_its_line_breaks_but_not_a_trailing_one() {
+        let mut t = TextInput::default();
+        t.paste("one\r\n\r\ntwo\nthree\n\n", true);
+        assert_eq!(t.as_str(), "one\n\ntwo\nthree");
+    }
+
+    #[test]
+    fn paste_drops_other_control_characters() {
+        let mut t = TextInput::default();
+        t.paste("a\x1b[31mb\x07", true);
+        assert_eq!(t.as_str(), "a[31mb");
     }
 
     #[test]
