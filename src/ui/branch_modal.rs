@@ -100,16 +100,23 @@ pub(super) fn draw_branch_modal(f: &mut Frame, app: &App, area: Rect, hits: &mut
 
     if will_prompt {
         body.push(Line::raw(""));
-        if editing_message {
+        let text: Vec<char> = app.harness_message_input.as_str().chars().collect();
+        if text.is_empty() && !editing_message {
+            body.push(Line::styled(
+                "  message  (↓ to add an optional initial message for the harness)",
+                theme::faint(),
+            ));
+        } else {
             // Unlike the name field (a single-line git ref, scrolled horizontally) or the
             // footer version of this same prompt (a fixed one-line strip), the modal has
             // room to grow downward — so the message wraps across as many lines as it
             // needs instead of scrolling one line sideways with older text hidden behind
-            // an ellipsis.
+            // an ellipsis. Shown the same way, minus the cursor, once focus has moved off
+            // it (`Up` back to the name step keeps what was typed — see
+            // `App::back_to_branch_name`), so leaving the field never looks like losing it.
             let message_prefix = "  message  ";
             let prefix_width = message_prefix.chars().count();
             let wrap_width = content_width.saturating_sub(prefix_width);
-            let text: Vec<char> = app.harness_message_input.as_str().chars().collect();
             let ranges = wrap_ranges(&text, wrap_width);
             let cursor_idx = app.harness_message_input.split_at_cursor().0.chars().count();
             let cursor_line = ranges
@@ -123,7 +130,7 @@ pub(super) fn draw_branch_modal(f: &mut Frame, app: &App, area: Rect, hits: &mut
                     Span::raw(" ".repeat(prefix_width))
                 };
                 let line: String = text[s..e].iter().collect();
-                if li == cursor_line {
+                if editing_message && li == cursor_line {
                     let byte_at = line
                         .char_indices()
                         .nth(cursor_idx - s)
@@ -140,11 +147,6 @@ pub(super) fn draw_branch_modal(f: &mut Frame, app: &App, area: Rect, hits: &mut
                     body.push(Line::from(vec![label, Span::styled(line, theme::title(true))]));
                 }
             }
-        } else {
-            body.push(Line::styled(
-                "  message  (↓ to add an optional initial message for the harness)",
-                theme::faint(),
-            ));
         }
     }
 

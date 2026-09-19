@@ -2112,7 +2112,11 @@ mod tests {
         assert_eq!(app.mode, Mode::Branch, "Up goes back to the name field");
         assert_eq!(app.branch_input.as_str(), "feature", "the name must come back exactly");
         assert_eq!(app.stack_onto.as_deref(), Some("main"), "the stack target must come back too");
-        assert!(app.harness_message_input.is_empty(), "the abandoned message must not linger");
+        assert_eq!(
+            app.harness_message_input.as_str(),
+            "an initial message",
+            "moving between fields must not throw away what was typed"
+        );
         assert!(app.pending_branch.is_none(), "nothing should still be pending — it's back on the name field");
         assert!(app.message.is_none(), "going back is not a cancel — no notice should fire");
         assert_eq!(
