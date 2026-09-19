@@ -91,14 +91,9 @@ impl App {
                 self.notify("task cancelled", Notice::Info);
             }
             K::Enter => self.confirm_task_dispatch(),
-            K::Backspace => self.task_input.backspace(),
-            K::Delete => self.task_input.delete_forward(),
-            K::Left => self.task_input.move_left(),
-            K::Right => self.task_input.move_right(),
-            K::Home => self.task_input.move_home(),
-            K::End => self.task_input.move_end(),
-            K::Char(c) => self.task_input.insert(c),
-            _ => {}
+            _ => {
+                self.task_input.handle_key(key);
+            }
         }
     }
 }

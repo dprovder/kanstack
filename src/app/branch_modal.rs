@@ -328,11 +328,9 @@ impl App {
             K::Right => self.branch_input.move_right(),
             K::Tab => self.toggle_stack_onto(),
             K::BackTab => self.toggle_open_harness(),
-            K::Backspace if on_name_row => self.branch_input.backspace(),
-            K::Delete if on_name_row => self.branch_input.delete_forward(),
-            K::Home if on_name_row => self.branch_input.move_home(),
-            K::End if on_name_row => self.branch_input.move_end(),
-            K::Char(c) if on_name_row => self.branch_input.insert(c),
+            _ if on_name_row => {
+                self.branch_input.handle_key(key);
+            }
             _ => {}
         }
     }
@@ -352,14 +350,9 @@ impl App {
             }
             K::Enter => self.confirm_harness_message(),
             K::Up => self.back_to_branch_name(),
-            K::Backspace => self.harness_message_input.backspace(),
-            K::Delete => self.harness_message_input.delete_forward(),
-            K::Left => self.harness_message_input.move_left(),
-            K::Right => self.harness_message_input.move_right(),
-            K::Home => self.harness_message_input.move_home(),
-            K::End => self.harness_message_input.move_end(),
-            K::Char(c) => self.harness_message_input.insert(c),
-            _ => {}
+            _ => {
+                self.harness_message_input.handle_key(key);
+            }
         }
     }
 }

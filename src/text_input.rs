@@ -7,6 +7,8 @@
 //! typing was append-only and the arrow keys did nothing. One implementation shared by
 //! both, rather than two copies of insert/delete/move logic that would drift apart.
 
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
 #[derive(Debug, Clone, Default)]
 pub struct TextInput {
     value: String,
@@ -53,6 +55,36 @@ impl TextInput {
             .nth(char_idx)
             .map(|(b, _)| b)
             .unwrap_or(self.value.len())
+    }
+
+    /// Applies an editing key — typing, `Backspace`/`Delete`, `Left`/`Right`/`Home`/`End`,
+    /// and `Ctrl-U` (clear the whole field) — and reports whether it was one. Callers try
+    /// their own navigation keys first and hand whatever's left to this, so the six text
+    /// fields don't each carry their own copy of this match.
+    ///
+    /// A `Ctrl`-modified character is consumed without being typed: terminals deliver
+    /// `Ctrl-U` as `Char('u')` plus a modifier, so matching on the char alone would insert
+    /// a literal `u` for every control chord.
+    pub fn handle_key(&mut self, key: KeyEvent) -> bool {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            if let KeyCode::Char(c) = key.code {
+                if c.eq_ignore_ascii_case(&'u') {
+                    self.clear();
+                }
+                return true;
+            }
+        }
+        match key.code {
+            KeyCode::Backspace => self.backspace(),
+            KeyCode::Delete => self.delete_forward(),
+            KeyCode::Left => self.move_left(),
+            KeyCode::Right => self.move_right(),
+            KeyCode::Home => self.move_home(),
+            KeyCode::End => self.move_end(),
+            KeyCode::Char(c) => self.insert(c),
+            _ => return false,
+        }
+        true
     }
 
     pub fn insert(&mut self, c: char) {
@@ -155,6 +187,37 @@ mod tests {
         let (before, after) = t.split_at_cursor();
         assert_eq!(before, "hé");
         assert_eq!(after, "llo");
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn ctrl_u_clears_the_whole_field_wherever_the_cursor_is() {
+        let mut t = TextInput::default();
+        t.set("hello world");
+        t.move_home();
+        t.move_right();
+        assert!(t.handle_key(ctrl('u')));
+        assert_eq!(t.as_str(), "");
+        t.insert('x');
+        assert_eq!(t.as_str(), "x", "the cursor must be reset along with the text");
+    }
+
+    #[test]
+    fn other_ctrl_chords_are_swallowed_not_typed() {
+        let mut t = TextInput::default();
+        t.set("abc");
+        assert!(t.handle_key(ctrl('w')));
+        assert_eq!(t.as_str(), "abc");
+    }
+
+    #[test]
+    fn handle_key_leaves_keys_it_does_not_own_to_the_caller() {
+        let mut t = TextInput::default();
+        assert!(!t.handle_key(KeyEvent::from(KeyCode::Up)));
+        assert!(!t.handle_key(KeyEvent::from(KeyCode::Enter)));
     }
 
     #[test]

@@ -2122,6 +2122,22 @@ mod tests {
         );
     }
 
+    /// `Ctrl-U` clears the focused field only — and must not type a `u`.
+    #[test]
+    fn ctrl_u_clears_only_the_focused_field_in_the_pr_modal() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::from_board(board());
+        app.mode = Mode::PrModal;
+        app.pr_modal_row = PrModalRow::Message;
+        app.pr_title_input.set("title");
+        app.pr_message_input.set("body");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+
+        assert_eq!(app.pr_message_input.as_str(), "");
+        assert_eq!(app.pr_title_input.as_str(), "title");
+    }
+
     /// The unassigned lane holds loose files, not commits — clicking through several of
     /// them to build up a bulk move is the point of a mouse there, so a click doubles as
     /// `space` only in that one lane.
