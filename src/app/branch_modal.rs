@@ -92,7 +92,7 @@ impl App {
     /// a stacked branch never opens one to opt out of.
     pub(super) fn toggle_open_harness(&mut self) {
         if self.splitter.is_none() {
-            self.notify("no harness-split backend found (cmux or tmux)", Notice::Info);
+            self.notify("no harness-split backend found (cmux, tmux or orca)", Notice::Info);
             return;
         }
         if self.stack_onto.is_some() {

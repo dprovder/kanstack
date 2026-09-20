@@ -1,4 +1,4 @@
-//! Interactive first-run/`--setup` wizard: detects `but`/`cmux`/`tmux`, and lets you pick
+//! Interactive first-run/`--setup` wizard: detects `but`/`cmux`/`tmux`/`orca`, and lets you pick
 //! the two environment variables that matter most for a new install (`KANSTACK_HARNESS`,
 //! `KANSTACK_SPLIT_BACKEND`), then persists them via `crate::config` so they don't need to
 //! be re-exported every session. Every other `KANSTACK_*` var — including
@@ -24,6 +24,7 @@ use ratatui::Frame;
 
 use crate::but::But;
 use crate::cmux::Cmux;
+use crate::orca::Orca;
 use crate::text_input::TextInput;
 use crate::theme;
 use crate::tmux::Tmux;
@@ -37,6 +38,7 @@ enum SplitBackendChoice {
     Auto,
     Cmux,
     Tmux,
+    Orca,
 }
 
 impl SplitBackendChoice {
@@ -45,6 +47,7 @@ impl SplitBackendChoice {
             SplitBackendChoice::Auto => "auto",
             SplitBackendChoice::Cmux => "cmux",
             SplitBackendChoice::Tmux => "tmux",
+            SplitBackendChoice::Orca => "orca",
         }
     }
 
@@ -53,10 +56,12 @@ impl SplitBackendChoice {
         match (self, forward) {
             (Auto, true) => Cmux,
             (Cmux, true) => Tmux,
-            (Tmux, true) => Auto,
-            (Auto, false) => Tmux,
+            (Tmux, true) => Orca,
+            (Orca, true) => Auto,
+            (Auto, false) => Orca,
             (Cmux, false) => Auto,
             (Tmux, false) => Cmux,
+            (Orca, false) => Tmux,
         }
     }
 
@@ -64,6 +69,7 @@ impl SplitBackendChoice {
         match std::env::var("KANSTACK_SPLIT_BACKEND").as_deref() {
             Ok("cmux") => SplitBackendChoice::Cmux,
             Ok("tmux") => SplitBackendChoice::Tmux,
+            Ok("orca") => SplitBackendChoice::Orca,
             _ => SplitBackendChoice::Auto,
         }
     }
@@ -118,6 +124,7 @@ struct Detection {
     harness: String,
     cmux: String,
     tmux: String,
+    orca: String,
     skill: String,
     skill_status: Option<SkillStatus>,
 }
@@ -148,7 +155,14 @@ fn detect() -> Detection {
         }
         None => "✗ tmux binary not found on PATH".to_string(),
     };
-    Detection { but, but_installed, harness, cmux, tmux, skill, skill_status }
+    let orca = match Orca::discover() {
+        Some(_) => "✓ orca found, and this terminal is inside Orca".to_string(),
+        None if !Orca::running_inside() => {
+            "✗ orca not usable here — not running inside an Orca terminal".to_string()
+        }
+        None => "✗ orca CLI not found on PATH — register it in Orca's settings, or set KANSTACK_ORCA_BIN".to_string(),
+    };
+    Detection { but, but_installed, harness, cmux, tmux, orca, skill, skill_status }
 }
 
 /// Describes the result of `but skill check` for the detection panel, and classifies it
@@ -448,6 +462,7 @@ fn main_body(wizard: &Wizard, text_width: usize) -> Vec<Line<'static>> {
         &wizard.detection.harness,
         &wizard.detection.cmux,
         &wizard.detection.tmux,
+        &wizard.detection.orca,
         &wizard.detection.skill,
     ] {
         for part in wrap(line, text_width) {
@@ -626,6 +641,7 @@ mod tests {
             harness: String::new(),
             cmux: String::new(),
             tmux: String::new(),
+            orca: String::new(),
             skill: String::new(),
             skill_status,
         }
@@ -644,6 +660,17 @@ mod tests {
             installing: false,
             action_message: None,
         }
+    }
+
+    /// Every backend is reachable from the wizard, in both directions, and the cycle closes.
+    #[test]
+    fn the_split_backend_choice_cycles_through_all_four_and_wraps_both_ways() {
+        use SplitBackendChoice::*;
+        let forward: Vec<_> = std::iter::successors(Some(Auto), |c| Some(c.cycle(true))).take(5).collect();
+        assert_eq!(forward, [Auto, Cmux, Tmux, Orca, Auto]);
+        let backward: Vec<_> = std::iter::successors(Some(Auto), |c| Some(c.cycle(false))).take(5).collect();
+        assert_eq!(backward, [Auto, Orca, Tmux, Cmux, Auto]);
+        assert_eq!(Orca.label(), "orca");
     }
 
     #[test]

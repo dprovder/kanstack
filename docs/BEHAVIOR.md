@@ -8,7 +8,9 @@ using `kanstack` day to day, not before you've installed it. See
 ## New branches and harness panes
 
 `b`'s parallel-lane option, with a harness split enabled (`cmux` if found, else plain
-`tmux` as a fallback when kanstack is itself running inside a tmux pane), asks for an
+`tmux` as a fallback when kanstack is itself running inside a tmux pane, else Orca when it
+is running inside an Orca terminal — or Orca first, when it's in one but in no cmux or tmux
+pane), asks for an
 optional initial message to seed the harness with, in a modal showing the name, action,
 and message together. Nothing is created until that step confirms, so `esc` at any point
 cancels the whole branch. `KANSTACK_BRANCH_UI=footer` squeezes the same prompts into the

@@ -23,9 +23,9 @@ past a lower branch's own commits in a stacked lane:
 </tr>
 </table>
 
-`b` spins up a new lane and, when a harness split is available (`cmux`, or `tmux` as a
-fallback), hands it straight to a coding agent — told which GitButler branch it's in, not
-just dropped into a plain checkout:
+`b` spins up a new lane and, when a harness split is available (`cmux`, `tmux` as a
+fallback, or [Orca](#using-orca)), hands it straight to a coding agent — told which
+GitButler branch it's in, not just dropped into a plain checkout:
 
 ![kanstack spinning up a new branch with a coding agent split into a pane beside it](docs/assets/agent-launch.gif)
 
@@ -100,11 +100,11 @@ notes, and the version-compatibility details a contributor would need.
 ## Setup
 
 The very first time kanstack runs on a machine, it opens a short wizard before the board:
-it checks whether `but`, `cmux`, and `tmux` are found (and, for `cmux`, whether the required
-`but` version is installed), and lets you pick a default harness — cycling with `←`/`→`
-through whichever known harnesses (`claude`, `codex`, `pi`, `opencode`, `kiro`, `gemini`)
-were actually found on `PATH`, or just typing a custom command — and a split backend
-(`auto`/`cmux`/`tmux`). Saving remembers your choices in
+it checks whether `but`, `cmux`, `tmux`, and `orca` are found (and, for `cmux`, whether the
+required `but` version is installed), and lets you pick a default harness — cycling with
+`←`/`→` through whichever known harnesses (`claude`, `codex`, `pi`, `opencode`, `kiro`,
+`gemini`) were actually found on `PATH`, or just typing a custom command — and a split
+backend (`auto`/`cmux`/`tmux`/`orca`). Saving remembers your choices in
 `$XDG_CONFIG_HOME/kanstack/env` (or `$HOME/.config/kanstack/env`), so you don't need to
 export the equivalent environment variables every session — an explicit environment
 variable always overrides what's saved there. `esc` skips it without picking anything.
@@ -154,7 +154,7 @@ repo is thrown away when you're done. `esc` or `q` leaves any time.
 | `r` | rebase onto the updated target — shows what will happen |
 | `tab` | on the unassigned lane: group its cards by folder, or back to a flat list |
 | `⏎` | open the diff beside the board — `←` goes back, `m` commits or amends one hunk |
-| `b` | new branch — stacks on the selected lane, `tab` for a parallel lane with a harness split (`cmux`, or `tmux` as a fallback); asks for an optional initial message before creating anything, so `esc` cancels the whole branch |
+| `b` | new branch — stacks on the selected lane, `tab` for a parallel lane with a harness split (`cmux`, `tmux` as a fallback, or `orca`); asks for an optional initial message before creating anything, so `esc` cancels the whole branch |
 | `t` | send a task to this lane's split pane — spawns one first if it isn't open yet |
 | `s` | stack this whole lane onto another — rewrites history |
 | `p` | push this lane — shows what it will do first |
@@ -185,11 +185,42 @@ named sweeps in everything uncommitted — fine from a shell, wrong for a board,
 dropping a card onto a lane is precisely how you say what belongs there. kanstack always
 passes the specific file or hunk id(s) being moved.
 
+## Using Orca
+
+kanstack can hand lanes to [Orca](https://github.com/stablyai/orca)'s terminals as well as
+cmux's or tmux's. It is picked automatically when kanstack runs in an Orca terminal (which
+Orca marks with `ORCA_TERMINAL_HANDLE`) and isn't in a cmux or tmux pane, or with
+`KANSTACK_SPLIT_BACKEND=orca`. Orca's CLI has to be registered under Settings in the app so
+`orca` (`orca-ide` on Linux) is on `PATH`, or pointed at with `KANSTACK_ORCA_BIN`.
+
+Orca's own model is one git worktree per agent, but every kanstack lane shares GitButler's
+single workspace checkout. So kanstack **never runs `orca worktree create`**: a lane's
+terminal is split off kanstack's own, and lives in whichever Orca worktree kanstack is in.
+If that split isn't possible (a stale terminal handle, say) the lane opens as a new tab in
+the repository's existing worktree instead, which needs the repository to have been added to
+Orca.
+
+A few things differ from the other two:
+
+- **Direction.** Orca can only place a new pane to the right of, or below, the one it splits.
+  `KANSTACK_ORCA_DIRECTION` and `KANSTACK_ORCA_CHAIN_DIRECTION` default to `below` and
+  `right`; `left` and `above` are accepted but behave as `right` and `below`, and so does
+  `KANSTACK_SPAWN_DIRECTION`.
+- **Busy and idle** come from Orca's own agent detection rather than from CPU usage. A
+  harness Orca doesn't recognize will read as busy, and so will one waiting on an approval
+  prompt.
+- **`t` refuses instead of typing blind.** Orca won't send a message to a terminal in which
+  it sees no agent, so pressing `t` before the harness has finished starting reports that
+  rather than typing the task into a shell.
+
+Orca support was written against Orca's CLI reference and source and hasn't yet been run
+against a live install. If a lane misbehaves, `KANSTACK_SPLIT_BACKEND` pins one of the others.
+
 ## Driving panes from a script or an agent
 
 Everything the board does to a harness pane is also available without the board, so an
-agent in one pane can start and talk to others. Run these inside the cmux or tmux the panes
-live in:
+agent in one pane can start and talk to others. Run these inside the cmux, tmux or Orca the
+panes live in:
 
 ```sh
 kanstack spawn <branch> [--agent codex] [--prompt "..."]   # creates <branch> if it doesn't exist

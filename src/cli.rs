@@ -31,8 +31,8 @@ kanstack focus <branch|session>
 kanstack stop <branch|session>
     close a pane, ending its harness, and forget the workstream
 
-<session> is a pane id as `kanstack status` prints it. These need to run inside the cmux
-or tmux the panes live in.
+<session> is a pane id as `kanstack status` prints it. These need to run inside the cmux,
+tmux or Orca the panes live in.
 ";
 
 #[derive(Debug, Clone, PartialEq, Eq)]

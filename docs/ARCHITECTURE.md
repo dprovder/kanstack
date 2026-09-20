@@ -207,3 +207,53 @@ repo returned a bare `{"ok":true}` with no embedded `status` at all, on a path t
 previously been a different (now-deleted) practice repo. `build_practice_repo` now suffixes
 the directory with a nanosecond timestamp so the path is never reused across runs — nothing
 stale to collide with, since nothing ever points at that exact path twice.
+
+## Harness split backends, and Orca's worktree model
+
+`splitter.rs` dispatches over three backends — `cmux.rs`, `tmux.rs`, `orca.rs` — each
+opening a terminal split per lane and typing a launch line (`harness_launch.rs`) into it.
+The first two are terminal multiplexers; Orca is an agent-oriented IDE whose CLI drives a
+running desktop app, and it differs in ways that shaped `orca.rs`.
+
+**One worktree per agent, against one shared checkout.** Orca's model is a git worktree per
+agent (`orca worktree create`). Every kanstack lane shares GitButler's single workspace
+checkout, so `orca.rs` never touches `orca worktree …`. A terminal joins an existing worktree
+two ways, both without creating one: `terminal split --terminal <handle>` takes no worktree
+argument and inherits the split terminal's, and `terminal create --worktree path:<root>`
+matches a registered worktree by exact path. A registered repository's main checkout is a
+worktree in Orca's own listing, which is what GitButler's workspace is — but only if the
+repository was added to Orca, else `selector_not_found`. `active`/`current` are not usable
+here: they resolve by finding the registered worktree *enclosing* the cwd, where `path:`
+compares for equality, so `orca.rs` lifts `cwd` to the repository root itself.
+
+**What the docs don't say.** Orca's published CLI reference names the commands and flags but
+gives no JSON shapes, no environment variables and no split semantics. Those come from its
+source (`stablyai/orca` at 9fbdfc5), and have not been checked against a running install:
+
+- Terminals get `ORCA_TERMINAL_HANDLE` (`src/main/ipc/pty/provider/local-configure.ts`), the
+  signal `Orca::discover` requires. A long-lived shell can keep a stale one across a window
+  reload, hence the `terminal create` fallback in `spawn_harness_with`.
+- `--json` writes `{"id","ok","result"|"error":{"code","message"},"_meta"}` to stdout, and
+  the exit status can't be trusted alone: an unaccepted `terminal send` and an unsatisfied
+  `terminal wait` exit 1 with an `ok: true` result, and a `terminal wait` that times out is an
+  error envelope with code `timeout`. `run_json` therefore reads the envelope, not the status.
+- `terminal split --direction vertical` is "Split Right" and `horizontal` is "Split Down" in
+  Orca's own menus, and the new pane is always the second child. `left`/`up` can't be honored
+  (`split_orientation`), which is why Orca's default directions are `down`/`right`.
+- Text values are passed as `--flag=value`: a `--flag value` whose value begins with `--` is
+  read as a boolean flag followed by a new one.
+- `terminal wait --for tui-idle` is the only status verb the CLI exposes; it blocks, so
+  `poll_statuses` runs one short-timeout probe per terminal in parallel and reads a timeout as
+  busy. It depends on Orca recognizing the agent, so an unknown harness reads busy forever.
+
+**Still unverified:** that `--command` reaches the shell as typed input, so the `cd … &&`
+launch line works as it does under cmux and tmux (the source passes it to the PTY provider
+rather than exec'ing it); that `path:` matches a symlinked or trailing-slash path the way
+`worktree_selector`'s canonicalization assumes; and every JSON shape in `orca.rs`'s tests,
+which were written from Orca's TypeScript types rather than captured from a live run.
+
+**Discovery order.** cmux, then tmux, then Orca, except that inside an Orca terminal with
+neither `$CMUX_SURFACE_ID` nor `$TMUX_PANE` set, Orca is tried first. `Cmux::discover` only
+checks for its binary on `PATH`, so a machine with cmux installed but not in use would
+otherwise pick it and fail at spawn time — the ambiguity `KANSTACK_SPLIT_BACKEND` exists to
+override, except that here a positive signal (`ORCA_TERMINAL_HANDLE`) settles it.

@@ -14,6 +14,7 @@ pub mod diff;
 pub mod harness_launch;
 pub mod hit;
 pub mod model;
+pub mod orca;
 pub mod pane_status;
 pub mod setup;
 pub mod snapshot;
@@ -26,11 +27,12 @@ pub mod ui;
 pub mod watch;
 pub mod workstream;
 
-/// Serializes tests, across `cmux.rs`/`tmux.rs`/`splitter.rs`, that mutate process-wide
-/// env vars each backend's `discover` reads (`PATH`, `KANSTACK_CMUX_BIN`,
-/// `KANSTACK_TMUX_BIN`, `TMUX_PANE`, `KANSTACK_SPLIT_BACKEND`). `cargo test` runs tests
-/// concurrently on separate threads by default, and those vars overlap across all three
-/// files' own `with_env` helpers, so a lock scoped to just one file's tests isn't enough —
+/// Serializes tests, across `cmux.rs`/`tmux.rs`/`orca.rs`/`splitter.rs`, that mutate
+/// process-wide env vars each backend's `discover` reads (`PATH`, `KANSTACK_CMUX_BIN`,
+/// `KANSTACK_TMUX_BIN`, `KANSTACK_ORCA_BIN`, `TMUX_PANE`, `ORCA_TERMINAL_HANDLE`,
+/// `KANSTACK_SPLIT_BACKEND`). `cargo test` runs tests concurrently on separate threads by
+/// default, and those vars overlap across all four files' own `with_env` helpers, so a
+/// lock scoped to just one file's tests isn't enough —
 /// two tests in *different* files can still interleave and clobber each other's value
 /// mid-test.
 #[cfg(test)]

@@ -23,7 +23,7 @@ impl App {
     /// Starts typing a task description to send into the selected lane's split pane.
     pub(super) fn begin_task_dispatch(&mut self) {
         if self.splitter.is_none() {
-            self.notify("no harness-split backend found (cmux or tmux)", Notice::Info);
+            self.notify("no harness-split backend found (cmux, tmux or orca)", Notice::Info);
             return;
         }
         let Some(branch) = self.pane_branch(self.col) else {

@@ -38,7 +38,7 @@ usage:
 
 options:
   -C <path>          run against the repository at <path> (default: cwd)
-  --setup            detect but/cmux/tmux and known harnesses on PATH, then save a default
+  --setup            detect but/cmux/tmux/orca and known harnesses on PATH, then save a default
                      harness and split-backend, so they don't need exporting every session.
                      Also offers to install the GitButler CLI itself if missing, and to
                      install/update its coding-agent skill (teaches whichever harness you
@@ -67,11 +67,20 @@ environment:
                      kanstack is itself running inside a tmux pane (default: `tmux` on
                      PATH if present and `$TMUX_PANE` is set; skipped otherwise, same as
                      cmux). Splits off kanstack's own pane the same way cmux does.
-  KANSTACK_SPLIT_BACKEND  force which of the above is used: `cmux` or `tmux`, skipping
-                     detection of the other entirely rather than just reordering the
-                     fallback (default: unset — cmux if found, else tmux). Mainly for a
-                     machine with both binaries installed where cmux isn't actually the
-                     one kanstack is running inside right now.
+  KANSTACK_ORCA_BIN  path to the `orca` CLI (`orca-ide` on Linux), used when neither cmux
+                     nor tmux is and kanstack is itself running inside an Orca terminal
+                     (default: `orca` on PATH if present and `$ORCA_TERMINAL_HANDLE` is
+                     set; skipped otherwise). Orca's CLI is only on PATH once registered
+                     under Settings in the app. Lanes attach to the Orca worktree
+                     kanstack is in — kanstack never runs `orca worktree create`, since
+                     every lane shares GitButler's one workspace checkout — so the
+                     repository needs to be added to Orca.
+  KANSTACK_SPLIT_BACKEND  force which of the above is used: `cmux`, `tmux` or `orca`,
+                     skipping detection of the others entirely rather than just reordering
+                     the fallback (default: unset — cmux if found, else tmux, else orca;
+                     except that inside an Orca terminal but not a cmux or tmux pane,
+                     orca goes first). Mainly for a machine with several installed where
+                     the first isn't actually the one kanstack is running inside right now.
   KANSTACK_HARNESS   command typed into that terminal (default: `claude`)
   KANSTACK_HARNESS_SYSTEM_FLAG  the harness's flag for appending to its own default
                      system prompt, e.g. `--append-system-prompt` (default: whatever's
@@ -93,6 +102,10 @@ environment:
                            previous lane instead of kanstack (default: `right`)
   KANSTACK_TMUX_DIRECTION, KANSTACK_TMUX_CHAIN_DIRECTION  the tmux fallback's equivalents
                            of the two above, same defaults
+  KANSTACK_ORCA_DIRECTION, KANSTACK_ORCA_CHAIN_DIRECTION  orca's equivalents, defaulting to
+                           `below` and `right`. Orca can only put a new pane right of or
+                           below the one it splits, so `left` and `above` behave as `right`
+                           and `below` there (as does KANSTACK_SPAWN_DIRECTION)
   KANSTACK_SPAWN_DIRECTION  where `kanstack spawn` splits off the pane it is run from:
                            left, right, above, or below (default: `right`). Separate from
                            the two above, which are the board's own; the chain direction
