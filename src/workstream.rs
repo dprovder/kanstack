@@ -1,11 +1,12 @@
 //! The registry behind the `kanstack spawn/send/status/focus/stop` subcommands.
 //!
-//! A backend's pane handles (`crate::cmux::Cmux::panes`, `crate::tmux::Tmux::panes`) live
-//! only in the memory of whichever process opened them, so a second `kanstack` invocation —
-//! an agent in another pane running `kanstack send`, say — can't see a pane the first one
-//! opened. A [`Workstream`] is the durable half of that handle: which branch it is, which
-//! pane it sits in, which agent is running there. Both the board and the subcommands record
-//! into it, and re-seed a fresh backend from it with [`Registry::adopt_into`].
+//! A backend's pane handles (`crate::cmux::Cmux::panes`, `crate::tmux::Tmux::panes`,
+//! `crate::orca::Orca::panes`) live only in the memory of whichever process opened them, so
+//! a second `kanstack` invocation — an agent in another pane running `kanstack send`, say —
+//! can't see a pane the first one opened. A [`Workstream`] is the durable half of that
+//! handle: which branch it is, which pane it sits in, which agent is running there. Both the
+//! board and the subcommands record into it, and re-seed a fresh backend from it with
+//! [`Registry::adopt_into`].
 //!
 //! One file per repository (see [`state_path`]), so two repositories can each have a
 //! `fix-login` branch without one's pane answering for the other's.
@@ -37,7 +38,8 @@ id_newtype!(
     BranchId
 );
 id_newtype!(
-    /// The split backend's own identifier for a pane: tmux's `%3`, cmux's `surface:12`.
+    /// The split backend's own identifier for a pane: tmux's `%3`, cmux's `surface:12`, or
+    /// Orca's terminal handle (runtime-scoped, so it stops resolving if Orca restarts).
     /// Doubles as the "session" a subcommand target may name instead of a branch.
     PaneId
 );
