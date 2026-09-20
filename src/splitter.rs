@@ -1,7 +1,8 @@
 //! Dispatch over whichever harness-split backend `main.rs` discovered — `cmux` if present,
-//! else plain `tmux`, else `orca` (see `crate::cmux`, `crate::tmux`, `crate::orca`). A plain
-//! enum rather than a trait object: there are exactly three backends, and the point is that
-//! `app.rs`'s call sites shouldn't have to care which one they hold.
+//! else plain `tmux`, else `orca` (see `crate::cmux`, `crate::tmux`, `crate::orca`), paired
+//! with the harness it launches (`crate::harness`). The backend is a plain enum rather than a
+//! trait object: there are exactly three, and the point is that `app.rs`'s call sites
+//! shouldn't have to care which one they hold.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -9,15 +10,25 @@ use std::path::Path;
 use anyhow::Result;
 
 use crate::cmux::Cmux;
+use crate::harness::HarnessConfig;
 use crate::orca::Orca;
 use crate::pane_status::PaneStatus;
 use crate::tmux::Tmux;
 
 #[derive(Clone)]
-pub enum Splitter {
+enum Backend {
     Cmux(Cmux),
     Tmux(Tmux),
     Orca(Orca),
+}
+
+/// A harness-split backend plus the harness it launches into new panes. The backend only
+/// knows how to open, type into, focus and close panes; which harness runs in them, and
+/// what its launch line looks like, is [`HarnessConfig`]'s business (see `crate::harness`).
+#[derive(Clone)]
+pub struct Splitter {
+    backend: Backend,
+    harness: HarnessConfig,
 }
 
 impl Splitter {
@@ -40,33 +51,40 @@ impl Splitter {
     /// same cmux-installed-but-not-in-use ambiguity, and here there *is* a positive signal
     /// that Orca is the one in use, so it is tried ahead of cmux's bare `PATH` check. Inside
     /// a tmux or cmux pane in an Orca terminal, the default order is left as it was.
+    ///
+    /// The harness launched into new panes is `$KANSTACK_HARNESS` (default `claude`), read
+    /// here once rather than by each backend.
     pub fn discover() -> Option<Self> {
+        Some(Splitter { backend: Self::discover_backend()?, harness: HarnessConfig::from_env() })
+    }
+
+    fn discover_backend() -> Option<Backend> {
         match std::env::var("KANSTACK_SPLIT_BACKEND").as_deref() {
-            Ok("cmux") => return Cmux::discover().map(Splitter::Cmux),
-            Ok("tmux") => return Tmux::discover().map(Splitter::Tmux),
-            Ok("orca") => return Orca::discover().map(Splitter::Orca),
+            Ok("cmux") => return Cmux::discover().map(Backend::Cmux),
+            Ok("tmux") => return Tmux::discover().map(Backend::Tmux),
+            Ok("orca") => return Orca::discover().map(Backend::Orca),
             _ => {}
         }
         let in_cmux_or_tmux =
             std::env::var_os("CMUX_SURFACE_ID").is_some() || std::env::var_os("TMUX_PANE").is_some();
         if Orca::running_inside() && !in_cmux_or_tmux {
             if let Some(orca) = Orca::discover() {
-                return Some(Splitter::Orca(orca));
+                return Some(Backend::Orca(orca));
             }
         }
         Cmux::discover()
-            .map(Splitter::Cmux)
-            .or_else(|| Tmux::discover().map(Splitter::Tmux))
-            .or_else(|| Orca::discover().map(Splitter::Orca))
+            .map(Backend::Cmux)
+            .or_else(|| Tmux::discover().map(Backend::Tmux))
+            .or_else(|| Orca::discover().map(Backend::Orca))
     }
 
     /// Which backend this is, for the one place UI copy needs to name it: the branch
     /// modal's checkbox row label.
     pub fn label(&self) -> &'static str {
-        match self {
-            Splitter::Cmux(_) => "cmux",
-            Splitter::Tmux(_) => "tmux",
-            Splitter::Orca(_) => "orca",
+        match &self.backend {
+            Backend::Cmux(_) => "cmux",
+            Backend::Tmux(_) => "tmux",
+            Backend::Orca(_) => "orca",
         }
     }
 
@@ -75,34 +93,34 @@ impl Splitter {
     /// makes sense while that's true. Cheap env-var checks, one per backend, rather than
     /// a round trip to the CLI.
     pub fn running_inside_host(&self) -> bool {
-        match self {
-            Splitter::Cmux(_) => std::env::var_os("CMUX_SURFACE_ID").is_some(),
-            Splitter::Tmux(_) => std::env::var_os("TMUX_PANE").is_some(),
-            Splitter::Orca(_) => Orca::running_inside(),
+        match &self.backend {
+            Backend::Cmux(_) => std::env::var_os("CMUX_SURFACE_ID").is_some(),
+            Backend::Tmux(_) => std::env::var_os("TMUX_PANE").is_some(),
+            Backend::Orca(_) => Orca::running_inside(),
         }
     }
 
     pub fn has_pane(&self, branch: &str) -> bool {
-        match self {
-            Splitter::Cmux(c) => c.has_pane(branch),
-            Splitter::Tmux(t) => t.has_pane(branch),
-            Splitter::Orca(o) => o.has_pane(branch),
+        match &self.backend {
+            Backend::Cmux(c) => c.has_pane(branch),
+            Backend::Tmux(t) => t.has_pane(branch),
+            Backend::Orca(o) => o.has_pane(branch),
         }
     }
 
     pub fn pane_status(&self, branch: &str) -> Option<PaneStatus> {
-        match self {
-            Splitter::Cmux(c) => c.pane_status(branch),
-            Splitter::Tmux(t) => t.pane_status(branch),
-            Splitter::Orca(o) => o.pane_status(branch),
+        match &self.backend {
+            Backend::Cmux(c) => c.pane_status(branch),
+            Backend::Tmux(t) => t.pane_status(branch),
+            Backend::Orca(o) => o.pane_status(branch),
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        match self {
-            Splitter::Cmux(c) => c.is_empty(),
-            Splitter::Tmux(t) => t.is_empty(),
-            Splitter::Orca(o) => o.is_empty(),
+        match &self.backend {
+            Backend::Cmux(c) => c.is_empty(),
+            Backend::Tmux(t) => t.is_empty(),
+            Backend::Orca(o) => o.is_empty(),
         }
     }
 
@@ -119,103 +137,104 @@ impl Splitter {
         initial_message: Option<&str>,
         harness: Option<&str>,
     ) -> Result<String> {
-        match self {
-            Splitter::Cmux(c) => c.spawn_harness_with(cwd, name, initial_message, harness),
-            Splitter::Tmux(t) => t.spawn_harness_with(cwd, name, initial_message, harness),
-            Splitter::Orca(o) => o.spawn_harness_with(cwd, name, initial_message, harness),
+        let launch = self.harness.launch_line(cwd, name, initial_message, harness)?;
+        match &mut self.backend {
+            Backend::Cmux(c) => c.spawn_pane(cwd, name, &launch),
+            Backend::Tmux(t) => t.spawn_pane(cwd, name, &launch),
+            Backend::Orca(o) => o.spawn_pane(cwd, name, &launch),
         }
     }
 
     /// Starts tracking a pane another process opened — see `crate::workstream::Registry`.
     pub fn adopt(&mut self, branch: &str, pane_id: &str) {
-        match self {
-            Splitter::Cmux(c) => c.adopt(branch, pane_id),
-            Splitter::Tmux(t) => t.adopt(branch, pane_id),
-            Splitter::Orca(o) => o.adopt(branch, pane_id),
+        match &mut self.backend {
+            Backend::Cmux(c) => c.adopt(branch, pane_id),
+            Backend::Tmux(t) => t.adopt(branch, pane_id),
+            Backend::Orca(o) => o.adopt(branch, pane_id),
         }
     }
 
     /// Pins the cmux workspace new panes are opened in; a no-op for tmux.
     pub fn set_workspace(&mut self, workspace: Option<&str>) {
-        match self {
-            Splitter::Cmux(c) => c.set_workspace(workspace),
-            Splitter::Tmux(t) => t.set_workspace(workspace),
-            Splitter::Orca(o) => o.set_workspace(workspace),
+        match &mut self.backend {
+            Backend::Cmux(c) => c.set_workspace(workspace),
+            Backend::Tmux(t) => t.set_workspace(workspace),
+            Backend::Orca(o) => o.set_workspace(workspace),
         }
     }
 
     /// The workspace new panes go in, if this backend has such a thing.
     pub fn workspace(&self) -> Option<String> {
-        match self {
-            Splitter::Cmux(c) => c.workspace(),
-            Splitter::Tmux(t) => t.workspace(),
-            Splitter::Orca(o) => o.workspace(),
+        match &self.backend {
+            Backend::Cmux(c) => c.workspace(),
+            Backend::Tmux(t) => t.workspace(),
+            Backend::Orca(o) => o.workspace(),
         }
     }
 
     /// Overrides the first-lane split direction — see `Cmux::set_first_direction`.
     pub fn set_first_direction(&mut self, direction: &str) {
-        match self {
-            Splitter::Cmux(c) => c.set_first_direction(direction),
-            Splitter::Tmux(t) => t.set_first_direction(direction),
-            Splitter::Orca(o) => o.set_first_direction(direction),
+        match &mut self.backend {
+            Backend::Cmux(c) => c.set_first_direction(direction),
+            Backend::Tmux(t) => t.set_first_direction(direction),
+            Backend::Orca(o) => o.set_first_direction(direction),
         }
     }
 
     /// Makes the next spawn split off `pane_id` instead of the caller's own pane.
     pub fn set_anchor(&mut self, pane_id: &str) {
-        match self {
-            Splitter::Cmux(c) => c.set_anchor(pane_id),
-            Splitter::Tmux(t) => t.set_anchor(pane_id),
-            Splitter::Orca(o) => o.set_anchor(pane_id),
+        match &mut self.backend {
+            Backend::Cmux(c) => c.set_anchor(pane_id),
+            Backend::Tmux(t) => t.set_anchor(pane_id),
+            Backend::Orca(o) => o.set_anchor(pane_id),
         }
     }
 
     pub fn pane_id(&self, branch: &str) -> Option<String> {
-        match self {
-            Splitter::Cmux(c) => c.pane_id(branch),
-            Splitter::Tmux(t) => t.pane_id(branch),
-            Splitter::Orca(o) => o.pane_id(branch),
+        match &self.backend {
+            Backend::Cmux(c) => c.pane_id(branch),
+            Backend::Tmux(t) => t.pane_id(branch),
+            Backend::Orca(o) => o.pane_id(branch),
         }
     }
 
     pub fn focus(&self, branch: &str) -> Result<()> {
-        match self {
-            Splitter::Cmux(c) => c.focus(branch),
-            Splitter::Tmux(t) => t.focus(branch),
-            Splitter::Orca(o) => o.focus(branch),
+        match &self.backend {
+            Backend::Cmux(c) => c.focus(branch),
+            Backend::Tmux(t) => t.focus(branch),
+            Backend::Orca(o) => o.focus(branch),
         }
     }
 
     pub fn stop(&mut self, branch: &str) -> Result<()> {
-        match self {
-            Splitter::Cmux(c) => c.stop(branch),
-            Splitter::Tmux(t) => t.stop(branch),
-            Splitter::Orca(o) => o.stop(branch),
+        match &mut self.backend {
+            Backend::Cmux(c) => c.stop(branch),
+            Backend::Tmux(t) => t.stop(branch),
+            Backend::Orca(o) => o.stop(branch),
         }
     }
 
     pub fn send_task(&self, branch: &str, text: &str) -> Result<()> {
-        match self {
-            Splitter::Cmux(c) => c.send_task(branch, text),
-            Splitter::Tmux(t) => t.send_task(branch, text),
-            Splitter::Orca(o) => o.send_task(branch, text),
+        match &self.backend {
+            Backend::Cmux(c) => c.send_task(branch, text),
+            Backend::Tmux(t) => t.send_task(branch, text),
+            Backend::Orca(o) => o.send_task(branch, text),
         }
     }
 
     pub fn poll_statuses(&self) -> Result<HashMap<String, PaneStatus>> {
-        match self {
-            Splitter::Cmux(c) => c.poll_statuses(),
-            Splitter::Tmux(t) => t.poll_statuses(),
-            Splitter::Orca(o) => o.poll_statuses(),
+        match &self.backend {
+            Backend::Cmux(c) => c.poll_statuses(),
+            Backend::Tmux(t) => t.poll_statuses(),
+            Backend::Orca(o) => o.poll_statuses(),
         }
     }
 
     pub fn apply_statuses(&mut self, statuses: HashMap<String, PaneStatus>) {
-        match self {
-            Splitter::Cmux(c) => c.apply_statuses(statuses),
-            Splitter::Tmux(t) => t.apply_statuses(statuses),
-            Splitter::Orca(o) => o.apply_statuses(statuses),
+        match &mut self.backend {
+            Backend::Cmux(c) => c.apply_statuses(statuses),
+            Backend::Tmux(t) => t.apply_statuses(statuses),
+            Backend::Orca(o) => o.apply_statuses(statuses),
         }
     }
 }
@@ -261,7 +280,7 @@ mod tests {
                 ("ORCA_TERMINAL_HANDLE", None),
             ],
             || {
-                assert!(matches!(Splitter::discover(), Some(Splitter::Cmux(_))));
+                assert!(matches!(Splitter::discover(), Some(Splitter { backend: Backend::Cmux(_), .. })));
             },
         );
     }
@@ -278,7 +297,7 @@ mod tests {
                 ("TMUX_PANE", Some("%3")),
             ],
             || {
-                assert!(matches!(Splitter::discover(), Some(Splitter::Tmux(_))));
+                assert!(matches!(Splitter::discover(), Some(Splitter { backend: Backend::Tmux(_), .. })));
             },
         );
     }
@@ -322,7 +341,7 @@ mod tests {
                 ("ORCA_TERMINAL_HANDLE", None),
             ],
             || {
-                assert!(matches!(Splitter::discover(), Some(Splitter::Cmux(_))));
+                assert!(matches!(Splitter::discover(), Some(Splitter { backend: Backend::Cmux(_), .. })));
             },
         );
     }
@@ -341,7 +360,7 @@ mod tests {
         let mut with_handle = usable.to_vec();
         with_handle.push(("ORCA_TERMINAL_HANDLE", Some("term_1")));
         with_env(&with_handle, || {
-            assert!(matches!(Splitter::discover(), Some(Splitter::Orca(_))));
+            assert!(matches!(Splitter::discover(), Some(Splitter { backend: Backend::Orca(_), .. })));
         });
 
         let mut without_handle = usable.to_vec();
@@ -370,7 +389,7 @@ mod tests {
                 ("TMUX_PANE", None),
             ],
             || {
-                assert!(matches!(Splitter::discover(), Some(Splitter::Orca(_))));
+                assert!(matches!(Splitter::discover(), Some(Splitter { backend: Backend::Orca(_), .. })));
             },
         );
     }
@@ -388,11 +407,11 @@ mod tests {
         ];
         let mut in_cmux = base.to_vec();
         in_cmux.extend([("CMUX_SURFACE_ID", Some("ABC")), ("TMUX_PANE", None)]);
-        with_env(&in_cmux, || assert!(matches!(Splitter::discover(), Some(Splitter::Cmux(_)))));
+        with_env(&in_cmux, || assert!(matches!(Splitter::discover(), Some(Splitter { backend: Backend::Cmux(_), .. }))));
 
         let mut in_tmux = base.to_vec();
         in_tmux.extend([("CMUX_SURFACE_ID", None), ("TMUX_PANE", Some("%3"))]);
-        with_env(&in_tmux, || assert!(matches!(Splitter::discover(), Some(Splitter::Cmux(_)))));
+        with_env(&in_tmux, || assert!(matches!(Splitter::discover(), Some(Splitter { backend: Backend::Cmux(_), .. }))));
     }
 
     /// Orca is last in the chain: a tmux pane whose `tmux` binary can't be found (no cmux
@@ -413,7 +432,7 @@ mod tests {
                 ("ORCA_TERMINAL_HANDLE", Some("term_1")),
             ],
             || {
-                assert!(matches!(Splitter::discover(), Some(Splitter::Orca(_))));
+                assert!(matches!(Splitter::discover(), Some(Splitter { backend: Backend::Orca(_), .. })));
             },
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -426,7 +445,7 @@ mod tests {
         with_env(
             &[("KANSTACK_ORCA_BIN", Some("/nonexistent/not-orca")), ("ORCA_TERMINAL_HANDLE", Some("term_1"))],
             || {
-                let splitter = Splitter::Orca(Orca::discover().unwrap());
+                let splitter = Splitter { backend: Backend::Orca(Orca::discover().unwrap()), harness: HarnessConfig::new("claude") };
                 assert_eq!(splitter.label(), "orca");
                 assert!(splitter.running_inside_host());
                 assert_eq!(splitter.workspace(), None, "there is no workspace to pin");

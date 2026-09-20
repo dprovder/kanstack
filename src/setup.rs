@@ -94,14 +94,6 @@ enum SkillStatus {
     UpToDate,
 }
 
-/// Every harness `harness_launch::resolve_note_delivery` knows a specific delivery
-/// mechanism for, in the same order it lists them in — checked against `PATH` to build
-/// both the detection line and the default `KANSTACK_HARNESS` value below. `kiro-cli` is
-/// left out of the scan despite being recognized there: it's the same binary as `kiro`
-/// under an alternate name, and listing it separately here would just double-count one
-/// install as two.
-const KNOWN_HARNESSES: &[&str] = &["claude", "codex", "pi", "opencode", "kiro", "gemini"];
-
 /// Whether `name` is on `PATH` — same PATH-search `cmux.rs`/`tmux.rs` each already do for
 /// their own binary, just not shared with them since neither exposes it publicly.
 fn harness_on_path(name: &str) -> bool {
@@ -111,8 +103,13 @@ fn harness_on_path(name: &str) -> bool {
     std::env::split_paths(&path_var).any(|dir| dir.join(name).is_file())
 }
 
+/// Every harness in `crate::harness::KNOWN` that's on `PATH`, in that list's priority order —
+/// what builds both the detection line and the default `KANSTACK_HARNESS` value below. Only
+/// each harness's own name is checked, not its aliases: `kiro-cli` is the same binary as
+/// `kiro` under an alternate name, and listing it separately would just double-count one
+/// install as two.
 fn detect_harnesses() -> Vec<&'static str> {
-    KNOWN_HARNESSES.iter().copied().filter(|name| harness_on_path(name)).collect()
+    crate::harness::KNOWN.iter().map(|h| h.id()).filter(|name| harness_on_path(name)).collect()
 }
 
 /// Read-only preview of what a normal launch would find — reuses the exact same
@@ -190,7 +187,7 @@ struct Wizard {
     detection: Detection,
     row: Row,
     harness: TextInput,
-    /// Every harness actually found on `PATH` (see `KNOWN_HARNESSES`) — what `←`/`→` cycle
+    /// Every harness actually found on `PATH` (see `crate::harness::KNOWN`) — what `←`/`→` cycle
     /// through on the harness row. Typing overrides the current pick with anything custom;
     /// cycling again then jumps back in from whichever end matches the direction pressed,
     /// rather than trying to find the closest match to what was typed.
@@ -213,7 +210,7 @@ impl Wizard {
         let harness_choices = detect_harnesses();
         // `KANSTACK_HARNESS` wins if already set (matches every other field here); failing
         // that, the first installed harness found beats a blind guess of "claude" — see
-        // `KNOWN_HARNESSES` for the priority order among several installed at once.
+        // `crate::harness::KNOWN` for the priority order among several installed at once.
         let default_harness = std::env::var("KANSTACK_HARNESS")
             .ok()
             .or_else(|| harness_choices.first().map(|s| s.to_string()))
@@ -584,14 +581,6 @@ mod tests {
         assert_eq!(wrap("short", 20), vec!["short".to_string()]);
     }
 
-    #[test]
-    fn known_harnesses_have_no_duplicate_basenames_to_double_count() {
-        let mut sorted = KNOWN_HARNESSES.to_vec();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(sorted.len(), KNOWN_HARNESSES.len());
-    }
-
     /// Same `PATH`-swap-and-restore pattern as `cmux.rs`'s own `command_exists` tests,
     /// held for the whole call via the crate-wide lock since `PATH` is shared surface with
     /// `cmux.rs`/`tmux.rs`/`splitter.rs`'s own env-mutating tests.
@@ -615,7 +604,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("kanstack-setup-test-{}-a", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // Created out of priority order, to prove the result order comes from
-        // `KNOWN_HARNESSES`, not from directory listing order.
+        // `crate::harness::KNOWN`, not from directory listing order.
         touch(&dir, "codex");
         touch(&dir, "claude");
         with_path(&dir, || {

@@ -26,9 +26,6 @@ use std::process::{Command, Output};
 
 use anyhow::{bail, Context, Result};
 
-use crate::harness_launch::{
-    launch_line, resolve_note_delivery, resolve_note_delivery_for_override, NoteDelivery,
-};
 use crate::pane_status::{PaneStatus, CPU_BUSY_THRESHOLD_PERCENT};
 
 #[derive(Debug, Clone)]
@@ -42,9 +39,6 @@ struct PaneHandle {
 #[derive(Clone)]
 pub struct Tmux {
     bin: PathBuf,
-    /// Shell command typed into the new pane, e.g. `"claude"` or `"codex"`.
-    harness: String,
-    note_delivery: NoteDelivery,
     /// kanstack's own pane (`$TMUX_PANE`), read once at `discover` time — the anchor the
     /// *first* lane splits off; later lanes chain off `last_anchor` instead.
     own_pane: String,
@@ -72,8 +66,6 @@ impl Tmux {
             }
         };
         let own_pane = std::env::var("TMUX_PANE").ok()?;
-        let harness = std::env::var("KANSTACK_HARNESS").unwrap_or_else(|_| "claude".to_string());
-        let note_delivery = resolve_note_delivery(&harness);
         let direction = std::env::var("KANSTACK_TMUX_DIRECTION")
             .map(|raw| normalize_direction(&raw))
             .unwrap_or_else(|_| "up".to_string());
@@ -82,8 +74,6 @@ impl Tmux {
             .unwrap_or_else(|_| "right".to_string());
         Some(Tmux {
             bin,
-            harness,
-            note_delivery,
             own_pane,
             direction,
             chain_direction,
@@ -110,29 +100,16 @@ impl Tmux {
         self.panes.is_empty()
     }
 
-    /// Splits off the previous lane's pane (or kanstack's own, for the first lane), types
-    /// the configured harness command into the fresh pane with `cwd` as its working
-    /// directory, then titles it `name` (e.g. the branch name) — best-effort, since pane
-    /// titles need `set -g pane-border-status` to actually be visible and an old tmux
-    /// without title support shouldn't fail the whole spawn over it.
+    /// Splits off the previous lane's pane (or kanstack's own, for the first lane) with
+    /// `cwd` as its working directory, types `launch` into it, then titles it `name` (e.g.
+    /// the branch name) — best-effort, since pane titles need `set -g pane-border-status` to
+    /// actually be visible and an old tmux without title support shouldn't fail the whole
+    /// spawn over it. Returns the new pane's id, for a caller that needs to find it again
+    /// from another process.
     ///
-    /// See `build_launch_command`/[`crate::harness_launch`] for `initial_message` and the
-    /// branch-context note, identical to `Cmux::spawn_harness`'s own handling of both.
-    pub fn spawn_harness(&mut self, cwd: &Path, name: &str, initial_message: Option<&str>) -> Result<String> {
-        self.spawn_harness_with(cwd, name, initial_message, None)
-    }
-
-    /// [`Self::spawn_harness`] with `harness` overriding the configured one for just this
-    /// pane (`kanstack spawn --agent`), including which delivery the branch-context note
-    /// uses — that depends on the harness, not on what was configured. Returns the new
-    /// pane's id, for a caller that needs to find it again from another process.
-    pub fn spawn_harness_with(
-        &mut self,
-        cwd: &Path,
-        name: &str,
-        initial_message: Option<&str>,
-        harness: Option<&str>,
-    ) -> Result<String> {
+    /// `launch` is the whole harness command line, initial message and branch-context note
+    /// included — see `crate::harness::HarnessConfig::launch_line`.
+    pub fn spawn_pane(&mut self, cwd: &Path, name: &str, launch: &str) -> Result<String> {
         let (direction, anchor) = match &self.last_anchor {
             Some(anchor) => (self.chain_direction.as_str(), anchor.as_str()),
             None => (self.direction.as_str(), self.own_pane.as_str()),
@@ -147,12 +124,7 @@ impl Tmux {
             bail!("`tmux split-window` did not report a pane id");
         }
 
-        let (harness, note_delivery) = match harness {
-            Some(h) if h != self.harness => (h, resolve_note_delivery_for_override(h)),
-            Some(_) | None => (self.harness.as_str(), self.note_delivery.clone()),
-        };
-        let launch = launch_line(cwd, harness, &note_delivery, name, initial_message)?;
-        self.type_and_submit(&pane_id, launch.trim_end_matches('\n'))?;
+        self.type_and_submit(&pane_id, launch)?;
 
         let _ = self.run(&["select-pane", "-t", &pane_id, "-T", name]);
 
@@ -221,7 +193,7 @@ impl Tmux {
     }
 
     /// Sends `text` followed by Enter into `branch`'s tracked pane — the same
-    /// literal-then-Enter sequence `spawn_harness` already uses to type the launch command,
+    /// literal-then-Enter sequence `spawn_pane` already uses to type the launch command,
     /// just generalized to target a pane recorded earlier rather than the one just created.
     pub fn send_task(&self, branch: &str, text: &str) -> Result<()> {
         let Some(pane) = self.panes.get(branch) else {

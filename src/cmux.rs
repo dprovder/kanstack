@@ -34,9 +34,6 @@ use std::process::{Command, Output};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
-use crate::harness_launch::{
-    launch_line, resolve_note_delivery, resolve_note_delivery_for_override, NoteDelivery,
-};
 pub use crate::pane_status::PaneStatus;
 use crate::pane_status::CPU_BUSY_THRESHOLD_PERCENT;
 
@@ -54,13 +51,6 @@ struct PaneHandle {
 #[derive(Clone)]
 pub struct Cmux {
     bin: PathBuf,
-    /// Shell command typed into the new terminal, e.g. `"claude"` or `"codex"`.
-    harness: String,
-    /// How the branch-context note (see `branch_context_note`) reaches this harness —
-    /// see [`NoteDelivery`]. From `KANSTACK_HARNESS_SYSTEM_FLAG` if set (including
-    /// explicitly to `""`, to opt out); otherwise whatever's known-good for `harness`
-    /// itself — see `resolve_note_delivery`.
-    note_delivery: NoteDelivery,
     /// Passed as `new-split`'s direction for the *first* lane, which splits off
     /// kanstack's own pane; `left`, `right`, `up`, or `down`.
     direction: String,
@@ -78,7 +68,7 @@ pub struct Cmux {
     /// good as that variable is for anything else.
     workspace: Option<String>,
     /// One entry per lane kanstack has opened a harness for, keyed by the branch name
-    /// passed to `spawn_harness` — the lane's *original* parallel branch, which stays the
+    /// passed to `spawn_pane` — the lane's *original* parallel branch, which stays the
     /// key even if other branches later stack on top of it (stacking never opens a second
     /// pane).
     panes: HashMap<String, PaneHandle>,
@@ -99,9 +89,6 @@ impl Cmux {
                 candidate
             }
         };
-        let harness =
-            std::env::var("KANSTACK_HARNESS").unwrap_or_else(|_| "claude".to_string());
-        let note_delivery = resolve_note_delivery(&harness);
         let direction = std::env::var("KANSTACK_CMUX_DIRECTION")
             .map(|raw| normalize_direction(&raw))
             .unwrap_or_else(|_| "up".to_string());
@@ -110,8 +97,6 @@ impl Cmux {
             .unwrap_or_else(|_| "right".to_string());
         Some(Cmux {
             bin,
-            harness,
-            note_delivery,
             direction,
             chain_direction,
             last_anchor: None,
@@ -139,35 +124,20 @@ impl Cmux {
     }
 
     /// Splits off the previous lane's pane (or kanstack's own, for the first lane), types
-    /// the configured harness command into the fresh terminal with `cwd` as its working
-    /// directory, then labels the tab `name` (e.g. the branch name).
+    /// `launch` into the fresh terminal, then labels the tab `name` (e.g. the branch name).
+    /// Returns the new surface's ref, for a caller that needs to find it again from another
+    /// process.
     ///
-    /// `initial_message`, if given, is appended to that same command line as a quoted
-    /// argument (e.g. `claude "fix the flaky login test"`) rather than sent as a second
-    /// `cmux send` afterwards — the harness needs a moment to start before it can receive
-    /// typed input, same problem `confirm_task_dispatch` works around by asking for a
-    /// second `t` press, and there's no "wait until ready" primitive to lean on here
-    /// either. Folding it into the launch line sidesteps the race instead of racing it.
+    /// `launch` is the whole harness command line (see
+    /// `crate::harness::HarnessConfig::launch_line`), initial message and branch-context note
+    /// included, rather than those being sent as a second `cmux send` afterwards — the
+    /// harness needs a moment to start before it can receive typed input, same problem
+    /// `confirm_task_dispatch` works around by asking for a second `t` press, and there's no
+    /// "wait until ready" primitive to lean on here either. Folding it into the launch line
+    /// sidesteps the race instead of racing it.
     ///
-    /// A note about `name` being a GitButler virtual branch — not a real one
-    /// `git status`/`git branch` would recognize — also goes out on this same launch
-    /// line, via whichever delivery `note_delivery` resolved to for this harness; see
-    /// [`NoteDelivery`] and `build_launch_command`.
-    pub fn spawn_harness(&mut self, cwd: &Path, name: &str, initial_message: Option<&str>) -> Result<String> {
-        self.spawn_harness_with(cwd, name, initial_message, None)
-    }
-
-    /// [`Self::spawn_harness`] with `harness` overriding the configured one for just this
-    /// pane (`kanstack spawn --agent`), including which delivery the branch-context note
-    /// uses — that depends on the harness, not on what was configured. Returns the new
-    /// surface's ref, for a caller that needs to find it again from another process.
-    pub fn spawn_harness_with(
-        &mut self,
-        cwd: &Path,
-        name: &str,
-        initial_message: Option<&str>,
-        harness: Option<&str>,
-    ) -> Result<String> {
+    /// `cwd` is unused: the launch line `cd`s there itself.
+    pub fn spawn_pane(&mut self, _cwd: &Path, name: &str, launch: &str) -> Result<String> {
         // A pinned workspace that no longer exists (closed since) is dropped: this spawn
         // falls back to the environment, and pins wherever that lands.
         let pinned = self.pinned_surface();
@@ -209,12 +179,7 @@ impl Cmux {
             self.workspace = Some(self.workspace_id(workspace));
         }
 
-        let (harness, note_delivery) = match harness {
-            Some(h) if h != self.harness => (h, resolve_note_delivery_for_override(h)),
-            Some(_) | None => (self.harness.as_str(), self.note_delivery.clone()),
-        };
-        let launch = launch_line(cwd, harness, &note_delivery, name, initial_message)?;
-        self.type_and_submit(&surface_ref, launch.trim_end_matches('\n'))?;
+        self.type_and_submit(&surface_ref, launch)?;
 
         self.run_scoped(&["rename-tab", "--surface", &surface_ref, name])?;
         self.panes.insert(
@@ -322,7 +287,7 @@ impl Cmux {
     }
 
     /// Sends `text` followed by Enter into `branch`'s tracked pane via `cmux send
-    /// --surface`, the same mechanism `spawn_harness` already uses to type the launch
+    /// --surface`, the same mechanism `spawn_pane` already uses to type the launch
     /// command — just generalized to target a pane recorded earlier rather than the one
     /// just created.
     pub fn send_task(&self, branch: &str, text: &str) -> Result<()> {
@@ -712,7 +677,7 @@ mod tests {
 
     /// `KANSTACK_CMUX_BIN` is trusted at face value — set it and `discover` returns
     /// `Some`, even pointing at a path that does not exist. That's intentional (see its
-    /// doc comment): the failure surfaces later, from `spawn_harness` actually trying to
+    /// doc comment): the failure surfaces later, from `spawn_pane` actually trying to
     /// run it, as a normal error the caller already handles — not silently, and not by
     /// `discover` re-implementing existence-checking for an explicit override.
     #[test]

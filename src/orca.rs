@@ -37,7 +37,7 @@
 //!   The first lane splits kanstack's own terminal, so it lands in whichever Orca worktree
 //!   kanstack is running in.
 //! - `terminal create --worktree path:<repo root>` is the fallback when that split fails
-//!   (see `spawn_harness_with`). `path:` is an exact-path match against Orca's registered
+//!   (see `spawn_pane`). `path:` is an exact-path match against Orca's registered
 //!   worktrees, *not* a search of enclosing ones like `active`/`current` — and a registered
 //!   repository's main checkout counts as a worktree in its own right (from source), which is
 //!   exactly what GitButler's workspace is. So this works only if the repository was added to
@@ -90,9 +90,6 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
-use crate::harness_launch::{
-    launch_line, resolve_note_delivery, resolve_note_delivery_for_override, NoteDelivery,
-};
 use crate::pane_status::PaneStatus;
 
 /// How long each `terminal wait --for tui-idle` probe may block before its timeout is read
@@ -111,9 +108,6 @@ struct PaneHandle {
 #[derive(Clone)]
 pub struct Orca {
     bin: PathBuf,
-    /// Shell command typed into the new terminal, e.g. `"claude"` or `"codex"`.
-    harness: String,
-    note_delivery: NoteDelivery,
     /// kanstack's own terminal (`$ORCA_TERMINAL_HANDLE`), read once at `discover` time — the
     /// anchor the *first* lane splits off; later lanes chain off `last_anchor` instead.
     own_terminal: String,
@@ -142,8 +136,6 @@ impl Orca {
                 candidate
             }
         };
-        let harness = std::env::var("KANSTACK_HARNESS").unwrap_or_else(|_| "claude".to_string());
-        let note_delivery = resolve_note_delivery(&harness);
         let direction = std::env::var("KANSTACK_ORCA_DIRECTION")
             .map(|raw| normalize_direction(&raw))
             .unwrap_or_else(|_| "down".to_string());
@@ -152,8 +144,6 @@ impl Orca {
             .unwrap_or_else(|_| "right".to_string());
         Some(Orca {
             bin,
-            harness,
-            note_delivery,
             own_terminal,
             direction,
             chain_direction,
@@ -188,47 +178,27 @@ impl Orca {
     }
 
     /// Splits off the previous lane's terminal (or kanstack's own, for the first lane), with
-    /// the launch line for the configured harness as the new terminal's `--command`, then
+    /// `launch` — the whole harness command line, see
+    /// `crate::harness::HarnessConfig::launch_line` — as the new terminal's `--command`, then
     /// titles it `name` (e.g. the branch name) — best-effort, since a failed rename shouldn't
-    /// undo a harness that did launch.
+    /// undo a harness that did launch. Returns the new terminal's handle, for a caller that
+    /// needs to find it again from another process.
     ///
     /// If the split fails — most likely a stale or closed anchor handle — the lane opens as a
     /// new tab in the repository's worktree instead (`terminal create --worktree path:…`),
     /// so a stale `$ORCA_TERMINAL_HANDLE` costs the split layout, not the lane. That needs the
     /// repository registered in Orca; see the module doc.
     ///
-    /// See [`crate::harness_launch`] for `initial_message`, the branch-context note and the
-    /// spill-to-files handling of a long prompt, identical to the other backends'.
-    ///
     /// `--command` reaches the shell as typed input — checked against `orcad`, with the
     /// `cd … && harness …` launch line arriving intact and running in the worktree directory,
     /// at 5000 characters too — which the launch line's shell syntax needs.
-    pub fn spawn_harness(&mut self, cwd: &Path, name: &str, initial_message: Option<&str>) -> Result<String> {
-        self.spawn_harness_with(cwd, name, initial_message, None)
-    }
-
-    /// [`Self::spawn_harness`] with `harness` overriding the configured one for just this
-    /// pane (`kanstack spawn --agent`), including which delivery the branch-context note
-    /// uses — that depends on the harness, not on what was configured. Returns the new
-    /// terminal's handle, for a caller that needs to find it again from another process.
-    pub fn spawn_harness_with(
-        &mut self,
-        cwd: &Path,
-        name: &str,
-        initial_message: Option<&str>,
-        harness: Option<&str>,
-    ) -> Result<String> {
+    pub fn spawn_pane(&mut self, cwd: &Path, name: &str, launch: &str) -> Result<String> {
         let (direction, anchor) = match &self.last_anchor {
             Some(anchor) => (self.chain_direction.as_str(), anchor.as_str()),
             None => (self.direction.as_str(), self.own_terminal.as_str()),
         };
 
-        let (harness, note_delivery) = match harness {
-            Some(h) if h != self.harness => (h, resolve_note_delivery_for_override(h)),
-            Some(_) | None => (self.harness.as_str(), self.note_delivery.clone()),
-        };
-        let launch = launch_line(cwd, harness, &note_delivery, name, initial_message)?;
-        let command = launch.trim_end_matches('\n');
+        let command = launch;
 
         let handle = match self.run_json::<SplitResult>(&split_args(anchor, direction, command)) {
             Ok(split) => split.split.handle,
@@ -932,7 +902,7 @@ mod tests {
     }
 
     /// A stale anchor handle fails as `runtime_unavailable` — not a "stale" code — which is
-    /// why `spawn_harness_with` falls back on any split failure instead of matching a code.
+    /// why `spawn_pane` falls back on any split failure instead of matching a code.
     #[test]
     fn live_failures_carry_orcas_own_error_codes() {
         let Response::Failed(stale) = parse_response::<SplitResult>(SPLIT_STALE_LIVE).unwrap() else { panic!("not a failure") };
@@ -1096,6 +1066,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(bin.parent().unwrap());
     }
 
+    /// What `Splitter::spawn_harness` does for an `Orca`: build the default harness's launch
+    /// line, then open a pane running it.
+    fn spawn(orca: &mut Orca, cwd: &Path, name: &str, initial_message: Option<&str>) -> Result<String> {
+        let launch = crate::harness::HarnessConfig::new("claude").launch_line(cwd, name, initial_message, None)?;
+        orca.spawn_pane(cwd, name, &launch)
+    }
+
     fn log_lines(log: &Path) -> Vec<String> {
         std::fs::read_to_string(log).unwrap_or_default().lines().map(str::to_string).collect()
     }
@@ -1111,8 +1088,8 @@ esac"#;
     #[test]
     fn the_first_lane_splits_kanstacks_own_terminal_down_and_the_next_chains_off_it_to_the_right() {
         with_fake_orca("chain", SPLITS_AND_ACKS, |mut orca, log| {
-            let first = orca.spawn_harness(Path::new("/nonexistent/repo"), "feat-a", Some("--fix it")).unwrap();
-            let second = orca.spawn_harness(Path::new("/nonexistent/repo"), "feat-b", None).unwrap();
+            let first = spawn(&mut orca, Path::new("/nonexistent/repo"), "feat-a", Some("--fix it")).unwrap();
+            let second = spawn(&mut orca, Path::new("/nonexistent/repo"), "feat-b", None).unwrap();
             assert_eq!(first, "after_term_own");
             assert_eq!(second, "after_after_term_own");
             assert_eq!(orca.pane_id("feat-b").as_deref(), Some("after_after_term_own"));
@@ -1138,7 +1115,7 @@ case "$2" in
   *) echo '{"id":"r","ok":true,"result":{}}' ;;
 esac"#;
         with_fake_orca("fallback", body, |mut orca, log| {
-            let handle = orca.spawn_harness(Path::new("/nonexistent/repo"), "feat-a", None).unwrap();
+            let handle = spawn(&mut orca, Path::new("/nonexistent/repo"), "feat-a", None).unwrap();
             assert_eq!(handle, "term_tab");
             let lines = log_lines(log);
             assert!(lines.iter().any(|l| l.starts_with("terminal create --worktree=path:/nonexistent/repo --command=cd ")), "{lines:#?}");
@@ -1150,7 +1127,7 @@ esac"#;
     fn a_spawn_where_both_the_split_and_the_fallback_fail_reports_both() {
         let body = r#"echo '{"id":"r","ok":false,"error":{"code":"selector_not_found","message":"No such worktree"}}'; exit 1"#;
         with_fake_orca("both-fail", body, |mut orca, _| {
-            let err = orca.spawn_harness(Path::new("/nonexistent/repo"), "feat-a", None).unwrap_err().to_string();
+            let err = spawn(&mut orca, Path::new("/nonexistent/repo"), "feat-a", None).unwrap_err().to_string();
             assert!(err.contains("terminal split") && err.contains("terminal create"), "{err}");
             assert!(err.contains("selector_not_found"), "{err}");
             assert!(!orca.has_pane("feat-a"), "a lane that never opened must not be tracked");

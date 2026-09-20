@@ -11,6 +11,7 @@ pub mod but;
 pub mod cmux;
 pub mod config;
 pub mod diff;
+pub mod harness;
 pub mod harness_launch;
 pub mod hit;
 pub mod model;
