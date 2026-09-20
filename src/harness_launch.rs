@@ -32,6 +32,29 @@ pub enum NoteDelivery {
     Disabled,
 }
 
+/// What a harness needs on its launch line beyond its note and first message: extra
+/// arguments, and environment variables for it to run with. Empty for most harnesses.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LaunchExtras {
+    /// Each is one shell word after the harness (and its note), before the first message.
+    pub args: Vec<String>,
+    /// `NAME=value` assignments in front of the harness. Names must be plain identifiers.
+    pub env: Vec<(String, String)>,
+}
+
+impl LaunchExtras {
+    /// `NAME='value' ` for each variable, ready to sit in front of the harness command.
+    fn env_prefix(&self) -> String {
+        self.env
+            .iter()
+            .map(|(name, value)| {
+                debug_assert!(name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'), "{name:?}");
+                format!("{name}={} ", shell_quote(value))
+            })
+            .collect()
+    }
+}
+
 /// The longest launch line typed straight into a fresh terminal. A new pane's shell is
 /// still starting up when the line arrives, and until it switches the tty to raw mode for
 /// its line editor the kernel's line discipline is in charge, which caps a line at about a
@@ -52,10 +75,22 @@ pub fn build_launch_command(
     name: &str,
     initial_message: Option<&str>,
 ) -> String {
-    let args = launch_args(note_delivery, name, initial_message, &mut |prefix, text| {
+    build_launch_command_with(cwd, harness, note_delivery, name, initial_message, &LaunchExtras::default())
+}
+
+/// [`build_launch_command`] with `extras` on the line too.
+pub fn build_launch_command_with(
+    cwd: &Path,
+    harness: &str,
+    note_delivery: &NoteDelivery,
+    name: &str,
+    initial_message: Option<&str>,
+    extras: &LaunchExtras,
+) -> String {
+    let args = launch_args(note_delivery, name, initial_message, extras, &mut |prefix, text| {
         shell_quote(&format!("{prefix}{text}"))
     });
-    format!("cd {} && {}{}\n", shell_quote(&cwd.to_string_lossy()), harness, args)
+    format!("cd {} && {}{}{}\n", shell_quote(&cwd.to_string_lossy()), extras.env_prefix(), harness, args)
 }
 
 /// The arguments after the harness, each preceded by a space. `word` turns a value into a
@@ -65,6 +100,7 @@ fn launch_args(
     note_delivery: &NoteDelivery,
     name: &str,
     initial_message: Option<&str>,
+    extras: &LaunchExtras,
     word: &mut dyn FnMut(&str, &str) -> String,
 ) -> String {
     let mut args = String::new();
@@ -90,6 +126,11 @@ fn launch_args(
         NoteDelivery::Disabled => {}
     }
 
+    for arg in &extras.args {
+        args.push(' ');
+        args.push_str(&word("", arg));
+    }
+
     if let Some(message) = message {
         args.push(' ');
         args.push_str(&word("", &message));
@@ -109,7 +150,20 @@ pub fn launch_line(
     name: &str,
     initial_message: Option<&str>,
 ) -> Result<String> {
-    launch_line_in(&std::env::temp_dir(), cwd, harness, note_delivery, name, initial_message)
+    launch_line_with(cwd, harness, note_delivery, name, initial_message, &LaunchExtras::default())
+}
+
+/// [`launch_line`] with `extras` on the line too. Long extras spill to files exactly as a
+/// long message does.
+pub fn launch_line_with(
+    cwd: &Path,
+    harness: &str,
+    note_delivery: &NoteDelivery,
+    name: &str,
+    initial_message: Option<&str>,
+    extras: &LaunchExtras,
+) -> Result<String> {
+    launch_line_in(&std::env::temp_dir(), cwd, harness, note_delivery, name, initial_message, extras)
 }
 
 fn launch_line_in(
@@ -119,8 +173,9 @@ fn launch_line_in(
     note_delivery: &NoteDelivery,
     name: &str,
     initial_message: Option<&str>,
+    extras: &LaunchExtras,
 ) -> Result<String> {
-    let direct = build_launch_command(cwd, harness, note_delivery, name, initial_message);
+    let direct = build_launch_command_with(cwd, harness, note_delivery, name, initial_message, extras);
     if direct.len() <= MAX_TYPED_LINE {
         return Ok(direct);
     }
@@ -138,7 +193,7 @@ fn launch_line_in(
 
     let mut reads = Vec::new();
     let mut failure = None;
-    let args = launch_args(note_delivery, name, initial_message, &mut |prefix, text| {
+    let args = launch_args(note_delivery, name, initial_message, extras, &mut |prefix, text| {
         let var = format!("k{}", reads.len());
         let path = dir.join(&var);
         if let Err(e) = std::fs::write(&path, text) {
@@ -153,10 +208,11 @@ fn launch_line_in(
     }
 
     Ok(format!(
-        "cd {} && {} && rm -rf {} && {}{}\n",
+        "cd {} && {} && rm -rf {} && {}{}{}\n",
         shell_quote(&cwd.to_string_lossy()),
         reads.join(" "),
         shell_quote(&dir.to_string_lossy()),
+        extras.env_prefix(),
         harness,
         args,
     ))
@@ -190,6 +246,17 @@ pub fn toml_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn launch_line_in_plain(
+        tmp: &Path,
+        cwd: &Path,
+        harness: &str,
+        delivery: &NoteDelivery,
+        name: &str,
+        message: Option<&str>,
+    ) -> Result<String> {
+        launch_line_in(tmp, cwd, harness, delivery, name, message, &LaunchExtras::default())
+    }
 
     /// `Disabled` (`KANSTACK_HARNESS_SYSTEM_FLAG=""`) is the one delivery that sends no
     /// note at all — the launch line is exactly what it would've been before this
@@ -310,7 +377,7 @@ mod tests {
     fn a_short_launch_line_is_typed_inline_exactly_as_before() {
         let tmp = scratch("short");
         let d = NoteDelivery::Flag("--append-system-prompt".to_string());
-        let line = launch_line_in(&tmp, Path::new("/repo"), "claude", &d, "feat-x", Some("fix it")).unwrap();
+        let line = launch_line_in_plain(&tmp, Path::new("/repo"), "claude", &d, "feat-x", Some("fix it")).unwrap();
         assert_eq!(line, build_launch_command(Path::new("/repo"), "claude", &d, "feat-x", Some("fix it")));
         assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 0, "nothing needs a file");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -325,7 +392,7 @@ mod tests {
         let d = NoteDelivery::Flag("--append-system-prompt".to_string());
 
         let inline = build_launch_command(Path::new("/tmp"), "printf '%s\\0'", &d, "feat-x", Some(&message));
-        let spilled = launch_line_in(&tmp, Path::new("/tmp"), "printf '%s\\0'", &d, "feat-x", Some(&message)).unwrap();
+        let spilled = launch_line_in_plain(&tmp, Path::new("/tmp"), "printf '%s\\0'", &d, "feat-x", Some(&message)).unwrap();
 
         assert!(inline.len() > MAX_TYPED_LINE, "the fixture must be long enough to matter");
         assert!(spilled.len() < MAX_TYPED_LINE, "typed line is {} bytes: {spilled:?}", spilled.len());
@@ -349,7 +416,7 @@ mod tests {
         let message = awkward_long_message();
         let inline = build_launch_command(Path::new("/tmp"), "printf '%s\\0'", &NoteDelivery::CodexConfig, "b", Some(&message));
         let spilled =
-            launch_line_in(&tmp, Path::new("/tmp"), "printf '%s\\0'", &NoteDelivery::CodexConfig, "b", Some(&message)).unwrap();
+            launch_line_in_plain(&tmp, Path::new("/tmp"), "printf '%s\\0'", &NoteDelivery::CodexConfig, "b", Some(&message)).unwrap();
         assert!(spilled.len() < MAX_TYPED_LINE);
         assert_eq!(args_seen_by_the_harness(&spilled), args_seen_by_the_harness(&inline));
         let _ = std::fs::remove_dir_all(&tmp);
@@ -360,6 +427,69 @@ mod tests {
     fn a_long_launch_line_fails_loudly_if_it_cannot_write_its_files() {
         let missing = std::env::temp_dir().join("kanstack-launch-test-no-such-dir/nested");
         let d = NoteDelivery::Disabled;
-        assert!(launch_line_in(&missing, Path::new("/tmp"), "claude", &d, "b", Some(&awkward_long_message())).is_err());
+        assert!(launch_line_in_plain(&missing, Path::new("/tmp"), "claude", &d, "b", Some(&awkward_long_message())).is_err());
+    }
+
+    const HOOKS_JSON: &str = r#"{"hooks":{"Stop":[]}}"#;
+
+    fn hooks_extras() -> LaunchExtras {
+        LaunchExtras {
+            args: vec!["--settings".to_string(), HOOKS_JSON.to_string()],
+            env: vec![("KANSTACK_BRANCH".to_string(), "feat-x".to_string())],
+        }
+    }
+
+    /// Env assignments sit in front of the harness, its extra arguments go after its note
+    /// and before the first message (which stays the last, positional argument).
+    #[test]
+    fn extras_put_env_before_the_harness_and_args_before_the_message() {
+        let delivery = NoteDelivery::Flag("--append-system-prompt".to_string());
+        let line = build_launch_command_with(Path::new("/repo"), "claude", &delivery, "feat-x", Some("fix it"), &hooks_extras());
+        assert_eq!(
+            line,
+            format!(
+                "cd '/repo' && KANSTACK_BRANCH='feat-x' claude --append-system-prompt {} '--settings' {} 'fix it'\n",
+                shell_quote(&branch_context_note("feat-x")),
+                shell_quote(HOOKS_JSON),
+            )
+        );
+    }
+
+    #[test]
+    fn no_extras_leaves_the_line_exactly_as_it_was() {
+        let delivery = NoteDelivery::Disabled;
+        assert_eq!(
+            build_launch_command_with(Path::new("/repo"), "claude", &delivery, "feat-x", Some("fix it"), &LaunchExtras::default()),
+            build_launch_command(Path::new("/repo"), "claude", &delivery, "feat-x", Some("fix it")),
+        );
+    }
+
+    /// Extras are arguments like any other: a value with quotes and spaces reaches the harness
+    /// byte for byte, on the short path and when the line is too long to type and spills.
+    #[test]
+    fn extras_reach_the_harness_intact_inline_and_spilled() {
+        let json = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"'/a b/kanstack' report idle"}]}]}}"#;
+        let extras = LaunchExtras {
+            args: vec!["--settings".to_string(), json.to_string()],
+            env: vec![("KANSTACK_BRANCH".to_string(), "it's a branch".to_string())],
+        };
+        let tmp = scratch("extras");
+        for message in ["fix it".to_string(), awkward_long_message()] {
+            let line = launch_line_in(
+                &tmp,
+                Path::new("/tmp"),
+                // `sh -c` so the variable is read by the harness, after the env prefix applies to it.
+                "sh -c 'printf \"%s\\0\" \"$KANSTACK_BRANCH\" \"$@\"' --",
+                &NoteDelivery::Disabled,
+                "b",
+                Some(&message),
+                &extras,
+            )
+            .unwrap();
+            let seen = args_seen_by_the_harness(&line);
+            // The helper splits on the NUL after each argument, so the last piece is empty.
+            assert_eq!(seen, ["it's a branch", "--settings", json, message.as_str(), ""], "line was {line:?}");
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

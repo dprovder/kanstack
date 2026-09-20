@@ -13,7 +13,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::harness_launch::{launch_line, NoteDelivery};
+use crate::harness_launch::{launch_line_with, shell_quote, LaunchExtras, NoteDelivery};
 
 /// One coding-agent harness. Unit structs, looked up by [`for_command`].
 pub trait Harness: Sync {
@@ -32,10 +32,32 @@ pub trait Harness: Sync {
     fn note_delivery(&self) -> NoteDelivery {
         NoteDelivery::FoldIntoMessage
     }
+
+    /// What to put on this harness's launch line so that it runs `report` — a shell-ready
+    /// command, `'/path/to/kanstack' report` — as its turns go by: `report busy` when a turn
+    /// starts and while it works, `report idle` when it ends (see `crate::report`).
+    ///
+    /// `None`, the default, means kanstack knows no way to hand this harness hooks when it
+    /// launches it. That costs nothing but accuracy: the multiplexer's own reading of the
+    /// pane is used instead, and anything can still call `kanstack report` itself.
+    fn status_hooks(&self, _report: &str) -> Option<LaunchExtras> {
+        None
+    }
 }
 
 /// Confirmed `--append-system-prompt <text>`, additive to (not replacing) its own default
 /// system prompt.
+///
+/// Hooks come in through `--settings <json>`, which is a settings layer of its own: the
+/// hooks in it run alongside the user's and the project's, they don't replace them, so
+/// nothing on disk is touched. `UserPromptSubmit` and `Stop` are synchronous — a few
+/// milliseconds, and it means the state is written before the turn runs and before the
+/// harness returns to its prompt. `PreToolUse` is async, only to keep a long turn's report
+/// fresh (see `crate::report::FRESH_FOR`), and a late one can't land after `Stop`'s because
+/// a tool call is followed by at least one more model round trip.
+///
+/// `report` prints nothing on success, which matters here: `UserPromptSubmit`'s stdout is
+/// added to what the model sees.
 struct Claude;
 impl Harness for Claude {
     fn id(&self) -> &'static str {
@@ -43,6 +65,27 @@ impl Harness for Claude {
     }
     fn note_delivery(&self) -> NoteDelivery {
         NoteDelivery::Flag("--append-system-prompt".to_string())
+    }
+    fn status_hooks(&self, report: &str) -> Option<LaunchExtras> {
+        let hook = |state: &str, is_async: bool| {
+            let mut command = serde_json::json!({
+                "type": "command",
+                "command": format!("{report} {state}"),
+                "timeout": 5,
+            });
+            if is_async {
+                command["async"] = serde_json::Value::Bool(true);
+            }
+            serde_json::json!([{ "matcher": "", "hooks": [command] }])
+        };
+        let settings = serde_json::json!({
+            "hooks": {
+                "UserPromptSubmit": hook("busy", false),
+                "PreToolUse": hook("busy", true),
+                "Stop": hook("idle", false),
+            }
+        });
+        Some(LaunchExtras { args: vec!["--settings".to_string(), settings.to_string()], env: Vec::new() })
     }
 }
 
@@ -161,19 +204,35 @@ pub fn resolve_note_delivery_for_override(harness: &str) -> NoteDelivery {
 pub struct HarnessConfig {
     command: String,
     note_delivery: NoteDelivery,
+    /// The `kanstack report` command harnesses are handed as their status hooks, when they
+    /// have a way to take them (see [`Harness::status_hooks`]).
+    report_command: Option<String>,
 }
 
 impl HarnessConfig {
-    /// `command`, with its note delivery resolved from the environment.
+    /// `command`, with its note delivery resolved from the environment. No status hooks —
+    /// see [`Self::from_env`] and [`Self::with_reporter`].
     pub fn new(command: impl Into<String>) -> Self {
         let command = command.into();
         let note_delivery = resolve_note_delivery(&command);
-        HarnessConfig { command, note_delivery }
+        HarnessConfig { command, note_delivery, report_command: None }
     }
 
-    /// `$KANSTACK_HARNESS`, or `claude`.
+    /// `$KANSTACK_HARNESS`, or `claude`, with status hooks pointing at this very executable
+    /// unless `KANSTACK_STATUS_HOOKS` turns them off (see [`reporter_command`]).
     pub fn from_env() -> Self {
-        Self::new(std::env::var("KANSTACK_HARNESS").unwrap_or_else(|_| "claude".to_string()))
+        let config = Self::new(std::env::var("KANSTACK_HARNESS").unwrap_or_else(|_| "claude".to_string()));
+        let setting = std::env::var("KANSTACK_STATUS_HOOKS").ok();
+        match reporter_command(std::env::current_exe().ok().as_deref(), setting.as_deref()) {
+            Some(report) => config.with_reporter(report),
+            None => config,
+        }
+    }
+
+    /// Hands harnesses that can take it `report` as their status hooks.
+    pub fn with_reporter(mut self, report: impl Into<String>) -> Self {
+        self.report_command = Some(report.into());
+        self
     }
 
     /// The command typed into a new pane when nothing overrides it.
@@ -199,9 +258,32 @@ impl HarnessConfig {
             Some(h) if h != self.command => (h, resolve_note_delivery_for_override(h)),
             Some(_) | None => (self.command.as_str(), self.note_delivery.clone()),
         };
-        let line = launch_line(cwd, command, &delivery, name, initial_message)?;
+        // Hooks tell `kanstack report` which lane they are for through the environment, so
+        // the hook commands themselves are the same for every lane.
+        let extras = self
+            .report_command
+            .as_deref()
+            .and_then(|report| for_command(command).status_hooks(report))
+            .map(|mut extras| {
+                extras.env.push(("KANSTACK_BRANCH".to_string(), name.to_string()));
+                extras
+            })
+            .unwrap_or_default();
+        let line = launch_line_with(cwd, command, &delivery, name, initial_message, &extras)?;
         Ok(line.trim_end_matches('\n').to_string())
     }
+}
+
+/// The command a harness's hooks run to report: `exe` (quoted, since it can have spaces in
+/// it) followed by `report`. `None` when there is no executable to point at, or `setting` —
+/// `KANSTACK_STATUS_HOOKS` — is `0`, `off`, `false` or `no`, for anyone who would rather
+/// harnesses were left entirely alone.
+fn reporter_command(exe: Option<&Path>, setting: Option<&str>) -> Option<String> {
+    let off = setting.is_some_and(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false" | "no"));
+    if off {
+        return None;
+    }
+    Some(format!("{} report", shell_quote(&exe?.to_string_lossy())))
 }
 
 #[cfg(test)]
@@ -347,5 +429,140 @@ mod tests {
             assert!(other.starts_with("cd '/repo' && codex -c "), "{other:?}");
             assert!(!other.contains("--append-system-prompt"), "{other:?}");
         });
+    }
+
+    // Status hooks.
+
+    const REPORT: &str = "'/opt/kanstack' report";
+
+    fn claude_settings() -> serde_json::Value {
+        let extras = for_command("claude").status_hooks(REPORT).expect("claude takes hooks at launch");
+        assert_eq!(extras.args[0], "--settings");
+        serde_json::from_str(&extras.args[1]).expect("--settings takes JSON")
+    }
+
+    #[test]
+    fn claude_reports_busy_when_a_turn_starts_and_works_and_idle_when_it_ends() {
+        let settings = claude_settings();
+        let hook = |event: &str| settings["hooks"][event][0]["hooks"][0].clone();
+
+        assert_eq!(hook("UserPromptSubmit")["command"], "'/opt/kanstack' report busy");
+        assert_eq!(hook("Stop")["command"], "'/opt/kanstack' report idle");
+        assert_eq!(hook("PreToolUse")["command"], "'/opt/kanstack' report busy");
+        // Only the keep-alive is async: `idle` must be recorded before the harness is back at
+        // its prompt, and `busy` before the turn runs.
+        assert_eq!(hook("PreToolUse")["async"], true);
+        assert!(hook("UserPromptSubmit").get("async").is_none());
+        assert!(hook("Stop").get("async").is_none());
+        for event in ["UserPromptSubmit", "PreToolUse", "Stop"] {
+            assert_eq!(hook(event)["type"], "command", "{event}");
+            assert_eq!(settings["hooks"][event][0]["matcher"], "", "{event}");
+        }
+        assert_eq!(settings["hooks"].as_object().unwrap().len(), 3, "no other events are hooked");
+    }
+
+    /// Only harnesses with a launch-time route are handed hooks; kanstack does not guess at
+    /// the others'.
+    #[test]
+    fn harnesses_without_a_known_launch_time_route_get_no_hooks() {
+        for name in ["codex", "pi", "opencode", "kiro", "gemini", "./my-wrapper.sh"] {
+            assert_eq!(for_command(name).status_hooks(REPORT), None, "{name}");
+        }
+    }
+
+    /// A directory holding stand-ins named `claude` and `codex` that print the environment
+    /// variable hooks rely on, then each argument they were started with.
+    fn stand_in_harnesses(tag: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("kanstack-harness-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["claude", "codex"] {
+            let path = dir.join(name);
+            std::fs::write(&path, "#!/bin/sh\nprintf '%s\\n' \"$KANSTACK_BRANCH\"\nfor a in \"$@\"; do printf '%s\\0' \"$a\"; done\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        dir
+    }
+
+    /// Runs the launch line for `config` under `sh`, as a pane's shell would, and returns
+    /// `$KANSTACK_BRANCH` as the harness saw it and the arguments it was started with. The
+    /// line is too long to type once it carries hooks, so this also runs the spill-to-files
+    /// path for real.
+    fn launched(config: &HarnessConfig, harness: Option<&str>, message: Option<&str>) -> (String, Vec<String>) {
+        // `sh` and `cat` are found through `PATH`, which the backends' discovery tests swap.
+        let _guard = crate::SPLIT_BACKEND_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let line = config.launch_line(Path::new("/tmp"), "feat-x", message, harness).unwrap();
+        let out = std::process::Command::new("sh").arg("-c").arg(&line).output().unwrap();
+        assert!(out.status.success(), "{line:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        let (branch, args) = stdout.split_once('\n').unwrap();
+        let mut args: Vec<String> = args.split('\0').map(str::to_string).collect();
+        assert_eq!(args.pop().as_deref(), Some(""), "every argument ends in a NUL");
+        (branch.to_string(), args)
+    }
+
+    #[test]
+    fn a_configured_reporter_hooks_claude_and_names_the_lane_in_the_environment() {
+        with_system_flag_env(None, || {
+            let dir = stand_in_harnesses("hooked");
+            let claude = dir.join("claude").to_string_lossy().into_owned();
+            let config = HarnessConfig::new(claude).with_reporter(REPORT);
+
+            let (branch, args) = launched(&config, None, Some("fix it"));
+            assert_eq!(branch, "feat-x");
+            assert_eq!(args[0], "--append-system-prompt");
+            assert_eq!(args[2], "--settings");
+            let settings: serde_json::Value = serde_json::from_str(&args[3]).unwrap();
+            assert_eq!(settings, claude_settings(), "the settings survive quoting and spilling byte for byte");
+            assert_eq!(args.len(), 5, "note flag, note, --settings, json, message: {args:?}");
+            assert_eq!(args[4], "fix it", "the first message stays last");
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn without_a_reporter_the_harness_gets_no_hooks_and_no_environment() {
+        with_system_flag_env(None, || {
+            let dir = stand_in_harnesses("plain");
+            let config = HarnessConfig::new(dir.join("claude").to_string_lossy().into_owned());
+            let (branch, args) = launched(&config, None, Some("fix it"));
+            assert_eq!(branch, "");
+            assert!(!args.iter().any(|a| a == "--settings"), "{args:?}");
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// `--agent codex` from a claude-configured board must not be handed claude's flags, and
+    /// the other way round.
+    #[test]
+    fn hooks_follow_the_harness_actually_launched_not_the_configured_one() {
+        with_system_flag_env(None, || {
+            let dir = stand_in_harnesses("override");
+            let claude = dir.join("claude").to_string_lossy().into_owned();
+            let codex = dir.join("codex").to_string_lossy().into_owned();
+
+            let config = HarnessConfig::new(claude.clone()).with_reporter(REPORT);
+            let (branch, args) = launched(&config, Some(&codex), Some("fix it"));
+            assert_eq!(branch, "", "codex takes no hooks, so no lane variable either");
+            assert!(!args.iter().any(|a| a == "--settings"), "{args:?}");
+
+            let config = HarnessConfig::new(codex).with_reporter(REPORT);
+            let (branch, args) = launched(&config, Some(&claude), Some("fix it"));
+            assert_eq!(branch, "feat-x");
+            assert!(args.iter().any(|a| a == "--settings"), "{args:?}");
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn the_reporter_points_at_the_running_executable_unless_turned_off() {
+        let exe = Path::new("/Applications/My Tools/kanstack");
+        assert_eq!(reporter_command(Some(exe), None).as_deref(), Some("'/Applications/My Tools/kanstack' report"));
+        assert_eq!(reporter_command(Some(exe), Some("1")).as_deref(), Some("'/Applications/My Tools/kanstack' report"));
+        for off in ["0", "off", "OFF", "false", "no", " off "] {
+            assert_eq!(reporter_command(Some(exe), Some(off)), None, "{off:?}");
+        }
+        assert_eq!(reporter_command(None, None), None, "nothing to point the hooks at");
     }
 }

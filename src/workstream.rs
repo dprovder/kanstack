@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::report::Reports;
 use crate::splitter::Splitter;
 
 macro_rules! id_newtype {
@@ -68,6 +69,21 @@ pub struct Workstream {
 /// `$XDG_STATE_HOME/kanstack`, else `$HOME/.local/state/kanstack`. `None` only when none of
 /// those can be resolved.
 pub fn state_path(repo: &Path) -> Option<PathBuf> {
+    let (dir, key) = repo_state(repo)?;
+    Some(dir.join(format!("workstreams-{key:016x}.json")))
+}
+
+/// Where the reports agents make about themselves for the repository at `repo` live — one
+/// small file per branch, see `crate::report`. A directory beside the registry rather than
+/// a field in it: hooks write these often and from several processes at once, and the
+/// registry is rewritten whole, so sharing it would lose updates.
+pub fn reports_dir(repo: &Path) -> Option<PathBuf> {
+    let (dir, key) = repo_state(repo)?;
+    Some(dir.join(format!("reports-{key:016x}")))
+}
+
+/// The state directory, and the key identifying `repo` within it.
+fn repo_state(repo: &Path) -> Option<(PathBuf, u64)> {
     let dir = std::env::var_os("KANSTACK_STATE_PATH")
         .map(PathBuf::from)
         .or_else(|| {
@@ -80,18 +96,21 @@ pub fn state_path(repo: &Path) -> Option<PathBuf> {
     // command run from a subdirectory all land on the same file.
     let repo = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
     let repo = repo.ancestors().find(|dir| dir.join(".git").exists()).unwrap_or(&repo);
-    Some(dir.join(format!("workstreams-{:016x}.json", fnv1a(repo.to_string_lossy().as_bytes()))))
+    Some((dir, fnv1a(repo.to_string_lossy().as_bytes())))
 }
 
 /// FNV-1a rather than `DefaultHasher`, whose output is explicitly unspecified across Rust
 /// releases — an upgrade must not orphan every registry on disk.
-fn fnv1a(bytes: &[u8]) -> u64 {
+pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf29ce484222325, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x100000001b3))
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct Registry {
     path: Option<PathBuf>,
+    /// What agents in this repository have reported about themselves, handed to a
+    /// [`Splitter`] by [`Self::adopt_into`].
+    reports: Reports,
     /// The terminal-multiplexer workspace this repository's panes live in (cmux's
     /// `workspace:1`), so a `spawn` run from a shell whose environment has drifted still
     /// opens its pane beside the others rather than wherever that environment points.
@@ -134,7 +153,7 @@ impl Registry {
             Some(OnDisk::Legacy(workstreams)) => (None, workstreams),
             None => (None, Vec::new()),
         };
-        Ok(Registry { path, workspace, workstreams })
+        Ok(Registry { path, reports: Reports::for_repo(repo), workspace, workstreams })
     }
 
     /// Writes via a temp file and rename, so a reader in another pane never sees a
@@ -178,6 +197,7 @@ impl Registry {
     /// Seeds a freshly discovered `splitter` with every recorded pane, so its own
     /// `send_task`/`poll_statuses`/`focus`/`stop` work on panes another process opened.
     pub fn adopt_into(&self, splitter: &mut Splitter) {
+        splitter.set_reports(self.reports.clone());
         for w in &self.workstreams {
             if let Some(pane) = &w.pane_id {
                 splitter.adopt(&w.branch_id.0, &pane.0);

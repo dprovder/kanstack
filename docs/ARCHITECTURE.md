@@ -233,6 +233,41 @@ Two independent axes, each one file plus one line, with the shared logic written
   Multiplexers never see a harness — `HarnessConfig::launch_line` hands them a finished
   line.
 
+### Where a pane's status comes from
+
+Two sources, combined in `Splitter::poll_statuses`. A `Multiplexer::probe` is the backend's
+own reading of the pane. A *report* is what the agent said about itself, through
+`kanstack report busy|idle`, which a harness's hooks run (`src/report.rs`). The rule: a pane
+the multiplexer says is gone is `dead`, whatever was reported; otherwise a fresh report wins;
+otherwise the probe stands; with neither, the pane is left out of the result and the last
+known status is kept.
+
+- **One file per branch, not a field in the registry.** Hooks fire on every turn from several
+  processes at once, and the registry is rewritten whole, so sharing it would lose updates.
+  Each report replaces one branch's file atomically. The file name is a hash of the branch,
+  so any branch name is a valid one. `spawn` and `stop` delete the file, before the harness
+  starts, so a fast agent's first report can't be erased and a new pane can't inherit an old
+  one's last word.
+- **A report expires** (`report::FRESH_FOR`, ten minutes), because a crashed agent never
+  reports that it stopped. Expiry falls back to the probe rather than to a guess.
+- **`kanstack report` must print nothing.** Claude adds a `UserPromptSubmit` hook's stdout to
+  what the model sees. It also returns before the registry is read, so a broken registry
+  can't make a per-turn hook noisy.
+- **Harnesses get hooks through `Harness::status_hooks`**, which returns launch arguments and
+  environment, so a harness whose route is a flag, an environment variable or a config
+  override can all be expressed the same way. The lane's name travels as `$KANSTACK_BRANCH`,
+  so the hook commands are identical for every lane. Only Claude has one, through
+  `--settings <json>`, which hooks merge across rather than replace. Adding another needs a
+  route that works *per launch* and touches no file the user owns; that has to be verified
+  for each harness, not assumed from its docs.
+- **A hooked launch line is always spilled to files.** The settings JSON pushes it past the
+  typed-line limit (`harness_launch::MAX_TYPED_LINE`), so every hooked launch uses the
+  read-into-variables path a long prompt takes. It is byte-exact and tested, but it is now the
+  common path rather than the rare one.
+- **What is not covered yet:** a state for "waiting on an approval prompt" (Claude's
+  `PermissionRequest` and `Notification` hooks would give it; it reads `busy` today, as it
+  does under Orca), and any harness other than Claude.
+
 ### The three backends today
 
 `splitter.rs` wraps whichever of three backends — `cmux.rs`, `tmux.rs`, `orca.rs` —

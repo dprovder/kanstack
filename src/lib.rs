@@ -18,6 +18,7 @@ pub mod mux;
 pub mod model;
 pub mod orca;
 pub mod pane_status;
+pub mod report;
 pub mod setup;
 pub mod snapshot;
 pub mod splitter;

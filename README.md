@@ -231,6 +231,7 @@ kanstack send <branch|session> "..."
 kanstack status [--json]
 kanstack focus <branch|session>
 kanstack stop <branch|session>                             # closes the pane, ends its harness
+kanstack report <busy|idle> [<branch>]                     # what an agent says about itself
 ```
 
 `<session>` is a pane id as `kanstack status` prints it. `spawn` splits off the pane you run it
@@ -255,6 +256,26 @@ you don't know; it changes only if an existing field is renamed, removed or rein
 Unlike the table, `--json` works outside cmux, tmux and Orca, and when the multiplexer can't
 be reached: it still lists every workstream, with `unknown` for those that have a pane. An
 empty registry gives `{"schema":1,"workstreams":[]}`.
+
+### Where busy and idle come from
+
+The multiplexer's own reading (CPU for cmux and tmux, Orca's idle detection) is a guess, and
+some multiplexers can't make one. So a harness can say for itself: `kanstack report busy` when
+a turn starts, `kanstack report idle` when it ends, from any script or hook. `<branch>`
+defaults to `$KANSTACK_BRANCH`, which kanstack sets in every pane it launches; it prints
+nothing, needs no multiplexer, and never reads the registry, so it is safe to run on every
+turn.
+
+For Claude Code, kanstack does this for you: it launches `claude` with `--settings` carrying
+hooks for the start of a turn, each tool call and the end of a turn. They run alongside your
+own hooks rather than replacing them, and nothing on disk is edited. Other harnesses get no
+hooks, because kanstack doesn't yet know a way to hand them any at launch; they keep the
+multiplexer's reading, and can call `kanstack report` themselves. `KANSTACK_STATUS_HOOKS=off`
+launches every harness without them.
+
+A fresh report beats the multiplexer's reading, except that a pane the multiplexer says is
+gone is always `dead`. A report is believed for ten minutes and then ignored, since an agent
+that crashed mid-turn never says it stopped.
 
 Each command is its own process, so panes are tracked in a per-repository registry under
 `$XDG_STATE_HOME/kanstack` (`~/.local/state/kanstack`; `KANSTACK_STATE_PATH` relocates it).

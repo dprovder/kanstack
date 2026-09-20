@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use anyhow::{anyhow, bail, Result};
 
@@ -18,6 +19,7 @@ use crate::harness::HarnessConfig;
 use crate::mux::{configured_directions, normalize_direction, Multiplexer, OpenRequest};
 use crate::orca::Orca;
 use crate::pane_status::PaneStatus;
+use crate::report::Reports;
 use crate::tmux::Tmux;
 
 /// One lane's pane, as this process knows it.
@@ -43,6 +45,8 @@ pub struct Splitter {
     /// `spawn_harness` — the lane's *original* parallel branch, which stays the key even if
     /// other branches later stack on top of it (stacking never opens a second pane).
     panes: HashMap<String, Pane>,
+    /// What each lane's agent has said about itself, where it can — see `crate::report`.
+    reports: Reports,
 }
 
 impl Splitter {
@@ -50,7 +54,15 @@ impl Splitter {
     /// for (see `crate::mux::configured_directions`) and no panes yet.
     pub fn new(mux: Arc<dyn Multiplexer>, harness: HarnessConfig) -> Self {
         let (first_direction, chain_direction) = configured_directions(mux.as_ref());
-        Splitter { mux, harness, first_direction, chain_direction, last_anchor: None, panes: HashMap::new() }
+        Splitter {
+            mux,
+            harness,
+            first_direction,
+            chain_direction,
+            last_anchor: None,
+            panes: HashMap::new(),
+            reports: Reports::default(),
+        }
     }
 
     /// Tries `Cmux::discover` first, then `Tmux::discover`, then `Orca::discover` — see each
@@ -155,6 +167,9 @@ impl Splitter {
         harness: Option<&str>,
     ) -> Result<String> {
         let launch = self.harness.launch_line(cwd, name, initial_message, harness)?;
+        // Before the harness starts, not after: a fast one could report before we got back,
+        // and the last word of a previous pane on this branch must not outlive it.
+        self.reports.forget(name);
         let id = self.mux.open_pane(&OpenRequest {
             cwd,
             title: name,
@@ -166,6 +181,12 @@ impl Splitter {
         self.panes.insert(name.to_string(), Pane { id: id.clone(), status: PaneStatus::Unknown });
         self.last_anchor = Some(id.clone());
         Ok(id)
+    }
+
+    /// Where to read what agents report about themselves. Without it, statuses come from the
+    /// multiplexer alone.
+    pub fn set_reports(&mut self, reports: Reports) {
+        self.reports = reports;
     }
 
     /// Starts tracking a pane another process opened — see `crate::workstream::Registry`.
@@ -219,6 +240,7 @@ impl Splitter {
         if self.last_anchor.as_deref() == Some(pane.id.as_str()) {
             self.last_anchor = None;
         }
+        self.reports.forget(branch);
         self.mux.close(&pane.id)
     }
 
@@ -229,11 +251,22 @@ impl Splitter {
         self.mux.type_line(&self.pane(branch)?.id, text).map_err(|e| anyhow!("{branch}: {e:#}"))
     }
 
-    /// Re-derives the status of every tracked pane, keyed by branch. A pane the backend had
-    /// no news about is left out, so [`Self::apply_statuses`] keeps what was known.
+    /// Re-derives the status of every tracked pane, keyed by branch, from two sources: the
+    /// multiplexer's own reading of the pane, and what the agent in it last said about itself
+    /// (see `crate::report`).
+    ///
+    /// A pane the multiplexer says is gone is `Dead`, whatever the agent last said — a
+    /// crashed one can't have said it stopped. Otherwise a fresh report wins: it comes from
+    /// the harness itself, where the multiplexer only infers from CPU, or from nothing at
+    /// all. Otherwise the multiplexer's reading stands. A pane with neither is left out, so
+    /// [`Self::apply_statuses`] keeps what was known.
     ///
     /// Read-only — safe to call from a background thread against a cloned snapshot.
     pub fn poll_statuses(&self) -> Result<HashMap<String, PaneStatus>> {
+        self.poll_statuses_at(SystemTime::now())
+    }
+
+    fn poll_statuses_at(&self, now: SystemTime) -> Result<HashMap<String, PaneStatus>> {
         if self.panes.is_empty() {
             return Ok(HashMap::new());
         }
@@ -242,7 +275,14 @@ impl Splitter {
         Ok(self
             .panes
             .iter()
-            .filter_map(|(branch, pane)| by_pane.get(&pane.id).map(|status| (branch.clone(), *status)))
+            .filter_map(|(branch, pane)| {
+                let native = by_pane.get(&pane.id).copied();
+                let status = match native {
+                    Some(PaneStatus::Dead) => PaneStatus::Dead,
+                    _ => self.reports.status(branch, now).or(native)?,
+                };
+                Some((branch.clone(), status))
+            })
             .collect())
     }
 
@@ -648,5 +688,88 @@ mod tests {
         assert_eq!(splitter.workspace().as_deref(), Some("workspace:2"));
         assert_eq!(splitter.label(), "fake");
         assert!(splitter.running_inside_host());
+    }
+
+    // What an agent says about itself, against what the multiplexer infers.
+
+    use crate::report::{Reported, Reports, FRESH_FOR};
+    use std::time::{Duration, SystemTime};
+
+    /// A splitter with one lane, `feat-a`, in pane `p1`, reading reports from a fresh
+    /// directory.
+    fn splitter_with_reports(tag: &str) -> (Splitter, Arc<FakeMux>, Reports) {
+        let dir = std::env::temp_dir().join(format!("kanstack-splitter-reports-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let reports = Reports::in_dir(dir);
+        let (mut splitter, mux) = fake_splitter();
+        splitter.set_reports(reports.clone());
+        splitter.spawn_harness(cwd(), "feat-a", None).unwrap();
+        (splitter, mux, reports)
+    }
+
+    fn polled(splitter: &Splitter, now: SystemTime) -> Option<PaneStatus> {
+        splitter.poll_statuses_at(now).unwrap().get("feat-a").copied()
+    }
+
+    /// The multiplexer only infers from CPU; the harness knows. So where both speak, the
+    /// harness is believed.
+    #[test]
+    fn a_fresh_report_wins_over_the_multiplexers_reading() {
+        let (splitter, mux, reports) = splitter_with_reports("wins");
+        let now = SystemTime::now();
+        mux.statuses.lock().unwrap().insert("p1".to_string(), PaneStatus::Idle);
+        reports.write("feat-a", Reported::Busy, now).unwrap();
+        assert_eq!(polled(&splitter, now), Some(PaneStatus::Busy));
+    }
+
+    /// A multiplexer with no idea whether its panes are busy — Ghostty's scripting can't
+    /// say — is where reports matter most.
+    #[test]
+    fn a_report_is_the_whole_answer_when_the_multiplexer_has_no_reading() {
+        let (splitter, _mux, reports) = splitter_with_reports("alone");
+        let now = SystemTime::now();
+        assert_eq!(polled(&splitter, now), None, "nobody has said anything yet");
+        reports.write("feat-a", Reported::Idle, now).unwrap();
+        assert_eq!(polled(&splitter, now), Some(PaneStatus::Idle));
+    }
+
+    /// A crashed harness never reports that it stopped.
+    #[test]
+    fn a_closed_pane_is_dead_whatever_the_agent_last_said() {
+        let (splitter, mux, reports) = splitter_with_reports("dead");
+        let now = SystemTime::now();
+        reports.write("feat-a", Reported::Busy, now).unwrap();
+        mux.statuses.lock().unwrap().insert("p1".to_string(), PaneStatus::Dead);
+        assert_eq!(polled(&splitter, now), Some(PaneStatus::Dead));
+    }
+
+    #[test]
+    fn a_stale_report_gives_way_to_the_multiplexers_reading() {
+        let (splitter, mux, reports) = splitter_with_reports("stale");
+        let then = SystemTime::now();
+        reports.write("feat-a", Reported::Busy, then).unwrap();
+        mux.statuses.lock().unwrap().insert("p1".to_string(), PaneStatus::Idle);
+        let later = then + FRESH_FOR + Duration::from_secs(1);
+        assert_eq!(polled(&splitter, later), Some(PaneStatus::Idle));
+        mux.statuses.lock().unwrap().clear();
+        assert_eq!(polled(&splitter, later), None, "stale and no other reading: no news");
+    }
+
+    #[test]
+    fn a_new_pane_on_a_branch_does_not_inherit_the_old_ones_last_word() {
+        let (mut splitter, _mux, reports) = splitter_with_reports("respawn");
+        let now = SystemTime::now();
+        reports.write("feat-a", Reported::Busy, now).unwrap();
+        splitter.spawn_harness(cwd(), "feat-a", None).unwrap();
+        assert_eq!(polled(&splitter, now), None);
+    }
+
+    #[test]
+    fn stopping_a_lane_forgets_what_its_agent_said() {
+        let (mut splitter, _mux, reports) = splitter_with_reports("stop");
+        let now = SystemTime::now();
+        reports.write("feat-a", Reported::Busy, now).unwrap();
+        splitter.stop("feat-a").unwrap();
+        assert_eq!(reports.status("feat-a", now), None);
     }
 }
