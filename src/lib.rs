@@ -14,6 +14,7 @@ pub mod diff;
 pub mod harness;
 pub mod harness_launch;
 pub mod hit;
+pub mod mux;
 pub mod model;
 pub mod orca;
 pub mod pane_status;

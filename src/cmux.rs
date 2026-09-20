@@ -28,13 +28,15 @@
 //! to on `PATH`.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Output};
+use std::sync::Mutex;
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 pub use crate::pane_status::PaneStatus;
+use crate::mux::{command_exists, Multiplexer, OpenRequest};
 use crate::pane_status::CPU_BUSY_THRESHOLD_PERCENT;
 
 /// Pixels of slack allowed when treating two pane edges as touching. Frames come back as
@@ -42,42 +44,22 @@ use crate::pane_status::CPU_BUSY_THRESHOLD_PERCENT;
 /// merely near each other.
 const ADJACENCY_EPSILON: f64 = 4.0;
 
-#[derive(Debug, Clone)]
-struct PaneHandle {
-    surface_ref: String,
-    status: PaneStatus,
-}
-
-#[derive(Clone)]
+/// cmux, through its own CLI. Which pane belongs to which branch is
+/// `crate::splitter::Splitter`'s business; the one thing this remembers itself is the cmux
+/// workspace new panes open in, because nothing else has such a concept.
 pub struct Cmux {
     bin: PathBuf,
-    /// Passed as `new-split`'s direction for the *first* lane, which splits off
-    /// kanstack's own pane; `left`, `right`, `up`, or `down`.
-    direction: String,
-    /// Direction for every lane after the first, which splits off the previous lane
-    /// instead of kanstack — kanstack's own above/below slot is taken after the first
-    /// split, so further lanes fan out to the side rather than restacking that slot.
-    chain_direction: String,
-    /// Surface ref of the most recently spawned harness, so the next lane splits off it
-    /// instead of kanstack's own pane. `None` splits off kanstack itself (the first lane).
-    last_anchor: Option<String>,
     /// The cmux workspace new panes belong in, e.g. `workspace:1`: pinned by the caller
-    /// (see [`Self::set_workspace`]) or, failing that, read off the last pane this opened.
+    /// (see [`Multiplexer::set_scope`]) or, failing that, read off the last pane this opened.
     /// `None` until one of those has happened, meaning "wherever `$CMUX_WORKSPACE_ID`
     /// says" — which is right for the board, running inside its own pane, but is only as
     /// good as that variable is for anything else.
-    workspace: Option<String>,
-    /// One entry per lane kanstack has opened a harness for, keyed by the branch name
-    /// passed to `spawn_pane` — the lane's *original* parallel branch, which stays the
-    /// key even if other branches later stack on top of it (stacking never opens a second
-    /// pane).
-    panes: HashMap<String, PaneHandle>,
+    workspace: Mutex<Option<String>>,
 }
 
 impl Cmux {
-    /// Locates the `cmux` binary and the configured harness/split direction. Returns
-    /// `None` (not an error) when `cmux` is not on `PATH` and `KANSTACK_CMUX_BIN` is
-    /// unset — kanstack runs fine outside cmux.
+    /// Locates the `cmux` binary. Returns `None` (not an error) when `cmux` is not on
+    /// `PATH` and `KANSTACK_CMUX_BIN` is unset — kanstack runs fine outside cmux.
     pub fn discover() -> Option<Self> {
         let bin = match std::env::var_os("KANSTACK_CMUX_BIN") {
             Some(path) => PathBuf::from(path),
@@ -89,137 +71,19 @@ impl Cmux {
                 candidate
             }
         };
-        let direction = std::env::var("KANSTACK_CMUX_DIRECTION")
-            .map(|raw| normalize_direction(&raw))
-            .unwrap_or_else(|_| "up".to_string());
-        let chain_direction = std::env::var("KANSTACK_CMUX_CHAIN_DIRECTION")
-            .map(|raw| normalize_direction(&raw))
-            .unwrap_or_else(|_| "right".to_string());
-        Some(Cmux {
-            bin,
-            direction,
-            chain_direction,
-            last_anchor: None,
-            workspace: None,
-            panes: HashMap::new(),
-        })
+        Some(Cmux { bin, workspace: Mutex::new(None) })
     }
 
-    /// Whether kanstack has ever opened a pane for `branch` (regardless of its current
-    /// status) — used to decide whether task dispatch needs to spawn one first.
-    pub fn has_pane(&self, branch: &str) -> bool {
-        self.panes.contains_key(branch)
-    }
-
-    /// Last known status of `branch`'s pane. `None` if kanstack has never tracked one for
-    /// it at all (as opposed to `Some(PaneStatus::Dead)`, which means one existed and its
-    /// surface has since disappeared from `pane.list`).
-    pub fn pane_status(&self, branch: &str) -> Option<PaneStatus> {
-        self.panes.get(branch).map(|p| p.status)
-    }
-
-    /// No panes tracked at all — nothing worth polling.
-    pub fn is_empty(&self) -> bool {
-        self.panes.is_empty()
-    }
-
-    /// Splits off the previous lane's pane (or kanstack's own, for the first lane), types
-    /// `launch` into the fresh terminal, then labels the tab `name` (e.g. the branch name).
-    /// Returns the new surface's ref, for a caller that needs to find it again from another
-    /// process.
-    ///
-    /// `launch` is the whole harness command line (see
-    /// `crate::harness::HarnessConfig::launch_line`), initial message and branch-context note
-    /// included, rather than those being sent as a second `cmux send` afterwards — the
-    /// harness needs a moment to start before it can receive typed input, same problem
-    /// `confirm_task_dispatch` works around by asking for a second `t` press, and there's no
-    /// "wait until ready" primitive to lean on here either. Folding it into the launch line
-    /// sidesteps the race instead of racing it.
-    ///
-    /// `cwd` is unused: the launch line `cd`s there itself.
-    pub fn spawn_pane(&mut self, _cwd: &Path, name: &str, launch: &str) -> Result<String> {
-        // A pinned workspace that no longer exists (closed since) is dropped: this spawn
-        // falls back to the environment, and pins wherever that lands.
-        let pinned = self.pinned_surface();
-        if self.workspace.is_some() && pinned.is_none() {
-            self.workspace = None;
-        }
-        let (direction, anchor) = match &self.last_anchor {
-            Some(anchor) => (self.chain_direction.clone(), Some(anchor.clone())),
-            None => match pinned {
-                // A workspace was pinned: split a surface inside it, whatever the
-                // environment says about where we're running.
-                Some(surface) => (self.direction.clone(), Some(surface)),
-                None => match self.occupant_in_direction(&self.direction) {
-                    // Something already sits in kanstack's own split slot (e.g. a tab the
-                    // user had open before kanstack started): join it beside that pane
-                    // instead of stacking a third row onto kanstack.
-                    Ok(Some(occupant)) => (self.chain_direction.clone(), Some(occupant)),
-                    Ok(None) => (self.direction.clone(), None),
-                    // No geometry, no $CMUX_SURFACE_ID, or a malformed response: fall back
-                    // to the plain behavior rather than failing the whole spawn over it.
-                    Err(_) => (self.direction.clone(), None),
-                },
-            },
-        };
-
-        let mut split_args = vec!["new-split", direction.as_str()];
-        if let Some(anchor) = &anchor {
-            split_args.extend(["--surface", anchor.as_str()]);
-        }
-        if let Some(workspace) = &self.workspace {
-            split_args.extend(["--workspace", workspace.as_str()]);
-        }
-        let split_out = self.run(&split_args)?;
-        let surface_ref = extract_ref(&split_out, "surface:")
-            .with_context(|| format!("`cmux new-split` did not report a surface: {split_out:?}"))?
-            .to_string();
-        // Remembered, so every later pane lands in the workspace this one did.
-        if let Some(workspace) = extract_ref(&split_out, "workspace:") {
-            self.workspace = Some(self.workspace_id(workspace));
-        }
-
-        self.type_and_submit(&surface_ref, launch)?;
-
-        self.run_scoped(&["rename-tab", "--surface", &surface_ref, name])?;
-        self.panes.insert(
-            name.to_string(),
-            PaneHandle {
-                surface_ref: surface_ref.clone(),
-                status: PaneStatus::Unknown,
-            },
-        );
-        self.last_anchor = Some(surface_ref.clone());
-        Ok(surface_ref)
-    }
-
-    /// Starts tracking a surface some other process opened, so `send_task`,
-    /// `poll_statuses`, `focus` and `stop` work on it.
-    pub fn adopt(&mut self, branch: &str, surface_ref: &str) {
-        self.panes.insert(
-            branch.to_string(),
-            PaneHandle { surface_ref: surface_ref.to_string(), status: PaneStatus::Unknown },
-        );
-    }
-
-    /// Pins the workspace new panes are opened in — see the `workspace` field. `None`
-    /// leaves it to `$CMUX_WORKSPACE_ID`.
-    pub fn set_workspace(&mut self, workspace: Option<&str>) {
-        self.workspace = workspace.map(str::to_string);
-    }
-
-    /// The workspace new panes are opened in: what was pinned, or what the last pane this
-    /// opened turned out to be in.
-    pub fn workspace(&self) -> Option<String> {
-        self.workspace.clone()
+    fn pinned_workspace(&self) -> Option<String> {
+        self.workspace.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// The pinned workspace, with a terminal surface in it to split from — `None` if
     /// nothing is pinned, or the pinned workspace no longer exists (closed since), in which
     /// case the caller falls back to the environment and pins wherever that lands.
     fn pinned_surface(&self) -> Option<String> {
-        let workspace = self.workspace.as_deref()?;
-        let out = self.run(&["list-panels", "--workspace", workspace]).ok()?;
+        let workspace = self.pinned_workspace()?;
+        let out = self.run(&["list-panels", "--workspace", &workspace]).ok()?;
         terminal_surface(&out)
     }
 
@@ -234,69 +98,6 @@ impl Cmux {
             .unwrap_or_else(|| workspace_ref.to_string())
     }
 
-    /// Overrides the first-lane split direction, which `discover` read from `KANSTACK_CMUX_DIRECTION`.
-    /// For a caller with its own setting — the `kanstack spawn` subcommand has
-    /// `KANSTACK_SPAWN_DIRECTION`, since the board's `above` puts lanes over kanstack's own
-    /// pane and an agent's pane is usually somewhere else.
-    pub fn set_first_direction(&mut self, direction: &str) {
-        self.direction = normalize_direction(direction);
-    }
-
-    /// Makes the next spawn split off `surface_ref` rather than kanstack's own pane, the
-    /// way consecutive spawns within one process already chain.
-    pub fn set_anchor(&mut self, surface_ref: &str) {
-        self.last_anchor = Some(surface_ref.to_string());
-    }
-
-    /// The ref of `branch`'s tracked surface.
-    pub fn pane_id(&self, branch: &str) -> Option<String> {
-        self.panes.get(branch).map(|p| p.surface_ref.clone())
-    }
-
-    /// Brings `branch`'s surface to the front and gives it keyboard focus. cmux's
-    /// "panel" refs are the same `surface:N` refs `new-split` reports.
-    pub fn focus(&self, branch: &str) -> Result<()> {
-        let Some(pane) = self.panes.get(branch) else {
-            bail!("no cmux pane open for {branch} yet");
-        };
-        self.run_scoped(&["focus-panel", "--panel", &pane.surface_ref])?;
-        Ok(())
-    }
-
-    /// Closes `branch`'s surface, ending whatever harness is running in it, and stops
-    /// tracking it. Already gone counts as stopped.
-    pub fn stop(&mut self, branch: &str) -> Result<()> {
-        let Some(pane) = self.panes.remove(branch) else {
-            bail!("no cmux pane open for {branch} yet");
-        };
-        if self.last_anchor.as_deref() == Some(pane.surface_ref.as_str()) {
-            self.last_anchor = None;
-        }
-        // Whether an already-closed surface is an error here isn't documented; a surface
-        // that no longer appears in `pane.list` is the state `stop` is after either way.
-        if self.run_scoped(&["close-surface", "--surface", &pane.surface_ref]).is_err() {
-            let still_there = self
-                .run(&["rpc", "pane.list"])
-                .map(|out| out.contains(&pane.surface_ref))
-                .unwrap_or(true);
-            if still_there {
-                bail!("`cmux close-surface` failed for {}", pane.surface_ref);
-            }
-        }
-        Ok(())
-    }
-
-    /// Sends `text` followed by Enter into `branch`'s tracked pane via `cmux send
-    /// --surface`, the same mechanism `spawn_pane` already uses to type the launch
-    /// command — just generalized to target a pane recorded earlier rather than the one
-    /// just created.
-    pub fn send_task(&self, branch: &str, text: &str) -> Result<()> {
-        let Some(pane) = self.panes.get(branch) else {
-            bail!("no cmux pane open for {branch} yet");
-        };
-        self.type_and_submit(&pane.surface_ref, text)
-    }
-
     /// Types `text` into `surface_ref`, then presses Enter as a separate key. A trailing
     /// newline in the same `cmux send` reaches the terminal as a carriage return in the
     /// same burst as the text, which a TUI like Claude Code reads as part of a paste rather
@@ -308,61 +109,6 @@ impl Cmux {
         self.run_scoped(&["send", "--surface", surface_ref, text])?;
         self.run_scoped(&["send-key", "--surface", surface_ref, "enter"])?;
         Ok(())
-    }
-
-    /// Re-derives every tracked pane's status: `cmux rpc pane.list` for whether the
-    /// surface still exists at all, then (only when a `CMUX_WORKSPACE_ID` is available to
-    /// scope the query to, and only when at least one tracked surface is still present)
-    /// `cmux top --workspace <id> --json` for whether anything beyond the resting login
-    /// shell is running in it.
-    ///
-    /// Pure and read-only on `self` — safe to call from a background thread against a
-    /// cloned snapshot.
-    pub fn poll_statuses(&self) -> Result<HashMap<String, PaneStatus>> {
-        if self.panes.is_empty() {
-            return Ok(HashMap::new());
-        }
-        // Without a workspace, `pane.list` covers whichever one is selected right now, which
-        // needn't be where these panes are — they'd all read as dead.
-        let list_out = match &self.workspace {
-            Some(ws) => self.run(&["rpc", "pane.list", &format!("{{\"workspace_id\":\"{ws}\"}}")])?,
-            None => self.run(&["rpc", "pane.list"])?,
-        };
-
-        let any_alive = {
-            let list: PaneListResponse = serde_json::from_str(&list_out)
-                .with_context(|| format!("bad pane.list response: {list_out:?}"))?;
-            let present: std::collections::HashSet<String> = list
-                .panes
-                .into_iter()
-                .flat_map(|p| p.surface_refs)
-                .collect();
-            self.panes.values().any(|p| present.contains(&p.surface_ref))
-        };
-
-        let top_out = if any_alive {
-            match self.workspace.clone().ok_or(()).or_else(|()| std::env::var("CMUX_WORKSPACE_ID").map_err(|_| ())) {
-                // Else: no workspace to scope `top` to without guessing —
-                // existence-only status is still derived below; the Busy/Idle split
-                // is skipped this round.
-                Ok(workspace_id) => Some(self.run(&["top", "--workspace", &workspace_id, "--json"])?),
-                Err(_) => None,
-            }
-        } else {
-            None
-        };
-
-        classify_statuses(&self.panes, &list_out, top_out.as_deref())
-    }
-
-    /// Merges a `poll_statuses` result back in, keyed by branch. Entries for lanes deleted
-    /// since the poll started are simply absent from `self.panes` and are ignored.
-    pub fn apply_statuses(&mut self, statuses: HashMap<String, PaneStatus>) {
-        for (branch, status) in statuses {
-            if let Some(pane) = self.panes.get_mut(&branch) {
-                pane.status = status;
-            }
-        }
     }
 
     /// Looks for a pane already touching kanstack's own pane on `direction`'s side, via
@@ -398,7 +144,7 @@ impl Cmux {
     /// pane that's right there — or, for `new-split`, opens the pane in the wrong workspace.
     /// The flag goes straight after the subcommand, ahead of any positional argument.
     fn run_scoped(&self, args: &[&str]) -> Result<String> {
-        match &self.workspace {
+        match self.pinned_workspace() {
             Some(ws) if !args.is_empty() => {
                 let mut scoped = vec![args[0], "--workspace", ws.as_str()];
                 scoped.extend(&args[1..]);
@@ -427,6 +173,150 @@ impl Cmux {
             );
         }
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+}
+
+impl Multiplexer for Cmux {
+    fn name(&self) -> &'static str {
+        "cmux"
+    }
+
+    fn running_inside(&self) -> bool {
+        std::env::var_os("CMUX_SURFACE_ID").is_some()
+    }
+
+    /// Splits off the previous lane's pane (or, for the first lane, whatever is right for
+    /// where kanstack sits — see below), types `launch` into the fresh terminal, then labels
+    /// the tab with the branch name.
+    ///
+    /// `launch` is the whole harness command line, initial message and branch-context note
+    /// included, rather than those being sent as a second `cmux send` afterwards — the
+    /// harness needs a moment to start before it can receive typed input, and there's no
+    /// "wait until ready" primitive to lean on here. Folding it into the launch line
+    /// sidesteps the race instead of racing it.
+    ///
+    /// The first lane splits a surface in the pinned workspace if one is pinned; failing
+    /// that, a pane already sitting in kanstack's own split slot, so a lane joins it rather
+    /// than stacking a third row onto kanstack; failing that, kanstack's own pane.
+    ///
+    /// `req.cwd` is unused: the launch line `cd`s there itself.
+    fn open_pane(&self, req: &OpenRequest<'_>) -> Result<String> {
+        // A pinned workspace that no longer exists (closed since) is dropped: this spawn
+        // falls back to the environment, and pins wherever that lands.
+        let pinned = self.pinned_surface();
+        if self.pinned_workspace().is_some() && pinned.is_none() {
+            self.set_scope(None);
+        }
+        let (direction, anchor) = match req.after {
+            Some(anchor) => (req.chain_direction, Some(anchor.to_string())),
+            None => match pinned {
+                // A workspace was pinned: split a surface inside it, whatever the
+                // environment says about where we're running.
+                Some(surface) => (req.first_direction, Some(surface)),
+                None => match self.occupant_in_direction(req.first_direction) {
+                    // Something already sits in kanstack's own split slot (e.g. a tab the
+                    // user had open before kanstack started): join it beside that pane
+                    // instead of stacking a third row onto kanstack.
+                    Ok(Some(occupant)) => (req.chain_direction, Some(occupant)),
+                    Ok(None) => (req.first_direction, None),
+                    // No geometry, no $CMUX_SURFACE_ID, or a malformed response: fall back
+                    // to the plain behavior rather than failing the whole spawn over it.
+                    Err(_) => (req.first_direction, None),
+                },
+            },
+        };
+
+        let workspace = self.pinned_workspace();
+        let mut split_args = vec!["new-split", direction];
+        if let Some(anchor) = &anchor {
+            split_args.extend(["--surface", anchor.as_str()]);
+        }
+        if let Some(workspace) = &workspace {
+            split_args.extend(["--workspace", workspace.as_str()]);
+        }
+        let split_out = self.run(&split_args)?;
+        let surface_ref = extract_ref(&split_out, "surface:")
+            .with_context(|| format!("`cmux new-split` did not report a surface: {split_out:?}"))?
+            .to_string();
+        // Remembered, so every later pane lands in the workspace this one did.
+        if let Some(workspace) = extract_ref(&split_out, "workspace:") {
+            self.set_scope(Some(&self.workspace_id(workspace)));
+        }
+
+        self.type_and_submit(&surface_ref, req.launch)?;
+        self.run_scoped(&["rename-tab", "--surface", &surface_ref, req.title])?;
+        Ok(surface_ref)
+    }
+
+    fn type_line(&self, pane: &str, text: &str) -> Result<()> {
+        self.type_and_submit(pane, text)
+    }
+
+    /// cmux's "panel" refs are the same `surface:N` refs `new-split` reports.
+    fn focus(&self, pane: &str) -> Result<()> {
+        self.run_scoped(&["focus-panel", "--panel", pane])?;
+        Ok(())
+    }
+
+    fn close(&self, pane: &str) -> Result<()> {
+        // Whether an already-closed surface is an error here isn't documented; a surface
+        // that no longer appears in `pane.list` is the state closing is after either way.
+        if self.run_scoped(&["close-surface", "--surface", pane]).is_err() {
+            let still_there = self.run(&["rpc", "pane.list"]).map(|out| out.contains(pane)).unwrap_or(true);
+            if still_there {
+                bail!("`cmux close-surface` failed for {pane}");
+            }
+        }
+        Ok(())
+    }
+
+    /// `cmux rpc pane.list` for whether each surface still exists at all, then (only when a
+    /// `CMUX_WORKSPACE_ID` is available to scope the query to, and only when at least one
+    /// tracked surface is still present) `cmux top --workspace <id> --json` for whether
+    /// anything beyond the resting login shell is running in it.
+    fn probe(&self, panes: &[&str]) -> Result<HashMap<String, PaneStatus>> {
+        if panes.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let workspace = self.pinned_workspace();
+        // Without a workspace, `pane.list` covers whichever one is selected right now, which
+        // needn't be where these panes are — they'd all read as dead.
+        let list_out = match &workspace {
+            Some(ws) => self.run(&["rpc", "pane.list", &format!("{{\"workspace_id\":\"{ws}\"}}")])?,
+            None => self.run(&["rpc", "pane.list"])?,
+        };
+
+        let any_alive = {
+            let list: PaneListResponse = serde_json::from_str(&list_out)
+                .with_context(|| format!("bad pane.list response: {list_out:?}"))?;
+            let present: std::collections::HashSet<String> =
+                list.panes.into_iter().flat_map(|p| p.surface_refs).collect();
+            panes.iter().any(|p| present.contains(*p))
+        };
+
+        let top_out = if any_alive {
+            match workspace.ok_or(()).or_else(|()| std::env::var("CMUX_WORKSPACE_ID").map_err(|_| ())) {
+                // Else: no workspace to scope `top` to without guessing —
+                // existence-only status is still derived below; the Busy/Idle split
+                // is skipped this round.
+                Ok(workspace_id) => Some(self.run(&["top", "--workspace", &workspace_id, "--json"])?),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+        classify_statuses(panes, &list_out, top_out.as_deref())
+    }
+
+    fn set_scope(&self, scope: Option<&str>) {
+        *self.workspace.lock().unwrap_or_else(|e| e.into_inner()) = scope.map(str::to_string);
+    }
+
+    /// The workspace new panes are opened in: what was pinned, or what the last pane this
+    /// opened turned out to be in.
+    fn scope(&self) -> Option<String> {
+        self.pinned_workspace()
     }
 }
 
@@ -501,12 +391,14 @@ struct PixelFrame {
     height: f64,
 }
 
-/// Pure classification step of [`Cmux::poll_statuses`], split out so it can be unit
-/// tested against captured JSON fixtures without shelling out to a real `cmux`.
-/// `list_json` is a `cmux rpc pane.list` response; `top_json`, if present, is a `cmux top
-/// --json` response.
+/// Pure classification step of [`Cmux::probe`], split out so it can be unit tested against
+/// captured JSON fixtures without shelling out to a real `cmux`. `list_json` is a `cmux rpc
+/// pane.list` response; `top_json`, if present, is a `cmux top --json` response. A surface
+/// present in the listing with no CPU data this round is left out — existence alone can't
+/// distinguish `Busy` from `Idle`, so the caller keeps what it knew rather than being
+/// handed a guess.
 fn classify_statuses(
-    panes: &HashMap<String, PaneHandle>,
+    panes: &[&str],
     list_json: &str,
     top_json: Option<&str>,
 ) -> Result<HashMap<String, PaneStatus>> {
@@ -532,19 +424,17 @@ fn classify_statuses(
 
     Ok(panes
         .iter()
-        .map(|(branch, pane)| {
-            let status = if !present.contains(pane.surface_ref.as_str()) {
+        .filter_map(|&pane| {
+            let status = if !present.contains(pane) {
                 PaneStatus::Dead
             } else {
-                match cpu_percents.get(&pane.surface_ref) {
+                match cpu_percents.get(pane) {
                     Some(cpu) if *cpu > CPU_BUSY_THRESHOLD_PERCENT => PaneStatus::Busy,
                     Some(_) => PaneStatus::Idle,
-                    // No CPU data this round: keep whatever was already known rather
-                    // than guessing.
-                    None => pane.status,
+                    None => return None,
                 }
             };
-            (branch.clone(), status)
+            Some((pane.to_string(), status))
         })
         .collect())
 }
@@ -563,18 +453,6 @@ fn touches(own: &PixelFrame, other: &PixelFrame, direction: &str) -> bool {
         "right" => close(own.x + own.width, other.x) && overlaps_vertically,
         _ => false,
     }
-}
-
-/// Accepts the more readable `above`/`below` alongside `cmux new-split`'s native
-/// `up`/`down`/`left`/`right`, so `KANSTACK_CMUX_DIRECTION=above` doesn't just get passed
-/// straight through to a flag that rejects it.
-fn normalize_direction(raw: &str) -> String {
-    match raw {
-        "above" => "up",
-        "below" => "down",
-        other => other,
-    }
-    .to_string()
 }
 
 /// The UUID `cmux --id-format both workspace list` prints beside `workspace_ref`. Lines
@@ -609,15 +487,10 @@ fn extract_ref<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
     text.split_whitespace().find(|tok| tok.starts_with(prefix))
 }
 
-fn command_exists(bin: &Path) -> bool {
-    let Some(path_var) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path_var).any(|dir| dir.join(bin).is_file())
-}
-
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     /// Runs `body` with `PATH` and `KANSTACK_CMUX_BIN` swapped out and restored
@@ -691,22 +564,13 @@ mod tests {
     const PANE_LIST_FIXTURE: &str = include_str!("../tests/fixtures/cmux_pane_list.json");
     const TOP_FIXTURE: &str = include_str!("../tests/fixtures/cmux_top.json");
 
-    fn pane(surface_ref: &str, status: PaneStatus) -> PaneHandle {
-        PaneHandle {
-            surface_ref: surface_ref.to_string(),
-            status,
-        }
-    }
-
     /// A tracked surface that's present in `pane.list` and shows CPU usage above
     /// [`CPU_BUSY_THRESHOLD_PERCENT`] in `cmux top` (a real, actively-generating `claude`
     /// session, captured live at ~35%) classifies as `Busy`.
     #[test]
     fn classify_statuses_marks_a_high_cpu_surface_busy() {
-        let panes = HashMap::from([("feature-a".to_string(), pane("surface:33", PaneStatus::Unknown))]);
-        let statuses =
-            classify_statuses(&panes, PANE_LIST_FIXTURE, Some(TOP_FIXTURE)).unwrap();
-        assert_eq!(statuses["feature-a"], PaneStatus::Busy);
+        let statuses = classify_statuses(&["surface:33"], PANE_LIST_FIXTURE, Some(TOP_FIXTURE)).unwrap();
+        assert_eq!(statuses["surface:33"], PaneStatus::Busy);
     }
 
     /// A tracked surface present in `pane.list` with CPU usage at the busy threshold or
@@ -715,30 +579,26 @@ mod tests {
     /// wrong.
     #[test]
     fn classify_statuses_marks_a_low_cpu_surface_idle() {
-        let panes = HashMap::from([("feature-b".to_string(), pane("surface:34", PaneStatus::Unknown))]);
-        let statuses =
-            classify_statuses(&panes, PANE_LIST_FIXTURE, Some(TOP_FIXTURE)).unwrap();
-        assert_eq!(statuses["feature-b"], PaneStatus::Idle);
+        let statuses = classify_statuses(&["surface:34"], PANE_LIST_FIXTURE, Some(TOP_FIXTURE)).unwrap();
+        assert_eq!(statuses["surface:34"], PaneStatus::Idle);
     }
 
     /// A tracked surface absent from `pane.list` entirely — its tab was closed —
     /// classifies as `Dead`, regardless of what `cmux top` says.
     #[test]
     fn classify_statuses_marks_a_missing_surface_dead() {
-        let panes = HashMap::from([("feature-c".to_string(), pane("surface:999", PaneStatus::Busy))]);
-        let statuses =
-            classify_statuses(&panes, PANE_LIST_FIXTURE, Some(TOP_FIXTURE)).unwrap();
-        assert_eq!(statuses["feature-c"], PaneStatus::Dead);
+        let statuses = classify_statuses(&["surface:999"], PANE_LIST_FIXTURE, Some(TOP_FIXTURE)).unwrap();
+        assert_eq!(statuses["surface:999"], PaneStatus::Dead);
     }
 
     /// Without a `cmux top` response (e.g. no `CMUX_WORKSPACE_ID` to scope it), a surface
-    /// still present in `pane.list` keeps its previously known status rather than being
-    /// guessed at — existence alone can't distinguish Busy from Idle.
+    /// still present in `pane.list` is left out: existence alone can't distinguish Busy from
+    /// Idle, so the caller keeps its previously known status rather than being handed a
+    /// guess.
     #[test]
-    fn classify_statuses_keeps_prior_status_without_a_top_response() {
-        let panes = HashMap::from([("feature-a".to_string(), pane("surface:33", PaneStatus::Busy))]);
-        let statuses = classify_statuses(&panes, PANE_LIST_FIXTURE, None).unwrap();
-        assert_eq!(statuses["feature-a"], PaneStatus::Busy);
+    fn classify_statuses_leaves_out_a_surface_without_a_top_response() {
+        let statuses = classify_statuses(&["surface:33"], PANE_LIST_FIXTURE, None).unwrap();
+        assert!(!statuses.contains_key("surface:33"), "{statuses:?}");
     }
 
     #[test]

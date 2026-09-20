@@ -1,11 +1,11 @@
 //! The registry behind the `kanstack spawn/send/status/focus/stop` subcommands.
 //!
-//! A backend's pane handles (`crate::cmux::Cmux::panes`, `crate::tmux::Tmux::panes`,
-//! `crate::orca::Orca::panes`) live only in the memory of whichever process opened them, so
+//! A [`Splitter`]'s pane handles — which pane belongs to which branch — live only in the
+//! memory of whichever process opened them, so
 //! a second `kanstack` invocation — an agent in another pane running `kanstack send`, say —
 //! can't see a pane the first one opened. A [`Workstream`] is the durable half of that
 //! handle: which branch it is, which pane it sits in, which agent is running there. Both the
-//! board and the subcommands record into it, and re-seed a fresh backend from it with
+//! board and the subcommands record into it, and re-seed a fresh [`Splitter`] from it with
 //! [`Registry::adopt_into`].
 //!
 //! One file per repository (see [`state_path`]), so two repositories can each have a

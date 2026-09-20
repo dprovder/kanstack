@@ -1,37 +1,58 @@
-//! Dispatch over whichever harness-split backend `main.rs` discovered — `cmux` if present,
-//! else plain `tmux`, else `orca` (see `crate::cmux`, `crate::tmux`, `crate::orca`), paired
-//! with the harness it launches (`crate::harness`). The backend is a plain enum rather than a
-//! trait object: there are exactly three, and the point is that `app.rs`'s call sites
-//! shouldn't have to care which one they hold.
+//! The harness-split state kanstack keeps, whichever multiplexer it is in — `cmux` if
+//! present, else plain `tmux`, else `orca` (see `crate::cmux`, `crate::tmux`, `crate::orca`),
+//! paired with the harness it launches (`crate::harness`).
+//!
+//! A [`Multiplexer`] only opens, types into, focuses, closes and probes panes. Which branch a
+//! pane belongs to, where the next one splits off, and what a pane's last known status was
+//! are the same for every multiplexer, so they live here once, and `app/`'s call sites
+//! needn't care which one they hold.
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{anyhow, bail, Result};
 
 use crate::cmux::Cmux;
 use crate::harness::HarnessConfig;
+use crate::mux::{configured_directions, normalize_direction, Multiplexer, OpenRequest};
 use crate::orca::Orca;
 use crate::pane_status::PaneStatus;
 use crate::tmux::Tmux;
 
-#[derive(Clone)]
-enum Backend {
-    Cmux(Cmux),
-    Tmux(Tmux),
-    Orca(Orca),
+/// One lane's pane, as this process knows it.
+#[derive(Debug, Clone)]
+struct Pane {
+    /// The multiplexer's own id for it.
+    id: String,
+    status: PaneStatus,
 }
 
-/// A harness-split backend plus the harness it launches into new panes. The backend only
-/// knows how to open, type into, focus and close panes; which harness runs in them, and
-/// what its launch line looks like, is [`HarnessConfig`]'s business (see `crate::harness`).
 #[derive(Clone)]
 pub struct Splitter {
-    backend: Backend,
+    mux: Arc<dyn Multiplexer>,
     harness: HarnessConfig,
+    /// Where the first lane goes relative to what it splits.
+    first_direction: String,
+    /// Where every later lane goes relative to the one before it.
+    chain_direction: String,
+    /// The pane the most recent spawn opened, so the next lane splits off it instead of
+    /// kanstack's own pane. `None` for the first lane.
+    last_anchor: Option<String>,
+    /// One entry per lane a harness was opened for, keyed by the branch name passed to
+    /// `spawn_harness` — the lane's *original* parallel branch, which stays the key even if
+    /// other branches later stack on top of it (stacking never opens a second pane).
+    panes: HashMap<String, Pane>,
 }
 
 impl Splitter {
+    /// A splitter over `mux` launching `harness`, with the directions `mux` is configured
+    /// for (see `crate::mux::configured_directions`) and no panes yet.
+    pub fn new(mux: Arc<dyn Multiplexer>, harness: HarnessConfig) -> Self {
+        let (first_direction, chain_direction) = configured_directions(mux.as_ref());
+        Splitter { mux, harness, first_direction, chain_direction, last_anchor: None, panes: HashMap::new() }
+    }
+
     /// Tries `Cmux::discover` first, then `Tmux::discover`, then `Orca::discover` — see each
     /// for what makes a backend usable at all. `None` means none is available, same as any
     /// alone.
@@ -55,81 +76,77 @@ impl Splitter {
     /// The harness launched into new panes is `$KANSTACK_HARNESS` (default `claude`), read
     /// here once rather than by each backend.
     pub fn discover() -> Option<Self> {
-        Some(Splitter { backend: Self::discover_backend()?, harness: HarnessConfig::from_env() })
+        Some(Splitter::new(Self::discover_mux()?, HarnessConfig::from_env()))
     }
 
-    fn discover_backend() -> Option<Backend> {
+    fn discover_mux() -> Option<Arc<dyn Multiplexer>> {
+        fn shared(mux: impl Multiplexer + 'static) -> Arc<dyn Multiplexer> {
+            Arc::new(mux)
+        }
         match std::env::var("KANSTACK_SPLIT_BACKEND").as_deref() {
-            Ok("cmux") => return Cmux::discover().map(Backend::Cmux),
-            Ok("tmux") => return Tmux::discover().map(Backend::Tmux),
-            Ok("orca") => return Orca::discover().map(Backend::Orca),
+            Ok("cmux") => return Cmux::discover().map(shared),
+            Ok("tmux") => return Tmux::discover().map(shared),
+            Ok("orca") => return Orca::discover().map(shared),
             _ => {}
         }
         let in_cmux_or_tmux =
             std::env::var_os("CMUX_SURFACE_ID").is_some() || std::env::var_os("TMUX_PANE").is_some();
         if Orca::running_inside() && !in_cmux_or_tmux {
             if let Some(orca) = Orca::discover() {
-                return Some(Backend::Orca(orca));
+                return Some(shared(orca));
             }
         }
         Cmux::discover()
-            .map(Backend::Cmux)
-            .or_else(|| Tmux::discover().map(Backend::Tmux))
-            .or_else(|| Orca::discover().map(Backend::Orca))
+            .map(shared)
+            .or_else(|| Tmux::discover().map(shared))
+            .or_else(|| Orca::discover().map(shared))
     }
 
     /// Which backend this is, for the one place UI copy needs to name it: the branch
     /// modal's checkbox row label.
     pub fn label(&self) -> &'static str {
-        match &self.backend {
-            Backend::Cmux(_) => "cmux",
-            Backend::Tmux(_) => "tmux",
-            Backend::Orca(_) => "orca",
-        }
+        self.mux.name()
     }
 
     /// Whether kanstack itself looks like it's still running inside this backend's own
     /// pane right now — checked before starting a background poll, since polling only
-    /// makes sense while that's true. Cheap env-var checks, one per backend, rather than
-    /// a round trip to the CLI.
+    /// makes sense while that's true.
     pub fn running_inside_host(&self) -> bool {
-        match &self.backend {
-            Backend::Cmux(_) => std::env::var_os("CMUX_SURFACE_ID").is_some(),
-            Backend::Tmux(_) => std::env::var_os("TMUX_PANE").is_some(),
-            Backend::Orca(_) => Orca::running_inside(),
-        }
+        self.mux.running_inside()
     }
 
+    /// Whether kanstack has ever opened a pane for `branch` (regardless of its current
+    /// status) — used to decide whether task dispatch needs to spawn one first.
     pub fn has_pane(&self, branch: &str) -> bool {
-        match &self.backend {
-            Backend::Cmux(c) => c.has_pane(branch),
-            Backend::Tmux(t) => t.has_pane(branch),
-            Backend::Orca(o) => o.has_pane(branch),
-        }
+        self.panes.contains_key(branch)
     }
 
+    /// Last known status of `branch`'s pane. `None` if kanstack has never tracked one for
+    /// it at all (as opposed to `Some(PaneStatus::Dead)`, which means one existed and has
+    /// since disappeared).
     pub fn pane_status(&self, branch: &str) -> Option<PaneStatus> {
-        match &self.backend {
-            Backend::Cmux(c) => c.pane_status(branch),
-            Backend::Tmux(t) => t.pane_status(branch),
-            Backend::Orca(o) => o.pane_status(branch),
-        }
+        self.panes.get(branch).map(|p| p.status)
     }
 
+    /// No panes tracked at all — nothing worth polling.
     pub fn is_empty(&self) -> bool {
-        match &self.backend {
-            Backend::Cmux(c) => c.is_empty(),
-            Backend::Tmux(t) => t.is_empty(),
-            Backend::Orca(o) => o.is_empty(),
-        }
+        self.panes.is_empty()
     }
 
     pub fn spawn_harness(&mut self, cwd: &Path, name: &str, initial_message: Option<&str>) -> Result<String> {
         self.spawn_harness_with(cwd, name, initial_message, None)
     }
 
-    /// [`Self::spawn_harness`] running `harness` in place of the configured one. Returns the
-    /// new pane's backend-specific id.
+    /// Opens a pane running the harness on lane `name`, with `cwd` as its working directory,
+    /// and starts tracking it. `harness` runs in place of the configured one, for just this
+    /// pane. Returns the new pane's backend-specific id, for a caller that needs to find it
+    /// again from another process.
+    ///
+    /// `initial_message` and the note that `name` is a GitButler virtual branch go out on
+    /// the launch line itself rather than as a second message afterwards: the harness needs
+    /// a moment to start before it can receive typed input, and there is no "wait until
+    /// ready" primitive to lean on, so folding them in sidesteps the race instead of racing
+    /// it. See `crate::harness::HarnessConfig::launch_line`.
     pub fn spawn_harness_with(
         &mut self,
         cwd: &Path,
@@ -138,103 +155,104 @@ impl Splitter {
         harness: Option<&str>,
     ) -> Result<String> {
         let launch = self.harness.launch_line(cwd, name, initial_message, harness)?;
-        match &mut self.backend {
-            Backend::Cmux(c) => c.spawn_pane(cwd, name, &launch),
-            Backend::Tmux(t) => t.spawn_pane(cwd, name, &launch),
-            Backend::Orca(o) => o.spawn_pane(cwd, name, &launch),
-        }
+        let id = self.mux.open_pane(&OpenRequest {
+            cwd,
+            title: name,
+            launch: &launch,
+            after: self.last_anchor.as_deref(),
+            first_direction: &self.first_direction,
+            chain_direction: &self.chain_direction,
+        })?;
+        self.panes.insert(name.to_string(), Pane { id: id.clone(), status: PaneStatus::Unknown });
+        self.last_anchor = Some(id.clone());
+        Ok(id)
     }
 
     /// Starts tracking a pane another process opened — see `crate::workstream::Registry`.
     pub fn adopt(&mut self, branch: &str, pane_id: &str) {
-        match &mut self.backend {
-            Backend::Cmux(c) => c.adopt(branch, pane_id),
-            Backend::Tmux(t) => t.adopt(branch, pane_id),
-            Backend::Orca(o) => o.adopt(branch, pane_id),
-        }
+        self.panes.insert(branch.to_string(), Pane { id: pane_id.to_string(), status: PaneStatus::Unknown });
     }
 
-    /// Pins the cmux workspace new panes are opened in; a no-op for tmux.
+    /// Pins the multiplexer-level grouping new panes open in (cmux's workspace); a no-op
+    /// for the others.
     pub fn set_workspace(&mut self, workspace: Option<&str>) {
-        match &mut self.backend {
-            Backend::Cmux(c) => c.set_workspace(workspace),
-            Backend::Tmux(t) => t.set_workspace(workspace),
-            Backend::Orca(o) => o.set_workspace(workspace),
-        }
+        self.mux.set_scope(workspace);
     }
 
     /// The workspace new panes go in, if this backend has such a thing.
     pub fn workspace(&self) -> Option<String> {
-        match &self.backend {
-            Backend::Cmux(c) => c.workspace(),
-            Backend::Tmux(t) => t.workspace(),
-            Backend::Orca(o) => o.workspace(),
-        }
+        self.mux.scope()
     }
 
-    /// Overrides the first-lane split direction — see `Cmux::set_first_direction`.
+    /// Overrides the first-lane split direction. For a caller with its own setting — the
+    /// `kanstack spawn` subcommand has `KANSTACK_SPAWN_DIRECTION`, since the board's `above`
+    /// puts lanes over kanstack's own pane and an agent's pane is usually somewhere else.
     pub fn set_first_direction(&mut self, direction: &str) {
-        match &mut self.backend {
-            Backend::Cmux(c) => c.set_first_direction(direction),
-            Backend::Tmux(t) => t.set_first_direction(direction),
-            Backend::Orca(o) => o.set_first_direction(direction),
-        }
+        self.first_direction = normalize_direction(direction);
     }
 
-    /// Makes the next spawn split off `pane_id` instead of the caller's own pane.
+    /// Makes the next spawn split off `pane_id` instead of the caller's own pane, the way
+    /// consecutive spawns within one process already chain.
     pub fn set_anchor(&mut self, pane_id: &str) {
-        match &mut self.backend {
-            Backend::Cmux(c) => c.set_anchor(pane_id),
-            Backend::Tmux(t) => t.set_anchor(pane_id),
-            Backend::Orca(o) => o.set_anchor(pane_id),
-        }
+        self.last_anchor = Some(pane_id.to_string());
     }
 
     pub fn pane_id(&self, branch: &str) -> Option<String> {
-        match &self.backend {
-            Backend::Cmux(c) => c.pane_id(branch),
-            Backend::Tmux(t) => t.pane_id(branch),
-            Backend::Orca(o) => o.pane_id(branch),
-        }
+        self.panes.get(branch).map(|p| p.id.clone())
+    }
+
+    /// `branch`'s tracked pane, or the error every action on an untracked lane reports.
+    fn pane(&self, branch: &str) -> Result<&Pane> {
+        self.panes.get(branch).ok_or_else(|| anyhow!("no {} pane open for {branch} yet", self.mux.name()))
     }
 
     pub fn focus(&self, branch: &str) -> Result<()> {
-        match &self.backend {
-            Backend::Cmux(c) => c.focus(branch),
-            Backend::Tmux(t) => t.focus(branch),
-            Backend::Orca(o) => o.focus(branch),
-        }
+        self.mux.focus(&self.pane(branch)?.id)
     }
 
+    /// Closes `branch`'s pane, ending whatever harness is running in it, and stops tracking
+    /// it. Already gone counts as stopped.
     pub fn stop(&mut self, branch: &str) -> Result<()> {
-        match &mut self.backend {
-            Backend::Cmux(c) => c.stop(branch),
-            Backend::Tmux(t) => t.stop(branch),
-            Backend::Orca(o) => o.stop(branch),
+        let Some(pane) = self.panes.remove(branch) else {
+            bail!("no {} pane open for {branch} yet", self.mux.name());
+        };
+        if self.last_anchor.as_deref() == Some(pane.id.as_str()) {
+            self.last_anchor = None;
         }
+        self.mux.close(&pane.id)
     }
 
+    /// Sends `text` followed by Enter into `branch`'s tracked pane — the same
+    /// literal-then-Enter sequence spawning uses to type the launch command, just aimed at a
+    /// pane recorded earlier.
     pub fn send_task(&self, branch: &str, text: &str) -> Result<()> {
-        match &self.backend {
-            Backend::Cmux(c) => c.send_task(branch, text),
-            Backend::Tmux(t) => t.send_task(branch, text),
-            Backend::Orca(o) => o.send_task(branch, text),
-        }
+        self.mux.type_line(&self.pane(branch)?.id, text).map_err(|e| anyhow!("{branch}: {e:#}"))
     }
 
+    /// Re-derives the status of every tracked pane, keyed by branch. A pane the backend had
+    /// no news about is left out, so [`Self::apply_statuses`] keeps what was known.
+    ///
+    /// Read-only — safe to call from a background thread against a cloned snapshot.
     pub fn poll_statuses(&self) -> Result<HashMap<String, PaneStatus>> {
-        match &self.backend {
-            Backend::Cmux(c) => c.poll_statuses(),
-            Backend::Tmux(t) => t.poll_statuses(),
-            Backend::Orca(o) => o.poll_statuses(),
+        if self.panes.is_empty() {
+            return Ok(HashMap::new());
         }
+        let ids: Vec<&str> = self.panes.values().map(|p| p.id.as_str()).collect();
+        let by_pane = self.mux.probe(&ids)?;
+        Ok(self
+            .panes
+            .iter()
+            .filter_map(|(branch, pane)| by_pane.get(&pane.id).map(|status| (branch.clone(), *status)))
+            .collect())
     }
 
+    /// Merges a `poll_statuses` result back in, keyed by branch. Entries for lanes deleted
+    /// since the poll started are simply absent from `self.panes` and are ignored.
     pub fn apply_statuses(&mut self, statuses: HashMap<String, PaneStatus>) {
-        match &mut self.backend {
-            Backend::Cmux(c) => c.apply_statuses(statuses),
-            Backend::Tmux(t) => t.apply_statuses(statuses),
-            Backend::Orca(o) => o.apply_statuses(statuses),
+        for (branch, status) in statuses {
+            if let Some(pane) = self.panes.get_mut(&branch) {
+                pane.status = status;
+            }
         }
     }
 }
@@ -280,7 +298,7 @@ mod tests {
                 ("ORCA_TERMINAL_HANDLE", None),
             ],
             || {
-                assert!(matches!(Splitter::discover(), Some(Splitter { backend: Backend::Cmux(_), .. })));
+                assert_eq!(Splitter::discover().map(|s| s.label()), Some("cmux"));
             },
         );
     }
@@ -297,7 +315,7 @@ mod tests {
                 ("TMUX_PANE", Some("%3")),
             ],
             || {
-                assert!(matches!(Splitter::discover(), Some(Splitter { backend: Backend::Tmux(_), .. })));
+                assert_eq!(Splitter::discover().map(|s| s.label()), Some("tmux"));
             },
         );
     }
@@ -341,7 +359,7 @@ mod tests {
                 ("ORCA_TERMINAL_HANDLE", None),
             ],
             || {
-                assert!(matches!(Splitter::discover(), Some(Splitter { backend: Backend::Cmux(_), .. })));
+                assert_eq!(Splitter::discover().map(|s| s.label()), Some("cmux"));
             },
         );
     }
@@ -360,7 +378,7 @@ mod tests {
         let mut with_handle = usable.to_vec();
         with_handle.push(("ORCA_TERMINAL_HANDLE", Some("term_1")));
         with_env(&with_handle, || {
-            assert!(matches!(Splitter::discover(), Some(Splitter { backend: Backend::Orca(_), .. })));
+            assert_eq!(Splitter::discover().map(|s| s.label()), Some("orca"));
         });
 
         let mut without_handle = usable.to_vec();
@@ -389,7 +407,7 @@ mod tests {
                 ("TMUX_PANE", None),
             ],
             || {
-                assert!(matches!(Splitter::discover(), Some(Splitter { backend: Backend::Orca(_), .. })));
+                assert_eq!(Splitter::discover().map(|s| s.label()), Some("orca"));
             },
         );
     }
@@ -407,11 +425,11 @@ mod tests {
         ];
         let mut in_cmux = base.to_vec();
         in_cmux.extend([("CMUX_SURFACE_ID", Some("ABC")), ("TMUX_PANE", None)]);
-        with_env(&in_cmux, || assert!(matches!(Splitter::discover(), Some(Splitter { backend: Backend::Cmux(_), .. }))));
+        with_env(&in_cmux, || assert_eq!(Splitter::discover().map(|s| s.label()), Some("cmux")));
 
         let mut in_tmux = base.to_vec();
         in_tmux.extend([("CMUX_SURFACE_ID", None), ("TMUX_PANE", Some("%3"))]);
-        with_env(&in_tmux, || assert!(matches!(Splitter::discover(), Some(Splitter { backend: Backend::Cmux(_), .. }))));
+        with_env(&in_tmux, || assert_eq!(Splitter::discover().map(|s| s.label()), Some("cmux")));
     }
 
     /// Orca is last in the chain: a tmux pane whose `tmux` binary can't be found (no cmux
@@ -432,7 +450,7 @@ mod tests {
                 ("ORCA_TERMINAL_HANDLE", Some("term_1")),
             ],
             || {
-                assert!(matches!(Splitter::discover(), Some(Splitter { backend: Backend::Orca(_), .. })));
+                assert_eq!(Splitter::discover().map(|s| s.label()), Some("orca"));
             },
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -445,7 +463,7 @@ mod tests {
         with_env(
             &[("KANSTACK_ORCA_BIN", Some("/nonexistent/not-orca")), ("ORCA_TERMINAL_HANDLE", Some("term_1"))],
             || {
-                let splitter = Splitter { backend: Backend::Orca(Orca::discover().unwrap()), harness: HarnessConfig::new("claude") };
+                let splitter = Splitter::new(Arc::new(Orca::discover().unwrap()), HarnessConfig::new("claude"));
                 assert_eq!(splitter.label(), "orca");
                 assert!(splitter.running_inside_host());
                 assert_eq!(splitter.workspace(), None, "there is no workspace to pin");
@@ -454,5 +472,181 @@ mod tests {
                 assert!(!splitter.running_inside_host());
             },
         );
+    }
+
+    // Everything below runs against `FakeMux`, so what it pins is the layer every backend
+    // shares — which pane belongs to which lane, where the next one goes, what a pane's last
+    // known status was — once, rather than once per backend.
+
+    use crate::mux::fake::FakeMux;
+
+    fn fake_splitter() -> (Splitter, Arc<FakeMux>) {
+        let mux = FakeMux::new();
+        (Splitter::new(mux.clone(), HarnessConfig::new("claude")), mux)
+    }
+
+    fn cwd() -> &'static Path {
+        Path::new("/repo")
+    }
+
+    #[test]
+    fn the_first_lane_splits_kanstacks_own_pane_and_each_later_one_chains_off_the_last() {
+        let (mut splitter, mux) = fake_splitter();
+        assert_eq!(splitter.spawn_harness(cwd(), "feat-a", None).unwrap(), "p1");
+        assert_eq!(splitter.spawn_harness(cwd(), "feat-b", None).unwrap(), "p2");
+        assert_eq!(splitter.spawn_harness(cwd(), "feat-c", None).unwrap(), "p3");
+        let lines = mux.lines();
+        assert!(lines[0].starts_with("open p1 up of own in /repo as feat-a: cd '/repo' && claude"), "{lines:#?}");
+        assert!(lines[1].starts_with("open p2 right of p1 in /repo as feat-b:"), "{lines:#?}");
+        assert!(lines[2].starts_with("open p3 right of p2 in /repo as feat-c:"), "{lines:#?}");
+    }
+
+    #[test]
+    fn a_spawned_lane_is_tracked_with_an_unknown_status_until_polled() {
+        let (mut splitter, _) = fake_splitter();
+        assert!(splitter.is_empty());
+        splitter.spawn_harness(cwd(), "feat-a", None).unwrap();
+        assert!(!splitter.is_empty());
+        assert!(splitter.has_pane("feat-a"));
+        assert_eq!(splitter.pane_id("feat-a").as_deref(), Some("p1"));
+        assert_eq!(splitter.pane_status("feat-a"), Some(PaneStatus::Unknown));
+        assert_eq!(splitter.pane_status("never-spawned"), None);
+    }
+
+    /// A launch that failed must not leave a phantom lane, or move the anchor the next
+    /// lane splits off.
+    #[test]
+    fn a_failed_open_tracks_nothing_and_leaves_the_anchor_alone() {
+        let (mut splitter, mux) = fake_splitter();
+        *mux.fail_open.lock().unwrap() = true;
+        assert!(splitter.spawn_harness(cwd(), "feat-a", None).is_err());
+        assert!(!splitter.has_pane("feat-a"));
+        *mux.fail_open.lock().unwrap() = false;
+        splitter.spawn_harness(cwd(), "feat-a", None).unwrap();
+        assert!(mux.lines()[0].starts_with("open p1 up of own"), "{:#?}", mux.lines());
+    }
+
+    #[test]
+    fn stopping_the_newest_lane_sends_the_next_one_back_to_kanstacks_own_pane() {
+        let (mut splitter, mux) = fake_splitter();
+        splitter.spawn_harness(cwd(), "feat-a", None).unwrap();
+        splitter.stop("feat-a").unwrap();
+        assert!(!splitter.has_pane("feat-a"));
+        splitter.spawn_harness(cwd(), "feat-b", None).unwrap();
+        let lines = mux.lines();
+        assert_eq!(lines[1], "close p1", "{lines:#?}");
+        assert!(lines[2].starts_with("open p2 up of own"), "the next lane must not split a closed pane: {lines:#?}");
+    }
+
+    #[test]
+    fn stopping_an_older_lane_keeps_chaining_off_the_newest() {
+        let (mut splitter, mux) = fake_splitter();
+        splitter.spawn_harness(cwd(), "feat-a", None).unwrap();
+        splitter.spawn_harness(cwd(), "feat-b", None).unwrap();
+        splitter.stop("feat-a").unwrap();
+        splitter.spawn_harness(cwd(), "feat-c", None).unwrap();
+        assert!(mux.lines().last().unwrap().starts_with("open p3 right of p2"), "{:#?}", mux.lines());
+    }
+
+    #[test]
+    fn acting_on_a_lane_with_no_pane_says_which_backend_and_which_lane() {
+        let (mut splitter, mux) = fake_splitter();
+        for err in [
+            splitter.focus("nope").unwrap_err(),
+            splitter.send_task("nope", "x").unwrap_err(),
+            splitter.stop("nope").unwrap_err(),
+        ] {
+            assert_eq!(err.to_string(), "no fake pane open for nope yet");
+        }
+        assert!(mux.lines().is_empty(), "nothing should reach the multiplexer: {:#?}", mux.lines());
+    }
+
+    /// The subcommands run in a process that never opened the pane, so they adopt one from
+    /// the registry and then act on it exactly as if they had.
+    #[test]
+    fn an_adopted_pane_can_be_focused_typed_into_and_stopped() {
+        let (mut splitter, mux) = fake_splitter();
+        splitter.adopt("feat-a", "p9");
+        splitter.focus("feat-a").unwrap();
+        splitter.send_task("feat-a", "run the tests").unwrap();
+        splitter.stop("feat-a").unwrap();
+        assert_eq!(mux.lines(), ["focus p9", "type p9: run the tests", "close p9"]);
+    }
+
+    #[test]
+    fn set_anchor_makes_the_next_lane_split_that_pane_in_the_chain_direction() {
+        let (mut splitter, mux) = fake_splitter();
+        splitter.set_anchor("p42");
+        splitter.spawn_harness(cwd(), "feat-a", None).unwrap();
+        assert!(mux.lines()[0].starts_with("open p1 right of p42"), "{:#?}", mux.lines());
+    }
+
+    #[test]
+    fn a_first_direction_override_is_normalized() {
+        let (mut splitter, mux) = fake_splitter();
+        splitter.set_first_direction("below");
+        splitter.spawn_harness(cwd(), "feat-a", None).unwrap();
+        assert!(mux.lines()[0].starts_with("open p1 down of own"), "{:#?}", mux.lines());
+    }
+
+    #[test]
+    fn a_harness_override_changes_only_that_lanes_launch_line() {
+        let (mut splitter, mux) = fake_splitter();
+        splitter.spawn_harness_with(cwd(), "feat-a", Some("go"), Some("codex")).unwrap();
+        splitter.spawn_harness(cwd(), "feat-b", Some("go")).unwrap();
+        let lines = mux.lines();
+        assert!(lines[0].contains("&& codex "), "{lines:#?}");
+        assert!(lines[1].contains("&& claude "), "{lines:#?}");
+    }
+
+    /// Statuses come back keyed by branch, and a pane the backend had no news about is left
+    /// out — so applying them keeps what was already known instead of overwriting it.
+    #[test]
+    fn polling_reports_by_branch_and_no_news_keeps_the_last_known_status() {
+        let (mut splitter, mux) = fake_splitter();
+        splitter.spawn_harness(cwd(), "feat-a", None).unwrap();
+        splitter.spawn_harness(cwd(), "feat-b", None).unwrap();
+
+        mux.statuses.lock().unwrap().insert("p1".to_string(), PaneStatus::Busy);
+        let polled = splitter.poll_statuses().unwrap();
+        assert_eq!(polled, HashMap::from([("feat-a".to_string(), PaneStatus::Busy)]));
+        splitter.apply_statuses(polled);
+        assert_eq!(splitter.pane_status("feat-a"), Some(PaneStatus::Busy));
+        assert_eq!(splitter.pane_status("feat-b"), Some(PaneStatus::Unknown));
+
+        mux.statuses.lock().unwrap().clear();
+        let polled = splitter.poll_statuses().unwrap();
+        assert!(polled.is_empty());
+        splitter.apply_statuses(polled);
+        assert_eq!(splitter.pane_status("feat-a"), Some(PaneStatus::Busy), "no news must not erase it");
+
+        mux.statuses.lock().unwrap().insert("p2".to_string(), PaneStatus::Dead);
+        splitter.apply_statuses(splitter.poll_statuses().unwrap());
+        assert_eq!(splitter.pane_status("feat-b"), Some(PaneStatus::Dead));
+    }
+
+    /// A lane deleted while a poll was in flight is simply not there to update.
+    #[test]
+    fn applying_statuses_for_a_lane_that_has_since_gone_is_a_no_op() {
+        let (mut splitter, _) = fake_splitter();
+        splitter.apply_statuses(HashMap::from([("gone".to_string(), PaneStatus::Busy)]));
+        assert!(!splitter.has_pane("gone"));
+    }
+
+    #[test]
+    fn polling_with_no_panes_never_asks_the_multiplexer() {
+        let (splitter, mux) = fake_splitter();
+        assert!(splitter.poll_statuses().unwrap().is_empty());
+        assert!(mux.lines().is_empty());
+    }
+
+    #[test]
+    fn the_workspace_is_the_multiplexers_scope() {
+        let (mut splitter, _) = fake_splitter();
+        assert_eq!(splitter.workspace(), None);
+        splitter.set_workspace(Some("workspace:2"));
+        assert_eq!(splitter.workspace().as_deref(), Some("workspace:2"));
+        assert_eq!(splitter.label(), "fake");
+        assert!(splitter.running_inside_host());
     }
 }

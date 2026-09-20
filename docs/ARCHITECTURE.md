@@ -210,8 +210,34 @@ stale to collide with, since nothing ever points at that exact path twice.
 
 ## Harness split backends, and Orca's worktree model
 
-`splitter.rs` dispatches over three backends — `cmux.rs`, `tmux.rs`, `orca.rs` — each
-opening a terminal split per lane and typing a launch line (`harness_launch.rs`) into it.
+### Adding a multiplexer or a harness
+
+Two independent axes, each one file plus one line, with the shared logic written once:
+
+- **A multiplexer** is a `Multiplexer` impl (`src/mux.rs`): open a pane running a command
+  line, type a line into one, focus it, close it, and `probe` whether panes are alive and
+  busy. It is stateless and knows nothing about branches, lanes or harnesses. Which pane
+  belongs to which branch, where the next one splits off, and what a pane's last known status
+  was live in `Splitter` (`src/splitter.rs`), once — so a backend is its own CLI calls and
+  nothing else. To add one, write `src/<name>.rs` with a `discover()` and the impl, then add
+  it to `Splitter::discover_mux`'s order. Its environment variables come for free:
+  `KANSTACK_<NAME>_DIRECTION` and `KANSTACK_<NAME>_CHAIN_DIRECTION`, with defaults from
+  `default_directions()`. `probe` returns only the panes it could classify; leaving one out
+  means "no news", and the caller keeps what it knew. Test everything above the trait
+  against `mux::fake::FakeMux`, and the backend itself against a stand-in binary that logs
+  its arguments (see `orca.rs`'s tests).
+- **A harness** is a `Harness` impl (`src/harness.rs`): one unit struct, one entry in
+  `harness::KNOWN` (which is also what `--setup` scans `PATH` for, in that priority order).
+  Its one job today is how the branch-context note reaches it (`note_delivery`); anything
+  else that varies per harness belongs on the trait. Anything not listed gets `Generic`.
+  Multiplexers never see a harness — `HarnessConfig::launch_line` hands them a finished
+  line.
+
+### The three backends today
+
+`splitter.rs` wraps whichever of three backends — `cmux.rs`, `tmux.rs`, `orca.rs` —
+discovery found, each opening a terminal split per lane and typing a launch line
+(`harness_launch.rs`) into it.
 The first two are terminal multiplexers; Orca is an agent-oriented IDE whose CLI drives a
 running desktop app, and it differs in ways that shaped `orca.rs`.
 

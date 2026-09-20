@@ -21,33 +21,22 @@
 //! whole process tree via `ps` rather than `cmux top`.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Output};
 
 use anyhow::{bail, Context, Result};
 
+use crate::mux::{command_exists, Multiplexer, OpenRequest};
 use crate::pane_status::{PaneStatus, CPU_BUSY_THRESHOLD_PERCENT};
 
-#[derive(Debug, Clone)]
-struct PaneHandle {
-    /// tmux's own pane identifier, e.g. `"%3"` — stable across resizes and reflows, unlike
-    /// a position-based `-t session:window.pane` target.
-    pane_id: String,
-    status: PaneStatus,
-}
-
+/// tmux, through its own CLI. Stateless: which pane belongs to which branch is
+/// `crate::splitter::Splitter`'s business, and this only knows how to act on a pane id.
 #[derive(Clone)]
 pub struct Tmux {
     bin: PathBuf,
     /// kanstack's own pane (`$TMUX_PANE`), read once at `discover` time — the anchor the
-    /// *first* lane splits off; later lanes chain off `last_anchor` instead.
+    /// *first* lane splits off; later lanes chain off the previous lane instead.
     own_pane: String,
-    /// Split direction for the first lane, off `own_pane`.
-    direction: String,
-    /// Split direction for every lane after the first, off the previous lane.
-    chain_direction: String,
-    last_anchor: Option<String>,
-    panes: HashMap<String, PaneHandle>,
 }
 
 impl Tmux {
@@ -66,170 +55,7 @@ impl Tmux {
             }
         };
         let own_pane = std::env::var("TMUX_PANE").ok()?;
-        let direction = std::env::var("KANSTACK_TMUX_DIRECTION")
-            .map(|raw| normalize_direction(&raw))
-            .unwrap_or_else(|_| "up".to_string());
-        let chain_direction = std::env::var("KANSTACK_TMUX_CHAIN_DIRECTION")
-            .map(|raw| normalize_direction(&raw))
-            .unwrap_or_else(|_| "right".to_string());
-        Some(Tmux {
-            bin,
-            own_pane,
-            direction,
-            chain_direction,
-            last_anchor: None,
-            panes: HashMap::new(),
-        })
-    }
-
-    /// Whether kanstack has ever opened a pane for `branch` (regardless of its current
-    /// status) — used to decide whether task dispatch needs to spawn one first.
-    pub fn has_pane(&self, branch: &str) -> bool {
-        self.panes.contains_key(branch)
-    }
-
-    /// Last known status of `branch`'s pane. `None` if kanstack has never tracked one for
-    /// it at all (as opposed to `Some(PaneStatus::Dead)`, which means one existed and has
-    /// since disappeared from `list-panes`).
-    pub fn pane_status(&self, branch: &str) -> Option<PaneStatus> {
-        self.panes.get(branch).map(|p| p.status)
-    }
-
-    /// No panes tracked at all — nothing worth polling.
-    pub fn is_empty(&self) -> bool {
-        self.panes.is_empty()
-    }
-
-    /// Splits off the previous lane's pane (or kanstack's own, for the first lane) with
-    /// `cwd` as its working directory, types `launch` into it, then titles it `name` (e.g.
-    /// the branch name) — best-effort, since pane titles need `set -g pane-border-status` to
-    /// actually be visible and an old tmux without title support shouldn't fail the whole
-    /// spawn over it. Returns the new pane's id, for a caller that needs to find it again
-    /// from another process.
-    ///
-    /// `launch` is the whole harness command line, initial message and branch-context note
-    /// included — see `crate::harness::HarnessConfig::launch_line`.
-    pub fn spawn_pane(&mut self, cwd: &Path, name: &str, launch: &str) -> Result<String> {
-        let (direction, anchor) = match &self.last_anchor {
-            Some(anchor) => (self.chain_direction.as_str(), anchor.as_str()),
-            None => (self.direction.as_str(), self.own_pane.as_str()),
-        };
-
-        let cwd_str = cwd.to_string_lossy().into_owned();
-        let mut split_args = vec!["split-window", "-t", anchor, "-c", cwd_str.as_str()];
-        split_args.extend(split_flags(direction));
-        split_args.extend(["-P", "-F", "#{pane_id}"]);
-        let pane_id = self.run(&split_args)?.trim().to_string();
-        if pane_id.is_empty() {
-            bail!("`tmux split-window` did not report a pane id");
-        }
-
-        self.type_and_submit(&pane_id, launch)?;
-
-        let _ = self.run(&["select-pane", "-t", &pane_id, "-T", name]);
-
-        self.panes.insert(name.to_string(), PaneHandle { pane_id: pane_id.clone(), status: PaneStatus::Unknown });
-        self.last_anchor = Some(pane_id.clone());
-        Ok(pane_id)
-    }
-
-    /// Starts tracking a pane some other process opened, so `send_task`, `poll_statuses`,
-    /// `focus` and `stop` work on it.
-    pub fn adopt(&mut self, branch: &str, pane_id: &str) {
-        self.panes.insert(branch.to_string(), PaneHandle { pane_id: pane_id.to_string(), status: PaneStatus::Unknown });
-    }
-
-    /// tmux pane ids are global and `$TMUX_PANE` names the caller's own, so there's no
-    /// workspace to pin — kept so `Splitter` needn't know which backend it holds.
-    pub fn set_workspace(&mut self, _workspace: Option<&str>) {}
-
-    pub fn workspace(&self) -> Option<String> {
-        None
-    }
-
-    /// Overrides the first-lane split direction, which `discover` read from `KANSTACK_TMUX_DIRECTION`.
-    /// For a caller with its own setting — the `kanstack spawn` subcommand has
-    /// `KANSTACK_SPAWN_DIRECTION`, since the board's `above` puts lanes over kanstack's own
-    /// pane and an agent's pane is usually somewhere else.
-    pub fn set_first_direction(&mut self, direction: &str) {
-        self.direction = normalize_direction(direction);
-    }
-
-    /// Makes the next spawn split off `pane_id` rather than kanstack's own pane, the way
-    /// consecutive spawns within one process already chain.
-    pub fn set_anchor(&mut self, pane_id: &str) {
-        self.last_anchor = Some(pane_id.to_string());
-    }
-
-    /// The id of `branch`'s tracked pane.
-    pub fn pane_id(&self, branch: &str) -> Option<String> {
-        self.panes.get(branch).map(|p| p.pane_id.clone())
-    }
-
-    /// Brings `branch`'s pane to the front and gives it keyboard focus. `select-window`
-    /// first, since `select-pane` alone leaves a pane in another window out of sight.
-    pub fn focus(&self, branch: &str) -> Result<()> {
-        let Some(pane) = self.panes.get(branch) else {
-            bail!("no tmux pane open for {branch} yet");
-        };
-        self.run(&["select-window", "-t", &pane.pane_id])?;
-        self.run(&["select-pane", "-t", &pane.pane_id])?;
-        Ok(())
-    }
-
-    /// Closes `branch`'s pane, ending whatever harness is running in it, and stops
-    /// tracking it. Already gone counts as stopped.
-    pub fn stop(&mut self, branch: &str) -> Result<()> {
-        let Some(pane) = self.panes.remove(branch) else {
-            bail!("no tmux pane open for {branch} yet");
-        };
-        if self.last_anchor.as_deref() == Some(pane.pane_id.as_str()) {
-            self.last_anchor = None;
-        }
-        match self.run(&["kill-pane", "-t", &pane.pane_id]) {
-            Err(e) if !e.to_string().contains("can't find pane") => Err(e),
-            _ => Ok(()),
-        }
-    }
-
-    /// Sends `text` followed by Enter into `branch`'s tracked pane — the same
-    /// literal-then-Enter sequence `spawn_pane` already uses to type the launch command,
-    /// just generalized to target a pane recorded earlier rather than the one just created.
-    pub fn send_task(&self, branch: &str, text: &str) -> Result<()> {
-        let Some(pane) = self.panes.get(branch) else {
-            bail!("no tmux pane open for {branch} yet");
-        };
-        self.type_and_submit(&pane.pane_id, text)
-    }
-
-    /// Re-derives every tracked pane's status: `tmux list-panes -a` for whether the pane
-    /// still exists at all and, for those that do, its `pane_pid`; then a single `ps` call
-    /// to sum CPU% over each pane_pid's whole descendant tree (see the module doc comment
-    /// for why the pane's own foreground-command name can't tell busy from idle).
-    ///
-    /// Pure and read-only on `self` — safe to call from a background thread against a
-    /// cloned snapshot.
-    pub fn poll_statuses(&self) -> Result<HashMap<String, PaneStatus>> {
-        if self.panes.is_empty() {
-            return Ok(HashMap::new());
-        }
-        let list_out = self.run(&["list-panes", "-a", "-F", "#{pane_id} #{pane_pid}"])?;
-        let (present, pane_pids) = parse_pane_list(&list_out);
-
-        let any_alive = self.panes.values().any(|p| present.contains(&p.pane_id));
-        let ps_table = if any_alive { read_ps_table()? } else { Vec::new() };
-
-        Ok(classify_statuses(&self.panes, &present, &pane_pids, &ps_table))
-    }
-
-    /// Merges a `poll_statuses` result back in, keyed by branch. Entries for lanes deleted
-    /// since the poll started are simply absent from `self.panes` and are ignored.
-    pub fn apply_statuses(&mut self, statuses: HashMap<String, PaneStatus>) {
-        for (branch, status) in statuses {
-            if let Some(pane) = self.panes.get_mut(&branch) {
-                pane.status = status;
-            }
-        }
+        Some(Tmux { bin, own_pane })
     }
 
     /// Types `text` into `pane_id` as literal keystrokes, then presses Enter as a separate
@@ -261,6 +87,78 @@ impl Tmux {
             );
         }
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+}
+
+impl Multiplexer for Tmux {
+    fn name(&self) -> &'static str {
+        "tmux"
+    }
+
+    fn running_inside(&self) -> bool {
+        std::env::var_os("TMUX_PANE").is_some()
+    }
+
+    /// Splits off the previous lane's pane (or kanstack's own, for the first lane) with
+    /// `cwd` as its working directory, types `launch` into it, then titles it (e.g. the
+    /// branch name) — best-effort, since pane titles need `set -g pane-border-status` to
+    /// actually be visible and an old tmux without title support shouldn't fail the whole
+    /// spawn over it.
+    fn open_pane(&self, req: &OpenRequest<'_>) -> Result<String> {
+        let (direction, anchor) = match req.after {
+            Some(anchor) => (req.chain_direction, anchor),
+            None => (req.first_direction, self.own_pane.as_str()),
+        };
+
+        let cwd_str = req.cwd.to_string_lossy().into_owned();
+        let mut split_args = vec!["split-window", "-t", anchor, "-c", cwd_str.as_str()];
+        split_args.extend(split_flags(direction));
+        split_args.extend(["-P", "-F", "#{pane_id}"]);
+        let pane_id = self.run(&split_args)?.trim().to_string();
+        if pane_id.is_empty() {
+            bail!("`tmux split-window` did not report a pane id");
+        }
+
+        self.type_and_submit(&pane_id, req.launch)?;
+
+        let _ = self.run(&["select-pane", "-t", &pane_id, "-T", req.title]);
+        Ok(pane_id)
+    }
+
+    fn type_line(&self, pane: &str, text: &str) -> Result<()> {
+        self.type_and_submit(pane, text)
+    }
+
+    /// `select-window` first, since `select-pane` alone leaves a pane in another window out
+    /// of sight.
+    fn focus(&self, pane: &str) -> Result<()> {
+        self.run(&["select-window", "-t", pane])?;
+        self.run(&["select-pane", "-t", pane])?;
+        Ok(())
+    }
+
+    fn close(&self, pane: &str) -> Result<()> {
+        match self.run(&["kill-pane", "-t", pane]) {
+            Err(e) if !e.to_string().contains("can't find pane") => Err(e),
+            _ => Ok(()),
+        }
+    }
+
+    /// `tmux list-panes -a` for whether each pane still exists at all and, for those that
+    /// do, its `pane_pid`; then a single `ps` call to sum CPU% over each pane_pid's whole
+    /// descendant tree (see the module doc comment for why the pane's own foreground-command
+    /// name can't tell busy from idle).
+    fn probe(&self, panes: &[&str]) -> Result<HashMap<String, PaneStatus>> {
+        if panes.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let list_out = self.run(&["list-panes", "-a", "-F", "#{pane_id} #{pane_pid}"])?;
+        let (present, pane_pids) = parse_pane_list(&list_out);
+
+        let any_alive = panes.iter().any(|p| present.contains(*p));
+        let ps_table = if any_alive { read_ps_table()? } else { Vec::new() };
+
+        Ok(classify_statuses(panes, &present, &pane_pids, &ps_table))
     }
 }
 
@@ -330,34 +228,29 @@ fn subtree_cpu(root_pid: u32, table: &[PsRow]) -> f64 {
     total
 }
 
-/// Pure classification step of [`Tmux::poll_statuses`], split out so it can be unit tested
-/// against synthetic `list-panes`/`ps` data without shelling out to either.
+/// Pure classification step of [`Tmux::probe`], split out so it can be unit tested against
+/// synthetic `list-panes`/`ps` data without shelling out to either. A pane that is present
+/// but whose pid didn't come back this round is left out — no news, not a guess.
 fn classify_statuses(
-    panes: &HashMap<String, PaneHandle>,
+    panes: &[&str],
     present: &HashSet<String>,
     pane_pids: &HashMap<String, u32>,
     ps_table: &[PsRow],
 ) -> HashMap<String, PaneStatus> {
     panes
         .iter()
-        .map(|(branch, pane)| {
-            let status = if !present.contains(&pane.pane_id) {
+        .filter_map(|&pane| {
+            let status = if !present.contains(pane) {
                 PaneStatus::Dead
             } else {
-                match pane_pids.get(&pane.pane_id) {
-                    Some(&pid) => {
-                        if subtree_cpu(pid, ps_table) > CPU_BUSY_THRESHOLD_PERCENT {
-                            PaneStatus::Busy
-                        } else {
-                            PaneStatus::Idle
-                        }
-                    }
-                    // Pane present but its pid didn't come back this round: keep whatever
-                    // was already known rather than guessing.
-                    None => pane.status,
+                let pid = *pane_pids.get(pane)?;
+                if subtree_cpu(pid, ps_table) > CPU_BUSY_THRESHOLD_PERCENT {
+                    PaneStatus::Busy
+                } else {
+                    PaneStatus::Idle
                 }
             };
-            (branch.clone(), status)
+            Some((pane.to_string(), status))
         })
         .collect()
 }
@@ -372,24 +265,6 @@ fn split_flags(direction: &str) -> Vec<&'static str> {
         "left" => vec!["-h", "-b"],
         _ => vec!["-h"],
     }
-}
-
-/// Accepts the more readable `above`/`below` alongside tmux's own `up`/`down`/`left`/
-/// `right` framing, matching `cmux.rs`'s `normalize_direction`.
-fn normalize_direction(raw: &str) -> String {
-    match raw {
-        "above" => "up",
-        "below" => "down",
-        other => other,
-    }
-    .to_string()
-}
-
-fn command_exists(bin: &Path) -> bool {
-    let Some(path_var) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path_var).any(|dir| dir.join(bin).is_file())
 }
 
 #[cfg(test)]
@@ -465,13 +340,6 @@ mod tests {
     }
 
     #[test]
-    fn normalize_direction_accepts_above_and_below() {
-        assert_eq!(normalize_direction("above"), "up");
-        assert_eq!(normalize_direction("below"), "down");
-        assert_eq!(normalize_direction("left"), "left");
-    }
-
-    #[test]
     fn parse_pane_list_reads_ids_and_pids() {
         let (present, pids) = parse_pane_list("%0 111\n%1 222\n");
         assert_eq!(present, HashSet::from(["%0".to_string(), "%1".to_string()]));
@@ -507,51 +375,35 @@ mod tests {
     /// `classify_statuses_marks_a_missing_surface_dead`.
     #[test]
     fn classify_statuses_marks_a_missing_pane_dead() {
-        let panes = HashMap::from([(
-            "feature-a".to_string(),
-            PaneHandle { pane_id: "%9".to_string(), status: PaneStatus::Busy },
-        )]);
-        let present = HashSet::new();
-        let statuses = classify_statuses(&panes, &present, &HashMap::new(), &[]);
-        assert_eq!(statuses["feature-a"], PaneStatus::Dead);
+        let statuses = classify_statuses(&["%9"], &HashSet::new(), &HashMap::new(), &[]);
+        assert_eq!(statuses["%9"], PaneStatus::Dead);
     }
 
     #[test]
     fn classify_statuses_marks_a_high_cpu_pane_busy() {
-        let panes = HashMap::from([(
-            "feature-a".to_string(),
-            PaneHandle { pane_id: "%1".to_string(), status: PaneStatus::Unknown },
-        )]);
         let present = HashSet::from(["%1".to_string()]);
         let pane_pids = HashMap::from([("%1".to_string(), 100)]);
         let ps_table = vec![(100, 1, 35.0)];
-        let statuses = classify_statuses(&panes, &present, &pane_pids, &ps_table);
-        assert_eq!(statuses["feature-a"], PaneStatus::Busy);
+        let statuses = classify_statuses(&["%1"], &present, &pane_pids, &ps_table);
+        assert_eq!(statuses["%1"], PaneStatus::Busy);
     }
 
     #[test]
     fn classify_statuses_marks_a_low_cpu_pane_idle() {
-        let panes = HashMap::from([(
-            "feature-b".to_string(),
-            PaneHandle { pane_id: "%2".to_string(), status: PaneStatus::Unknown },
-        )]);
         let present = HashSet::from(["%2".to_string()]);
         let pane_pids = HashMap::from([("%2".to_string(), 200)]);
         let ps_table = vec![(200, 1, 0.0)];
-        let statuses = classify_statuses(&panes, &present, &pane_pids, &ps_table);
-        assert_eq!(statuses["feature-b"], PaneStatus::Idle);
+        let statuses = classify_statuses(&["%2"], &present, &pane_pids, &ps_table);
+        assert_eq!(statuses["%2"], PaneStatus::Idle);
     }
 
     /// Present in `list-panes` but its pid didn't come back this round (a race between the
-    /// two `tmux`/`ps` calls): keep whatever was already known rather than guessing.
+    /// two `tmux`/`ps` calls): no news, so the caller keeps whatever it already knew rather
+    /// than being handed a guess.
     #[test]
-    fn classify_statuses_keeps_prior_status_without_a_pid() {
-        let panes = HashMap::from([(
-            "feature-c".to_string(),
-            PaneHandle { pane_id: "%3".to_string(), status: PaneStatus::Busy },
-        )]);
+    fn classify_statuses_leaves_out_a_pane_without_a_pid() {
         let present = HashSet::from(["%3".to_string()]);
-        let statuses = classify_statuses(&panes, &present, &HashMap::new(), &[]);
-        assert_eq!(statuses["feature-c"], PaneStatus::Busy);
+        let statuses = classify_statuses(&["%3"], &present, &HashMap::new(), &[]);
+        assert!(!statuses.contains_key("%3"), "{statuses:?}");
     }
 }

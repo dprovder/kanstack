@@ -90,6 +90,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
+use crate::mux::{command_exists, Multiplexer, OpenRequest};
 use crate::pane_status::PaneStatus;
 
 /// How long each `terminal wait --for tui-idle` probe may block before its timeout is read
@@ -97,27 +98,13 @@ use crate::pane_status::PaneStatus;
 /// poll costs in total.
 const IDLE_PROBE_TIMEOUT_MS: u32 = 1500;
 
-#[derive(Debug, Clone)]
-struct PaneHandle {
-    /// Orca's terminal handle. Runtime-scoped: it stops resolving if Orca restarts, which
-    /// `poll_statuses` reads as the pane being gone (per the CLI reference).
-    handle: String,
-    status: PaneStatus,
-}
-
-#[derive(Clone)]
+/// Orca, through its own CLI. Stateless: which terminal belongs to which branch is
+/// `crate::splitter::Splitter`'s business, and this only knows how to act on a handle.
 pub struct Orca {
     bin: PathBuf,
     /// kanstack's own terminal (`$ORCA_TERMINAL_HANDLE`), read once at `discover` time — the
-    /// anchor the *first* lane splits off; later lanes chain off `last_anchor` instead.
+    /// anchor the *first* lane splits off; later lanes chain off the previous lane instead.
     own_terminal: String,
-    /// Direction for the first lane, off `own_terminal`. See the module doc for which
-    /// values Orca can actually honor.
-    direction: String,
-    /// Direction for every lane after the first, off the previous lane.
-    chain_direction: String,
-    last_anchor: Option<String>,
-    panes: HashMap<String, PaneHandle>,
 }
 
 impl Orca {
@@ -136,20 +123,7 @@ impl Orca {
                 candidate
             }
         };
-        let direction = std::env::var("KANSTACK_ORCA_DIRECTION")
-            .map(|raw| normalize_direction(&raw))
-            .unwrap_or_else(|_| "down".to_string());
-        let chain_direction = std::env::var("KANSTACK_ORCA_CHAIN_DIRECTION")
-            .map(|raw| normalize_direction(&raw))
-            .unwrap_or_else(|_| "right".to_string());
-        Some(Orca {
-            bin,
-            own_terminal,
-            direction,
-            chain_direction,
-            last_anchor: None,
-            panes: HashMap::new(),
-        })
+        Some(Orca { bin, own_terminal })
     }
 
     /// Whether this process looks to be running inside an Orca terminal — the same
@@ -157,191 +131,6 @@ impl Orca {
     /// binary lookup.
     pub fn running_inside() -> bool {
         own_terminal_handle().is_some()
-    }
-
-    /// Whether kanstack has ever opened a pane for `branch` (regardless of its current
-    /// status) — used to decide whether task dispatch needs to spawn one first.
-    pub fn has_pane(&self, branch: &str) -> bool {
-        self.panes.contains_key(branch)
-    }
-
-    /// Last known status of `branch`'s pane. `None` if kanstack has never tracked one for
-    /// it at all (as opposed to `Some(PaneStatus::Dead)`, which means one existed and has
-    /// since disappeared from `terminal list`).
-    pub fn pane_status(&self, branch: &str) -> Option<PaneStatus> {
-        self.panes.get(branch).map(|p| p.status)
-    }
-
-    /// No panes tracked at all — nothing worth polling.
-    pub fn is_empty(&self) -> bool {
-        self.panes.is_empty()
-    }
-
-    /// Splits off the previous lane's terminal (or kanstack's own, for the first lane), with
-    /// `launch` — the whole harness command line, see
-    /// `crate::harness::HarnessConfig::launch_line` — as the new terminal's `--command`, then
-    /// titles it `name` (e.g. the branch name) — best-effort, since a failed rename shouldn't
-    /// undo a harness that did launch. Returns the new terminal's handle, for a caller that
-    /// needs to find it again from another process.
-    ///
-    /// If the split fails — most likely a stale or closed anchor handle — the lane opens as a
-    /// new tab in the repository's worktree instead (`terminal create --worktree path:…`),
-    /// so a stale `$ORCA_TERMINAL_HANDLE` costs the split layout, not the lane. That needs the
-    /// repository registered in Orca; see the module doc.
-    ///
-    /// `--command` reaches the shell as typed input — checked against `orcad`, with the
-    /// `cd … && harness …` launch line arriving intact and running in the worktree directory,
-    /// at 5000 characters too — which the launch line's shell syntax needs.
-    pub fn spawn_pane(&mut self, cwd: &Path, name: &str, launch: &str) -> Result<String> {
-        let (direction, anchor) = match &self.last_anchor {
-            Some(anchor) => (self.chain_direction.as_str(), anchor.as_str()),
-            None => (self.direction.as_str(), self.own_terminal.as_str()),
-        };
-
-        let command = launch;
-
-        let handle = match self.run_json::<SplitResult>(&split_args(anchor, direction, command)) {
-            Ok(split) => split.split.handle,
-            Err(split_err) => self
-                .run_json::<CreateResult>(&create_args(cwd, command))
-                .map(|created| created.terminal.handle)
-                .map_err(|create_err| {
-                    anyhow!("{split_err:#} — and opening a tab in the worktree instead failed too: {create_err:#}")
-                })?,
-        };
-
-        let _ = self.run_json::<serde_json::Value>(&rename_args(&handle, name));
-
-        self.panes.insert(name.to_string(), PaneHandle { handle: handle.clone(), status: PaneStatus::Unknown });
-        self.last_anchor = Some(handle.clone());
-        Ok(handle)
-    }
-
-    /// Starts tracking a terminal some other process opened, so `send_task`, `poll_statuses`,
-    /// `focus` and `stop` work on it.
-    pub fn adopt(&mut self, branch: &str, handle: &str) {
-        self.panes.insert(branch.to_string(), PaneHandle { handle: handle.to_string(), status: PaneStatus::Unknown });
-    }
-
-    /// Nothing to pin: a new terminal's worktree comes from the terminal it splits, or from
-    /// `cwd` on the `create` fallback (see the module doc), never from remembered state. Kept
-    /// so `Splitter` needn't know which backend it holds.
-    pub fn set_workspace(&mut self, _workspace: Option<&str>) {}
-
-    pub fn workspace(&self) -> Option<String> {
-        None
-    }
-
-    /// Overrides the first-lane split direction, which `discover` read from
-    /// `KANSTACK_ORCA_DIRECTION`. For a caller with its own setting — the `kanstack spawn`
-    /// subcommand has `KANSTACK_SPAWN_DIRECTION`.
-    pub fn set_first_direction(&mut self, direction: &str) {
-        self.direction = normalize_direction(direction);
-    }
-
-    /// Makes the next spawn split off `handle` rather than kanstack's own terminal, the way
-    /// consecutive spawns within one process already chain.
-    pub fn set_anchor(&mut self, handle: &str) {
-        self.last_anchor = Some(handle.to_string());
-    }
-
-    /// The handle of `branch`'s tracked terminal.
-    pub fn pane_id(&self, branch: &str) -> Option<String> {
-        self.panes.get(branch).map(|p| p.handle.clone())
-    }
-
-    /// Brings `branch`'s terminal to the front and gives it focus (`terminal switch`).
-    pub fn focus(&self, branch: &str) -> Result<()> {
-        let Some(pane) = self.panes.get(branch) else {
-            bail!("no orca terminal open for {branch} yet");
-        };
-        self.run_json::<serde_json::Value>(&switch_args(&pane.handle))?;
-        Ok(())
-    }
-
-    /// Closes `branch`'s terminal, ending whatever harness is running in it, and stops
-    /// tracking it. Already gone counts as stopped.
-    pub fn stop(&mut self, branch: &str) -> Result<()> {
-        let Some(pane) = self.panes.remove(branch) else {
-            bail!("no orca terminal open for {branch} yet");
-        };
-        if self.last_anchor.as_deref() == Some(pane.handle.as_str()) {
-            self.last_anchor = None;
-        }
-        // How `terminal close` reports an already-closed handle isn't documented, so rather
-        // than matching an error code, a handle that no longer appears in `terminal list` is
-        // taken as the state `stop` is after either way — the approach `cmux.rs` takes too.
-        let Err(close_err) = self.run_json::<serde_json::Value>(&close_args(&pane.handle)) else {
-            return Ok(());
-        };
-        let still_there = self
-            .run_json::<ListResult>(&list_args())
-            .map(|list| list.terminals.iter().any(|t| t.handle == pane.handle))
-            .unwrap_or(true);
-        if still_there {
-            Err(close_err)
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Sends `text` followed by Enter into `branch`'s tracked terminal (`terminal send
-    /// --enter`). Orca's types allow it to refuse this as a prompt for an agent it can't see
-    /// (`no-agent`), and a refusal is reported by name if it happens — but `orcad` *accepted*
-    /// text sent to a plain terminal (with a warning that delivery can't be observed), so
-    /// this does not reliably guard against sending before the harness has started.
-    pub fn send_task(&self, branch: &str, text: &str) -> Result<()> {
-        let Some(pane) = self.panes.get(branch) else {
-            bail!("no orca terminal open for {branch} yet");
-        };
-        let receipt = self.run_json::<SendResult>(&send_args(&pane.handle, text))?.send;
-        if receipt.accepted {
-            return Ok(());
-        }
-        match receipt.refused_reason.as_deref() {
-            Some("no-agent") => bail!("orca sees no agent running in {branch}'s terminal yet — is the harness still starting?"),
-            Some(reason) => bail!("orca refused the message for {branch}: {reason}"),
-            None => bail!("orca did not accept the message for {branch}"),
-        }
-    }
-
-    /// Re-derives every tracked terminal's status: `terminal list` for which still exist (and
-    /// have not exited), then a `terminal wait --for tui-idle` probe per live one — see the
-    /// module doc for how a probe is read.
-    ///
-    /// Pure and read-only on `self` — safe to call from a background thread against a
-    /// cloned snapshot.
-    pub fn poll_statuses(&self) -> Result<HashMap<String, PaneStatus>> {
-        if self.panes.is_empty() {
-            return Ok(HashMap::new());
-        }
-        let list: ListResult = self.run_json(&list_args())?;
-        let live: Vec<&str> = self
-            .panes
-            .values()
-            .map(|p| p.handle.as_str())
-            .filter(|handle| list.terminals.iter().any(|t| t.handle == *handle && t.exit_cause.is_none()))
-            .collect();
-
-        let probes: HashMap<String, IdleProbe> = std::thread::scope(|scope| {
-            let jobs: Vec<_> = live
-                .iter()
-                .map(|handle| scope.spawn(move || (handle.to_string(), self.probe_idle(handle))))
-                .collect();
-            jobs.into_iter().filter_map(|job| job.join().ok()).collect()
-        });
-
-        Ok(classify_statuses(&self.panes, &list, &probes))
-    }
-
-    /// Merges a `poll_statuses` result back in, keyed by branch. Entries for lanes deleted
-    /// since the poll started are simply absent from `self.panes` and are ignored.
-    pub fn apply_statuses(&mut self, statuses: HashMap<String, PaneStatus>) {
-        for (branch, status) in statuses {
-            if let Some(pane) = self.panes.get_mut(&branch) {
-                pane.status = status;
-            }
-        }
     }
 
     fn probe_idle(&self, handle: &str) -> IdleProbe {
@@ -386,6 +175,124 @@ impl Orca {
     }
 }
 
+impl Multiplexer for Orca {
+    fn name(&self) -> &'static str {
+        "orca"
+    }
+
+    fn running_inside(&self) -> bool {
+        Orca::running_inside()
+    }
+
+    /// Orca can only place a new terminal right of, or below, the one it splits, so the first
+    /// lane defaults to below rather than above. See the module doc for which directions it
+    /// can honor.
+    fn default_directions(&self) -> (&'static str, &'static str) {
+        ("down", "right")
+    }
+
+    /// Splits off the previous lane's terminal (or kanstack's own, for the first lane), with
+    /// `req.launch` — the whole harness command line, see
+    /// `crate::harness::HarnessConfig::launch_line` — as the new terminal's `--command`, then
+    /// titles it (e.g. the branch name) — best-effort, since a failed rename shouldn't undo a
+    /// harness that did launch.
+    ///
+    /// If the split fails — most likely a stale or closed anchor handle — the lane opens as a
+    /// new tab in the repository's worktree instead (`terminal create --worktree path:…`),
+    /// so a stale `$ORCA_TERMINAL_HANDLE` costs the split layout, not the lane. That needs the
+    /// repository registered in Orca; see the module doc.
+    ///
+    /// `--command` reaches the shell as typed input — checked against `orcad`, with the
+    /// `cd … && harness …` launch line arriving intact and running in the worktree directory,
+    /// at 5000 characters too — which the launch line's shell syntax needs.
+    fn open_pane(&self, req: &OpenRequest<'_>) -> Result<String> {
+        let (direction, anchor) = match req.after {
+            Some(anchor) => (req.chain_direction, anchor),
+            None => (req.first_direction, self.own_terminal.as_str()),
+        };
+        let command = req.launch;
+
+        let handle = match self.run_json::<SplitResult>(&split_args(anchor, direction, command)) {
+            Ok(split) => split.split.handle,
+            Err(split_err) => self
+                .run_json::<CreateResult>(&create_args(req.cwd, command))
+                .map(|created| created.terminal.handle)
+                .map_err(|create_err| {
+                    anyhow!("{split_err:#} — and opening a tab in the worktree instead failed too: {create_err:#}")
+                })?,
+        };
+
+        let _ = self.run_json::<serde_json::Value>(&rename_args(&handle, req.title));
+        Ok(handle)
+    }
+
+    /// Sends `text` followed by Enter (`terminal send --enter`). Orca's types allow it to
+    /// refuse this as a prompt for an agent it can't see (`no-agent`), and a refusal is
+    /// reported by name if it happens — but `orcad` *accepted* text sent to a plain terminal
+    /// (with a warning that delivery can't be observed), so this does not reliably guard
+    /// against sending before the harness has started.
+    fn type_line(&self, pane: &str, text: &str) -> Result<()> {
+        let receipt = self.run_json::<SendResult>(&send_args(pane, text))?.send;
+        if receipt.accepted {
+            return Ok(());
+        }
+        match receipt.refused_reason.as_deref() {
+            Some("no-agent") => bail!("orca sees no agent running in that terminal yet — is the harness still starting?"),
+            Some(reason) => bail!("orca refused the message: {reason}"),
+            None => bail!("orca did not accept the message"),
+        }
+    }
+
+    /// Brings the terminal to the front and gives it focus (`terminal switch`).
+    fn focus(&self, pane: &str) -> Result<()> {
+        self.run_json::<serde_json::Value>(&switch_args(pane))?;
+        Ok(())
+    }
+
+    fn close(&self, pane: &str) -> Result<()> {
+        // How `terminal close` reports an already-closed handle isn't documented, so rather
+        // than matching an error code, a handle that no longer appears in `terminal list` is
+        // taken as the state closing is after either way — the approach `cmux.rs` takes too.
+        let Err(close_err) = self.run_json::<serde_json::Value>(&close_args(pane)) else {
+            return Ok(());
+        };
+        let still_there = self
+            .run_json::<ListResult>(&list_args())
+            .map(|list| list.terminals.iter().any(|t| t.handle == pane))
+            .unwrap_or(true);
+        if still_there {
+            Err(close_err)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// `terminal list` for which terminals still exist (and have not exited), then a
+    /// `terminal wait --for tui-idle` probe per live one — see the module doc for how a
+    /// probe is read.
+    fn probe(&self, panes: &[&str]) -> Result<HashMap<String, PaneStatus>> {
+        if panes.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let list: ListResult = self.run_json(&list_args())?;
+        let live: Vec<&str> = panes
+            .iter()
+            .copied()
+            .filter(|handle| list.terminals.iter().any(|t| t.handle == *handle && t.exit_cause.is_none()))
+            .collect();
+
+        let probes: HashMap<String, IdleProbe> = std::thread::scope(|scope| {
+            let jobs: Vec<_> = live
+                .iter()
+                .map(|handle| scope.spawn(move || (handle.to_string(), self.probe_idle(handle))))
+                .collect();
+            jobs.into_iter().filter_map(|job| job.join().ok()).collect()
+        });
+
+        Ok(classify_statuses(panes, &list, &probes))
+    }
+}
+
 fn own_terminal_handle() -> Option<String> {
     std::env::var("ORCA_TERMINAL_HANDLE").ok().filter(|handle| !handle.is_empty())
 }
@@ -408,17 +315,6 @@ fn split_orientation(direction: &str) -> &'static str {
         "left" | "right" => "vertical",
         _ => "horizontal",
     }
-}
-
-/// Accepts the more readable `above`/`below` alongside `up`/`down`/`left`/`right`, matching
-/// `cmux.rs`'s and `tmux.rs`'s `normalize_direction`.
-fn normalize_direction(raw: &str) -> String {
-    match raw {
-        "above" => "up",
-        "below" => "down",
-        other => other,
-    }
-    .to_string()
 }
 
 /// The `path:` selector for the worktree containing `cwd`. Orca compares it for *equality*
@@ -627,44 +523,38 @@ fn parse_idle_probe(stdout: &str) -> IdleProbe {
     }
 }
 
-/// Pure classification step of [`Orca::poll_statuses`], split out so it can be unit tested
-/// against JSON without shelling out to a real `orca`. A tracked terminal missing from a
-/// complete listing, or listed with an exit cause, is `Dead`; a live one takes its probe's
-/// answer, or keeps its previous status if the probe couldn't give one. A *truncated* listing
-/// proves nothing about a terminal missing from it, so that one keeps its status too.
+/// Reads each of `panes` off the listing and its probe. A handle missing from a complete
+/// listing, or listed with an exit cause, is `Dead`; a live one takes its probe's answer. A
+/// live one whose probe couldn't give one is left out — no news — and so is one missing from
+/// a *truncated* listing, which proves nothing about it: either way the caller keeps its
+/// previous status.
 fn classify_statuses(
-    panes: &HashMap<String, PaneHandle>,
+    panes: &[&str],
     list: &ListResult,
     probes: &HashMap<String, IdleProbe>,
 ) -> HashMap<String, PaneStatus> {
     panes
         .iter()
-        .map(|(branch, pane)| {
-            let status = match list.terminals.iter().find(|t| t.handle == pane.handle) {
-                None if list.truncated => pane.status,
+        .filter_map(|&handle| {
+            let status = match list.terminals.iter().find(|t| t.handle == handle) {
+                None if list.truncated => return None,
                 None => PaneStatus::Dead,
                 Some(t) if t.exit_cause.is_some() => PaneStatus::Dead,
-                Some(_) => match probes.get(&pane.handle) {
+                Some(_) => match probes.get(handle) {
                     Some(IdleProbe::Idle) => PaneStatus::Idle,
                     Some(IdleProbe::Busy) => PaneStatus::Busy,
-                    Some(IdleProbe::Failed) | None => pane.status,
+                    Some(IdleProbe::Failed) | None => return None,
                 },
             };
-            (branch.clone(), status)
+            Some((handle.to_string(), status))
         })
         .collect()
-}
-
-fn command_exists(bin: &Path) -> bool {
-    let Some(path_var) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path_var).any(|dir| dir.join(bin).is_file())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::splitter::Splitter;
 
     /// Runs `body` with each of `vars` swapped out and restored afterwards. These are
     /// process-wide state also read by the other backends' and `splitter.rs`'s own
@@ -732,7 +622,7 @@ mod tests {
             ],
             || {
                 let orca = Orca::discover().unwrap();
-                assert_eq!((orca.direction.as_str(), orca.chain_direction.as_str()), ("down", "right"));
+                assert_eq!(crate::mux::configured_directions(&orca), ("down".to_string(), "right".to_string()));
             },
         );
         with_env(
@@ -744,7 +634,7 @@ mod tests {
             ],
             || {
                 let orca = Orca::discover().unwrap();
-                assert_eq!((orca.direction.as_str(), orca.chain_direction.as_str()), ("down", "up"));
+                assert_eq!(crate::mux::configured_directions(&orca), ("down".to_string(), "up".to_string()));
             },
         );
     }
@@ -760,13 +650,6 @@ mod tests {
         assert_eq!(split_orientation("down"), "horizontal", "Orca's `horizontal` is stacked");
         assert_eq!(split_orientation("left"), "vertical", "can only be honored as `right`");
         assert_eq!(split_orientation("up"), "horizontal", "can only be honored as `down`");
-    }
-
-    #[test]
-    fn normalize_direction_accepts_above_and_below() {
-        assert_eq!(normalize_direction("above"), "up");
-        assert_eq!(normalize_direction("below"), "down");
-        assert_eq!(normalize_direction("left"), "left");
     }
 
     #[test]
@@ -870,14 +753,11 @@ mod tests {
         assert!(list.terminals.iter().all(|t| t.exit_cause.is_none()));
 
         let live = list.terminals[0].handle.clone();
-        let panes = HashMap::from([
-            ("here".to_string(), pane(&live, PaneStatus::Unknown)),
-            ("gone".to_string(), pane("term_00000000-0000-0000-0000-000000000000", PaneStatus::Busy)),
-        ]);
-        let probes = HashMap::from([(live, IdleProbe::Busy)]);
-        let statuses = classify_statuses(&panes, &list, &probes);
-        assert_eq!(statuses["here"], PaneStatus::Busy);
-        assert_eq!(statuses["gone"], PaneStatus::Dead);
+        let gone = "term_00000000-0000-0000-0000-000000000000";
+        let probes = HashMap::from([(live.clone(), IdleProbe::Busy)]);
+        let statuses = classify_statuses(&[live.as_str(), gone], &list, &probes);
+        assert_eq!(statuses[live.as_str()], PaneStatus::Busy);
+        assert_eq!(statuses[gone], PaneStatus::Dead);
     }
 
     /// An idle *shell* is not an idle *agent*: Orca's `tui-idle` timed out against one, so
@@ -973,10 +853,6 @@ mod tests {
         assert_eq!(parse_idle_probe("Orca is not running"), IdleProbe::Failed);
     }
 
-    fn pane(handle: &str, status: PaneStatus) -> PaneHandle {
-        PaneHandle { handle: handle.to_string(), status }
-    }
-
     fn list() -> ListResult {
         let Response::Ok(list) = parse_response::<ListResult>(LIST).unwrap() else { panic!("not ok") };
         list
@@ -984,40 +860,29 @@ mod tests {
 
     #[test]
     fn classify_statuses_takes_a_live_terminals_probe() {
-        let panes = HashMap::from([
-            ("feat-a".to_string(), pane("term_a", PaneStatus::Unknown)),
-            ("feat-b".to_string(), pane("term_b", PaneStatus::Unknown)),
-        ]);
         let probes = HashMap::from([("term_a".to_string(), IdleProbe::Busy), ("term_b".to_string(), IdleProbe::Idle)]);
-        let statuses = classify_statuses(&panes, &list(), &probes);
-        assert_eq!(statuses["feat-a"], PaneStatus::Busy);
-        assert_eq!(statuses["feat-b"], PaneStatus::Idle);
+        let statuses = classify_statuses(&["term_a", "term_b"], &list(), &probes);
+        assert_eq!(statuses["term_a"], PaneStatus::Busy);
+        assert_eq!(statuses["term_b"], PaneStatus::Idle);
     }
 
     /// Gone from a complete listing, or still listed but ended: either way its harness is
     /// not running, whatever any probe says.
     #[test]
     fn classify_statuses_marks_a_missing_or_exited_terminal_dead() {
-        let panes = HashMap::from([
-            ("gone".to_string(), pane("term_zzz", PaneStatus::Busy)),
-            ("ended".to_string(), pane("term_c", PaneStatus::Busy)),
-        ]);
         let probes = HashMap::from([("term_c".to_string(), IdleProbe::Idle), ("term_zzz".to_string(), IdleProbe::Idle)]);
-        let statuses = classify_statuses(&panes, &list(), &probes);
-        assert_eq!(statuses["gone"], PaneStatus::Dead);
-        assert_eq!(statuses["ended"], PaneStatus::Dead);
+        let statuses = classify_statuses(&["term_zzz", "term_c"], &list(), &probes);
+        assert_eq!(statuses["term_zzz"], PaneStatus::Dead);
+        assert_eq!(statuses["term_c"], PaneStatus::Dead);
     }
 
+    /// A live terminal whose probe failed, or never ran, is left out: no news, so the caller
+    /// keeps whatever it already knew.
     #[test]
-    fn classify_statuses_keeps_prior_status_when_a_probe_fails_or_is_missing() {
-        let panes = HashMap::from([
-            ("feat-a".to_string(), pane("term_a", PaneStatus::Busy)),
-            ("feat-b".to_string(), pane("term_b", PaneStatus::Idle)),
-        ]);
+    fn classify_statuses_leaves_out_a_terminal_when_a_probe_fails_or_is_missing() {
         let probes = HashMap::from([("term_a".to_string(), IdleProbe::Failed)]);
-        let statuses = classify_statuses(&panes, &list(), &probes);
-        assert_eq!(statuses["feat-a"], PaneStatus::Busy);
-        assert_eq!(statuses["feat-b"], PaneStatus::Idle);
+        let statuses = classify_statuses(&["term_a", "term_b"], &list(), &probes);
+        assert!(statuses.is_empty(), "{statuses:?}");
     }
 
     /// A truncated listing can't prove a terminal is gone — it may just not have made the
@@ -1026,8 +891,7 @@ mod tests {
     fn classify_statuses_does_not_read_absence_from_a_truncated_listing_as_death() {
         let truncated = r#"{"id":"r","ok":true,"result":{"terminals":[],"totalCount":500,"truncated":true}}"#;
         let Response::Ok(list) = parse_response::<ListResult>(truncated).unwrap() else { panic!("not ok") };
-        let panes = HashMap::from([("feat-a".to_string(), pane("term_a", PaneStatus::Busy))]);
-        assert_eq!(classify_statuses(&panes, &list, &HashMap::new())["feat-a"], PaneStatus::Busy);
+        assert!(classify_statuses(&["term_a"], &list, &HashMap::new()).is_empty());
     }
 
     // What follows drives the real `spawn`/`send`/`poll`/`stop` paths against a stand-in
@@ -1049,9 +913,11 @@ mod tests {
         (bin, log)
     }
 
-    /// Runs `test` with an `Orca` discovered against the fake, inside an "Orca terminal"
-    /// whose own handle is `term_own`, and the fake's log path. Cleans up after itself.
-    fn with_fake_orca(tag: &str, body: &str, test: impl FnOnce(Orca, &Path)) {
+    /// Runs `test` with a `Splitter` over an `Orca` discovered against the fake, inside an
+    /// "Orca terminal" whose own handle is `term_own`, and the fake's log path. Going through
+    /// the `Splitter` is what kanstack itself does, so these cover the shared layer's use of
+    /// the backend too. Cleans up after itself.
+    fn with_fake_orca(tag: &str, body: &str, test: impl FnOnce(Splitter, &Path)) {
         let (bin, log) = fake_orca(tag, body);
         with_env(
             &[
@@ -1061,16 +927,16 @@ mod tests {
                 ("KANSTACK_ORCA_CHAIN_DIRECTION", None),
                 ("KANSTACK_HARNESS", Some("claude")),
             ],
-            || test(Orca::discover().unwrap(), &log),
+            || {
+                let orca = Orca::discover().unwrap();
+                test(Splitter::new(std::sync::Arc::new(orca), crate::harness::HarnessConfig::new("claude")), &log)
+            },
         );
         let _ = std::fs::remove_dir_all(bin.parent().unwrap());
     }
 
-    /// What `Splitter::spawn_harness` does for an `Orca`: build the default harness's launch
-    /// line, then open a pane running it.
-    fn spawn(orca: &mut Orca, cwd: &Path, name: &str, initial_message: Option<&str>) -> Result<String> {
-        let launch = crate::harness::HarnessConfig::new("claude").launch_line(cwd, name, initial_message, None)?;
-        orca.spawn_pane(cwd, name, &launch)
+    fn spawn(orca: &mut Splitter, cwd: &Path, name: &str, initial_message: Option<&str>) -> Result<String> {
+        orca.spawn_harness(cwd, name, initial_message)
     }
 
     fn log_lines(log: &Path) -> Vec<String> {
@@ -1213,7 +1079,6 @@ esac"#;
             orca.set_anchor("term_a");
             orca.stop("feat-a").unwrap();
             assert!(!orca.has_pane("feat-a"));
-            assert_eq!(orca.last_anchor, None, "the next lane must not split a closed terminal");
         });
         let live = r#"
 case "$2" in
