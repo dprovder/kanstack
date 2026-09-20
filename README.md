@@ -228,7 +228,7 @@ panes live in:
 ```sh
 kanstack spawn <branch> [--agent codex] [--prompt "..."]   # creates <branch> if it doesn't exist
 kanstack send <branch|session> "..."
-kanstack status
+kanstack status [--json]
 kanstack focus <branch|session>
 kanstack stop <branch|session>                             # closes the pane, ends its harness
 ```
@@ -237,6 +237,24 @@ kanstack stop <branch|session>                             # closes the pane, en
 from, to its right; `KANSTACK_SPAWN_DIRECTION` (`left`, `right`, `above` or `below`, and
 saveable in the config file) changes that without touching where the board puts its lanes. `--agent` runs that harness instead
 of `$KANSTACK_HARNESS` for this one pane.
+
+`kanstack status --json` prints one JSON document instead of the table, for a script or an
+agent to parse:
+
+```json
+{"schema":1,"workstreams":[
+  {"branch":"fix-login","pane":"%3","agent":"claude","item":"GH-4","status":"busy"},
+  {"branch":"planned","pane":null,"agent":null,"item":null,"status":"no-pane"}
+]}
+```
+
+Every key is always present (`null` when there's no value), one entry per registered
+workstream, in registry order. `status` is `busy`, `idle`, `dead`, `unknown` or `no-pane` (the
+workstream has no pane). New fields may be added under the same `schema` number, so ignore keys
+you don't know; it changes only if an existing field is renamed, removed or reinterpreted.
+Unlike the table, `--json` works outside cmux, tmux and Orca, and when the multiplexer can't
+be reached: it still lists every workstream, with `unknown` for those that have a pane. An
+empty registry gives `{"schema":1,"workstreams":[]}`.
 
 Each command is its own process, so panes are tracked in a per-repository registry under
 `$XDG_STATE_HOME/kanstack` (`~/.local/state/kanstack`; `KANSTACK_STATE_PATH` relocates it).

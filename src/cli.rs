@@ -5,10 +5,12 @@
 //! one opened. They share state through [`Registry`] instead: every command loads it, seeds
 //! a fresh [`Splitter`] with it, acts, and writes back whatever changed.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 
 use anyhow::{bail, Result};
+use serde::Serialize;
 
 use crate::but::But;
 use crate::pane_status::PaneStatus;
@@ -24,8 +26,10 @@ kanstack spawn <branch> [--agent <name>] [--prompt \"...\"]
     the harness's first message
 kanstack send <branch|session> \"...\"
     type a message into a pane and submit it
-kanstack status
-    list every workstream and whether its pane is busy, idle, or dead
+kanstack status [--json]
+    list every workstream and whether its pane is busy, idle, or dead. --json prints one
+    JSON document instead (schema in the README) and, unlike the table, still lists every
+    workstream when no multiplexer is reachable, with their panes' status \"unknown\"
 kanstack focus <branch|session>
     bring a pane to the front
 kanstack stop <branch|session>
@@ -39,7 +43,7 @@ tmux or Orca the panes live in.
 pub enum Command {
     Spawn { branch: String, agent: Option<String>, prompt: Option<String> },
     Send { target: String, text: String },
-    Status,
+    Status { json: bool },
     Focus { target: String },
     Stop { target: String },
 }
@@ -53,6 +57,7 @@ pub fn parse(name: &str, args: Vec<String>) -> Result<Option<Command>> {
     let mut positional = Vec::new();
     let mut agent = None;
     let mut prompt = None;
+    let mut json = false;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let flag = |long: &str, value: Option<&str>, rest: &mut std::vec::IntoIter<String>| -> Result<String> {
@@ -68,6 +73,12 @@ pub fn parse(name: &str, args: Vec<String>) -> Result<Option<Command>> {
         match key.as_str() {
             "--agent" if name == "spawn" => agent = Some(flag("--agent", inline.as_deref(), &mut args)?),
             "--prompt" if name == "spawn" => prompt = Some(flag("--prompt", inline.as_deref(), &mut args)?),
+            "--json" if name == "status" => {
+                if inline.is_some() {
+                    bail!("--json takes no value\n\n{HELP}");
+                }
+                json = true;
+            }
             k if k.starts_with("--") => bail!("unknown option {k:?} for `kanstack {name}`\n\n{HELP}"),
             _ => positional.push(arg),
         }
@@ -89,7 +100,7 @@ pub fn parse(name: &str, args: Vec<String>) -> Result<Option<Command>> {
             }
             return Ok(Some(Command::Send { target, text }));
         }
-        "status" => Command::Status,
+        "status" => Command::Status { json },
         "focus" => Command::Focus { target: one("<branch|session>")? },
         "stop" => Command::Stop { target: one("<branch|session>")? },
         other => bail!("unknown subcommand {other:?}"),
@@ -145,6 +156,81 @@ fn label(status: Option<PaneStatus>) -> &'static str {
         Some(PaneStatus::Dead) => "dead",
         Some(PaneStatus::Unknown) | None => "unknown",
     }
+}
+
+/// The `"schema"` of `kanstack status --json`. Fields are only ever added within a version;
+/// bump this when one is renamed, removed or changes meaning.
+pub const STATUS_SCHEMA: u32 = 1;
+
+/// The document `kanstack status --json` prints. Every field of every entry is always
+/// present (`null`, never omitted), so consumers needn't guard, and later steps add fields
+/// rather than reshaping these.
+#[derive(Debug, Serialize)]
+struct StatusReport {
+    schema: u32,
+    workstreams: Vec<WorkstreamReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkstreamReport {
+    branch: String,
+    pane: Option<String>,
+    agent: Option<String>,
+    item: Option<String>,
+    status: ReportStatus,
+}
+
+/// [`PaneStatus`] plus `NoPane`, which is a fact about the registry rather than about a pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum ReportStatus {
+    Busy,
+    Idle,
+    Dead,
+    Unknown,
+    NoPane,
+}
+
+impl From<Option<PaneStatus>> for ReportStatus {
+    fn from(status: Option<PaneStatus>) -> Self {
+        match status {
+            Some(PaneStatus::Busy) => ReportStatus::Busy,
+            Some(PaneStatus::Idle) => ReportStatus::Idle,
+            Some(PaneStatus::Dead) => ReportStatus::Dead,
+            Some(PaneStatus::Unknown) | None => ReportStatus::Unknown,
+        }
+    }
+}
+
+/// Every workstream in `registry`, with `status_of` answering for the ones that have a pane
+/// (by branch, as `Splitter::poll_statuses` keys them). Taking a lookup rather than a
+/// splitter keeps this free of a real multiplexer; a lookup that knows nothing yields
+/// `unknown` for every pane.
+fn report(registry: &Registry, status_of: impl Fn(&str) -> Option<PaneStatus>) -> StatusReport {
+    let workstreams = registry
+        .workstreams
+        .iter()
+        .map(|w| WorkstreamReport {
+            branch: w.branch_id.0.clone(),
+            pane: w.pane_id.as_ref().map(|p| p.0.clone()),
+            agent: w.agent.as_ref().map(|a| a.0.clone()),
+            item: w.item.as_ref().map(|i| i.0.clone()),
+            status: match w.pane_id {
+                Some(_) => status_of(&w.branch_id.0).into(),
+                None => ReportStatus::NoPane,
+            },
+        })
+        .collect();
+    StatusReport { schema: STATUS_SCHEMA, workstreams }
+}
+
+/// Pane statuses by branch, or nothing at all if there's no multiplexer to ask or the poll
+/// fails — `status --json` reports what's registered either way.
+fn poll_or_nothing(registry: &Registry) -> HashMap<String, PaneStatus> {
+    if registry.workstreams.iter().all(|w| w.pane_id.is_none()) {
+        return HashMap::new();
+    }
+    seeded_splitter(registry).and_then(|s| s.poll_statuses()).unwrap_or_default()
 }
 
 pub fn run(command: Command, cwd: &Path, out: &mut impl Write) -> Result<()> {
@@ -211,7 +297,12 @@ pub fn run(command: Command, cwd: &Path, out: &mut impl Write) -> Result<()> {
             splitter.send_task(&w.branch_id.0, &text)?;
             writeln!(out, "sent to {}", w.branch_id)?;
         }
-        Command::Status => {
+        Command::Status { json: true } => {
+            let statuses = poll_or_nothing(&registry);
+            let report = report(&registry, |branch| statuses.get(branch).copied());
+            writeln!(out, "{}", serde_json::to_string(&report)?)?;
+        }
+        Command::Status { json: false } => {
             if registry.workstreams.is_empty() {
                 writeln!(out, "no workstreams — `kanstack spawn <branch>` starts one")?;
                 return Ok(());
@@ -263,6 +354,7 @@ pub fn run(command: Command, cwd: &Path, out: &mut impl Write) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workstream::WorkItemRef;
 
     fn args(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| s.to_string()).collect()
@@ -304,8 +396,143 @@ mod tests {
         assert_eq!(parse("stop", args(&["a"])).unwrap(), Some(Command::Stop { target: "a".into() }));
         assert!(parse("stop", args(&[])).is_err());
         assert!(parse("stop", args(&["a", "b"])).is_err());
-        assert_eq!(parse("status", args(&[])).unwrap(), Some(Command::Status));
+        assert_eq!(parse("status", args(&[])).unwrap(), Some(Command::Status { json: false }));
         assert!(parse("status", args(&["extra"])).is_err());
+    }
+
+    #[test]
+    fn status_takes_a_json_flag_and_no_other_command_does() {
+        assert_eq!(parse("status", args(&["--json"])).unwrap(), Some(Command::Status { json: true }));
+        assert!(parse("status", args(&["--json=true"])).is_err(), "it is a switch, not an option with a value");
+        assert!(parse("status", args(&["--json", "extra"])).is_err());
+        assert!(parse("spawn", args(&["b", "--json"])).is_err());
+        assert!(parse("send", args(&["b", "hi", "--json"])).is_err());
+        assert!(parse("focus", args(&["b", "--json"])).is_err());
+        assert!(parse("stop", args(&["b", "--json"])).is_err());
+    }
+
+    fn registry_of(workstreams: Vec<Workstream>) -> Registry {
+        let mut registry = Registry::default();
+        registry.workstreams = workstreams;
+        registry
+    }
+
+    fn workstream(branch: &str, pane: Option<&str>, agent: Option<&str>, item: Option<&str>) -> Workstream {
+        Workstream {
+            branch_id: BranchId(branch.into()),
+            pane_id: pane.map(|p| PaneId(p.into())),
+            agent: agent.map(|a| AgentId(a.into())),
+            item: item.map(|i| WorkItemRef(i.into())),
+        }
+    }
+
+    fn five_workstreams() -> Registry {
+        registry_of(vec![
+            workstream("fix-login", Some("%3"), Some("claude"), Some("GH-4")),
+            workstream("add-search", Some("%4"), Some("codex"), None),
+            workstream("old-spike", Some("%5"), None, None),
+            workstream("mystery", Some("%6"), Some("claude"), None),
+            workstream("planned", None, None, Some("GH-9")),
+        ])
+    }
+
+    #[test]
+    fn the_status_json_shape_is_pinned() {
+        let statuses = HashMap::from([
+            ("fix-login".to_string(), PaneStatus::Busy),
+            ("add-search".to_string(), PaneStatus::Idle),
+            ("old-spike".to_string(), PaneStatus::Dead),
+            ("mystery".to_string(), PaneStatus::Unknown),
+            // No entry for "planned": it has no pane, so nobody is asked.
+            ("stray".to_string(), PaneStatus::Busy),
+        ]);
+        let json = serde_json::to_string(&report(&five_workstreams(), |b| statuses.get(b).copied())).unwrap();
+        assert_eq!(
+            json,
+            concat!(
+                r#"{"schema":1,"workstreams":["#,
+                r#"{"branch":"fix-login","pane":"%3","agent":"claude","item":"GH-4","status":"busy"},"#,
+                r#"{"branch":"add-search","pane":"%4","agent":"codex","item":null,"status":"idle"},"#,
+                r#"{"branch":"old-spike","pane":"%5","agent":null,"item":null,"status":"dead"},"#,
+                r#"{"branch":"mystery","pane":"%6","agent":"claude","item":null,"status":"unknown"},"#,
+                r#"{"branch":"planned","pane":null,"agent":null,"item":"GH-9","status":"no-pane"}"#,
+                r#"]}"#
+            )
+        );
+    }
+
+    #[test]
+    fn a_pane_the_poll_did_not_mention_is_unknown_and_a_paneless_workstream_stays_no_pane() {
+        let nothing = report(&five_workstreams(), |_| None);
+        let statuses: Vec<_> = nothing.workstreams.iter().map(|w| w.status).collect();
+        assert_eq!(
+            statuses,
+            [
+                ReportStatus::Unknown,
+                ReportStatus::Unknown,
+                ReportStatus::Unknown,
+                ReportStatus::Unknown,
+                ReportStatus::NoPane
+            ]
+        );
+    }
+
+    #[test]
+    fn an_empty_registry_is_an_empty_list_not_prose() {
+        let json = serde_json::to_string(&report(&Registry::default(), |_| None)).unwrap();
+        assert_eq!(json, r#"{"schema":1,"workstreams":[]}"#);
+    }
+
+    /// With no multiplexer to ask, `status --json` still lists everything and exits 0. Forcing
+    /// the tmux backend with no `TMUX_PANE` makes `discover` come back `None` wherever the
+    /// test runs.
+    #[test]
+    fn status_json_degrades_to_unknown_when_no_backend_is_reachable() {
+        let _guard = crate::SPLIT_BACKEND_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("kanstack-cli-status-json-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let vars = [
+            ("KANSTACK_STATE_PATH", Some(dir.to_str().unwrap())),
+            ("KANSTACK_SPLIT_BACKEND", Some("tmux")),
+            ("TMUX_PANE", None),
+        ];
+        let old: Vec<_> = vars.iter().map(|(k, _)| (*k, std::env::var_os(k))).collect();
+        for (k, v) in vars {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+
+        let repo = Path::new("/repo/status-json");
+        let mut registry = Registry::load(repo).unwrap();
+        registry.upsert(workstream("fix-login", Some("%3"), Some("claude"), None));
+        registry.upsert(workstream("planned", None, None, None));
+        registry.save().unwrap();
+
+        let mut out = Vec::new();
+        let result = run(Command::Status { json: true }, repo, &mut out);
+        let human = run(Command::Status { json: false }, repo, &mut Vec::new());
+
+        for (k, v) in old {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        result.unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            concat!(
+                r#"{"schema":1,"workstreams":["#,
+                r#"{"branch":"fix-login","pane":"%3","agent":"claude","item":null,"status":"unknown"},"#,
+                r#"{"branch":"planned","pane":null,"agent":null,"item":null,"status":"no-pane"}"#,
+                "]}\n"
+            )
+        );
+        assert!(human.is_err(), "the table still needs a backend");
     }
 
     #[test]
