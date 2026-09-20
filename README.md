@@ -199,7 +199,9 @@ kanstack focus <branch|session>
 kanstack stop <branch|session>                             # closes the pane, ends its harness
 ```
 
-`<session>` is a pane id as `kanstack status` prints it. `--agent` runs that harness instead
+`<session>` is a pane id as `kanstack status` prints it. `spawn` splits off the pane you run it
+from, to its right; `KANSTACK_SPAWN_DIRECTION` (`left`, `right`, `above` or `below`, and
+saveable in the config file) changes that without touching where the board puts its lanes. `--agent` runs that harness instead
 of `$KANSTACK_HARNESS` for this one pane.
 
 Each command is its own process, so panes are tracked in a per-repository registry under

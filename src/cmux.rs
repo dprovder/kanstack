@@ -212,6 +212,14 @@ impl Cmux {
         );
     }
 
+    /// Overrides the first-lane split direction, which `discover` read from `KANSTACK_CMUX_DIRECTION`.
+    /// For a caller with its own setting — the `kanstack spawn` subcommand has
+    /// `KANSTACK_SPAWN_DIRECTION`, since the board's `above` puts lanes over kanstack's own
+    /// pane and an agent's pane is usually somewhere else.
+    pub fn set_first_direction(&mut self, direction: &str) {
+        self.direction = normalize_direction(direction);
+    }
+
     /// Makes the next spawn split off `surface_ref` rather than kanstack's own pane, the
     /// way consecutive spawns within one process already chain.
     pub fn set_anchor(&mut self, surface_ref: &str) {

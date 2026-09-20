@@ -100,6 +100,17 @@ pub fn parse(name: &str, args: Vec<String>) -> Result<Option<Command>> {
     Ok(Some(command))
 }
 
+/// Where `spawn` splits off the calling pane: `raw` (`KANSTACK_SPAWN_DIRECTION`) if set,
+/// else `right`. Checked here, unlike the board's own direction settings, because a typo
+/// would otherwise surface as the multiplexer's own error about a flag it never heard of.
+fn spawn_direction(raw: Option<&str>) -> Result<String> {
+    match raw.map(str::trim).filter(|d| !d.is_empty()) {
+        None => Ok("right".to_string()),
+        Some(d) if ["left", "right", "above", "below", "up", "down"].contains(&d) => Ok(d.to_string()),
+        Some(d) => bail!("KANSTACK_SPAWN_DIRECTION={d:?} is not one of left, right, above, below"),
+    }
+}
+
 /// A splitter seeded with every pane in `registry`, or an explanation of why there isn't one.
 fn seeded_splitter(registry: &Registry) -> Result<Splitter> {
     let mut splitter = Splitter::discover().ok_or_else(|| {
@@ -139,6 +150,10 @@ pub fn run(command: Command, cwd: &Path, out: &mut impl Write) -> Result<()> {
         Command::Spawn { branch, agent, prompt } => {
             let but = But::discover(cwd)?;
             let mut splitter = seeded_splitter(&registry)?;
+            // Its own setting, not the board's `KANSTACK_*_DIRECTION`: the board's `above`
+            // assumes kanstack is the pane at the bottom, but here the caller is usually an
+            // agent's pane, and a new lane belongs beside it.
+            splitter.set_first_direction(&spawn_direction(std::env::var("KANSTACK_SPAWN_DIRECTION").ok().as_deref())?);
 
             // One poll answers both questions below: is the branch's old pane still alive,
             // and which live pane should the new one split off. A failed poll leaves every
@@ -289,6 +304,15 @@ mod tests {
         assert!(parse("spawn", args(&["b", "--bogus"])).is_err());
         assert!(parse("send", args(&["b", "--agent", "codex"])).is_err());
         assert!(parse("spawn", args(&["b", "--agent"])).is_err());
+    }
+
+    #[test]
+    fn spawn_direction_defaults_to_right_and_rejects_unknown_values() {
+        assert_eq!(spawn_direction(None).unwrap(), "right");
+        assert_eq!(spawn_direction(Some("")).unwrap(), "right");
+        assert_eq!(spawn_direction(Some("below")).unwrap(), "below");
+        assert_eq!(spawn_direction(Some(" left ")).unwrap(), "left");
+        assert!(spawn_direction(Some("sideways")).is_err());
     }
 
     #[test]

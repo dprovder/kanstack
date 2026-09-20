@@ -107,6 +107,14 @@ impl Splitter {
         }
     }
 
+    /// Overrides the first-lane split direction — see `Cmux::set_first_direction`.
+    pub fn set_first_direction(&mut self, direction: &str) {
+        match self {
+            Splitter::Cmux(c) => c.set_first_direction(direction),
+            Splitter::Tmux(t) => t.set_first_direction(direction),
+        }
+    }
+
     /// Makes the next spawn split off `pane_id` instead of the caller's own pane.
     pub fn set_anchor(&mut self, pane_id: &str) {
         match self {

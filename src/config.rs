@@ -13,7 +13,12 @@ use std::path::PathBuf;
 /// Every `KEY=value` line the config file may set. `load_into_env`/`save` only ever touch
 /// these — anything else found in the file is ignored, so a typo'd key silently does
 /// nothing rather than mysteriously reaching some unrelated part of the app.
-const KEYS: &[&str] = &["KANSTACK_HARNESS", "KANSTACK_SPLIT_BACKEND", "KANSTACK_BRANCH_UI"];
+const KEYS: &[&str] = &[
+    "KANSTACK_HARNESS",
+    "KANSTACK_SPLIT_BACKEND",
+    "KANSTACK_BRANCH_UI",
+    "KANSTACK_SPAWN_DIRECTION",
+];
 
 /// Where the config file lives: `KANSTACK_CONFIG_PATH` if set — also the test seam, so
 /// tests point this at a temp dir and never touch a real `~/.config` — else

@@ -93,6 +93,10 @@ environment:
                            previous lane instead of kanstack (default: `right`)
   KANSTACK_TMUX_DIRECTION, KANSTACK_TMUX_CHAIN_DIRECTION  the tmux fallback's equivalents
                            of the two above, same defaults
+  KANSTACK_SPAWN_DIRECTION  where `kanstack spawn` splits off the pane it is run from:
+                           left, right, above, or below (default: `right`). Separate from
+                           the two above, which are the board's own; the chain direction
+                           for every lane after the first is shared
   KANSTACK_BRANCH_UI  how `b`'s branch-name/initial-message prompts are presented: `modal`
                       (default), a dedicated box showing the name, the pending action, and
                       the message all together, or `footer`, squeezed into the one-line
