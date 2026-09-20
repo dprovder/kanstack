@@ -5,6 +5,8 @@
 
 use std::path::Path;
 
+use anyhow::{Context, Result};
+
 /// How the branch-context note (see [`branch_context_note`]) reaches a harness's launch
 /// command — resolved once, in [`resolve_note_delivery`], from `KANSTACK_HARNESS_SYSTEM_FLAG`
 /// and the configured harness itself.
@@ -31,8 +33,19 @@ pub enum NoteDelivery {
     Disabled,
 }
 
+/// The longest launch line typed straight into a fresh terminal. A new pane's shell is
+/// still starting up when the line arrives, and until it switches the tty to raw mode for
+/// its line editor the kernel's line discipline is in charge, which caps a line at about a
+/// kilobyte and silently drops the rest — leaving a command cut off mid-quote that never
+/// runs. Anything longer goes through files instead, see [`launch_line`]. Well under the
+/// limit, since the limit counts bytes and the line has multibyte text in it.
+const MAX_TYPED_LINE: usize = 700;
+
 /// Builds the shell command line a split backend types into the fresh terminal — split out
 /// so it can be unit tested without shelling out to a real `cmux`/`tmux`.
+///
+/// Always the whole text inline; see [`launch_line`] for the one that copes with a prompt
+/// too long to type.
 pub fn build_launch_command(
     cwd: &Path,
     harness: &str,
@@ -40,22 +53,34 @@ pub fn build_launch_command(
     name: &str,
     initial_message: Option<&str>,
 ) -> String {
-    let mut launch = format!("cd {} && {}", shell_quote(&cwd.to_string_lossy()), harness);
+    let args = launch_args(note_delivery, name, initial_message, &mut |prefix, text| {
+        shell_quote(&format!("{prefix}{text}"))
+    });
+    format!("cd {} && {}{}\n", shell_quote(&cwd.to_string_lossy()), harness, args)
+}
+
+/// The arguments after the harness, each preceded by a space. `word` turns a value into a
+/// shell word: given the literal `prefix` that must stay in front of it (Codex's
+/// `developer_instructions=`, empty otherwise) and the value's own `text`.
+fn launch_args(
+    note_delivery: &NoteDelivery,
+    name: &str,
+    initial_message: Option<&str>,
+    word: &mut dyn FnMut(&str, &str) -> String,
+) -> String {
+    let mut args = String::new();
     let mut message = initial_message.map(str::to_string);
 
     match note_delivery {
         NoteDelivery::Flag(flag) => {
-            launch.push(' ');
-            launch.push_str(flag);
-            launch.push(' ');
-            launch.push_str(&shell_quote(&branch_context_note(name)));
+            args.push(' ');
+            args.push_str(flag);
+            args.push(' ');
+            args.push_str(&word("", &branch_context_note(name)));
         }
         NoteDelivery::CodexConfig => {
-            launch.push_str(" -c ");
-            launch.push_str(&shell_quote(&format!(
-                "developer_instructions={}",
-                toml_quote(&branch_context_note(name))
-            )));
+            args.push_str(" -c ");
+            args.push_str(&word("developer_instructions=", &toml_quote(&branch_context_note(name))));
         }
         NoteDelivery::FoldIntoMessage => {
             message = Some(match message {
@@ -67,11 +92,75 @@ pub fn build_launch_command(
     }
 
     if let Some(message) = message {
-        launch.push(' ');
-        launch.push_str(&shell_quote(&message));
+        args.push(' ');
+        args.push_str(&word("", &message));
     }
-    launch.push('\n');
-    launch
+    args
+}
+
+/// [`build_launch_command`], unless that would be too long to type into a fresh terminal
+/// (see `MAX_TYPED_LINE`): then each long value is written to a private temp file, and the
+/// line typed is short — it reads the files into shell variables, deletes them, and
+/// launches the harness with `"$variable"` arguments. The values reach the harness
+/// byte-for-byte the same either way.
+pub fn launch_line(
+    cwd: &Path,
+    harness: &str,
+    note_delivery: &NoteDelivery,
+    name: &str,
+    initial_message: Option<&str>,
+) -> Result<String> {
+    launch_line_in(&std::env::temp_dir(), cwd, harness, note_delivery, name, initial_message)
+}
+
+fn launch_line_in(
+    tmp: &Path,
+    cwd: &Path,
+    harness: &str,
+    note_delivery: &NoteDelivery,
+    name: &str,
+    initial_message: Option<&str>,
+) -> Result<String> {
+    let direct = build_launch_command(cwd, harness, note_delivery, name, initial_message);
+    if direct.len() <= MAX_TYPED_LINE {
+        return Ok(direct);
+    }
+
+    use std::os::unix::fs::DirBuilderExt;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let dir = tmp.join(format!("kanstack-launch-{}-{nanos}", std::process::id()));
+    // Owner-only: what's in here is the user's prompt.
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&dir)
+        .with_context(|| format!("creating {}", dir.display()))?;
+
+    let mut reads = Vec::new();
+    let mut failure = None;
+    let args = launch_args(note_delivery, name, initial_message, &mut |prefix, text| {
+        let var = format!("k{}", reads.len());
+        let path = dir.join(&var);
+        if let Err(e) = std::fs::write(&path, text) {
+            failure.get_or_insert_with(|| anyhow::Error::new(e).context(format!("writing {}", path.display())));
+        }
+        reads.push(format!("{var}=$(cat {})", shell_quote(&path.to_string_lossy())));
+        format!("\"{prefix}${var}\"")
+    });
+    if let Some(e) = failure {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(e);
+    }
+
+    Ok(format!(
+        "cd {} && {} && rm -rf {} && {}{}\n",
+        shell_quote(&cwd.to_string_lossy()),
+        reads.join(" "),
+        shell_quote(&dir.to_string_lossy()),
+        harness,
+        args,
+    ))
 }
 
 /// The `NoteDelivery` for `harness`, from `KANSTACK_HARNESS_SYSTEM_FLAG` if set —
@@ -339,5 +428,90 @@ mod tests {
         with_system_flag_env(Some(""), || {
             assert_eq!(resolve_note_delivery("claude"), NoteDelivery::Disabled);
         });
+    }
+
+    /// Runs `line` under `sh` with `printf` standing in for the harness, so what comes back
+    /// is exactly the argument vector a real harness would have received.
+    fn args_seen_by_the_harness(line: &str) -> Vec<String> {
+        // `sh` and the `cat` in a spilled line are both found through `PATH`, which the
+        // backends' discovery tests swap out while holding this lock.
+        let _guard = crate::SPLIT_BACKEND_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let out =std::process::Command::new("sh").arg("-c").arg(line).output().unwrap();
+        assert!(out.status.success(), "{line:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .split('\0')
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    }
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("kanstack-launch-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A message that would blow the line-length limit, with everything a shell might
+    /// mangle in it: quotes of both kinds, `$`, backticks, a backslash, a newline, unicode.
+    fn awkward_long_message() -> String {
+        format!("it's \"quoted\" $HOME `id` \\ done\nsecond line — ünï {}", "x".repeat(3000))
+    }
+
+    #[test]
+    fn a_short_launch_line_is_typed_inline_exactly_as_before() {
+        let tmp = scratch("short");
+        let d = NoteDelivery::Flag("--append-system-prompt".to_string());
+        let line = launch_line_in(&tmp, Path::new("/repo"), "claude", &d, "feat-x", Some("fix it")).unwrap();
+        assert_eq!(line, build_launch_command(Path::new("/repo"), "claude", &d, "feat-x", Some("fix it")));
+        assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 0, "nothing needs a file");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The bug this exists for: a long prompt used to be typed whole, and the terminal
+    /// dropped everything past about a kilobyte.
+    #[test]
+    fn a_long_launch_line_stays_short_and_hands_the_harness_the_same_arguments() {
+        let tmp = scratch("long");
+        let message = awkward_long_message();
+        let d = NoteDelivery::Flag("--append-system-prompt".to_string());
+
+        let inline = build_launch_command(Path::new("/tmp"), "printf '%s\\0'", &d, "feat-x", Some(&message));
+        let spilled = launch_line_in(&tmp, Path::new("/tmp"), "printf '%s\\0'", &d, "feat-x", Some(&message)).unwrap();
+
+        assert!(inline.len() > MAX_TYPED_LINE, "the fixture must be long enough to matter");
+        assert!(spilled.len() < MAX_TYPED_LINE, "typed line is {} bytes: {spilled:?}", spilled.len());
+        assert!(!spilled.contains("second line"), "the prompt itself must not be typed");
+
+        let mut expected = args_seen_by_the_harness(&inline);
+        let mut got = args_seen_by_the_harness(&spilled);
+        assert_eq!(got.pop(), expected.pop()); // trailing empty field after the last NUL
+        assert_eq!(got, expected);
+        assert_eq!(got.last().unwrap(), &message);
+
+        assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 0, "the line deletes what it wrote");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Codex's note is a TOML string behind a fixed `developer_instructions=` prefix, and
+    /// that prefix has to stay outside the variable it's joined to.
+    #[test]
+    fn a_long_launch_line_keeps_codexs_config_prefix_intact() {
+        let tmp = scratch("codex");
+        let message = awkward_long_message();
+        let inline = build_launch_command(Path::new("/tmp"), "printf '%s\\0'", &NoteDelivery::CodexConfig, "b", Some(&message));
+        let spilled =
+            launch_line_in(&tmp, Path::new("/tmp"), "printf '%s\\0'", &NoteDelivery::CodexConfig, "b", Some(&message)).unwrap();
+        assert!(spilled.len() < MAX_TYPED_LINE);
+        assert_eq!(args_seen_by_the_harness(&spilled), args_seen_by_the_harness(&inline));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// With nowhere to put the files, say so rather than typing a truncated line.
+    #[test]
+    fn a_long_launch_line_fails_loudly_if_it_cannot_write_its_files() {
+        let missing = std::env::temp_dir().join("kanstack-launch-test-no-such-dir/nested");
+        let d = NoteDelivery::Disabled;
+        assert!(launch_line_in(&missing, Path::new("/tmp"), "claude", &d, "b", Some(&awkward_long_message())).is_err());
     }
 }

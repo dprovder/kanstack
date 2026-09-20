@@ -90,7 +90,24 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 #[derive(Debug, Clone, Default)]
 pub struct Registry {
     path: Option<PathBuf>,
+    /// The terminal-multiplexer workspace this repository's panes live in (cmux's
+    /// `workspace:1`), so a `spawn` run from a shell whose environment has drifted still
+    /// opens its pane beside the others rather than wherever that environment points.
+    pub workspace: Option<String>,
     pub workstreams: Vec<Workstream>,
+}
+
+/// What's in the file. The first version was a bare array of workstreams, with no room for
+/// anything else; still read, and rewritten in this shape the next time it's saved.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum OnDisk {
+    Current {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace: Option<String>,
+        workstreams: Vec<Workstream>,
+    },
+    Legacy(Vec<Workstream>),
 }
 
 impl Registry {
@@ -99,16 +116,23 @@ impl Registry {
     /// starting over would orphan every pane it was tracking.
     pub fn load(repo: &Path) -> Result<Self> {
         let path = state_path(repo);
-        let workstreams = match path.as_ref().map(std::fs::read_to_string) {
-            Some(Ok(raw)) => serde_json::from_str(&raw)
-                .with_context(|| format!("{} is not a valid workstream registry", path.as_ref().unwrap().display()))?,
-            Some(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        let on_disk = match path.as_ref().map(std::fs::read_to_string) {
+            Some(Ok(raw)) => Some(
+                serde_json::from_str::<OnDisk>(&raw)
+                    .with_context(|| format!("{} is not a valid workstream registry", path.as_ref().unwrap().display()))?,
+            ),
+            Some(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => None,
             Some(Err(e)) => {
                 return Err(e).with_context(|| format!("reading {}", path.as_ref().unwrap().display()))
             }
-            None => Vec::new(),
+            None => None,
         };
-        Ok(Registry { path, workstreams })
+        let (workspace, workstreams) = match on_disk {
+            Some(OnDisk::Current { workspace, workstreams }) => (workspace, workstreams),
+            Some(OnDisk::Legacy(workstreams)) => (None, workstreams),
+            None => (None, Vec::new()),
+        };
+        Ok(Registry { path, workspace, workstreams })
     }
 
     /// Writes via a temp file and rename, so a reader in another pane never sees a
@@ -119,7 +143,8 @@ impl Registry {
             std::fs::create_dir_all(parent)?;
         }
         let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
-        std::fs::write(&tmp, serde_json::to_string_pretty(&self.workstreams)? + "\n")?;
+        let on_disk = OnDisk::Current { workspace: self.workspace.clone(), workstreams: self.workstreams.clone() };
+        std::fs::write(&tmp, serde_json::to_string_pretty(&on_disk)? + "\n")?;
         std::fs::rename(&tmp, path)?;
         Ok(())
     }
@@ -161,8 +186,11 @@ impl Registry {
 
 /// Records a pane the board just opened, so the subcommands can find it. Best-effort: a
 /// registry that can't be written must not undo a pane that did open.
-pub fn record_spawn(repo: &Path, branch: &str, pane_id: &str, agent: Option<&str>) {
+pub fn record_spawn(repo: &Path, branch: &str, pane_id: &str, agent: Option<&str>, workspace: Option<&str>) {
     let Ok(mut registry) = Registry::load(repo) else { return };
+    if let Some(workspace) = workspace {
+        registry.workspace = Some(workspace.to_string());
+    }
     let existing = registry.get(branch).cloned();
     registry.upsert(Workstream {
         branch_id: BranchId(branch.to_string()),
@@ -231,11 +259,12 @@ mod tests {
         assert_eq!(again.workstreams, a.workstreams);
         assert!(Registry::load(Path::new("/repo/b")).unwrap().workstreams.is_empty());
 
-        record_spawn(Path::new("/repo/a"), "fix-login", "%7", Some("codex"));
+        record_spawn(Path::new("/repo/a"), "fix-login", "%7", Some("codex"), Some("workspace:1"));
         let after = Registry::load(Path::new("/repo/a")).unwrap();
         let w = after.get("fix-login").unwrap();
         assert_eq!(w.pane_id, Some(PaneId("%7".into())));
         assert_eq!(w.item, Some(WorkItemRef("GH-4".into())), "re-recording keeps the work item");
+        assert_eq!(after.workspace.as_deref(), Some("workspace:1"), "and pins the workspace");
 
         std::env::remove_var("KANSTACK_STATE_PATH");
         let _ = std::fs::remove_dir_all(&dir);
@@ -251,6 +280,30 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(&path, "{ not json").unwrap();
         assert!(Registry::load(Path::new("/repo/c")).is_err());
+        std::env::remove_var("KANSTACK_STATE_PATH");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The first registry format was a bare array. Files written then must still load, with
+    /// no workspace pinned, and come back out in the current shape.
+    #[test]
+    fn a_registry_from_the_first_format_still_loads() {
+        let _guard = crate::SPLIT_BACKEND_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("kanstack-workstream-legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("KANSTACK_STATE_PATH", &dir);
+        let path = state_path(Path::new("/repo/d")).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, r#"[{"branch_id":"a","pane_id":"surface:1","agent":"claude","item":null}]"#).unwrap();
+
+        let mut r = Registry::load(Path::new("/repo/d")).unwrap();
+        assert_eq!(r.workstreams.len(), 1);
+        assert_eq!(r.workspace, None);
+        r.workspace = Some("workspace:2".into());
+        r.save().unwrap();
+        let again = Registry::load(Path::new("/repo/d")).unwrap();
+        assert_eq!((again.workspace.as_deref(), again.workstreams.len()), (Some("workspace:2"), 1));
+
         std::env::remove_var("KANSTACK_STATE_PATH");
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -62,7 +62,7 @@ impl App {
             let label = splitter.label();
             match splitter.spawn_harness(&cwd, &branch, None) {
                 Ok(pane) => {
-                    crate::workstream::record_spawn(&cwd, &branch, &pane, None);
+                    crate::workstream::record_spawn(&cwd, &branch, &pane, None, splitter.workspace().as_deref());
                     self.notify(
                         format!("opened a pane for {branch} — press t again once it's ready for the task"),
                         Notice::Info,

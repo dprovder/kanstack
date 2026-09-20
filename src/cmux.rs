@@ -35,7 +35,7 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 use crate::harness_launch::{
-    build_launch_command, resolve_note_delivery, resolve_note_delivery_for_override, NoteDelivery,
+    launch_line, resolve_note_delivery, resolve_note_delivery_for_override, NoteDelivery,
 };
 pub use crate::pane_status::PaneStatus;
 use crate::pane_status::CPU_BUSY_THRESHOLD_PERCENT;
@@ -71,6 +71,12 @@ pub struct Cmux {
     /// Surface ref of the most recently spawned harness, so the next lane splits off it
     /// instead of kanstack's own pane. `None` splits off kanstack itself (the first lane).
     last_anchor: Option<String>,
+    /// The cmux workspace new panes belong in, e.g. `workspace:1`: pinned by the caller
+    /// (see [`Self::set_workspace`]) or, failing that, read off the last pane this opened.
+    /// `None` until one of those has happened, meaning "wherever `$CMUX_WORKSPACE_ID`
+    /// says" — which is right for the board, running inside its own pane, but is only as
+    /// good as that variable is for anything else.
+    workspace: Option<String>,
     /// One entry per lane kanstack has opened a harness for, keyed by the branch name
     /// passed to `spawn_harness` — the lane's *original* parallel branch, which stays the
     /// key even if other branches later stack on top of it (stacking never opens a second
@@ -109,6 +115,7 @@ impl Cmux {
             direction,
             chain_direction,
             last_anchor: None,
+            workspace: None,
             panes: HashMap::new(),
         })
     }
@@ -161,17 +168,28 @@ impl Cmux {
         initial_message: Option<&str>,
         harness: Option<&str>,
     ) -> Result<String> {
+        // A pinned workspace that no longer exists (closed since) is dropped: this spawn
+        // falls back to the environment, and pins wherever that lands.
+        let pinned = self.pinned_surface();
+        if self.workspace.is_some() && pinned.is_none() {
+            self.workspace = None;
+        }
         let (direction, anchor) = match &self.last_anchor {
             Some(anchor) => (self.chain_direction.clone(), Some(anchor.clone())),
-            None => match self.occupant_in_direction(&self.direction) {
-                // Something already sits in kanstack's own split slot (e.g. a tab the
-                // user had open before kanstack started): join it beside that pane
-                // instead of stacking a third row onto kanstack.
-                Ok(Some(occupant)) => (self.chain_direction.clone(), Some(occupant)),
-                Ok(None) => (self.direction.clone(), None),
-                // No geometry, no $CMUX_SURFACE_ID, or a malformed response: fall back
-                // to the plain behavior rather than failing the whole spawn over it.
-                Err(_) => (self.direction.clone(), None),
+            None => match pinned {
+                // A workspace was pinned: split a surface inside it, whatever the
+                // environment says about where we're running.
+                Some(surface) => (self.direction.clone(), Some(surface)),
+                None => match self.occupant_in_direction(&self.direction) {
+                    // Something already sits in kanstack's own split slot (e.g. a tab the
+                    // user had open before kanstack started): join it beside that pane
+                    // instead of stacking a third row onto kanstack.
+                    Ok(Some(occupant)) => (self.chain_direction.clone(), Some(occupant)),
+                    Ok(None) => (self.direction.clone(), None),
+                    // No geometry, no $CMUX_SURFACE_ID, or a malformed response: fall back
+                    // to the plain behavior rather than failing the whole spawn over it.
+                    Err(_) => (self.direction.clone(), None),
+                },
             },
         };
 
@@ -179,19 +197,26 @@ impl Cmux {
         if let Some(anchor) = &anchor {
             split_args.extend(["--surface", anchor.as_str()]);
         }
+        if let Some(workspace) = &self.workspace {
+            split_args.extend(["--workspace", workspace.as_str()]);
+        }
         let split_out = self.run(&split_args)?;
         let surface_ref = extract_ref(&split_out, "surface:")
             .with_context(|| format!("`cmux new-split` did not report a surface: {split_out:?}"))?
             .to_string();
+        // Remembered, so every later pane lands in the workspace this one did.
+        if let Some(workspace) = extract_ref(&split_out, "workspace:") {
+            self.workspace = Some(self.workspace_id(workspace));
+        }
 
         let (harness, note_delivery) = match harness {
             Some(h) if h != self.harness => (h, resolve_note_delivery_for_override(h)),
             Some(_) | None => (self.harness.as_str(), self.note_delivery.clone()),
         };
-        let launch = build_launch_command(cwd, harness, &note_delivery, name, initial_message);
-        self.run(&["send", "--surface", &surface_ref, &launch])?;
+        let launch = launch_line(cwd, harness, &note_delivery, name, initial_message)?;
+        self.type_and_submit(&surface_ref, launch.trim_end_matches('\n'))?;
 
-        self.run(&["rename-tab", "--surface", &surface_ref, name])?;
+        self.run_scoped(&["rename-tab", "--surface", &surface_ref, name])?;
         self.panes.insert(
             name.to_string(),
             PaneHandle {
@@ -210,6 +235,38 @@ impl Cmux {
             branch.to_string(),
             PaneHandle { surface_ref: surface_ref.to_string(), status: PaneStatus::Unknown },
         );
+    }
+
+    /// Pins the workspace new panes are opened in — see the `workspace` field. `None`
+    /// leaves it to `$CMUX_WORKSPACE_ID`.
+    pub fn set_workspace(&mut self, workspace: Option<&str>) {
+        self.workspace = workspace.map(str::to_string);
+    }
+
+    /// The workspace new panes are opened in: what was pinned, or what the last pane this
+    /// opened turned out to be in.
+    pub fn workspace(&self) -> Option<String> {
+        self.workspace.clone()
+    }
+
+    /// The pinned workspace, with a terminal surface in it to split from — `None` if
+    /// nothing is pinned, or the pinned workspace no longer exists (closed since), in which
+    /// case the caller falls back to the environment and pins wherever that lands.
+    fn pinned_surface(&self) -> Option<String> {
+        let workspace = self.workspace.as_deref()?;
+        let out = self.run(&["list-panels", "--workspace", workspace]).ok()?;
+        terminal_surface(&out)
+    }
+
+    /// The UUID for a workspace `workspace_ref` (`workspace:1`), which is what's worth
+    /// remembering: a short ref is only an ordinal within the running app and can name a
+    /// different workspace after cmux restarts. Falls back to the ref itself if the
+    /// listing can't be read.
+    fn workspace_id(&self, workspace_ref: &str) -> String {
+        self.run(&["--id-format", "both", "workspace", "list"])
+            .ok()
+            .and_then(|listing| workspace_uuid(&listing, workspace_ref))
+            .unwrap_or_else(|| workspace_ref.to_string())
     }
 
     /// Overrides the first-lane split direction, which `discover` read from `KANSTACK_CMUX_DIRECTION`.
@@ -237,7 +294,7 @@ impl Cmux {
         let Some(pane) = self.panes.get(branch) else {
             bail!("no cmux pane open for {branch} yet");
         };
-        self.run(&["focus-panel", "--panel", &pane.surface_ref])?;
+        self.run_scoped(&["focus-panel", "--panel", &pane.surface_ref])?;
         Ok(())
     }
 
@@ -252,7 +309,7 @@ impl Cmux {
         }
         // Whether an already-closed surface is an error here isn't documented; a surface
         // that no longer appears in `pane.list` is the state `stop` is after either way.
-        if self.run(&["close-surface", "--surface", &pane.surface_ref]).is_err() {
+        if self.run_scoped(&["close-surface", "--surface", &pane.surface_ref]).is_err() {
             let still_there = self
                 .run(&["rpc", "pane.list"])
                 .map(|out| out.contains(&pane.surface_ref))
@@ -272,7 +329,19 @@ impl Cmux {
         let Some(pane) = self.panes.get(branch) else {
             bail!("no cmux pane open for {branch} yet");
         };
-        self.run(&["send", "--surface", &pane.surface_ref, &format!("{text}\n")])?;
+        self.type_and_submit(&pane.surface_ref, text)
+    }
+
+    /// Types `text` into `surface_ref`, then presses Enter as a separate key. A trailing
+    /// newline in the same `cmux send` reaches the terminal as a carriage return in the
+    /// same burst as the text, which a TUI like Claude Code reads as part of a paste rather
+    /// than as Enter — the text lands in its input box and never submits. Verified against
+    /// a real `claude` with a ~4KB message: one send with a trailing newline stays in the
+    /// input box; the same text followed by its own `send-key enter` is submitted at once.
+    /// `tmux.rs` sends its Enter as a separate key for the same reason.
+    fn type_and_submit(&self, surface_ref: &str, text: &str) -> Result<()> {
+        self.run_scoped(&["send", "--surface", surface_ref, text])?;
+        self.run_scoped(&["send-key", "--surface", surface_ref, "enter"])?;
         Ok(())
     }
 
@@ -288,7 +357,12 @@ impl Cmux {
         if self.panes.is_empty() {
             return Ok(HashMap::new());
         }
-        let list_out = self.run(&["rpc", "pane.list"])?;
+        // Without a workspace, `pane.list` covers whichever one is selected right now, which
+        // needn't be where these panes are — they'd all read as dead.
+        let list_out = match &self.workspace {
+            Some(ws) => self.run(&["rpc", "pane.list", &format!("{{\"workspace_id\":\"{ws}\"}}")])?,
+            None => self.run(&["rpc", "pane.list"])?,
+        };
 
         let any_alive = {
             let list: PaneListResponse = serde_json::from_str(&list_out)
@@ -302,7 +376,7 @@ impl Cmux {
         };
 
         let top_out = if any_alive {
-            match std::env::var("CMUX_WORKSPACE_ID") {
+            match self.workspace.clone().ok_or(()).or_else(|()| std::env::var("CMUX_WORKSPACE_ID").map_err(|_| ())) {
                 // Else: no workspace to scope `top` to without guessing —
                 // existence-only status is still derived below; the Busy/Idle split
                 // is skipped this round.
@@ -351,6 +425,22 @@ impl Cmux {
             .iter()
             .find(|p| p.pane_ref != own.pane_ref && touches(&own.pixel_frame, &p.pixel_frame, direction))
             .map(|p| p.selected_surface_ref.clone()))
+    }
+
+    /// [`Self::run`] with `--workspace <pinned>` added, when a workspace is pinned. cmux
+    /// looks a `--surface` up in `$CMUX_WORKSPACE_ID`'s workspace unless told otherwise, so
+    /// a shell whose environment names some other workspace gets "surface not found" for a
+    /// pane that's right there — or, for `new-split`, opens the pane in the wrong workspace.
+    /// The flag goes straight after the subcommand, ahead of any positional argument.
+    fn run_scoped(&self, args: &[&str]) -> Result<String> {
+        match &self.workspace {
+            Some(ws) if !args.is_empty() => {
+                let mut scoped = vec![args[0], "--workspace", ws.as_str()];
+                scoped.extend(&args[1..]);
+                self.run(&scoped)
+            }
+            _ => self.run(args),
+        }
     }
 
     fn run(&self, args: &[&str]) -> Result<String> {
@@ -522,6 +612,33 @@ fn normalize_direction(raw: &str) -> String {
     .to_string()
 }
 
+/// The UUID `cmux --id-format both workspace list` prints beside `workspace_ref`. Lines
+/// look like `* workspace:1 6AAD1488-…  ◑ title  [selected]`.
+fn workspace_uuid(listing: &str, workspace_ref: &str) -> Option<String> {
+    listing.lines().find_map(|line| {
+        let mut tokens = line.trim_start().trim_start_matches('*').split_whitespace();
+        (tokens.next() == Some(workspace_ref)).then(|| tokens.next().map(str::to_string)).flatten()
+    })
+}
+
+/// The terminal surface to split from in a `cmux list-panels` listing: the focused one if
+/// it's a terminal, else the first terminal. Lines look like `* surface:158  terminal
+/// [focused]  "title"`, the star marking the focused surface.
+fn terminal_surface(list_panels: &str) -> Option<String> {
+    let terminals = list_panels.lines().filter_map(|line| {
+        let focused = line.trim_start().starts_with('*');
+        let mut tokens = line.trim_start().trim_start_matches('*').split_whitespace();
+        let surface = tokens.next().filter(|t| t.starts_with("surface:"))?;
+        (tokens.next() == Some("terminal")).then(|| (focused, surface.to_string()))
+    });
+    let terminals: Vec<_> = terminals.collect();
+    terminals
+        .iter()
+        .find(|(focused, _)| *focused)
+        .or_else(|| terminals.first())
+        .map(|(_, surface)| surface.clone())
+}
+
 /// Pulls a `<prefix><id>` token (e.g. `surface:31`) out of an `OK ...` response line.
 fn extract_ref<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
     text.split_whitespace().find(|tok| tok.starts_with(prefix))
@@ -657,5 +774,30 @@ mod tests {
         let panes = HashMap::from([("feature-a".to_string(), pane("surface:33", PaneStatus::Busy))]);
         let statuses = classify_statuses(&panes, PANE_LIST_FIXTURE, None).unwrap();
         assert_eq!(statuses["feature-a"], PaneStatus::Busy);
+    }
+
+    #[test]
+    fn terminal_surface_prefers_the_focused_terminal() {
+        let listing = "  surface:2  terminal  \"~/repo\"\n\
+                       * surface:158  terminal  [focused]  \"feat\"\n\
+                         surface:3  terminal  \"cargo run\"\n";
+        assert_eq!(terminal_surface(listing).as_deref(), Some("surface:158"));
+    }
+
+    #[test]
+    fn terminal_surface_skips_browsers_and_falls_back_to_the_first_terminal() {
+        let listing = "* surface:74  browser  [focused]  \"docs\"\n  surface:9  terminal  \"sh\"\n  surface:10  terminal  \"sh\"\n";
+        assert_eq!(terminal_surface(listing).as_deref(), Some("surface:9"));
+        assert_eq!(terminal_surface("  surface:74  browser  \"docs\"\n"), None);
+        assert_eq!(terminal_surface(""), None);
+    }
+
+    #[test]
+    fn workspace_uuid_finds_the_id_beside_a_ref() {
+        let listing = "* workspace:1 6AAD1488-99C9-4520-B89A-3E06E25ADB61  \u{25d1} Kanstack CLI  [selected]\n\
+                         workspace:10 5C659CD2-D2CC-42BD-85B7-6B0D7166C924  wdl\n";
+        assert_eq!(workspace_uuid(listing, "workspace:1").as_deref(), Some("6AAD1488-99C9-4520-B89A-3E06E25ADB61"));
+        assert_eq!(workspace_uuid(listing, "workspace:10").as_deref(), Some("5C659CD2-D2CC-42BD-85B7-6B0D7166C924"));
+        assert_eq!(workspace_uuid(listing, "workspace:2"), None, "workspace:1 must not match workspace:10 or vice versa");
     }
 }

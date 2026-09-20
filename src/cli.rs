@@ -120,6 +120,9 @@ fn seeded_splitter(registry: &Registry) -> Result<Splitter> {
         )
     })?;
     registry.adopt_into(&mut splitter);
+    // Every pane goes in the workspace the others did, not wherever this shell's
+    // environment happens to say.
+    splitter.set_workspace(registry.workspace.as_deref());
     Ok(splitter)
 }
 
@@ -186,6 +189,9 @@ pub fn run(command: Command, cwd: &Path, out: &mut impl Write) -> Result<()> {
             let agent = agent
                 .or_else(|| std::env::var("KANSTACK_HARNESS").ok())
                 .unwrap_or_else(|| "claude".to_string());
+            if let Some(workspace) = splitter.workspace() {
+                registry.workspace = Some(workspace);
+            }
             let item = registry.get(&branch).and_then(|w| w.item.clone());
             registry.upsert(Workstream {
                 branch_id: BranchId(branch.clone()),
@@ -194,7 +200,10 @@ pub fn run(command: Command, cwd: &Path, out: &mut impl Write) -> Result<()> {
                 item,
             });
             registry.save()?;
-            writeln!(out, "spawned {agent} on {branch} in {pane}")?;
+            match &registry.workspace {
+                Some(workspace) => writeln!(out, "spawned {agent} on {branch} in {pane} ({workspace})")?,
+                None => writeln!(out, "spawned {agent} on {branch} in {pane}")?,
+            }
         }
         Command::Send { target, text } => {
             let splitter = seeded_splitter(&registry)?;

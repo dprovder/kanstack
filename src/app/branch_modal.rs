@@ -309,7 +309,7 @@ impl App {
                         let label = splitter.label();
                         match splitter.spawn_harness(&cwd, name, initial_message) {
                             Ok(pane) => {
-                                crate::workstream::record_spawn(&cwd, name, &pane, None);
+                                crate::workstream::record_spawn(&cwd, name, &pane, None, splitter.workspace().as_deref());
                                 self.notify(format!("created {name} — harness open"), Notice::Success);
                             }
                             Err(e) => self.notify(format!("{label}: {e}"), Notice::Error),

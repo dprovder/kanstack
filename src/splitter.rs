@@ -107,6 +107,22 @@ impl Splitter {
         }
     }
 
+    /// Pins the cmux workspace new panes are opened in; a no-op for tmux.
+    pub fn set_workspace(&mut self, workspace: Option<&str>) {
+        match self {
+            Splitter::Cmux(c) => c.set_workspace(workspace),
+            Splitter::Tmux(t) => t.set_workspace(workspace),
+        }
+    }
+
+    /// The workspace new panes go in, if this backend has such a thing.
+    pub fn workspace(&self) -> Option<String> {
+        match self {
+            Splitter::Cmux(c) => c.workspace(),
+            Splitter::Tmux(t) => t.workspace(),
+        }
+    }
+
     /// Overrides the first-lane split direction — see `Cmux::set_first_direction`.
     pub fn set_first_direction(&mut self, direction: &str) {
         match self {

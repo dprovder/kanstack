@@ -27,7 +27,7 @@ use std::process::{Command, Output};
 use anyhow::{bail, Context, Result};
 
 use crate::harness_launch::{
-    build_launch_command, resolve_note_delivery, resolve_note_delivery_for_override, NoteDelivery,
+    launch_line, resolve_note_delivery, resolve_note_delivery_for_override, NoteDelivery,
 };
 use crate::pane_status::{PaneStatus, CPU_BUSY_THRESHOLD_PERCENT};
 
@@ -151,7 +151,7 @@ impl Tmux {
             Some(h) if h != self.harness => (h, resolve_note_delivery_for_override(h)),
             Some(_) | None => (self.harness.as_str(), self.note_delivery.clone()),
         };
-        let launch = build_launch_command(cwd, harness, &note_delivery, name, initial_message);
+        let launch = launch_line(cwd, harness, &note_delivery, name, initial_message)?;
         self.type_and_submit(&pane_id, launch.trim_end_matches('\n'))?;
 
         let _ = self.run(&["select-pane", "-t", &pane_id, "-T", name]);
@@ -165,6 +165,14 @@ impl Tmux {
     /// `focus` and `stop` work on it.
     pub fn adopt(&mut self, branch: &str, pane_id: &str) {
         self.panes.insert(branch.to_string(), PaneHandle { pane_id: pane_id.to_string(), status: PaneStatus::Unknown });
+    }
+
+    /// tmux pane ids are global and `$TMUX_PANE` names the caller's own, so there's no
+    /// workspace to pin — kept so `Splitter` needn't know which backend it holds.
+    pub fn set_workspace(&mut self, _workspace: Option<&str>) {}
+
+    pub fn workspace(&self) -> Option<String> {
+        None
     }
 
     /// Overrides the first-lane split direction, which `discover` read from `KANSTACK_TMUX_DIRECTION`.
