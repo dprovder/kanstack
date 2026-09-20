@@ -2,14 +2,28 @@
 //! <https://www.onorca.dev/docs/cli/reference>), the third harness-split backend beside
 //! `crate::cmux` and `crate::tmux`.
 //!
-//! **What is verified, and against what.** Orca is not installed on the machine this was
-//! written on, so nothing here has run against a live Orca. The command names and flags come
-//! from the published CLI reference. The JSON shapes, the `path:` selector rules, the split
-//! orientation and the `ORCA_TERMINAL_HANDLE` variable are *not* in that reference: they were
-//! read from Orca's own source (`stablyai/orca` at 9fbdfc5 — `src/cli/handlers/terminal*.ts`,
+//! **What is verified, and against what.** The command names and flags come from the
+//! published CLI reference. The JSON shapes, the `path:` selector rules, the split orientation
+//! and the `ORCA_TERMINAL_HANDLE` variable are *not* in that reference: they were read from
+//! Orca's own source (`stablyai/orca` at 9fbdfc5 — `src/cli/handlers/terminal*.ts`,
 //! `src/shared/runtime-terminal-contracts.ts`, `src/main/runtime/orca-runtime-resolve-
-//! worktree-selector.ts`). Each such spot is marked "(from source)"; treat those as strong
-//! leads to confirm against a real install, not as documented behavior.
+//! worktree-selector.ts`), marked "(from source)" below.
+//!
+//! Those were then run against `orcad`, Orca's headless Node runtime, built from that same
+//! commit — *not* the desktop app, which was not available. Confirmed live: `repo add`
+//! registers a repository's main checkout as a worktree (`path:<root>` then resolves, and
+//! `worktree create` is never needed); `terminal create`/`split`/`rename`/`switch`/`close`/
+//! `list`/`read` reply as parsed here; `--command` runs as typed input, in the worktree's
+//! directory, even for a 5000-character launch line; `ORCA_TERMINAL_HANDLE` is exported and
+//! is the terminal's own handle; a split joins its source's tab; `close` is idempotent; a
+//! stale anchor fails the split (as `runtime_unavailable`) and the `create` fallback works.
+//! The `tests/fixtures/orca_*.json` files are those replies.
+//!
+//! **Not** verified, because it needs the desktop app or an agent Orca recognizes: that
+//! `tui-idle` ever reads *satisfied* (against a plain shell and a plain process it only timed
+//! out, so the idle half of `poll_statuses` is untested live); how a blocked approval prompt
+//! is reported; whether Orca ever refuses a send as `no-agent` (a plain terminal *accepted*
+//! one); and anything that differs between `orcad` and the renderer-backed desktop app.
 //!
 //! # One worktree per agent, and why kanstack never creates one
 //!
@@ -186,10 +200,9 @@ impl Orca {
     /// See [`crate::harness_launch`] for `initial_message`, the branch-context note and the
     /// spill-to-files handling of a long prompt, identical to the other backends'.
     ///
-    /// **Unverified:** how Orca delivers `--command` to the shell. Its source hands it to the
-    /// PTY provider ("commandDelivery: provider") rather than exec'ing it, which is what the
-    /// `cd … && harness …` shape of the launch line needs, but that hasn't been watched
-    /// happening.
+    /// `--command` reaches the shell as typed input — checked against `orcad`, with the
+    /// `cd … && harness …` launch line arriving intact and running in the worktree directory,
+    /// at 5000 characters too — which the launch line's shell syntax needs.
     pub fn spawn_harness(&mut self, cwd: &Path, name: &str, initial_message: Option<&str>) -> Result<String> {
         self.spawn_harness_with(cwd, name, initial_message, None)
     }
@@ -303,9 +316,10 @@ impl Orca {
     }
 
     /// Sends `text` followed by Enter into `branch`'s tracked terminal (`terminal send
-    /// --enter`). Orca treats text-plus-Enter as a prompt for an agent and refuses it when it
-    /// sees no agent in that terminal (`no-agent`) — which turns "the harness hasn't finished
-    /// starting" into an error rather than a task typed into a bare shell.
+    /// --enter`). Orca's types allow it to refuse this as a prompt for an agent it can't see
+    /// (`no-agent`), and a refusal is reported by name if it happens — but `orcad` *accepted*
+    /// text sent to a plain terminal (with a warning that delivery can't be observed), so
+    /// this does not reliably guard against sending before the harness has started.
     pub fn send_task(&self, branch: &str, text: &str) -> Result<()> {
         let Some(pane) = self.panes.get(branch) else {
             bail!("no orca terminal open for {branch} yet");
@@ -857,8 +871,79 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // The JSON below is shaped from Orca's TypeScript result types (see the module doc), not
-    // captured from a running Orca — there was none to capture from.
+    // Real replies, captured from Orca's headless runtime (`orcad`, built from stablyai/orca
+    // at 9fbdfc5) with paths, username and hostname scrubbed. The desktop app was not run.
+    const CREATE_LIVE: &str = include_str!("../tests/fixtures/orca_create.json");
+    const SPLIT_LIVE: &str = include_str!("../tests/fixtures/orca_split.json");
+    const LIST_LIVE: &str = include_str!("../tests/fixtures/orca_list.json");
+    const WAIT_TIMEOUT_LIVE: &str = include_str!("../tests/fixtures/orca_wait_timeout.json");
+    const SEND_PLAIN_LIVE: &str = include_str!("../tests/fixtures/orca_send_plain.json");
+    const CLOSE_LIVE: &str = include_str!("../tests/fixtures/orca_close.json");
+    const SPLIT_STALE_LIVE: &str = include_str!("../tests/fixtures/orca_split_stale.json");
+    const BAD_SELECTOR_LIVE: &str = include_str!("../tests/fixtures/orca_create_bad_selector.json");
+
+    #[test]
+    fn live_create_and_split_replies_yield_the_new_handle() {
+        let Response::Ok(created) = parse_response::<CreateResult>(CREATE_LIVE).unwrap() else { panic!("not ok") };
+        assert!(created.terminal.handle.starts_with("term_"), "{}", created.terminal.handle);
+        let Response::Ok(split) = parse_response::<SplitResult>(SPLIT_LIVE).unwrap() else { panic!("not ok") };
+        assert!(split.split.handle.starts_with("term_"), "{}", split.split.handle);
+    }
+
+    /// The live listing carries many fields this module ignores, and `"exitCause": null`
+    /// (not an absent key) for a running terminal — both must read as "alive".
+    #[test]
+    fn a_live_listing_reads_running_terminals_as_alive_and_a_missing_one_as_dead() {
+        let Response::Ok(list) = parse_response::<ListResult>(LIST_LIVE).unwrap() else { panic!("not ok") };
+        assert_eq!(list.terminals.len(), 2);
+        assert!(!list.truncated);
+        assert!(list.terminals.iter().all(|t| t.exit_cause.is_none()));
+
+        let live = list.terminals[0].handle.clone();
+        let panes = HashMap::from([
+            ("here".to_string(), pane(&live, PaneStatus::Unknown)),
+            ("gone".to_string(), pane("term_00000000-0000-0000-0000-000000000000", PaneStatus::Busy)),
+        ]);
+        let probes = HashMap::from([(live, IdleProbe::Busy)]);
+        let statuses = classify_statuses(&panes, &list, &probes);
+        assert_eq!(statuses["here"], PaneStatus::Busy);
+        assert_eq!(statuses["gone"], PaneStatus::Dead);
+    }
+
+    /// An idle *shell* is not an idle *agent*: Orca's `tui-idle` timed out against one, so
+    /// only a harness Orca recognizes can ever read idle.
+    #[test]
+    fn a_live_tui_idle_timeout_reads_as_busy() {
+        assert_eq!(parse_idle_probe(WAIT_TIMEOUT_LIVE), IdleProbe::Busy);
+    }
+
+    /// Orca *accepted* text sent to a plain, non-agent terminal — with a warning that it
+    /// can't see delivery, rather than the `no-agent` refusal its types allow for.
+    #[test]
+    fn a_live_send_to_a_plain_terminal_is_accepted() {
+        let Response::Ok(sent) = parse_response::<SendResult>(SEND_PLAIN_LIVE).unwrap() else { panic!("not ok") };
+        assert!(sent.send.accepted);
+        assert_eq!(sent.send.refused_reason, None);
+    }
+
+    #[test]
+    fn a_live_close_reply_parses_as_a_success() {
+        assert!(matches!(parse_response::<serde_json::Value>(CLOSE_LIVE), Ok(Response::Ok(_))));
+    }
+
+    /// A stale anchor handle fails as `runtime_unavailable` — not a "stale" code — which is
+    /// why `spawn_harness_with` falls back on any split failure instead of matching a code.
+    #[test]
+    fn live_failures_carry_orcas_own_error_codes() {
+        let Response::Failed(stale) = parse_response::<SplitResult>(SPLIT_STALE_LIVE).unwrap() else { panic!("not a failure") };
+        assert_eq!(stale.code, "runtime_unavailable");
+        let Response::Failed(bad) = parse_response::<CreateResult>(BAD_SELECTOR_LIVE).unwrap() else { panic!("not a failure") };
+        assert_eq!(bad.code, "selector_not_found");
+    }
+
+    // The rest could not be provoked against `orcad` — they need an agent Orca recognizes
+    // or a blocked prompt — so they are shaped from Orca's TypeScript result types (see the
+    // module doc) and not observed.
 
     const SPLIT_OK: &str = r#"{"id":"req_1","ok":true,"result":{"split":{"handle":"term_new","tabId":"tab_1","paneRuntimeId":4}},"_meta":{"runtimeId":"rt"}}"#;
     const SEND_REFUSED: &str = r#"{"id":"r","ok":true,"result":{"send":{"handle":"t","accepted":false,"bytesWritten":0,"refusedReason":"no-agent"}},"_meta":{"runtimeId":"rt"}}"#;

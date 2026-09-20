@@ -1,0 +1,22 @@
+{
+  "id": "493f3585-c300-4ad6-9055-83596fedb96c",
+  "ok": true,
+  "result": {
+    "terminal": {
+      "handle": "term_60584899-19f6-4c3b-a9d5-d6d93171d25c",
+      "tabId": "a6093781-f535-4b38-be5f-27d33be7cec8",
+      "paneKey": "a6093781-f535-4b38-be5f-27d33be7cec8:56eaa2aa-e304-4544-b291-25ae5f87e3b4",
+      "ptyId": "8dc52a7f-f1e2-482d-9c2b-faadd7c225e7::/repo@@e68009d9",
+      "worktreeId": "8dc52a7f-f1e2-482d-9c2b-faadd7c225e7::/repo",
+      "title": null,
+      "executionHostId": "local",
+      "incarnationId": "69ed00ec-e4e8-4bff-a49f-3288fae5e0d5",
+      "hostPlatform": "darwin",
+      "surface": "background",
+      "warning": "Terminal term_60584899-19f6-4c3b-a9d5-d6d93171d25c is running, but Orca could not make it discoverable. Run `orca terminal focus --terminal term_60584899-19f6-4c3b-a9d5-d6d93171d25c` to reveal and focus it."
+    }
+  },
+  "_meta": {
+    "runtimeId": "0f643071-4552-4b67-94aa-d2607c0c0f3b"
+  }
+}

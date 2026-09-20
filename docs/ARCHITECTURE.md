@@ -228,7 +228,8 @@ compares for equality, so `orca.rs` lifts `cwd` to the repository root itself.
 
 **What the docs don't say.** Orca's published CLI reference names the commands and flags but
 gives no JSON shapes, no environment variables and no split semantics. Those come from its
-source (`stablyai/orca` at 9fbdfc5), and have not been checked against a running install:
+source (`stablyai/orca` at 9fbdfc5), and were then confirmed against `orcad`, its headless
+Node runtime built from that commit (not the desktop app):
 
 - Terminals get `ORCA_TERMINAL_HANDLE` (`src/main/ipc/pty/provider/local-configure.ts`), the
   signal `Orca::discover` requires. A long-lived shell can keep a stale one across a window
@@ -246,11 +247,25 @@ source (`stablyai/orca` at 9fbdfc5), and have not been checked against a running
   `poll_statuses` runs one short-timeout probe per terminal in parallel and reads a timeout as
   busy. It depends on Orca recognizing the agent, so an unknown harness reads busy forever.
 
-**Still unverified:** that `--command` reaches the shell as typed input, so the `cd … &&`
-launch line works as it does under cmux and tmux (the source passes it to the PTY provider
-rather than exec'ing it); that `path:` matches a symlinked or trailing-slash path the way
-`worktree_selector`'s canonicalization assumes; and every JSON shape in `orca.rs`'s tests,
-which were written from Orca's TypeScript types rather than captured from a live run.
+**Confirmed against `orcad`:** every point above except the two idle-related ones below;
+that `--command` reaches the shell as typed input, so the `cd … &&` launch line runs in the
+worktree directory as under cmux and tmux (also at 5000 characters, through the spill-to-files
+path); that `repo add` alone makes `path:<root>` resolve, with no `worktree create`; that a
+split joins its source's tab; that `close` is idempotent; and that a stale anchor fails the
+split (as `runtime_unavailable`, not a "stale" code) so the `create` fallback takes over. The
+replies in `tests/fixtures/orca_*.json` were captured from it. To repeat that: build `orcad`
+and the CLI from a checkout of `stablyai/orca` (`pnpm install --ignore-scripts`, `tsc -p
+config/tsconfig.cli.json`, `node config/scripts/build-orcad.mjs`, `chmod +x` node-pty's
+`spawn-helper`), start it with `ORCA_USER_DATA` on a short path (its daemon socket must fit
+in 104 characters), and point `KANSTACK_ORCA_BIN` at a wrapper adding `--pairing-code`.
+
+**Still unverified:** anything that needs the desktop app or a recognized agent. `terminal
+wait --for tui-idle` only ever timed out against `orcad` — on a plain process and on an idle
+interactive shell — so a satisfied wait, and with it `Idle` in `poll_statuses`, has not been
+seen; how a blocked approval prompt is reported is likewise unseen; `orcad` accepted a
+`terminal send` to a plain terminal where Orca's types allow a `no-agent` refusal, so
+`send_task` cannot rely on that guard; and `orcad` may differ from the renderer-backed app.
+Those replies in `orca.rs`'s tests are shaped from Orca's TypeScript types instead.
 
 **Discovery order.** cmux, then tmux, then Orca, except that inside an Orca terminal with
 neither `$CMUX_SURFACE_ID` nor `$TMUX_PANE` set, Orca is tried first. `Cmux::discover` only

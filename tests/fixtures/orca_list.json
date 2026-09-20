@@ -1,0 +1,56 @@
+{
+  "id": "f6e61bcc-1802-447c-8d47-96114616f365",
+  "ok": true,
+  "result": {
+    "terminals": [
+      {
+        "handle": "term_60584899-19f6-4c3b-a9d5-d6d93171d25c",
+        "ptyId": "8dc52a7f-f1e2-482d-9c2b-faadd7c225e7::/repo@@e68009d9",
+        "incarnationId": "69ed00ec-e4e8-4bff-a49f-3288fae5e0d5",
+        "orphaned": false,
+        "worktreeId": "8dc52a7f-f1e2-482d-9c2b-faadd7c225e7::/repo",
+        "worktreePath": "/repo",
+        "branch": "refs/heads/main",
+        "tabId": "a6093781-f535-4b38-be5f-27d33be7cec8",
+        "leafId": "56eaa2aa-e304-4544-b291-25ae5f87e3b4",
+        "title": null,
+        "connected": true,
+        "writable": true,
+        "lastOutputAt": 1789930756637,
+        "preview": "user@host repo %",
+        "executionHostId": "local"
+      },
+      {
+        "handle": "term_71a137e2-7182-4e4d-a32c-5c614e0265b9",
+        "ptyId": "8dc52a7f-f1e2-482d-9c2b-faadd7c225e7::/repo@@46518073",
+        "incarnationId": "83adfeaa-c42b-4808-b7b7-f8e3f4dabc1e",
+        "orphaned": false,
+        "worktreeId": "8dc52a7f-f1e2-482d-9c2b-faadd7c225e7::/repo",
+        "worktreePath": "/repo",
+        "branch": "refs/heads/main",
+        "tabId": "a6093781-f535-4b38-be5f-27d33be7cec8",
+        "leafId": "1a1514d2-c210-49a8-8a61-b00db7c83744",
+        "title": "feat-a",
+        "connected": true,
+        "writable": true,
+        "lastOutputAt": 1789930756979,
+        "preview": "",
+        "executionHostId": "local"
+      }
+    ],
+    "hostScope": {
+      "hostIds": [
+        "local"
+      ],
+      "omittedHostIds": []
+    },
+    "topologyRevisions": {
+      "8dc52a7f-f1e2-482d-9c2b-faadd7c225e7::/repo": 2
+    },
+    "totalCount": 2,
+    "truncated": false
+  },
+  "_meta": {
+    "runtimeId": "0f643071-4552-4b67-94aa-d2607c0c0f3b"
+  }
+}

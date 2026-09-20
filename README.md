@@ -209,12 +209,15 @@ A few things differ from the other two:
 - **Busy and idle** come from Orca's own agent detection rather than from CPU usage. A
   harness Orca doesn't recognize will read as busy, and so will one waiting on an approval
   prompt.
-- **`t` refuses instead of typing blind.** Orca won't send a message to a terminal in which
-  it sees no agent, so pressing `t` before the harness has finished starting reports that
-  rather than typing the task into a shell.
+- **`t` doesn't wait for the harness.** In testing, Orca accepted a message sent to a
+  terminal with no agent running, so pressing `t` before the harness has finished starting
+  can type the task into whatever is there — wait for it to be ready, as with the others.
 
-Orca support was written against Orca's CLI reference and source and hasn't yet been run
-against a live install. If a lane misbehaves, `KANSTACK_SPLIT_BACKEND` pins one of the others.
+Orca support was written against Orca's CLI reference and source, and exercised against
+Orca's headless runtime (`orcad`) — splitting, launching, focusing, closing and the
+worktree handling all behave as described. It hasn't been run in the desktop app, and idle
+detection hasn't been seen to report *idle* (only busy). If a lane misbehaves,
+`KANSTACK_SPLIT_BACKEND` pins one of the others.
 
 ## Driving panes from a script or an agent
 
