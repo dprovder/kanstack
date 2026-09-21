@@ -19,6 +19,7 @@ use crate::harness::HarnessConfig;
 use crate::mux::{configured_directions, normalize_direction, Multiplexer, OpenRequest};
 use crate::orca::Orca;
 use crate::pane_status::PaneStatus;
+use crate::procs::{record_pid_prefix, tracking_applies, Pids};
 use crate::report::{Reports, Said};
 use crate::tmux::Tmux;
 
@@ -144,6 +145,12 @@ pub struct Splitter {
     panes: HashMap<String, Pane>,
     /// What each lane's agent has said about itself, where it can — see `crate::report`.
     reports: Reports,
+    /// Where each pane's shell pid is recorded, when its process is tracked — see
+    /// `crate::procs`.
+    pids: Pids,
+    /// `KANSTACK_TRACK_PIDS` as it was when this splitter was made, so what a splitter does
+    /// doesn't change under a test that sets it for another.
+    track_setting: Option<String>,
     /// How long to wait between the looks that confirm a pane is really quiet.
     quiet_gap: Duration,
 }
@@ -161,6 +168,8 @@ impl Splitter {
             last_anchor: None,
             panes: HashMap::new(),
             reports: Reports::default(),
+            pids: Pids::default(),
+            track_setting: std::env::var("KANSTACK_TRACK_PIDS").ok(),
             quiet_gap: QUIET_GAP,
         }
     }
@@ -258,10 +267,19 @@ impl Splitter {
         initial_message: Option<&str>,
         harness: Option<&str>,
     ) -> Result<String> {
-        let launch = self.harness.launch_line(cwd, name, initial_message, harness)?;
+        let mut launch = self.harness.launch_line(cwd, name, initial_message, harness)?;
         // Before the harness starts, not after: a fast one could report before we got back,
-        // and the last word of a previous pane on this branch must not outlive it.
+        // and the last word of a previous pane on this branch must not outlive it. The same
+        // goes for the pid of a previous pane's shell.
         self.reports.forget(name);
+        self.pids.forget(name);
+        if self.tracks_pids() {
+            // Best-effort, like the registry: a state directory that can't be made must not
+            // stop the pane opening, only leave it untracked.
+            if let Ok(Some(file)) = self.pids.prepare(name) {
+                launch = format!("{}{launch}", record_pid_prefix(&file));
+            }
+        }
         let id = self.mux.open_pane(&OpenRequest {
             cwd,
             title: name,
@@ -279,6 +297,18 @@ impl Splitter {
     /// multiplexer alone.
     pub fn set_reports(&mut self, reports: Reports) {
         self.reports = reports;
+    }
+
+    /// Where panes' shell pids are recorded. Without it nothing is tracked by process, whatever
+    /// the multiplexer asks for.
+    pub fn set_pids(&mut self, pids: Pids) {
+        self.pids = pids;
+    }
+
+    /// Whether panes' processes are tracked by kanstack itself: what the multiplexer asks for
+    /// (see [`Multiplexer::tracks_pids`]), unless `KANSTACK_TRACK_PIDS` says otherwise.
+    fn tracks_pids(&self) -> bool {
+        tracking_applies(self.mux.tracks_pids(), self.track_setting.as_deref())
     }
 
     /// Starts tracking a pane another process opened — see `crate::workstream::Registry`.
@@ -333,6 +363,7 @@ impl Splitter {
             self.last_anchor = None;
         }
         self.reports.forget(branch);
+        self.pids.forget(branch);
         self.mux.close(&pane.id)
     }
 
@@ -1104,6 +1135,173 @@ mod tests {
             assert_eq!(polled(&splitter, said + Duration::from_secs(3600)), Some(PaneStatus::Waiting), "over {native:?}");
             assert_eq!(*mux.probes.lock().unwrap(), 1, "no confirmation looks for a prompt");
         }
+    }
+
+    // Process tracking: what goes on the launch line, and the pid file it fills.
+
+    use crate::procs::Pids;
+
+    /// A splitter over a fake multiplexer that does (`mux_asks`) or doesn't ask for its panes'
+    /// processes to be tracked, with `KANSTACK_TRACK_PIDS` set to `setting` while it is made, and
+    /// pids kept in a fresh directory.
+    fn splitter_tracking(tag: &str, mux_asks: bool, setting: Option<&str>) -> (Splitter, Arc<FakeMux>, Pids) {
+        let dir = std::env::temp_dir().join(format!("kanstack-splitter-pids-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pids = Pids::in_dir(dir);
+        let mut made = None;
+        with_env(&[("KANSTACK_TRACK_PIDS", setting)], || {
+            let (mut splitter, mux) = fake_splitter();
+            *mux.tracks_pids.lock().unwrap() = mux_asks;
+            splitter.set_pids(pids.clone());
+            made = Some((splitter, mux));
+        });
+        let (splitter, mux) = made.unwrap();
+        (splitter, mux, pids)
+    }
+
+    /// The `feat-a` pane's launch line as the multiplexer was handed it.
+    fn launched(mux: &FakeMux) -> String {
+        let line = mux.lines().into_iter().find(|l| l.starts_with("open ")).expect("a pane was opened");
+        line.split_once(" as feat-a: ").expect("opened as feat-a").1.to_string()
+    }
+
+    /// The whole point of the prefix: the pane's own shell writes its pid before the harness
+    /// starts, and the harness still launches after it.
+    #[test]
+    fn a_tracked_launch_records_the_shells_pid_before_the_harness_starts() {
+        let (mut splitter, mux, pids) = splitter_tracking("prefix", true, None);
+        splitter.spawn_harness(cwd(), "feat-a", None).unwrap();
+        let file = pids.prepare("feat-a").unwrap().unwrap();
+        let untracked = {
+            let (mut plain, plain_mux) = fake_splitter();
+            plain.spawn_harness(cwd(), "feat-a", None).unwrap();
+            launched(&plain_mux)
+        };
+        assert!(untracked.starts_with("cd '/repo' && claude "), "{untracked}");
+        assert_eq!(
+            launched(&mux),
+            format!(r#"sh -c 'printf %s "$PPID" > "$0"' '{}' && {untracked}"#, file.display()),
+        );
+        assert!(file.parent().unwrap().is_dir(), "the directory exists before the pane's shell writes into it");
+    }
+
+    /// A path with spaces and a quote in it stays one word, quoted once.
+    #[test]
+    fn the_pid_file_path_is_quoted_for_the_pane_shell() {
+        let dir = std::env::temp_dir().join(format!("kanstack it's spaced-{}", std::process::id()));
+        let (mut splitter, mux, _) = splitter_tracking("quoting", true, None);
+        splitter.set_pids(Pids::in_dir(dir.clone()));
+        splitter.spawn_harness(cwd(), "feat-a", None).unwrap();
+        let quoted = crate::harness_launch::shell_quote(&dir.join("x").to_string_lossy());
+        let quoted_dir = quoted.trim_end_matches("x'");
+        let line = launched(&mux);
+        assert!(line.contains("'\\''s"), "the apostrophe is closed out and escaped: {line}");
+        assert!(line.starts_with(&format!(r#"sh -c 'printf %s "$PPID" > "$0"' {quoted_dir}"#)), "{line}");
+        assert!(line.contains(".pid' && cd '/repo' && claude "), "{line}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_multiplexer_that_reports_for_itself_gets_the_launch_line_untouched_and_no_pid_directory() {
+        let (mut splitter, mux, pids) = splitter_tracking("off", false, None);
+        splitter.spawn_harness(cwd(), "feat-a", None).unwrap();
+        assert!(launched(&mux).starts_with("cd '/repo' && claude "), "{}", launched(&mux));
+        assert!(!launched(&mux).contains("PPID"));
+        let dir = pids.prepare("feat-a").unwrap().unwrap().parent().unwrap().to_path_buf();
+        let _ = std::fs::remove_dir_all(&dir);
+        splitter.spawn_harness(cwd(), "feat-b", None).unwrap();
+        assert!(!dir.exists(), "nothing was prepared for an untracked pane");
+    }
+
+    #[test]
+    fn the_setting_turns_tracking_on_for_a_multiplexer_that_does_not_ask_and_off_for_one_that_does() {
+        for (mux_asks, setting, tracked) in [
+            (false, Some("1"), true),
+            (false, Some("true"), true),
+            (false, Some("on"), true),
+            (false, Some("yes"), true),
+            (false, Some("0"), false),
+            (false, None, false),
+            (true, None, true),
+            (true, Some("1"), true),
+            (true, Some("0"), false),
+            (true, Some("off"), false),
+            (true, Some("false"), false),
+            (true, Some("no"), false),
+            (true, Some("whatever"), true),
+        ] {
+            let (mut splitter, mux, _) = splitter_tracking("setting", mux_asks, setting);
+            splitter.spawn_harness(cwd(), "feat-a", None).unwrap();
+            assert_eq!(launched(&mux).contains("$PPID"), tracked, "mux asks {mux_asks}, KANSTACK_TRACK_PIDS={setting:?}");
+        }
+    }
+
+    /// The setting is read when the splitter is made: a test (or a process) that changes it later
+    /// doesn't change what an existing splitter does.
+    #[test]
+    fn the_setting_is_read_once_when_the_splitter_is_made() {
+        let (mut splitter, mux, _) = splitter_tracking("once", true, Some("off"));
+        with_env(&[("KANSTACK_TRACK_PIDS", Some("1"))], || {
+            splitter.spawn_harness(cwd(), "feat-a", None).unwrap();
+        });
+        assert!(!launched(&mux).contains("PPID"));
+    }
+
+    /// Nowhere to keep a pid means nothing to record: no prefix, rather than one pointing at a
+    /// file nobody will read.
+    #[test]
+    fn without_a_pid_directory_there_is_no_prefix_however_tracking_was_asked_for() {
+        let mut made = None;
+        with_env(&[("KANSTACK_TRACK_PIDS", Some("1"))], || {
+            let (splitter, mux) = fake_splitter();
+            *mux.tracks_pids.lock().unwrap() = true;
+            made = Some((splitter, mux));
+        });
+        let (mut splitter, mux) = made.unwrap();
+        splitter.spawn_harness(cwd(), "feat-a", None).unwrap();
+        assert!(launched(&mux).starts_with("cd '/repo' && claude "), "{}", launched(&mux));
+    }
+
+    /// The last pane's shell is gone with it, and a pane that hasn't written its own yet must not
+    /// be read through it. Before the pane opens, not after: the new shell may be quick.
+    #[test]
+    fn a_new_pane_on_a_branch_does_not_inherit_the_old_ones_pid() {
+        let (mut splitter, _mux, pids) = splitter_tracking("respawn", true, None);
+        let file = pids.prepare("feat-a").unwrap().unwrap();
+        std::fs::write(&file, "4242").unwrap();
+        splitter.spawn_harness(cwd(), "feat-a", None).unwrap();
+        assert_eq!(pids.read("feat-a"), None);
+    }
+
+    /// ...even when tracking has since been turned off, so nothing stale is left to be read later.
+    #[test]
+    fn a_new_pane_forgets_the_old_pid_even_when_it_is_not_itself_tracked() {
+        let (mut splitter, _mux, pids) = splitter_tracking("respawn-off", false, None);
+        std::fs::write(pids.prepare("feat-a").unwrap().unwrap(), "4242").unwrap();
+        splitter.spawn_harness(cwd(), "feat-a", None).unwrap();
+        assert_eq!(pids.read("feat-a"), None);
+    }
+
+    #[test]
+    fn stopping_a_lane_forgets_its_pid() {
+        let (mut splitter, _mux, pids) = splitter_tracking("stop", true, None);
+        splitter.spawn_harness(cwd(), "feat-a", None).unwrap();
+        splitter.spawn_harness(cwd(), "feat-b", None).unwrap();
+        std::fs::write(pids.prepare("feat-a").unwrap().unwrap(), "4242").unwrap();
+        std::fs::write(pids.prepare("feat-b").unwrap().unwrap(), "4243").unwrap();
+        splitter.stop("feat-a").unwrap();
+        assert_eq!(pids.read("feat-a"), None);
+        assert_eq!(pids.read("feat-b"), Some(4243), "only that lane's");
+    }
+
+    /// An open that failed opened nothing to track, but the old pane's pid is stale either way.
+    #[test]
+    fn a_failed_open_leaves_no_pid_behind() {
+        let (mut splitter, mux, pids) = splitter_tracking("failed-open", true, None);
+        std::fs::write(pids.prepare("feat-a").unwrap().unwrap(), "4242").unwrap();
+        *mux.fail_open.lock().unwrap() = true;
+        assert!(splitter.spawn_harness(cwd(), "feat-a", None).is_err());
+        assert_eq!(pids.read("feat-a"), None);
     }
 
     // The backend list is the one place backends are named. What can't be generated from it —

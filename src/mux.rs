@@ -207,6 +207,8 @@ pub(crate) mod fake {
         /// Makes every `probe` after this many calls fail, so a later look can fail while the
         /// first succeeds.
         pub fail_probe_after: Mutex<Option<u32>>,
+        /// What `tracks_pids` answers, as a backend that can't report activity would.
+        pub tracks_pids: Mutex<bool>,
         next: Mutex<u32>,
     }
 
@@ -280,6 +282,10 @@ pub(crate) mod fake {
             }
             let known = self.statuses.lock().unwrap();
             Ok(panes.iter().filter_map(|p| known.get(*p).map(|s| (p.to_string(), *s))).collect())
+        }
+
+        fn tracks_pids(&self) -> bool {
+            *self.tracks_pids.lock().unwrap()
         }
 
         fn set_scope(&self, scope: Option<&str>) {

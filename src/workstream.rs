@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::procs::Pids;
 use crate::report::Reports;
 use crate::splitter::Splitter;
 
@@ -82,6 +83,15 @@ pub fn reports_dir(repo: &Path) -> Option<PathBuf> {
     Some(dir.join(format!("reports-{key:016x}")))
 }
 
+/// Where the shell pids of `repo`'s panes are recorded, when they are tracked — one small
+/// file per branch, see `crate::procs::Pids`. A directory beside the reports, for the same
+/// reason: the pane's own shell writes it, from the launch line, in a process that never
+/// loads the registry.
+pub fn pids_dir(repo: &Path) -> Option<PathBuf> {
+    let (dir, key) = repo_state(repo)?;
+    Some(dir.join(format!("pids-{key:016x}")))
+}
+
 /// The state directory, and the key identifying `repo` within it.
 fn repo_state(repo: &Path) -> Option<(PathBuf, u64)> {
     let dir = std::env::var_os("KANSTACK_STATE_PATH")
@@ -111,6 +121,9 @@ pub struct Registry {
     /// What agents in this repository have reported about themselves, handed to a
     /// [`Splitter`] by [`Self::adopt_into`].
     reports: Reports,
+    /// Where panes' shell pids are recorded, handed to a [`Splitter`] by
+    /// [`Self::adopt_into`] beside `reports`.
+    pids: Pids,
     /// The terminal-multiplexer workspace this repository's panes live in (cmux's
     /// `workspace:1`), so a `spawn` run from a shell whose environment has drifted still
     /// opens its pane beside the others rather than wherever that environment points.
@@ -153,7 +166,7 @@ impl Registry {
             Some(OnDisk::Legacy(workstreams)) => (None, workstreams),
             None => (None, Vec::new()),
         };
-        Ok(Registry { path, reports: Reports::for_repo(repo), workspace, workstreams })
+        Ok(Registry { path, reports: Reports::for_repo(repo), pids: Pids::for_repo(repo), workspace, workstreams })
     }
 
     /// Writes via a temp file and rename, so a reader in another pane never sees a
@@ -198,6 +211,7 @@ impl Registry {
     /// `send_task`/`poll_statuses`/`focus`/`stop` work on panes another process opened.
     pub fn adopt_into(&self, splitter: &mut Splitter) {
         splitter.set_reports(self.reports.clone());
+        splitter.set_pids(self.pids.clone());
         for w in &self.workstreams {
             if let Some(pane) = &w.pane_id {
                 splitter.adopt(&w.branch_id.0, &pane.0);
