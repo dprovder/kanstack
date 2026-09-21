@@ -83,6 +83,15 @@ pub trait Multiplexer: Send + Sync {
     /// whatever it knew before.
     fn probe(&self, panes: &[&str]) -> Result<HashMap<String, PaneStatus>>;
 
+    /// Whether this multiplexer cannot say for itself whether a pane's harness is busy, idle or
+    /// still running — Ghostty's scripting can only say whether a pane exists — so kanstack
+    /// should track the harness's process itself: the launch line records the shell's pid, and
+    /// its CPU and liveness stand in for what [`Self::probe`] can't report. Most multiplexers
+    /// can report it, and this stays `false`.
+    fn tracks_pids(&self) -> bool {
+        false
+    }
+
     /// Pins the multiplexer-level grouping new panes open in (cmux's workspace). Only
     /// backends with such a notion do anything.
     fn set_scope(&self, _scope: Option<&str>) {}
@@ -311,5 +320,12 @@ mod tests {
         assert_eq!(configured_directions(mux.as_ref()), ("down".to_string(), "left".to_string()));
         std::env::remove_var("KANSTACK_FAKE_DIRECTION");
         std::env::remove_var("KANSTACK_FAKE_CHAIN_DIRECTION");
+    }
+
+    /// Every backend that can report a pane's activity leaves process tracking off; only one that
+    /// cannot asks for it, so nothing changes for the ones that work today.
+    #[test]
+    fn process_tracking_is_off_unless_a_backend_asks_for_it() {
+        assert!(!fake::FakeMux::new().tracks_pids());
     }
 }
