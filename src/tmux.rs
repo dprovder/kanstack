@@ -90,6 +90,17 @@ impl Tmux {
     }
 }
 
+/// One line for the setup wizard: whether tmux is usable here and, if not, what to do.
+pub fn detection() -> String {
+    match Tmux::discover() {
+        Some(_) => "✓ tmux found, and this pane is inside one".to_string(),
+        None if std::env::var_os("TMUX_PANE").is_none() => {
+            "✗ tmux not usable here — not running inside a tmux pane".to_string()
+        }
+        None => "✗ tmux binary not found on PATH".to_string(),
+    }
+}
+
 impl Multiplexer for Tmux {
     fn name(&self) -> &'static str {
         "tmux"

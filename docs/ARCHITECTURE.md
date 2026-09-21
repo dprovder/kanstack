@@ -219,8 +219,13 @@ Two independent axes, each one file plus one line, with the shared logic written
   busy. It is stateless and knows nothing about branches, lanes or harnesses. Which pane
   belongs to which branch, where the next one splits off, and what a pane's last known status
   was live in `Splitter` (`src/splitter.rs`), once — so a backend is its own CLI calls and
-  nothing else. To add one, write `src/<name>.rs` with a `discover()` and the impl, then add
-  it to `Splitter::discover_mux`'s order. Its environment variables come for free:
+  nothing else. To add one, write `src/<name>.rs` with a `discover()`, a `detection()` (one
+  line for the `--setup` wizard) and the impl, then add one entry to `splitter::BACKENDS`.
+  That list is the only place backends are named: discovery order, the `KANSTACK_SPLIT_BACKEND`
+  override, the wizard's picker and detection panel, and the "no backend found" message all
+  read it. What can't be generated is checked instead, so forgetting fails a test: the README
+  and this file must mention the backend, `--help` must document it and its
+  `KANSTACK_<NAME>_DIRECTION` variables, and the wizard must offer it. Its environment variables come for free:
   `KANSTACK_<NAME>_DIRECTION` and `KANSTACK_<NAME>_CHAIN_DIRECTION`, with defaults from
   `default_directions()`. `probe` returns only the panes it could classify; leaving one out
   means "no news", and the caller keeps what it knew. Test everything above the trait

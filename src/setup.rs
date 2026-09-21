@@ -23,54 +23,39 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::but::But;
-use crate::cmux::Cmux;
-use crate::orca::Orca;
+use crate::splitter::BACKENDS;
 use crate::text_input::TextInput;
 use crate::theme;
-use crate::tmux::Tmux;
 
 /// The exact command shown to (and run for) the user — GitButler's own documented
 /// installer, already the one linked from this project's own README.
 const INSTALL_BUT_CMD: &str = "curl -fsSL https://gitbutler.com/install.sh | sh";
 
+/// Which backend the wizard pins: `None` is "auto" (detect one), `Some(i)` is
+/// `BACKENDS[i]`. An index into the list rather than an enum of their names, so a new backend
+/// is offered here without touching this file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SplitBackendChoice {
-    Auto,
-    Cmux,
-    Tmux,
-    Orca,
-}
+struct SplitBackendChoice(Option<usize>);
 
 impl SplitBackendChoice {
+    const AUTO: Self = SplitBackendChoice(None);
+
     fn label(self) -> &'static str {
-        match self {
-            SplitBackendChoice::Auto => "auto",
-            SplitBackendChoice::Cmux => "cmux",
-            SplitBackendChoice::Tmux => "tmux",
-            SplitBackendChoice::Orca => "orca",
-        }
+        self.0.map_or("auto", |i| BACKENDS[i].name)
     }
 
+    /// Auto, then each backend in list order, and back round to auto.
     fn cycle(self, forward: bool) -> Self {
-        use SplitBackendChoice::*;
-        match (self, forward) {
-            (Auto, true) => Cmux,
-            (Cmux, true) => Tmux,
-            (Tmux, true) => Orca,
-            (Orca, true) => Auto,
-            (Auto, false) => Orca,
-            (Cmux, false) => Auto,
-            (Tmux, false) => Cmux,
-            (Orca, false) => Tmux,
-        }
+        let stops = BACKENDS.len() + 1;
+        let here = self.0.map_or(0, |i| i + 1);
+        let next = if forward { (here + 1) % stops } else { (here + stops - 1) % stops };
+        SplitBackendChoice(next.checked_sub(1))
     }
 
     fn from_env() -> Self {
-        match std::env::var("KANSTACK_SPLIT_BACKEND").as_deref() {
-            Ok("cmux") => SplitBackendChoice::Cmux,
-            Ok("tmux") => SplitBackendChoice::Tmux,
-            Ok("orca") => SplitBackendChoice::Orca,
-            _ => SplitBackendChoice::Auto,
+        match std::env::var("KANSTACK_SPLIT_BACKEND") {
+            Ok(name) => SplitBackendChoice(BACKENDS.iter().position(|b| b.name == name)),
+            Err(_) => Self::AUTO,
         }
     }
 }
@@ -119,9 +104,8 @@ struct Detection {
     but: String,
     but_installed: bool,
     harness: String,
-    cmux: String,
-    tmux: String,
-    orca: String,
+    /// One line per backend in `BACKENDS`, in that order.
+    backends: Vec<String>,
     skill: String,
     skill_status: Option<SkillStatus>,
 }
@@ -141,25 +125,8 @@ fn detect() -> Detection {
         [] => "✗ no known harness found on PATH — type one below anyway if it's just not on PATH here".to_string(),
         found => format!("✓ found on PATH: {}", found.join(", ")),
     };
-    let cmux = match Cmux::discover() {
-        Some(_) => "✓ cmux found on PATH".to_string(),
-        None => "✗ cmux not found — set KANSTACK_CMUX_BIN to point at it".to_string(),
-    };
-    let tmux = match Tmux::discover() {
-        Some(_) => "✓ tmux found, and this pane is inside one".to_string(),
-        None if std::env::var_os("TMUX_PANE").is_none() => {
-            "✗ tmux not usable here — not running inside a tmux pane".to_string()
-        }
-        None => "✗ tmux binary not found on PATH".to_string(),
-    };
-    let orca = match Orca::discover() {
-        Some(_) => "✓ orca found, and this terminal is inside Orca".to_string(),
-        None if !Orca::running_inside() => {
-            "✗ orca not usable here — not running inside an Orca terminal".to_string()
-        }
-        None => "✗ orca CLI not found on PATH — register it in Orca's settings, or set KANSTACK_ORCA_BIN".to_string(),
-    };
-    Detection { but, but_installed, harness, cmux, tmux, orca, skill, skill_status }
+    let backends = BACKENDS.iter().map(|b| (b.detection)()).collect();
+    Detection { but, but_installed, harness, backends, skill, skill_status }
 }
 
 /// Describes the result of `but skill check` for the detection panel, and classifies it
@@ -330,7 +297,7 @@ impl Wizard {
     /// keeps auto-detecting on future runs rather than getting pinned to today's result.
     fn save(&self) -> Result<()> {
         let mut fields: Vec<(&str, String)> = vec![("KANSTACK_HARNESS", self.harness.trimmed())];
-        if self.split_backend != SplitBackendChoice::Auto {
+        if self.split_backend != SplitBackendChoice::AUTO {
             fields.push(("KANSTACK_SPLIT_BACKEND", self.split_backend.label().to_string()));
         }
         crate::config::save(&fields)
@@ -454,14 +421,12 @@ fn confirm_install_but_body(text_width: usize) -> Vec<Line<'static>> {
 fn main_body(wizard: &Wizard, text_width: usize) -> Vec<Line<'static>> {
     let rows = wizard.visible_rows();
     let mut body = vec![Line::styled("  kanstack setup", theme::title(true)), Line::raw("")];
-    for line in [
-        &wizard.detection.but,
-        &wizard.detection.harness,
-        &wizard.detection.cmux,
-        &wizard.detection.tmux,
-        &wizard.detection.orca,
-        &wizard.detection.skill,
-    ] {
+    let detection = &wizard.detection;
+    for line in [&detection.but, &detection.harness]
+        .into_iter()
+        .chain(&detection.backends)
+        .chain([&detection.skill])
+    {
         for part in wrap(line, text_width) {
             body.push(Line::styled(format!("  {part}"), theme::muted()));
         }
@@ -628,9 +593,7 @@ mod tests {
             but: String::new(),
             but_installed,
             harness: String::new(),
-            cmux: String::new(),
-            tmux: String::new(),
-            orca: String::new(),
+            backends: Vec::new(),
             skill: String::new(),
             skill_status,
         }
@@ -644,22 +607,59 @@ mod tests {
             row: Row::Harness,
             harness,
             harness_choices: choices,
-            split_backend: SplitBackendChoice::Auto,
+            split_backend: SplitBackendChoice::AUTO,
             confirm_install_but: false,
             installing: false,
             action_message: None,
         }
     }
 
-    /// Every backend is reachable from the wizard, in both directions, and the cycle closes.
+    /// Every backend in `BACKENDS` is reachable from the wizard, in both directions, and the
+    /// cycle closes — so adding one to the list is enough to offer it here.
     #[test]
-    fn the_split_backend_choice_cycles_through_all_four_and_wraps_both_ways() {
-        use SplitBackendChoice::*;
-        let forward: Vec<_> = std::iter::successors(Some(Auto), |c| Some(c.cycle(true))).take(5).collect();
-        assert_eq!(forward, [Auto, Cmux, Tmux, Orca, Auto]);
-        let backward: Vec<_> = std::iter::successors(Some(Auto), |c| Some(c.cycle(false))).take(5).collect();
-        assert_eq!(backward, [Auto, Orca, Tmux, Cmux, Auto]);
-        assert_eq!(Orca.label(), "orca");
+    fn the_split_backend_choice_offers_every_backend_and_wraps_both_ways() {
+        let names: Vec<&str> = BACKENDS.iter().map(|b| b.name).collect();
+        let n = names.len();
+        let forward: Vec<_> =
+            std::iter::successors(Some(SplitBackendChoice::AUTO), |c| Some(c.cycle(true))).take(n + 2).map(|c| c.label()).collect();
+        let mut expected = vec!["auto"];
+        expected.extend(&names);
+        expected.push("auto");
+        assert_eq!(forward, expected);
+        let backward: Vec<_> =
+            std::iter::successors(Some(SplitBackendChoice::AUTO), |c| Some(c.cycle(false))).take(n + 2).map(|c| c.label()).collect();
+        let mut reversed = vec!["auto"];
+        reversed.extend(names.iter().rev());
+        reversed.push("auto");
+        assert_eq!(backward, reversed);
+    }
+
+    /// What a saved config names is what the wizard shows next time.
+    #[test]
+    fn the_wizard_recognizes_every_backend_a_config_can_name() {
+        let _guard = crate::SPLIT_BACKEND_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old = std::env::var_os("KANSTACK_SPLIT_BACKEND");
+        for backend in BACKENDS {
+            std::env::set_var("KANSTACK_SPLIT_BACKEND", backend.name);
+            assert_eq!(SplitBackendChoice::from_env().label(), backend.name);
+        }
+        std::env::set_var("KANSTACK_SPLIT_BACKEND", "no-such-backend");
+        assert_eq!(SplitBackendChoice::from_env(), SplitBackendChoice::AUTO);
+        std::env::remove_var("KANSTACK_SPLIT_BACKEND");
+        assert_eq!(SplitBackendChoice::from_env(), SplitBackendChoice::AUTO);
+        if let Some(old) = old {
+            std::env::set_var("KANSTACK_SPLIT_BACKEND", old);
+        }
+    }
+
+    /// The detection panel has a line for each backend, saying which it is.
+    #[test]
+    fn the_detection_panel_describes_every_backend() {
+        let detection = detect();
+        assert_eq!(detection.backends.len(), BACKENDS.len());
+        for (line, backend) in detection.backends.iter().zip(BACKENDS) {
+            assert!(line.to_lowercase().contains(backend.name), "{line:?} does not mention {}", backend.name);
+        }
     }
 
     #[test]

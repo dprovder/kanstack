@@ -38,7 +38,7 @@ usage:
 
 options:
   -C <path>          run against the repository at <path> (default: cwd)
-  --setup            detect but/cmux/tmux/orca and known harnesses on PATH, then save a default
+  --setup            detect but, your terminal multiplexers and known harnesses, then save a default
                      harness and split-backend, so they don't need exporting every session.
                      Also offers to install the GitButler CLI itself if missing, and to
                      install/update its coding-agent skill (teaches whichever harness you
@@ -343,6 +343,26 @@ fn run(
                 if w.poll() {
                     app.begin_background_refresh();
                 }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HELP;
+    use kanstack::splitter::BACKENDS;
+
+    /// `--help` documents each backend by hand, since its variables differ, so a new one
+    /// must be added there — this fails until it is.
+    #[test]
+    fn help_documents_every_backend_and_its_direction_variables() {
+        for backend in BACKENDS {
+            let upper = backend.name.to_ascii_uppercase();
+            assert!(HELP.contains(&format!("`{}`", backend.name)), "--help never names the `{}` backend", backend.name);
+            for suffix in ["DIRECTION", "CHAIN_DIRECTION"] {
+                let var = format!("KANSTACK_{upper}_{suffix}");
+                assert!(HELP.contains(&var), "--help never documents {var}");
             }
         }
     }

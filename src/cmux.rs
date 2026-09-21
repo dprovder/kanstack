@@ -176,6 +176,14 @@ impl Cmux {
     }
 }
 
+/// One line for the setup wizard: whether cmux is usable here and, if not, what to do.
+pub fn detection() -> String {
+    match Cmux::discover() {
+        Some(_) => "✓ cmux found on PATH".to_string(),
+        None => "✗ cmux not found — set KANSTACK_CMUX_BIN to point at it".to_string(),
+    }
+}
+
 impl Multiplexer for Cmux {
     fn name(&self) -> &'static str {
         "cmux"

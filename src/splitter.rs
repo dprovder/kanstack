@@ -59,6 +59,49 @@ fn merge(native: Option<PaneStatus>, said: Option<Said>) -> Option<PaneStatus> {
     }
 }
 
+/// One multiplexer backend kanstack can find. [`BACKENDS`] is the only place they are listed:
+/// discovery, the `KANSTACK_SPLIT_BACKEND` override, the setup wizard's picker and its
+/// detection panel, and the messages that name them all read it. Adding a backend is a new
+/// file, one entry here, and the docs the tests below say are missing.
+pub struct BackendEntry {
+    /// What `KANSTACK_SPLIT_BACKEND` calls it, and what `Multiplexer::name` returns: `tmux`.
+    pub name: &'static str,
+    /// How it is written in prose: `Orca`.
+    pub label: &'static str,
+    discover: fn() -> Option<Arc<dyn Multiplexer>>,
+    /// One line for the setup wizard: whether it is usable here and, if not, what to do.
+    pub detection: fn() -> String,
+}
+
+fn discover_cmux() -> Option<Arc<dyn Multiplexer>> {
+    Cmux::discover().map(|m| Arc::new(m) as Arc<dyn Multiplexer>)
+}
+
+fn discover_tmux() -> Option<Arc<dyn Multiplexer>> {
+    Tmux::discover().map(|m| Arc::new(m) as Arc<dyn Multiplexer>)
+}
+
+fn discover_orca() -> Option<Arc<dyn Multiplexer>> {
+    Orca::discover().map(|m| Arc::new(m) as Arc<dyn Multiplexer>)
+}
+
+/// Every backend, in the order automatic discovery tries them.
+pub const BACKENDS: &[BackendEntry] = &[
+    BackendEntry { name: "cmux", label: "cmux", discover: discover_cmux, detection: crate::cmux::detection },
+    BackendEntry { name: "tmux", label: "tmux", discover: discover_tmux, detection: crate::tmux::detection },
+    BackendEntry { name: "orca", label: "Orca", discover: discover_orca, detection: crate::orca::detection },
+];
+
+/// The backends' names as prose: `cmux, tmux or Orca`.
+pub fn describe_backends() -> String {
+    let labels: Vec<&str> = BACKENDS.iter().map(|b| b.label).collect();
+    match labels.as_slice() {
+        [] => String::new(),
+        [only] => only.to_string(),
+        [rest @ .., last] => format!("{} or {last}", rest.join(", ")),
+    }
+}
+
 /// One lane's pane, as this process knows it.
 #[derive(Debug, Clone)]
 struct Pane {
@@ -129,26 +172,18 @@ impl Splitter {
     }
 
     fn discover_mux() -> Option<Arc<dyn Multiplexer>> {
-        fn shared(mux: impl Multiplexer + 'static) -> Arc<dyn Multiplexer> {
-            Arc::new(mux)
-        }
-        match std::env::var("KANSTACK_SPLIT_BACKEND").as_deref() {
-            Ok("cmux") => return Cmux::discover().map(shared),
-            Ok("tmux") => return Tmux::discover().map(shared),
-            Ok("orca") => return Orca::discover().map(shared),
-            _ => {}
+        let forced = std::env::var("KANSTACK_SPLIT_BACKEND").ok();
+        if let Some(backend) = BACKENDS.iter().find(|b| Some(b.name) == forced.as_deref()) {
+            return (backend.discover)();
         }
         let in_cmux_or_tmux =
             std::env::var_os("CMUX_SURFACE_ID").is_some() || std::env::var_os("TMUX_PANE").is_some();
         if Orca::running_inside() && !in_cmux_or_tmux {
-            if let Some(orca) = Orca::discover() {
-                return Some(shared(orca));
+            if let Some(orca) = discover_orca() {
+                return Some(orca);
             }
         }
-        Cmux::discover()
-            .map(shared)
-            .or_else(|| Tmux::discover().map(shared))
-            .or_else(|| Orca::discover().map(shared))
+        BACKENDS.iter().find_map(|b| (b.discover)())
     }
 
     /// Which backend this is, for the one place UI copy needs to name it: the branch
@@ -941,5 +976,43 @@ mod tests {
     fn merge_with_nothing_said_is_the_multiplexers_reading_or_no_news() {
         assert_eq!(merge(Some(PaneStatus::Busy), None), Some(PaneStatus::Busy));
         assert_eq!(merge(None, None), None);
+    }
+
+    // The backend list is the one place backends are named. What can't be generated from it —
+    // prose in the docs, `--help` — is checked here instead, so adding a backend without
+    // documenting it fails a test rather than shipping silently.
+
+    #[test]
+    fn backends_are_described_as_prose_from_the_list() {
+        assert_eq!(describe_backends(), "cmux, tmux or Orca");
+    }
+
+    #[test]
+    fn backend_names_are_unique_lowercase_words() {
+        let mut names: Vec<&str> = BACKENDS.iter().map(|b| b.name).collect();
+        for name in &names {
+            assert!(name.chars().all(|c| c.is_ascii_lowercase()), "{name:?}: names are the middle of KANSTACK_<NAME>_DIRECTION");
+        }
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), BACKENDS.len(), "two backends share a name");
+    }
+
+    /// Each backend must be named in the README and in the architecture doc.
+    #[test]
+    fn every_backend_is_documented() {
+        let docs = [
+            ("README.md", include_str!("../README.md")),
+            ("docs/ARCHITECTURE.md", include_str!("../docs/ARCHITECTURE.md")),
+        ];
+        for backend in BACKENDS {
+            for (file, text) in docs {
+                assert!(
+                    text.to_lowercase().contains(&backend.label.to_lowercase()),
+                    "{file} never mentions the {} backend",
+                    backend.label
+                );
+            }
+        }
     }
 }

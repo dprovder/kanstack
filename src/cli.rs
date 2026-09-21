@@ -46,8 +46,8 @@ kanstack report <busy|idle|waiting> [<branch>]
     Prints nothing, and needs no multiplexer. KANSTACK_STATUS_HOOKS=off stops kanstack
     handing harnesses those hooks
 
-<session> is a pane id as `kanstack status` prints it. These need to run inside the cmux,
-tmux or Orca the panes live in.
+<session> is a pane id as `kanstack status` prints it. These need to run inside the
+multiplexer the panes live in (see README).
 ";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,8 +145,9 @@ fn spawn_direction(raw: Option<&str>) -> Result<String> {
 fn seeded_splitter(registry: &Registry) -> Result<Splitter> {
     let mut splitter = Splitter::discover().ok_or_else(|| {
         anyhow::anyhow!(
-            "no harness-split backend found — run this from inside a cmux or tmux pane \
-             (see KANSTACK_SPLIT_BACKEND)"
+            "no harness-split backend found — run this from inside a {} pane \
+             (see KANSTACK_SPLIT_BACKEND)",
+            crate::splitter::describe_backends()
         )
     })?;
     registry.adopt_into(&mut splitter);

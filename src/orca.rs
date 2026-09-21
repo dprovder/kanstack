@@ -175,6 +175,17 @@ impl Orca {
     }
 }
 
+/// One line for the setup wizard: whether Orca is usable here and, if not, what to do.
+pub fn detection() -> String {
+    match Orca::discover() {
+        Some(_) => "✓ orca found, and this terminal is inside Orca".to_string(),
+        None if !Orca::running_inside() => {
+            "✗ orca not usable here — not running inside an Orca terminal".to_string()
+        }
+        None => "✗ orca CLI not found on PATH — register it in Orca's settings, or set KANSTACK_ORCA_BIN".to_string(),
+    }
+}
+
 impl Multiplexer for Orca {
     fn name(&self) -> &'static str {
         "orca"
