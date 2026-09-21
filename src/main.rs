@@ -75,12 +75,22 @@ environment:
                      kanstack is in — kanstack never runs `orca worktree create`, since
                      every lane shares GitButler's one workspace checkout — so the
                      repository needs to be added to Orca.
-  KANSTACK_SPLIT_BACKEND  force which of the above is used: `cmux`, `tmux` or `orca`,
-                     skipping detection of the others entirely rather than just reordering
-                     the fallback (default: unset — cmux if found, else tmux, else orca;
-                     except that inside an Orca terminal but not a cmux or tmux pane,
-                     orca goes first). Mainly for a machine with several installed where
-                     the first isn't actually the one kanstack is running inside right now.
+  KANSTACK_OSASCRIPT_BIN  path to `osascript`, which is how the `ghostty` backend (macOS
+                     only) drives the Ghostty app, used when kanstack is itself running in a
+                     Ghostty window (default: `osascript` on PATH if present and
+                     `TERM_PROGRAM` is `ghostty` with no cmux or tmux pane; skipped
+                     otherwise). macOS asks once to let the app running kanstack control
+                     Ghostty (System Settings > Privacy & Security > Automation). Ghostty
+                     can't say whether a pane is busy or idle, and a pane stays open after
+                     its harness exits, so status there comes from what agents report and
+                     from tracking the harness's process
+  KANSTACK_SPLIT_BACKEND  force which of the above is used: `cmux`, `tmux`, `orca` or
+                     `ghostty`, skipping detection of the others entirely rather than just
+                     reordering the fallback (default: unset — cmux if found, else tmux,
+                     else orca, else ghostty; except that inside an Orca terminal but not a
+                     cmux or tmux pane, orca goes first, and likewise ghostty inside plain
+                     Ghostty). Mainly for a machine with several installed where the first
+                     isn't actually the one kanstack is running inside right now.
   KANSTACK_TRACK_PIDS  whether kanstack follows each pane's shell process itself, for its
                      busy/idle/dead status: the pane's shell writes its pid before it starts
                      the harness, and `ps` is read for it. Off unless the multiplexer can't
@@ -112,6 +122,9 @@ environment:
                            `below` and `right`. Orca can only put a new pane right of or
                            below the one it splits, so `left` and `above` behave as `right`
                            and `below` there (as does KANSTACK_SPAWN_DIRECTION)
+  KANSTACK_GHOSTTY_DIRECTION, KANSTACK_GHOSTTY_CHAIN_DIRECTION  ghostty's equivalents, with
+                           the same defaults as tmux's (`above` and `right`); Ghostty splits
+                           in all four directions
   KANSTACK_SPAWN_DIRECTION  where `kanstack spawn` splits off the pane it is run from:
                            left, right, above, or below (default: `right`). Separate from
                            the two above, which are the board's own; the chain direction

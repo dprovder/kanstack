@@ -1,4 +1,4 @@
-//! Interactive first-run/`--setup` wizard: detects `but`/`cmux`/`tmux`/`orca`, and lets you pick
+//! Interactive first-run/`--setup` wizard: detects `but`/`cmux`/`tmux`/`orca`/`ghostty`, and lets you pick
 //! the two environment variables that matter most for a new install (`KANSTACK_HARNESS`,
 //! `KANSTACK_SPLIT_BACKEND`), then persists them via `crate::config` so they don't need to
 //! be re-exported every session. Every other `KANSTACK_*` var — including

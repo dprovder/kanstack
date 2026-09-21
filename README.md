@@ -24,7 +24,7 @@ past a lower branch's own commits in a stacked lane:
 </table>
 
 `b` spins up a new lane and, when a harness split is available (`cmux`, `tmux` as a
-fallback, or [Orca](#using-orca)), hands it straight to a coding agent — told which
+fallback, [Orca](#using-orca), or [Ghostty](#using-ghostty) on macOS), hands it straight to a coding agent — told which
 GitButler branch it's in, not just dropped into a plain checkout:
 
 ![kanstack spinning up a new branch with a coding agent split into a pane beside it](docs/assets/agent-launch.gif)
@@ -100,11 +100,11 @@ notes, and the version-compatibility details a contributor would need.
 ## Setup
 
 The very first time kanstack runs on a machine, it opens a short wizard before the board:
-it checks whether `but`, `cmux`, `tmux`, and `orca` are found (and, for `cmux`, whether the
+it checks whether `but`, `cmux`, `tmux`, `orca`, and `ghostty` are found (and, for `cmux`, whether the
 required `but` version is installed), and lets you pick a default harness — cycling with
 `←`/`→` through whichever known harnesses (`claude`, `codex`, `pi`, `opencode`, `kiro`,
 `gemini`) were actually found on `PATH`, or just typing a custom command — and a split
-backend (`auto`/`cmux`/`tmux`/`orca`). Saving remembers your choices in
+backend (`auto`/`cmux`/`tmux`/`orca`/`ghostty`). Saving remembers your choices in
 `$XDG_CONFIG_HOME/kanstack/env` (or `$HOME/.config/kanstack/env`), so you don't need to
 export the equivalent environment variables every session — an explicit environment
 variable always overrides what's saved there. `esc` skips it without picking anything.
@@ -154,7 +154,7 @@ repo is thrown away when you're done. `esc` or `q` leaves any time.
 | `r` | rebase onto the updated target — shows what will happen |
 | `tab` | on the unassigned lane: group its cards by folder, or back to a flat list |
 | `⏎` | open the diff beside the board — `←` goes back, `m` commits or amends one hunk |
-| `b` | new branch — stacks on the selected lane, `tab` for a parallel lane with a harness split (`cmux`, `tmux` as a fallback, or `orca`); asks for an optional initial message before creating anything, so `esc` cancels the whole branch |
+| `b` | new branch — stacks on the selected lane, `tab` for a parallel lane with a harness split (`cmux`, `tmux` as a fallback, `orca`, or `ghostty`); asks for an optional initial message before creating anything, so `esc` cancels the whole branch |
 | `t` | send a task to this lane's split pane — spawns one first if it isn't open yet |
 | `s` | stack this whole lane onto another — rewrites history |
 | `p` | push this lane — shows what it will do first |
@@ -219,10 +219,55 @@ worktree handling all behave as described. It hasn't been run in the desktop app
 detection hasn't been seen to report *idle* (only busy). If a lane misbehaves,
 `KANSTACK_SPLIT_BACKEND` pins one of the others.
 
+## Using Ghostty
+
+On macOS, kanstack can hand lanes to [Ghostty](https://ghostty.org) itself, with no tmux or
+cmux in between. It needs Ghostty 1.3 or newer, the first release with AppleScript support,
+and it is picked automatically when kanstack runs in a Ghostty window (`TERM_PROGRAM` is
+`ghostty`) that isn't a cmux or tmux pane, or with `KANSTACK_SPLIT_BACKEND=ghostty`. cmux is a
+Ghostty fork and sets `TERM_PROGRAM=ghostty` too, so cmux and tmux panes keep their own
+backends, and a machine that merely has `cmux` installed still gets Ghostty inside plain Ghostty.
+
+kanstack drives Ghostty through `osascript`; `KANSTACK_OSASCRIPT_BIN` points it at a different
+one. The first time, macOS asks whether to let the app running kanstack control Ghostty. If
+that was refused, or the prompt never came, turn it on under System Settings > Privacy &
+Security > Automation.
+
+A few things differ from the others:
+
+- **No busy or idle from the terminal itself.** Ghostty can say whether a pane exists, and
+  nothing else, so a closed pane reads `dead` and every other reading comes from the agent's
+  own reports (`kanstack report`, which Claude Code's hooks call) and from kanstack tracking
+  the harness's process.
+- **A pane stays open after its harness exits.** Ghostty leaves the finished pane on screen,
+  and there is no way to ask it whether the command is done, so an exited harness doesn't
+  read `dead`. Close the pane or run `kanstack stop`.
+- **The harness is started by `sh -c`, not typed into a shell.** So there is no shell prompt
+  in the pane and your `~/.zshrc` has not run. kanstack passes along your `PATH` and every
+  `KANSTACK_*` variable; other variables that exist only in your interactive shell won't
+  reach the harness.
+- **Stopping a lane leaves its process running.** `kanstack stop` closes the pane through
+  AppleScript, which removes it from the window, but in Ghostty 1.3.1 that did not end the
+  process inside it: a `sleep` and a `cat` outlived their closed panes by many minutes
+  (closing a whole window did end its process). Quit the harness first if that matters.
+- **Don't expect a lane to start while the Mac is idle.** Once, with nobody at the machine,
+  every new pane opened but ran nothing until someone was back; it isn't understood yet.
+- **Finding its own pane.** Ghostty gives a shell no id for its own pane, so for the first
+  lane kanstack sets its terminal's title to a unique marker, looks that up, and sets the title
+  back. The lanes after it split off the one before.
+- **Direction.** All four work. `KANSTACK_GHOSTTY_DIRECTION` and
+  `KANSTACK_GHOSTTY_CHAIN_DIRECTION` default to `above` and `right`, as for tmux. A new pane
+  takes keyboard focus.
+- **Labels.** The new pane is titled with the branch name until the harness sets its own title.
+
+What is said above about how Ghostty behaves was measured against Ghostty 1.3.1, including a
+`kanstack spawn` run from a shell and a lane started from the board; [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+says which parts were and which weren't.
+
 ## Driving panes from a script or an agent
 
 Everything the board does to a harness pane is also available without the board, so an
-agent in one pane can start and talk to others. Run these inside the cmux, tmux or Orca the
+agent in one pane can start and talk to others. Run these inside the cmux, tmux, Orca or Ghostty the
 panes live in:
 
 ```sh
@@ -289,7 +334,7 @@ tens of milliseconds more than plain `but status`; `-u` is the only way `but` fi
 each state (`tests/fixtures/status_lane_*.json`), except the assigned-files count, which this
 `but` cannot produce from the command line and is hand-set in its test.
 
-Unlike the table, `--json` works outside cmux, tmux and Orca, and when the multiplexer can't
+Unlike the table, `--json` works outside cmux, tmux, Orca and Ghostty, and when the multiplexer can't
 be reached: it still lists every workstream, with `unknown` for those that have a pane. An
 empty registry gives `{"schema":1,"workstreams":[],"workspace":null}`. What it will not do is
 paper over a registry file that is corrupt or unreadable: that exits non-zero with the reason
@@ -298,7 +343,7 @@ on stderr and nothing on stdout, because starting over would orphan every pane i
 ### Where busy, idle and waiting come from
 
 The multiplexer's own reading (CPU for cmux and tmux, Orca's idle detection) is a guess, and
-some multiplexers can't make one. So a harness can say for itself: `kanstack report busy`
+some multiplexers can't make one (Ghostty can only say whether a pane still exists). So a harness can say for itself: `kanstack report busy`
 when a turn starts, `idle` when it ends, and `waiting` when it stops on a permission prompt,
 from any script or hook. `<branch>` defaults to `$KANSTACK_BRANCH`, which kanstack sets in
 every pane it launches; it prints nothing, needs no multiplexer, and never reads the

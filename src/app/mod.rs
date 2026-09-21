@@ -144,7 +144,7 @@ pub struct App {
     /// `None` in snapshot mode, where a captured status is rendered read-only.
     /// `Arc` so `confirm_land` can hand a handle to the background thread it spawns.
     but: Option<Arc<But>>,
-    /// `None` when neither `cmux` nor `tmux` is usable — see [`crate::splitter::Splitter::discover`].
+    /// `None` when no harness-split backend is usable — see [`crate::splitter::Splitter::discover`].
     splitter: Option<Splitter>,
     pub board: Board,
     pub col: usize,

@@ -229,10 +229,11 @@ Two independent axes, each one file plus one line, with the shared logic written
   `KANSTACK_<NAME>_DIRECTION` and `KANSTACK_<NAME>_CHAIN_DIRECTION`, with defaults from
   `default_directions()`. `probe` returns only the panes it could classify; leaving one out
   means "no news", and the caller keeps what it knew. A backend that can only say whether a
-  pane exists returns `true` from `tracks_pids()` and everything else follows (below); it need
-  only report a pane that is gone as `Dead`. Test everything above the trait
-  against `mux::fake::FakeMux`, and the backend itself against a stand-in binary that logs
-  its arguments (see `orca.rs`'s tests).
+  pane exists returns `true` from `tracks_pids()` and everything else follows (below), as
+  `ghostty.rs` does; it need only report a pane that is gone as `Dead`. Test everything above
+  the trait against `mux::fake::FakeMux`, and the backend itself against a stand-in binary
+  that logs its arguments (see `orca.rs`'s tests, or `ghostty.rs`'s for one that scripts a GUI
+  app: its stand-in `osascript` records each call's operation and `argv`).
 - **A harness** is a `Harness` impl (`src/harness.rs`): one unit struct, one entry in
   `harness::KNOWN` (which is also what `--setup` scans `PATH` for, in that priority order).
   Its one job today is how the branch-context note reaches it (`note_delivery`); anything
@@ -362,13 +363,14 @@ that flag to every launched Codex to get a status light is the wrong trade. `not
 `busy` is actively harmful under this rule: its stale `idle` would outrank the multiplexer's
 correct `busy`. Any harness hooked here must report both edges.
 
-### The three backends today
+### The four backends today
 
-`splitter.rs` wraps whichever of three backends — `cmux.rs`, `tmux.rs`, `orca.rs` —
+`splitter.rs` wraps whichever of four backends — `cmux.rs`, `tmux.rs`, `orca.rs`, `ghostty.rs` —
 discovery found, each opening a terminal split per lane and typing a launch line
 (`harness_launch.rs`) into it.
 The first two are terminal multiplexers; Orca is an agent-oriented IDE whose CLI drives a
-running desktop app, and it differs in ways that shaped `orca.rs`.
+running desktop app, and it differs in ways that shaped `orca.rs`; Ghostty is a terminal
+emulator with no CLI at all, scripted through AppleScript, described after Orca's.
 
 **One worktree per agent, against one shared checkout.** Orca's model is a git worktree per
 agent (`orca worktree create`). Every kanstack lane shares GitButler's single workspace
@@ -422,8 +424,104 @@ seen; how a blocked approval prompt is reported is likewise unseen; `orcad` acce
 `send_task` cannot rely on that guard; and `orcad` may differ from the renderer-backed app.
 Those replies in `orca.rs`'s tests are shaped from Orca's TypeScript types instead.
 
-**Discovery order.** cmux, then tmux, then Orca, except that inside an Orca terminal with
-neither `$CMUX_SURFACE_ID` nor `$TMUX_PANE` set, Orca is tried first. `Cmux::discover` only
-checks for its binary on `PATH`, so a machine with cmux installed but not in use would
-otherwise pick it and fail at spawn time — the ambiguity `KANSTACK_SPLIT_BACKEND` exists to
-override, except that here a positive signal (`ORCA_TERMINAL_HANDLE`) settles it.
+**Discovery order.** cmux, then tmux, then Orca, then Ghostty, except that inside an Orca
+terminal with neither `$CMUX_SURFACE_ID` nor `$TMUX_PANE` set, Orca is tried first, and inside
+plain Ghostty (below) Ghostty is. `Cmux::discover` only checks for its binary on `PATH`, so a
+machine with cmux installed but not in use would otherwise pick it and fail at spawn time — the
+ambiguity `KANSTACK_SPLIT_BACKEND` exists to override, except that here a positive signal
+(`ORCA_TERMINAL_HANDLE`, `TERM_PROGRAM=ghostty`) settles it.
+
+### Ghostty (`ghostty.rs`)
+
+macOS only, and the only backend with no CLI: it runs fixed AppleScripts through `osascript`
+against the dictionary Ghostty 1.3 added (`Ghostty.app/Contents/Resources/Ghostty.sdef`:
+`application > window > tab > terminal`; `split`, `focus`, `close`, `input text`, `send key`,
+`perform action`, and a `surface configuration` record for a new terminal's cwd, command and
+environment). Which of the claims below were measured and which assumed matters here, since
+there is no documentation to fall back on, so each is marked. **Measured** means run against
+the official Ghostty 1.3.1 build (Developer ID team `24VZTF6M5V`), with an isolated config
+(`XDG_CONFIG_HOME` plus `--config-default-files=false`, since the macOS-specific config
+file is read too), launched with a scrubbed environment so it behaved as it does from the Dock.
+
+- **Every dynamic value is an `osascript` argument**, read by the script as `argv`, after a
+  `--` (measured: without it a text starting with `-` is parsed as an option; with it, quotes,
+  backslashes, newlines and empty strings arrive intact). Nothing is interpolated into
+  script source. A call costs 110-160 ms (measured, five terminals open), so `probe` is one.
+- **The launch line must be wrapped in `sh -c`** (measured, and not what the surface's
+  `command` documentation suggests). On macOS Ghostty starts a command as `login -flp <user>
+  /bin/bash --noprofile --norc -c "exec -l <command>"` with the command spliced in
+  *unquoted*. `cd '/repo' && claude` becomes `exec -l cd '/repo'` and the pane's process is gone
+  before the harness starts, while `sleep 60 && echo hi` runs `sleep 60` alone and drops the
+  rest. `/bin/sh -c '<line>'`, quoted with `harness_launch::shell_quote`, reaches one shell
+  whole, including the hooked launch line that spills its prompt to files (measured with a
+  stand-in `claude` on a real hooked line: cwd, `KANSTACK_BRANCH`, arguments all correct).
+- **Working directory and environment apply exactly** (measured). The `sh` is a login shell
+  but not the user's interactive one, and a Dock-launched Ghostty's `PATH` is `/usr/bin:/bin:…`
+  (measured), so `PATH` and every `KANSTACK_*` variable except `KANSTACK_BRANCH` (which names
+  the *caller's* lane, and would make a new lane report as it) are passed in the configuration;
+  nothing else is. Whether some other variable that a user's `.zshrc` sets matters to a harness is
+  assumed, not measured.
+- **`split` returns the new terminal** and the new pane takes focus (measured: the tab's
+  focused terminal was the new one). Directions `up`, `down`, `left`, `right` are an
+  enumeration constant, not a string, so the script branches on them; all four measured, by
+  reading which terminal `goto_split:<direction>` reaches from the old one.
+- **The pane's title** is set with `perform action "set_surface_title:<branch>"`, which
+  returned true and changed `name of terminal` (measured). A harness that sets its own title
+  replaces it (assumed for Claude Code, not measured).
+- **A pane stays after its command exits**: exit 0 and exit 3 both stayed in `id of every
+  terminal` for 10+ seconds (measured). AppleScript can say a pane was closed, never that its
+  command finished; that is why `tracks_pids()` is true for Ghostty and the pid tier supplies
+  liveness and CPU. `probe` says `Dead` for an id that is gone and nothing for one that is
+  present.
+- **`close` does not end the process promptly** (measured, and the most surprising result):
+  after `close <terminal>` the id is gone from `id of every terminal`, but a `sleep`, a `cat`
+  and a shell ran on, and `lsof` on the app showed it still holding their pty masters. Three
+  closed panes' processes were still running 5 to 7 minutes later and were gone at the next
+  look, some 18 minutes on (nothing was done to them; why is not established), and one closed
+  9 minutes earlier was still running when the app was killed, which ended it. `close window`
+  did end its process at once; `perform action "close_surface"` on a pane with a running
+  process raises a confirmation dialog no script can answer. `Multiplexer::close` therefore only
+  removes the pane, and ending the harness needs its pid.
+- **Panes that never started** (observed, cause not established): during one stretch of about
+  six minutes, with the machine idle, *every* pane created failed to run its command at all,
+  including a bare `echo hi > file` split by hand with no kanstack involved, and stayed that way
+  minutes later. It began when nobody was using the Mac (`pmset -g assertions` said
+  `UserIsActive 0`, and the display was probably asleep); a fresh split right after `caffeinate -u`
+  worked, and later idle splits (6 of 6) did too. The pane was created and listed either way, so
+  nothing but the command's missing effect shows it. Expect a lane spawned while the display is
+  asleep to sit empty.
+- **Typing**: `input text` is a real bracketed paste and `send key "enter"` is its own `\r`
+  (measured, against a TUI that had enabled bracketed paste), so `type_line` is both, in one
+  script. `send key` with a plain letter sent nothing to a raw-mode reader (measured), while
+  `escape`, `tab` and `enter` did; that is why nothing else here uses it, and why the board
+  can't be driven letter by letter through AppleScript in tests.
+- **Existence**: `exists terminal id X` throws (-1728) for a missing id, and so does
+  `first terminal whose id is X` (-1719, "Invalid index"); membership in `id of every
+  terminal` is what the scripts test.
+- **Finding kanstack's own terminal.** Ghostty exports no per-terminal variable (a
+  `GHOSTTY_SURFACE_ID` seen in some shells was inherited from cmux, a Ghostty fork). A program
+  can set its terminal's title with `OSC 2` and read it back as `name of terminal`, so the first
+  lane writes a unique marker to `/dev/tty`, lists `id`/`name` pairs until one contains it (the
+  title lands asynchronously, so it retries for up to three seconds), and writes the previous
+  title back. Measured from a shell (`kanstack spawn`), where the shell's own title (`my-custom-
+  title`, set with `printf`) was restored, and from the board's alternate screen with raw mode
+  and bracketed paste on (a lane started with `b`, two `list` calls, one `split`, the pane split
+  `up`). Not measured: a `/dev/tty` that isn't Ghostty's (it then fails after three seconds
+  with an error naming the cause), and two kanstacks finding their terminals in the same
+  instant (each marker is unique, so assumed fine).
+- **Scripts refuse to launch Ghostty.** `tell application id … ` launches an app that isn't
+  running, so each script starts with an `is running` check that raises -600 instead. With the
+  scratch Ghostty quit and no installed copy, `osascript` failed earlier than that, at compile
+  time: `Can’t get application id "com.mitchellh.ghostty". (-1728)` (measured, and the app was
+  not launched). -1728 also means "no such terminal" elsewhere, so `explain` checks the text
+  first. The `is running` guard itself, and the -1743 (Automation refused) message, are covered
+  only by the stand-in: permission was already granted here, and an installed Ghostty that has
+  merely quit was not available.
+- **Discovery.** `TERM_PROGRAM=ghostty` and neither `$CMUX_SURFACE_ID` nor `$TMUX_PANE`
+  (cmux sets `TERM_PROGRAM=ghostty` too, and tmux in Ghostty should get tmux); anything else,
+  and any other OS, is `None`. Measured end to end with `cmux` and `tmux` both on `PATH`
+  and no `KANSTACK_SPLIT_BACKEND`: the spawn chose Ghostty.
+- **Not measured**: Ghostty older than 1.3 (assumed to fail with a syntax error, which
+  `explain` reports as needing 1.3; -2740/-2741/-1708), more than one Ghostty running, a
+  window in native fullscreen, and a real Claude in a lane (a stand-in that logged its
+  environment and arguments took its place).

@@ -53,7 +53,7 @@ pub(super) fn draw_help(f: &mut Frame, area: Rect, hits: &mut HitMap) {
         help_row("● filled dot", "a lane's tip branch — c/p/L/z always act here"),
         help_row("○ hollow dot", "a branch stacked below the tip, along for the ride"),
         help_row("▸ folder", "a directory divider in unassigned, when grouped by folder"),
-        help_row("● busy / ○ idle / ✕ pane closed", "a lane's split harness pane (cmux, tmux or orca), if one is open"),
+        help_row("● busy / ○ idle / ✕ pane closed", "a lane's split harness pane (cmux, tmux, orca or ghostty), if one is open"),
         help_row("drawer ● green/red", "whether applying that branch would merge cleanly"),
         help_row("drawer remote-only", "divider — everything below has no local ref"),
         help_row("drawer stale", "old and no longer merges cleanly — a delete candidate"),
