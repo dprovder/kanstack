@@ -44,7 +44,7 @@ pub(super) fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     if b.behind > 0 {
         spans.push(Span::styled("  ·  ", theme::faint()));
         spans.push(Span::styled(
-            format!("{} behind upstream", b.behind),
+            format!("{} behind upstream · r to rebase", b.behind),
             theme::tone(crate::board::Tone::Warn),
         ));
     }

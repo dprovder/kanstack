@@ -190,6 +190,25 @@ impl App {
                 } else {
                     format!("landed {title} onto the target")
                 };
+                // `but land` is documented to reconcile the remaining lanes onto the result,
+                // but 0.22.0 was observed to advance the target and leave the workspace on
+                // its old base when a land emptied it. Still behind straight after a land is
+                // that state, so go on to the usual preview-then-confirm rebase rather than
+                // sending the user to the CLI to `but pull`.
+                if self.board.behind > 0 {
+                    self.begin_rebase();
+                    if self.mode == Mode::RebaseConfirm {
+                        self.notify(
+                            format!(
+                                "{message} — the workspace is still {} behind, review the rebase",
+                                self.board.behind
+                            ),
+                            Notice::Success,
+                        );
+                        self.check_tutorial_advance();
+                        return;
+                    }
+                }
                 self.notify(message, Notice::Success);
             }
             Ok(Err(e)) => {
