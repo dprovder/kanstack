@@ -214,6 +214,10 @@ struct WorkspaceReport {
     behind: usize,
     /// Changes in the working tree that no lane owns yet.
     uncommitted: usize,
+    /// When the workspace last fetched from the remote, as `but` reports it. `behind`, `landed`
+    /// and a lane's own `behind` only change on a fetch — `but status` never fetches, and
+    /// neither does this — so this is how stale they might be. `null` if never fetched.
+    fetched: Option<String>,
 }
 
 /// One lane's git state, from `but status`.
@@ -224,11 +228,15 @@ struct LaneReport {
     conflicted: bool,
     /// Commits on the lane's remote branch that the lane doesn't have.
     behind: usize,
-    /// What updating the lane from upstream would do; `null` when there is nothing to say.
+    /// What updating the lane from upstream would do; `null` when there is nothing to say —
+    /// which includes right after `but pull`, when the update has already happened.
     rebase: Option<Rebase>,
-    /// The lane has landed upstream, and `but pull` will remove it. Commits on it can't be
-    /// changed any more.
+    /// The lane has landed upstream, and `but pull` will remove it (after which the lane is no
+    /// longer in the workspace and its `lane` is `null`). Commits on it can't be changed any
+    /// more. Only visible between a fetch and that pull.
     landed: bool,
+    /// `needs-force` means a plain push would be refused: either the lane's pushed history was
+    /// rewritten, or the remote branch has commits the lane doesn't (it has diverged).
     push: PushState,
     /// Uncommitted files assigned to the lane's stack.
     uncommitted: usize,
@@ -285,7 +293,11 @@ fn lane_report(status: &WorkspaceStatus, branch: &str) -> Option<LaneReport> {
 }
 
 fn workspace_report(status: &WorkspaceStatus) -> WorkspaceReport {
-    WorkspaceReport { behind: status.upstream_state.behind, uncommitted: status.uncommitted_changes.len() }
+    WorkspaceReport {
+        behind: status.upstream_state.behind,
+        uncommitted: status.uncommitted_changes.len(),
+        fetched: status.upstream_state.last_fetched.clone(),
+    }
 }
 
 /// [`PaneStatus`] plus `NoPane`, which is a fact about the registry rather than about a pane.
@@ -346,7 +358,7 @@ fn git_state(registry: &Registry, cwd: &Path) -> Option<WorkspaceStatus> {
     if registry.workstreams.is_empty() {
         return None;
     }
-    But::discover(cwd).ok()?.status().ok()
+    But::discover(cwd).ok()?.status_with_upstream().ok()
 }
 
 /// Pane statuses by branch, or nothing at all if there's no multiplexer to ask or the poll
@@ -882,25 +894,143 @@ mod tests {
         assert!(json.contains(r#""branch":"fix-login","pane":"%3","agent":"claude","item":"GH-4","status":"waiting""#), "{json}");
     }
 
-    // Lane state. The unaltered tests read a real capture of `but status -f --json`
-    // (tests/fixtures/status.json: three clean, local-only lanes). It has no conflicted,
-    // behind or landed lane, so those cases change specific values in it — real shape,
-    // hand-set values, and labelled so.
+    // Lane state. These read REAL captures of `but status -f --json` (tests/fixtures/
+    // status_lane_*.json), taken from a scratch GitButler repo with a local remote by driving
+    // it into each state — and for the upstream ones, fetching first, since `but status`
+    // never does. Only what `but` 0.22.0 can't be made to produce from the command line is
+    // hand-set below, and says so.
 
-    const STATUS_FIXTURE: &str = include_str!("../tests/fixtures/status.json");
-
-    fn fixture() -> WorkspaceStatus {
-        crate::but::parse_status(STATUS_FIXTURE).unwrap()
+    fn capture(raw: &str) -> WorkspaceStatus {
+        crate::but::parse_status(raw).unwrap()
     }
 
-    /// The fixture with `change` applied to its JSON first.
+    fn lane_of(raw: &str, branch: &str) -> Option<LaneReport> {
+        lane_report(&capture(raw), branch)
+    }
+
+    const PUSHED: &str = include_str!("../tests/fixtures/status_lane_pushed.json");
+    const UNPUSHED: &str = include_str!("../tests/fixtures/status_lane_unpushed.json");
+    const NEEDS_FORCE: &str = include_str!("../tests/fixtures/status_lane_needs_force.json");
+    const BEHIND_REMOTE: &str = include_str!("../tests/fixtures/status_lane_behind_remote.json");
+    const LANDED_NO_FLAG: &str = include_str!("../tests/fixtures/status_lane_landed_no_upstream_flag.json");
+    const LANDED: &str = include_str!("../tests/fixtures/status_lane_landed_upstream_flag.json");
+    const CONFLICT_NO_FLAG: &str = include_str!("../tests/fixtures/status_lane_conflict_expected_no_upstream_flag.json");
+    const CONFLICT_EXPECTED: &str = include_str!("../tests/fixtures/status_lane_conflict_expected_upstream_flag.json");
+    const CONFLICTED: &str = include_str!("../tests/fixtures/status_lane_conflicted.json");
+
+    fn clean(commits: usize, push: PushState) -> LaneReport {
+        LaneReport { commits, conflicted: false, behind: 0, rebase: None, landed: false, push, uncommitted: 0 }
+    }
+
+    #[test]
+    fn a_pushed_lane_and_one_with_a_local_commit_after_the_push() {
+        assert_eq!(lane_of(PUSHED, "lane-pushed"), Some(clean(1, PushState::Pushed)));
+        assert_eq!(lane_of(UNPUSHED, "lane-pushed"), Some(clean(2, PushState::Unpushed)));
+    }
+
+    /// Rewriting a commit that was already pushed.
+    #[test]
+    fn a_lane_whose_pushed_history_was_rewritten_needs_a_force_push() {
+        assert_eq!(lane_of(NEEDS_FORCE, "lane-force"), Some(clean(1, PushState::NeedsForce)));
+        assert_eq!(lane_of(NEEDS_FORCE, "lane-pushed"), Some(clean(2, PushState::Pushed)));
+    }
+
+    /// Nothing was rewritten here: someone else pushed to the lane's remote branch. `but`
+    /// still calls it "requiring force", because the lane and its remote have diverged, so
+    /// `needs-force` means a plain push would be refused, not necessarily that history changed.
+    #[test]
+    fn a_lane_behind_its_own_remote_branch_is_diverged_and_also_needs_force() {
+        let lane = lane_of(BEHIND_REMOTE, "lane-pushed").unwrap();
+        assert_eq!((lane.commits, lane.behind, lane.push), (2, 1, PushState::NeedsForce));
+        assert!(!lane.conflicted && !lane.landed);
+    }
+
+    /// The same lane in the state just before the fetch that revealed it. `but status` reads
+    /// remote-tracking refs, so until something fetches, the remote looks unchanged.
+    #[test]
+    fn behind_only_appears_after_a_fetch() {
+        let before = lane_of(include_str!("../tests/fixtures/status_lane_needs_force.json"), "lane-pushed").unwrap();
+        assert_eq!((before.behind, before.push), (0, PushState::Pushed));
+        assert_eq!(lane_of(BEHIND_REMOTE, "lane-pushed").unwrap().behind, 1);
+    }
+
+    #[test]
+    fn the_workspace_reports_how_far_behind_the_target_it_is_and_when_it_last_fetched() {
+        let workspace = workspace_report(&capture(LANDED));
+        assert_eq!((workspace.behind, workspace.uncommitted), (2, 0));
+        let raw: serde_json::Value = serde_json::from_str(LANDED).unwrap();
+        assert_eq!(workspace.fetched.as_deref(), raw["upstreamState"]["lastFetched"].as_str());
+        assert!(workspace.fetched.is_some());
+    }
+
+    /// A lane that was merged into the target upstream, seen after a fetch and before
+    /// `but pull` removes it — captured with `-u`, which is how kanstack asks.
+    #[test]
+    fn a_lane_that_landed_upstream_is_flagged_and_the_others_can_rebase_cleanly() {
+        let landed = lane_of(LANDED, "lane-land").unwrap();
+        assert_eq!(
+            landed,
+            LaneReport {
+                commits: 1,
+                conflicted: false,
+                behind: 0,
+                rebase: Some(Rebase::Integrated),
+                landed: true,
+                push: PushState::Integrated,
+                uncommitted: 0,
+            }
+        );
+        let force = lane_of(LANDED, "lane-force").unwrap();
+        assert_eq!((force.rebase, force.landed), (Some(Rebase::Clean), false));
+        let pushed = lane_of(LANDED, "lane-pushed").unwrap();
+        assert_eq!((pushed.rebase, pushed.behind), (Some(Rebase::Clean), 1));
+    }
+
+    /// `branchStatus: integrated` alone says a lane has landed, so that survives without `-u`.
+    #[test]
+    fn landed_is_still_known_without_the_upstream_flag_but_rebase_is_not() {
+        let lane = lane_of(LANDED_NO_FLAG, "lane-land").unwrap();
+        assert!(lane.landed);
+        assert_eq!((lane.push, lane.rebase), (PushState::Integrated, None));
+    }
+
+    /// This is why `status --json` asks `but` for `-u`: without it `mergeStatus` is absent
+    /// entirely, so `rebase` would be null for every lane, including one about to conflict.
+    #[test]
+    fn a_lane_that_would_conflict_on_update_says_so_only_when_asked_with_the_upstream_flag() {
+        assert_eq!(lane_of(CONFLICT_NO_FLAG, "lane-conflict").unwrap().rebase, None);
+        let lane = lane_of(CONFLICT_EXPECTED, "lane-conflict").unwrap();
+        assert_eq!(lane.rebase, Some(Rebase::Conflicts));
+        assert!(!lane.conflicted, "nothing is conflicted until the pull actually rebases it");
+        assert_eq!(workspace_report(&capture(CONFLICT_EXPECTED)).behind, 3);
+    }
+
+    /// After `but pull` the conflict is real and the landed lane has been removed from the
+    /// workspace, so it has no lane to report.
+    #[test]
+    fn after_the_pull_the_commit_is_conflicted_and_the_landed_lane_is_gone() {
+        let conflicted = lane_of(CONFLICTED, "lane-conflict").unwrap();
+        assert_eq!((conflicted.conflicted, conflicted.push, conflicted.commits), (true, PushState::LocalOnly, 1));
+        assert_eq!(lane_of(CONFLICTED, "lane-land"), None);
+        assert_eq!(workspace_report(&capture(CONFLICTED)).behind, 0);
+    }
+
+    // Hand-set from here: what this `but` cannot be made to produce.
+    //
+    // Assigned changes: 0.22.0's command line has no way to assign an uncommitted file to a
+    // stack (`but rub` is retired, `but move` refuses uncommitted sources, and editing a file a
+    // lane committed did not auto-assign it), so a real capture with `assignedChanges` filled
+    // in couldn't be taken. This is the real fixture with three files put in by hand.
+
+    const BASE: &str = include_str!("../tests/fixtures/status.json");
+
     fn altered(change: impl FnOnce(&mut serde_json::Value)) -> WorkspaceStatus {
-        let mut json: serde_json::Value = serde_json::from_str(STATUS_FIXTURE).unwrap();
+        let mut json: serde_json::Value = serde_json::from_str(BASE).unwrap();
         change(&mut json);
-        crate::but::parse_status(&json.to_string()).unwrap()
+        capture(&json.to_string())
     }
 
-    fn lane<'a>(json: &'a mut serde_json::Value, name: &str) -> &'a mut serde_json::Value {
+    fn branch<'a>(json: &'a mut serde_json::Value, name: &str) -> &'a mut serde_json::Value {
         json["stacks"]
             .as_array_mut()
             .unwrap()
@@ -911,86 +1041,29 @@ mod tests {
     }
 
     #[test]
-    fn a_clean_local_lane_reads_from_a_real_capture() {
-        let status = fixture();
-        assert_eq!(
-            lane_report(&status, "feat-ui"),
-            Some(LaneReport {
-                commits: 2,
-                conflicted: false,
-                behind: 0,
-                rebase: None,
-                landed: false,
-                push: PushState::LocalOnly,
-                uncommitted: 0,
-            })
-        );
-        assert_eq!(lane_report(&status, "fix-flaky-tests").unwrap().commits, 1);
-        assert_eq!(workspace_report(&status), WorkspaceReport { behind: 0, uncommitted: 2 });
-    }
-
-    #[test]
-    fn a_branch_the_workspace_does_not_have_has_no_lane() {
-        assert_eq!(lane_report(&fixture(), "deleted-long-ago"), None);
-    }
-
-    #[test]
-    fn a_conflicted_lane_behind_upstream_that_needs_a_force_push() {
+    fn files_assigned_to_a_lanes_stack_are_counted_on_the_lane() {
         let status = altered(|json| {
-            let commit = json["stacks"][2]["branches"][0]["commits"][0].clone();
-            let mut conflicted = commit.clone();
-            conflicted["conflicted"] = true.into();
-            let feat_auth = lane(json, "feat-auth");
-            feat_auth["commits"][0] = conflicted;
-            feat_auth["upstreamCommits"] = serde_json::json!([commit.clone(), commit]);
-            feat_auth["branchStatus"] = "unpushedCommitsRequiringForce".into();
-            feat_auth["mergeStatus"] = serde_json::json!({"conflicted": {"rebasable": true}});
             json["stacks"][2]["assignedChanges"] = serde_json::json!([
                 {"cliId": "a", "filePath": "x.rs", "changeType": "modified"},
                 {"cliId": "b", "filePath": "y.rs", "changeType": "added"},
                 {"cliId": "c", "filePath": "z.rs", "changeType": "removed"},
             ]);
-            json["upstreamState"]["behind"] = 4.into();
         });
-        assert_eq!(
-            lane_report(&status, "feat-auth"),
-            Some(LaneReport {
-                commits: 2,
-                conflicted: true,
-                behind: 2,
-                rebase: Some(Rebase::Conflicts),
-                landed: false,
-                push: PushState::NeedsForce,
-                uncommitted: 3,
-            })
-        );
-        assert_eq!(workspace_report(&status), WorkspaceReport { behind: 4, uncommitted: 2 });
-        // The other lanes are untouched by it.
-        assert!(!lane_report(&status, "feat-ui").unwrap().conflicted);
+        assert_eq!(lane_report(&status, "feat-auth").unwrap().uncommitted, 3);
+        assert_eq!(lane_report(&status, "feat-ui").unwrap().uncommitted, 0);
+        assert_eq!(workspace_report(&status).uncommitted, 2, "unassigned changes are counted on the workspace, not a lane");
     }
 
-    /// Either signal says a lane has landed, and `but pull` will remove it.
-    #[test]
-    fn a_landed_lane_is_flagged_by_either_of_its_two_signals() {
-        let by_branch_status = altered(|json| lane(json, "feat-ui")["branchStatus"] = "integrated".into());
-        let landed = lane_report(&by_branch_status, "feat-ui").unwrap();
-        assert!(landed.landed);
-        assert_eq!(landed.push, PushState::Integrated);
-
-        let by_merge_status = altered(|json| lane(json, "feat-ui")["mergeStatus"] = "integrated".into());
-        let landed = lane_report(&by_merge_status, "feat-ui").unwrap();
-        assert!(landed.landed);
-        assert_eq!(landed.rebase, Some(Rebase::Integrated));
-
-        assert!(!lane_report(&fixture(), "feat-ui").unwrap().landed);
-    }
-
+    /// Every wire word `but` can send maps to its own word, including one a newer `but` might
+    /// add — none of these is reachable from a real capture without inventing a state.
     #[test]
     fn every_upstream_merge_status_and_push_status_has_its_own_word() {
         for (wire, expected) in [("clean", Rebase::Clean), ("integrated", Rebase::Integrated), ("empty", Rebase::Empty)] {
-            let status = altered(|json| lane(json, "feat-ui")["mergeStatus"] = wire.into());
+            let status = altered(|json| branch(json, "feat-ui")["mergeStatus"] = wire.into());
             assert_eq!(lane_report(&status, "feat-ui").unwrap().rebase, Some(expected), "{wire}");
         }
+        let status = altered(|json| branch(json, "feat-ui")["mergeStatus"] = serde_json::json!({"conflicted": {"rebasable": true}}));
+        assert_eq!(lane_report(&status, "feat-ui").unwrap().rebase, Some(Rebase::Conflicts), "rebasable is ignored");
         for (wire, expected) in [
             ("nothingToPush", PushState::Pushed),
             ("unpushedCommits", PushState::Unpushed),
@@ -999,9 +1072,14 @@ mod tests {
             ("integrated", PushState::Integrated),
             ("somethingNewerThanThisClient", PushState::Unknown),
         ] {
-            let status = altered(|json| lane(json, "feat-ui")["branchStatus"] = wire.into());
+            let status = altered(|json| branch(json, "feat-ui")["branchStatus"] = wire.into());
             assert_eq!(lane_report(&status, "feat-ui").unwrap().push, expected, "{wire}");
         }
+    }
+
+    #[test]
+    fn a_branch_the_workspace_does_not_have_has_no_lane() {
+        assert_eq!(lane_report(&altered(|_| {}), "deleted-long-ago"), None);
     }
 
     /// The shape an agent parses: the lane object inside its workstream, the workspace beside
@@ -1009,21 +1087,22 @@ mod tests {
     #[test]
     fn the_json_carries_the_lane_and_the_workspace() {
         let mut registry = Registry::default();
-        registry.upsert(workstream("feat-ui", Some("%3"), Some("claude"), None));
+        registry.upsert(workstream("lane-conflict", Some("%3"), Some("claude"), None));
         registry.upsert(workstream("gone", Some("%4"), None, None));
-        let status = altered(|json| {
-            lane(json, "feat-ui")["mergeStatus"] = serde_json::json!({"conflicted": {"rebasable": false}});
-            json["upstreamState"]["behind"] = 3.into();
-        });
+        let status = capture(CONFLICT_EXPECTED);
+        let fetched = workspace_report(&status).fetched.unwrap();
         let json = serde_json::to_string(&report(&registry, |_| Some(PaneStatus::Idle), Some(&status))).unwrap();
         assert_eq!(
             json,
-            concat!(
-                r#"{"schema":1,"workstreams":["#,
-                r#"{"branch":"feat-ui","pane":"%3","agent":"claude","item":null,"status":"idle","lane":"#,
-                r#"{"commits":2,"conflicted":false,"behind":0,"rebase":"conflicts","landed":false,"push":"local-only","uncommitted":0}},"#,
-                r#"{"branch":"gone","pane":"%4","agent":null,"item":null,"status":"idle","lane":null}"#,
-                r#"],"workspace":{"behind":3,"uncommitted":2}}"#
+            format!(
+                concat!(
+                    r#"{{"schema":1,"workstreams":["#,
+                    r#"{{"branch":"lane-conflict","pane":"%3","agent":"claude","item":null,"status":"idle","lane":"#,
+                    r#"{{"commits":1,"conflicted":false,"behind":0,"rebase":"conflicts","landed":false,"push":"local-only","uncommitted":0}}}},"#,
+                    r#"{{"branch":"gone","pane":"%4","agent":null,"item":null,"status":"idle","lane":null}}"#,
+                    r#"],"workspace":{{"behind":3,"uncommitted":0,"fetched":"{}"}}}}"#
+                ),
+                fetched
             )
         );
     }

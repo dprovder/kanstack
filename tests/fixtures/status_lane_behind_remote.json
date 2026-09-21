@@ -1,0 +1,129 @@
+{
+  "uncommittedChanges": [],
+  "stacks": [
+    {
+      "cliId": "g0",
+      "assignedChanges": [],
+      "branches": [
+        {
+          "cliId": "la",
+          "name": "lane-force",
+          "commits": [
+            {
+              "cliId": "mqm",
+              "changeId": "mqmqoomrqprntovnypzuyokzvnwzzwpv",
+              "commitId": "fd34810f70cd8768cf8be81e7f370c59571e6ed3",
+              "createdAt": "2026-09-21T02:59:22+00:00",
+              "message": "Add ff (reworded after push)",
+              "authorName": "Dani",
+              "authorEmail": "d@e.com",
+              "conflicted": false,
+              "reviewId": null,
+              "changes": [
+                {
+                  "cliId": "m:p",
+                  "filePath": "ff.txt",
+                  "changeType": "added"
+                }
+              ]
+            }
+          ],
+          "upstreamCommits": [],
+          "branchStatus": "unpushedCommitsRequiringForce",
+          "reviewId": null,
+          "ci": null
+        }
+      ]
+    },
+    {
+      "cliId": "h0",
+      "assignedChanges": [],
+      "branches": [
+        {
+          "cliId": "an",
+          "name": "lane-pushed",
+          "commits": [
+            {
+              "cliId": "qrz",
+              "changeId": "qrzuusynlkmxxosxyxmvtpzysvwykvus",
+              "commitId": "5d8846cf7ebf2f0c3fe70b80d677917a305966fd",
+              "createdAt": "2026-09-21T02:59:09+00:00",
+              "message": "Add pb (unpushed)",
+              "authorName": "Dani",
+              "authorEmail": "d@e.com",
+              "conflicted": false,
+              "reviewId": null,
+              "changes": [
+                {
+                  "cliId": "q:t",
+                  "filePath": "pb.txt",
+                  "changeType": "added"
+                }
+              ]
+            },
+            {
+              "cliId": "plx",
+              "changeId": "plxsqwoykuumpwxwlkktzlquvnxwspzw",
+              "commitId": "0e2a583ff126010a7285529592ce6f850d0cc3a2",
+              "createdAt": "2026-09-21T02:59:08+00:00",
+              "message": "Add pa",
+              "authorName": "Dani",
+              "authorEmail": "d@e.com",
+              "conflicted": false,
+              "reviewId": null,
+              "changes": [
+                {
+                  "cliId": "p:p",
+                  "filePath": "pa.txt",
+                  "changeType": "added"
+                }
+              ]
+            }
+          ],
+          "upstreamCommits": [
+            {
+              "cliId": "9",
+              "commitId": "97dddabf3e11c81ce5ca3eb34e3f9f80bd594c45",
+              "createdAt": "2026-09-21T02:59:35+00:00",
+              "message": "Other person's commit on lane-pushed\n",
+              "authorName": "Dani",
+              "authorEmail": "d@e.com",
+              "conflicted": null,
+              "reviewId": null,
+              "changes": null
+            }
+          ],
+          "branchStatus": "unpushedCommitsRequiringForce",
+          "reviewId": null,
+          "ci": null
+        }
+      ]
+    }
+  ],
+  "mergeBase": {
+    "cliId": "",
+    "commitId": "a6909c7967db71d748dc557aef8d742858d135a6",
+    "createdAt": "2026-09-21T02:58:18+00:00",
+    "message": "initial\n",
+    "authorName": "Dani",
+    "authorEmail": "d@e.com",
+    "conflicted": null,
+    "reviewId": null,
+    "changes": null
+  },
+  "upstreamState": {
+    "behind": 0,
+    "latestCommit": {
+      "cliId": "",
+      "commitId": "a6909c7967db71d748dc557aef8d742858d135a6",
+      "createdAt": "2026-09-21T02:58:18+00:00",
+      "message": "initial\n",
+      "authorName": "Dani",
+      "authorEmail": "d@e.com",
+      "conflicted": null,
+      "reviewId": null,
+      "changes": null
+    },
+    "lastFetched": "2026-09-21T02:59:38.016+00:00"
+  }
+}

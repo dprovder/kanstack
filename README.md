@@ -246,11 +246,11 @@ agent to parse:
 {"schema":1,
  "workstreams":[
   {"branch":"fix-login","pane":"%3","agent":"claude","item":"GH-4","status":"busy",
-   "lane":{"commits":3,"conflicted":false,"behind":0,"rebase":null,"landed":false,
-           "push":"unpushed","uncommitted":2}},
+   "lane":{"commits":3,"conflicted":false,"behind":0,"rebase":"clean","landed":false,
+           "push":"unpushed","uncommitted":0}},
   {"branch":"planned","pane":null,"agent":null,"item":null,"status":"no-pane","lane":null}
  ],
- "workspace":{"behind":2,"uncommitted":1}}
+ "workspace":{"behind":2,"uncommitted":1,"fetched":"2026-09-21T03:07:40.977+00:00"}}
 ```
 
 Every key is always present (`null` when there's no value), one entry per registered
@@ -265,17 +265,29 @@ reinterpreted.
 | field | meaning |
 | --- | --- |
 | `commits` | commits on the lane |
-| `conflicted` | a commit on the lane is conflicted now, and needs `but resolve` |
+| `conflicted` | a commit on the lane is conflicted now, and needs `but resolve`. This only happens once `but pull` has rebased the lane; before that, `rebase` is the warning |
 | `behind` | commits on the lane's remote branch that the lane doesn't have |
-| `rebase` | what updating the lane from upstream would do: `clean`, `conflicts`, `integrated` or `empty`; `null` when there is nothing to say |
+| `rebase` | what updating the lane from upstream would do: `clean`, `conflicts`, `integrated` or `empty`; `null` when there is nothing to say, which includes right after `but pull`, when the update has already happened |
 | `landed` | the lane has landed upstream and `but pull` will remove it; its commits can't be changed |
-| `push` | `pushed`, `unpushed`, `needs-force`, `local-only`, `integrated` or `unknown` |
-| `uncommitted` | uncommitted files assigned to the lane's stack |
+| `push` | `pushed`, `unpushed`, `needs-force`, `local-only`, `integrated` or `unknown`. `needs-force` means a plain push would be refused: the lane's pushed history was rewritten, or its remote branch has commits the lane lacks (it has diverged) |
+| `uncommitted` | uncommitted files assigned to the lane's stack. GitButler's desktop app does the assigning; with the command line alone nothing gets assigned, so those changes show up under `workspace.uncommitted` instead |
 
 `workspace.behind` is how many commits the target branch has that the workspace doesn't, which
 is what `but pull` would bring in; `workspace.uncommitted` counts changes no lane owns yet.
+
+**These are as of the last fetch.** `but status` reads remote-tracking refs and never fetches,
+and neither does `kanstack status`, so `behind`, `landed`, `rebase` and `workspace.behind`
+only change once something fetches (`but pull --check` fetches and changes nothing else).
+`workspace.fetched` is when that last happened, so a consumer can judge how stale they might
+be; it is `null` if the workspace never fetched. A landed lane is only visible between a fetch
+and the `but pull` that removes it, after which its `lane` is `null`.
+
 `lane` and `workspace` are `null` when `but` can't be reached, and `lane` alone is `null` for
-a branch that is no longer in the workspace. Reading them costs one `but status` call.
+a branch that is no longer in the workspace. Reading them costs one `but status -u` call, a few
+tens of milliseconds more than plain `but status`; `-u` is the only way `but` fills in
+`rebase`. Every value above was read from a real capture, from a scratch repository driven into
+each state (`tests/fixtures/status_lane_*.json`), except the assigned-files count, which this
+`but` cannot produce from the command line and is hand-set in its test.
 
 Unlike the table, `--json` works outside cmux, tmux and Orca, and when the multiplexer can't
 be reached: it still lists every workstream, with `unknown` for those that have a pane. An

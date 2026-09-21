@@ -273,6 +273,15 @@ impl But {
         parse_status(&raw)
     }
 
+    /// [`Self::status`] with `-u`, the only way `but` fills in each branch's `mergeStatus`
+    /// (what updating it from upstream would do) and the workspace's `upstreamCommits`.
+    /// Without the flag both are simply absent — checked against `but` 0.22.0 — so anything
+    /// that wants them asks here, and the board's own refresh stays as it was.
+    pub fn status_with_upstream(&self) -> Result<WorkspaceStatus> {
+        let raw = self.run(&["status", "-f", "--json", "-u"])?;
+        parse_status(&raw)
+    }
+
     // 0.22.1 added `--status-after`, which folds a mutation and its resulting workspace
     // status into one call (`{"result":…,"status":…}`) instead of two. Tempting, but
     // deliberately *not* used here: verified live against 0.22.3, the status it appends is
