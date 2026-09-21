@@ -525,18 +525,14 @@ impl Board {
         Board {
             columns,
             base_short_id: s.merge_base.short_id().to_string(),
-            // `but status`'s own `behind` count is observed to stick at its pre-merge value
-            // after a land/pull folds those very commits into the merge base — verified live
-            // against 0.22.0: `upstreamState.latestCommit` matches `mergeBase` exactly, yet
-            // `behind` still reports the count from before that merge. When the two commit
-            // ids agree there is by definition nothing left unintegrated, so that case
-            // overrides the raw count rather than showing a "still behind" that no amount of
-            // re-pulling can clear.
-            behind: if s.upstream_state.latest_commit.commit_id == s.merge_base.commit_id {
-                0
-            } else {
-                s.upstream_state.behind
-            },
+            // Passed through as reported. `mergeBase` is read from GitButler's recorded target,
+            // while `behind` is measured from where the workspace commit really sits, and the
+            // two can disagree: a land that empties the workspace was observed (0.22.0) to
+            // advance the target without moving the workspace commit, leaving `mergeBase`
+            // equal to `upstreamState.latestCommit` with `behind` still 12. That count is the
+            // truth — the workspace is stale and `but pull` clears it (verified on a copy of
+            // the repo in exactly that state) — so it must not be clamped away.
+            behind: s.upstream_state.behind,
             conflicted_files: s.conflicted_files.clone(),
         }
     }
@@ -641,16 +637,16 @@ mod tests {
     }
 
     #[test]
-    fn behind_count_is_clamped_to_zero_once_upstream_matches_the_merge_base() {
-        // Reproduces a live `but` 0.22.0 bug: after a land/pull folds upstream's commits
-        // into the merge base, `upstreamState.latestCommit` catches up to match it, but
-        // `upstreamState.behind` is observed to keep reporting the pre-merge count — no
-        // further pull ever clears it, since there is nothing left to fetch.
+    fn behind_count_survives_a_recorded_target_that_already_matches_upstream() {
+        // The stale-workspace state: the recorded target (`mergeBase`) has been advanced to
+        // upstream's tip but the workspace commit was left on the old base, so `behind`
+        // still counts the commits the workspace is missing. Hiding it made `but pull`
+        // look unnecessary while new lanes were still being cut from the old base.
         let mut status = sample();
-        status.upstream_state.behind = 2;
+        status.upstream_state.behind = 12;
         status.upstream_state.latest_commit = status.merge_base.clone();
         let b = Board::from_status(&status);
-        assert_eq!(b.behind, 0);
+        assert_eq!(b.behind, 12);
     }
 
     #[test]
