@@ -19,7 +19,7 @@ use crate::harness::HarnessConfig;
 use crate::mux::{configured_directions, normalize_direction, Multiplexer, OpenRequest};
 use crate::orca::Orca;
 use crate::pane_status::PaneStatus;
-use crate::procs::{record_pid_prefix, tracking_applies, Pids};
+use crate::procs::{reading_from_pid, real_ps, record_pid_prefix, tracking_applies, Pids, PsReader, PsRow};
 use crate::report::{Reports, Said};
 use crate::tmux::Tmux;
 
@@ -34,14 +34,15 @@ const CORROBORATION_GRACE: Duration = Duration::from_secs(20);
 const QUIET_CONFIRMATIONS: usize = 2;
 const QUIET_GAP: Duration = Duration::from_millis(1200);
 
-/// A lane's status from the multiplexer's reading of its pane (`native`) and what its agent
-/// last said about itself (`said`). `None` means neither has news, and the caller keeps what
-/// it knew.
+/// A lane's status from what can be seen of its pane from outside (`native`: the multiplexer's
+/// reading, or failing that the process table's — see [`Splitter::native_readings`]) and what
+/// its agent last said about itself (`said`). `None` means neither has news, and the caller
+/// keeps what it knew.
 ///
-/// - A pane the multiplexer says is gone is `Dead`, whatever was reported: a crashed agent
-///   can't have said it stopped.
+/// - A pane that is gone is `Dead`, whatever was reported: a crashed agent can't have said it
+///   stopped.
 /// - Otherwise a fresh report wins. It comes from the harness itself, where the multiplexer
-///   only infers from CPU, or from nothing at all.
+///   (or the process table) only infers from CPU, or from nothing at all.
 /// - A report that has run out is worth nothing, and must not leave the last thing it said
 ///   standing: where no multiplexer can contradict it, an agent that never said it had
 ///   stopped would read `busy` forever. It is `Unknown` unless the multiplexer knows better.
@@ -74,6 +75,21 @@ fn stale_busy_suspect(native: Option<PaneStatus>, said: Option<Said>) -> Option<
     match (native, said) {
         (Some(PaneStatus::Idle), Some(Said::Fresh { status: PaneStatus::Busy, age, at })) if age >= CORROBORATION_GRACE => Some(at),
         _ => None,
+    }
+}
+
+/// The process table for one call of [`Splitter::native_readings`]: read the first time a pane
+/// needs it and never again within that call, and read as `None` if `ps` failed — the panes
+/// that needed it then have no reading, and it isn't retried for each of them.
+struct ProcessTable<'a> {
+    read: &'a PsReader,
+    rows: Option<Option<Vec<PsRow>>>,
+}
+
+impl ProcessTable<'_> {
+    fn rows(&mut self) -> Option<&[PsRow]> {
+        let read = self.read;
+        self.rows.get_or_insert_with(|| read().ok()).as_deref()
     }
 }
 
@@ -151,6 +167,9 @@ pub struct Splitter {
     /// `KANSTACK_TRACK_PIDS` as it was when this splitter was made, so what a splitter does
     /// doesn't change under a test that sets it for another.
     track_setting: Option<String>,
+    /// Where the process table comes from, for a pane whose process is tracked: `ps`, except
+    /// in a test.
+    ps: PsReader,
     /// How long to wait between the looks that confirm a pane is really quiet.
     quiet_gap: Duration,
 }
@@ -170,6 +189,7 @@ impl Splitter {
             reports: Reports::default(),
             pids: Pids::default(),
             track_setting: std::env::var("KANSTACK_TRACK_PIDS").ok(),
+            ps: real_ps(),
             quiet_gap: QUIET_GAP,
         }
     }
@@ -293,6 +313,13 @@ impl Splitter {
         Ok(id)
     }
 
+    /// Stands in for `ps`, so what a test reads from the process table doesn't depend on what is
+    /// running.
+    #[cfg(test)]
+    fn set_process_table(&mut self, read: PsReader) {
+        self.ps = read;
+    }
+
     /// Where to read what agents report about themselves. Without it, statuses come from the
     /// multiplexer alone.
     pub fn set_reports(&mut self, reports: Reports) {
@@ -374,15 +401,15 @@ impl Splitter {
         self.mux.type_line(&self.pane(branch)?.id, text).map_err(|e| anyhow!("{branch}: {e:#}"))
     }
 
-    /// Re-derives the status of every tracked pane, keyed by branch, from two sources: the
-    /// multiplexer's own reading of the pane, and what the agent in it last said about itself
-    /// (see `crate::report`).
+    /// Re-derives the status of every tracked pane, keyed by branch, from what the multiplexer
+    /// (and, for a pane whose process kanstack tracks, the process table — see
+    /// [`Self::native_readings`]) says about the pane, and what the agent in it last said about
+    /// itself (see `crate::report`).
     ///
-    /// A pane the multiplexer says is gone is `Dead`, whatever the agent last said — a
-    /// crashed one can't have said it stopped. Otherwise a fresh report wins: it comes from
-    /// the harness itself, where the multiplexer only infers from CPU, or from nothing at
-    /// all. Otherwise the multiplexer's reading stands. A pane with neither is left out, so
-    /// [`Self::apply_statuses`] keeps what was known.
+    /// A pane that is gone is `Dead`, whatever the agent last said — a crashed one can't have
+    /// said it stopped. Otherwise a fresh report wins: it comes from the harness itself, where
+    /// the other two only infer from CPU, or from nothing at all. Otherwise the reading stands.
+    /// A pane with neither is left out, so [`Self::apply_statuses`] keeps what was known.
     ///
     /// Read-only — safe to call from a background thread against a cloned snapshot.
     pub fn poll_statuses(&self) -> Result<HashMap<String, PaneStatus>> {
@@ -393,9 +420,9 @@ impl Splitter {
         if self.panes.is_empty() {
             return Ok(HashMap::new());
         }
-        let ids: Vec<&str> = self.panes.values().map(|p| p.id.as_str()).collect();
-        let by_pane = match self.mux.probe(&ids) {
-            Ok(by_pane) => by_pane,
+        let panes: Vec<(&str, &str)> = self.panes.iter().map(|(branch, pane)| (branch.as_str(), pane.id.as_str())).collect();
+        let native = match self.native_readings(&panes) {
+            Ok(native) => native,
             // The multiplexer couldn't be read — no server, a permission refused — but what
             // agents said about themselves is still good. Only whether a pane is gone is
             // unknowable, so that is all that is lost. The error surfaces only when there is
@@ -408,7 +435,7 @@ impl Splitter {
         let mut statuses: HashMap<String, PaneStatus> = HashMap::new();
         let mut suspects: Vec<(&str, &str, u64)> = Vec::new(); // (branch, pane id, report second)
         for (branch, pane) in &self.panes {
-            let native = by_pane.get(&pane.id).copied();
+            let native = native.get(branch).copied();
             let said = self.reports.said(branch, now);
             if let Some(at) = stale_busy_suspect(native, said) {
                 suspects.push((branch, &pane.id, at));
@@ -427,15 +454,58 @@ impl Splitter {
         Ok(statuses)
     }
 
+    /// What can be seen of each of `panes` (branch, pane id) from outside the agent, keyed by
+    /// branch — the `native` reading [`merge`] takes. The one place it is derived, so the poll
+    /// and the looks that confirm a quiet pane (see [`Self::confirmed_quiet`]) can't disagree
+    /// about what counts.
+    ///
+    /// Two tiers. The multiplexer's own probe comes first: a pane it says is `Dead`, `Busy` or
+    /// `Idle` is that. Where it has no reading — Ghostty can only say a pane exists — and the
+    /// pane's process is tracked (see [`Self::tracks_pids`]) and its shell has recorded its pid,
+    /// the process table answers instead: [`reading_from_pid`]. A tracked pane without a pid
+    /// yet has no reading at all, and is left out. The table is read at most once per call, and
+    /// not at all when no pane needs it. It can fail without failing the call: those panes
+    /// simply have no reading, which the callers already treat as "no news".
+    ///
+    /// Fails only if the multiplexer can't be probed.
+    fn native_readings(&self, panes: &[(&str, &str)]) -> Result<HashMap<String, PaneStatus>> {
+        let ids: Vec<&str> = panes.iter().map(|(_, id)| *id).collect();
+        let probed = self.mux.probe(&ids)?;
+        let mut table = ProcessTable { read: &self.ps, rows: None };
+        let mut readings = HashMap::new();
+        for (branch, id) in panes {
+            let reading = match probed.get(*id).copied() {
+                Some(status @ (PaneStatus::Dead | PaneStatus::Busy | PaneStatus::Idle)) => Some(status),
+                other => self.reading_from_recorded_pid(branch, &mut table).or(other),
+            };
+            if let Some(status) = reading {
+                readings.insert(branch.to_string(), status);
+            }
+        }
+        Ok(readings)
+    }
+
+    /// The process table's reading of `branch`'s pane: `None` unless its process is tracked and
+    /// its shell has recorded a pid. `table` is only read once there is a pid to look up.
+    fn reading_from_recorded_pid(&self, branch: &str, table: &mut ProcessTable<'_>) -> Option<PaneStatus> {
+        if !self.tracks_pids() {
+            return None;
+        }
+        let pid = self.pids.read(branch)?;
+        Some(reading_from_pid(pid, table.rows()?))
+    }
+
     /// Of `suspects` — panes whose `busy` report a quiet reading casts doubt on — the ones
     /// that are still quiet on every one of [`QUIET_CONFIRMATIONS`] further looks, spaced
     /// [`QUIET_GAP`] apart. A pane that shows any activity, or can't be read, keeps its report.
+    /// Each look is a full [`Self::native_readings`], so a pane whose only reading is from the
+    /// process table is confirmed by it, with a fresh read of the table each time.
     fn confirmed_quiet<'a>(&self, mut suspects: Vec<(&'a str, &str, u64)>) -> Vec<(&'a str, u64)> {
         for _ in 0..QUIET_CONFIRMATIONS {
             std::thread::sleep(self.quiet_gap);
-            let ids: Vec<&str> = suspects.iter().map(|(_, id, _)| *id).collect();
-            let Ok(now_seen) = self.mux.probe(&ids) else { return Vec::new() };
-            suspects.retain(|(_, id, _)| now_seen.get(*id) == Some(&PaneStatus::Idle));
+            let panes: Vec<(&str, &str)> = suspects.iter().map(|(branch, id, _)| (*branch, *id)).collect();
+            let Ok(seen) = self.native_readings(&panes) else { return Vec::new() };
+            suspects.retain(|(branch, _, _)| seen.get(*branch) == Some(&PaneStatus::Idle));
             if suspects.is_empty() {
                 break;
             }
@@ -1302,6 +1372,353 @@ mod tests {
         *mux.fail_open.lock().unwrap() = true;
         assert!(splitter.spawn_harness(cwd(), "feat-a", None).is_err());
         assert_eq!(pids.read("feat-a"), None);
+    }
+
+    // The process table as a third source: what a multiplexer that can't say whether a pane is busy
+    // reads like, from the pid its shell recorded, against a table the test scripts.
+
+    use crate::procs::PsRow;
+    use crate::pane_status::CPU_BUSY_THRESHOLD_PERCENT;
+    use std::sync::Mutex;
+
+    /// A process table the test controls, that counts how often it was read.
+    #[derive(Default)]
+    struct FakeProcs {
+        table: Mutex<Vec<PsRow>>,
+        /// Tables for the next reads, one per call, before falling back to `table`.
+        queue: Mutex<std::collections::VecDeque<Vec<PsRow>>>,
+        reads: Mutex<u32>,
+        /// Makes every read after this many fail.
+        fail_after: Mutex<Option<u32>>,
+    }
+
+    impl FakeProcs {
+        fn set(&self, table: Vec<PsRow>) {
+            *self.table.lock().unwrap() = table;
+        }
+
+        fn reads(&self) -> u32 {
+            *self.reads.lock().unwrap()
+        }
+
+        fn reader(self: &Arc<Self>) -> crate::procs::PsReader {
+            let this = self.clone();
+            Arc::new(move || {
+                let n = {
+                    let mut reads = this.reads.lock().unwrap();
+                    *reads += 1;
+                    *reads
+                };
+                if this.fail_after.lock().unwrap().is_some_and(|after| n > after) {
+                    anyhow::bail!("fake ps failed");
+                }
+                Ok(this.queue.lock().unwrap().pop_front().unwrap_or_else(|| this.table.lock().unwrap().clone()))
+            })
+        }
+    }
+
+    /// The shell of `feat-a`'s pane, as `ps` lists it.
+    const SHELL: u32 = 100;
+
+    fn shell_using(cpu: f64) -> Vec<PsRow> {
+        vec![(1, 0, 0.0), (SHELL, 1, cpu)]
+    }
+
+    struct Tracked {
+        splitter: Splitter,
+        mux: Arc<FakeMux>,
+        procs: Arc<FakeProcs>,
+        pids: Pids,
+        reports: Reports,
+    }
+
+    /// A splitter over a multiplexer that has no reading of its own and asks for tracking, with one
+    /// lane, `feat-a`, whose shell (pid [`SHELL`]) has recorded itself and is using no CPU.
+    fn tracked_lane(tag: &str) -> Tracked {
+        let (mut splitter, mux, pids) = splitter_tracking(&format!("procs-{tag}"), true, None);
+        let dir = std::env::temp_dir().join(format!("kanstack-splitter-procs-reports-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let reports = Reports::in_dir(dir);
+        splitter.set_reports(reports.clone());
+        let procs = Arc::new(FakeProcs::default());
+        procs.set(shell_using(0.0));
+        splitter.set_process_table(procs.reader());
+        splitter.quiet_gap = Duration::ZERO;
+        splitter.spawn_harness(cwd(), "feat-a", None).unwrap();
+        std::fs::write(pids.prepare("feat-a").unwrap().unwrap(), SHELL.to_string()).unwrap();
+        Tracked { splitter, mux, procs, pids, reports }
+    }
+
+    /// A shell that has exited is not in the table. On a multiplexer that keeps a finished pane
+    /// listed, this is the only way the pane is ever noticed to be over.
+    #[test]
+    fn a_recorded_shell_that_is_gone_from_the_process_table_reads_dead() {
+        let t = tracked_lane("gone");
+        t.procs.set(vec![(1, 0, 0.0), (999, 1, 50.0)]);
+        assert_eq!(polled(&t.splitter, SystemTime::now()), Some(PaneStatus::Dead));
+    }
+
+    #[test]
+    fn a_recorded_shell_that_is_present_reads_idle_or_busy_by_its_subtrees_cpu() {
+        let t = tracked_lane("cpu");
+        let now = SystemTime::now();
+        assert_eq!(polled(&t.splitter, now), Some(PaneStatus::Idle));
+        t.procs.set(shell_using(60.0));
+        assert_eq!(polled(&t.splitter, now), Some(PaneStatus::Busy));
+        // The shell itself is quiet; the harness under it is not, and so is what it runs.
+        t.procs.set(vec![(1, 0, 0.0), (SHELL, 1, 0.0), (200, SHELL, 0.2), (300, 200, 45.0)]);
+        assert_eq!(polled(&t.splitter, now), Some(PaneStatus::Busy));
+        // Busy elsewhere is not busy here.
+        t.procs.set(vec![(1, 0, 90.0), (SHELL, 1, 0.5), (999, 1, 90.0)]);
+        assert_eq!(polled(&t.splitter, now), Some(PaneStatus::Idle));
+    }
+
+    /// "Above" the threshold, as the multiplexers that measure CPU themselves have it: exactly at
+    /// it is still idle.
+    #[test]
+    fn the_cpu_threshold_is_exclusive() {
+        let t = tracked_lane("boundary");
+        let now = SystemTime::now();
+        t.procs.set(shell_using(CPU_BUSY_THRESHOLD_PERCENT));
+        assert_eq!(polled(&t.splitter, now), Some(PaneStatus::Idle), "at the threshold");
+        t.procs.set(shell_using(CPU_BUSY_THRESHOLD_PERCENT + 0.1));
+        assert_eq!(polled(&t.splitter, now), Some(PaneStatus::Busy), "just above it");
+        t.procs.set(shell_using(CPU_BUSY_THRESHOLD_PERCENT - 0.1));
+        assert_eq!(polled(&t.splitter, now), Some(PaneStatus::Idle), "just below it");
+    }
+
+    /// The shell writes its pid a moment after the pane opens. Until it has, nothing is known, and
+    /// the table isn't read for a pane it can't look up.
+    #[test]
+    fn a_tracked_pane_with_no_pid_recorded_has_no_reading_and_costs_no_ps() {
+        let t = tracked_lane("no-pid");
+        t.pids.forget("feat-a");
+        assert_eq!(polled(&t.splitter, SystemTime::now()), None);
+        assert_eq!(t.procs.reads(), 0);
+    }
+
+    /// The multiplexer measures CPU itself where it can, and a reading of its own is not
+    /// second-guessed by a guess from `ps`.
+    #[test]
+    fn the_multiplexers_own_busy_or_idle_reading_wins_over_the_pid_reading() {
+        let t = tracked_lane("probe-wins");
+        let now = SystemTime::now();
+        t.procs.set(shell_using(60.0));
+        t.mux.statuses.lock().unwrap().insert("p1".to_string(), PaneStatus::Idle);
+        assert_eq!(polled(&t.splitter, now), Some(PaneStatus::Idle));
+        t.procs.set(shell_using(0.0));
+        t.mux.statuses.lock().unwrap().insert("p1".to_string(), PaneStatus::Busy);
+        assert_eq!(polled(&t.splitter, now), Some(PaneStatus::Busy));
+        assert_eq!(t.procs.reads(), 0, "nothing needed the table");
+    }
+
+    #[test]
+    fn a_pane_the_multiplexer_says_is_gone_is_dead_whatever_the_process_table_says() {
+        let t = tracked_lane("probe-dead");
+        let now = SystemTime::now();
+        t.procs.set(shell_using(60.0));
+        t.reports.write("feat-a", Reported::Busy, now).unwrap();
+        t.mux.statuses.lock().unwrap().insert("p1".to_string(), PaneStatus::Dead);
+        assert_eq!(polled(&t.splitter, now), Some(PaneStatus::Dead));
+        assert_eq!(t.procs.reads(), 0);
+    }
+
+    /// A shell that is gone can't have said it stopped either.
+    #[test]
+    fn a_recorded_shell_that_is_gone_is_dead_whatever_the_agent_last_said() {
+        let t = tracked_lane("gone-said");
+        let now = SystemTime::now();
+        t.reports.write("feat-a", Reported::Busy, now).unwrap();
+        t.procs.set(vec![(1, 0, 0.0)]);
+        assert_eq!(polled(&t.splitter, now), Some(PaneStatus::Dead));
+    }
+
+    /// The pid reading is a guess from CPU, the same as a multiplexer's, so it ranks where that
+    /// does: under what the agent says.
+    #[test]
+    fn a_fresh_report_wins_over_the_pid_reading_and_a_stale_one_gives_way_to_it() {
+        let t = tracked_lane("said");
+        let then = SystemTime::now();
+        t.reports.write("feat-a", Reported::Waiting, then).unwrap();
+        t.procs.set(shell_using(60.0));
+        assert_eq!(polled(&t.splitter, then), Some(PaneStatus::Waiting));
+        t.reports.write("feat-a", Reported::Idle, then).unwrap();
+        assert_eq!(polled(&t.splitter, then), Some(PaneStatus::Idle), "not busy, despite the CPU");
+        let later = then + FRESH_FOR + Duration::from_secs(1);
+        assert_eq!(polled(&t.splitter, later), Some(PaneStatus::Busy), "expired: the table is all there is");
+        t.procs.set(shell_using(0.0));
+        assert_eq!(polled(&t.splitter, later), Some(PaneStatus::Idle));
+    }
+
+    /// One `ps` for the whole poll, however many panes need it.
+    #[test]
+    fn the_process_table_is_read_once_per_poll_however_many_panes_need_it() {
+        let mut t = tracked_lane("once");
+        t.splitter.spawn_harness(cwd(), "feat-b", None).unwrap();
+        t.splitter.spawn_harness(cwd(), "feat-c", None).unwrap();
+        for (branch, pid) in [("feat-b", 101), ("feat-c", 102)] {
+            std::fs::write(t.pids.prepare(branch).unwrap().unwrap(), pid.to_string()).unwrap();
+        }
+        t.procs.set(vec![(SHELL, 1, 0.0), (101, 1, 80.0)]);
+        let polled = t.splitter.poll_statuses_at(SystemTime::now()).unwrap();
+        assert_eq!(
+            polled,
+            HashMap::from([
+                ("feat-a".to_string(), PaneStatus::Idle),
+                ("feat-b".to_string(), PaneStatus::Busy),
+                ("feat-c".to_string(), PaneStatus::Dead),
+            ])
+        );
+        assert_eq!(t.procs.reads(), 1);
+        assert_eq!(*t.mux.probes.lock().unwrap(), 1);
+    }
+
+    /// Only the panes that the multiplexer had nothing for need the table, and if there are none
+    /// it is not read.
+    #[test]
+    fn a_pane_with_its_own_reading_beside_one_without_still_costs_one_read() {
+        let mut t = tracked_lane("mixed");
+        t.splitter.spawn_harness(cwd(), "feat-b", None).unwrap();
+        std::fs::write(t.pids.prepare("feat-b").unwrap().unwrap(), "101").unwrap();
+        t.mux.statuses.lock().unwrap().insert("p2".to_string(), PaneStatus::Idle);
+        t.procs.set(vec![(SHELL, 1, 80.0), (101, 1, 80.0)]);
+        let polled = t.splitter.poll_statuses_at(SystemTime::now()).unwrap();
+        assert_eq!(polled["feat-a"], PaneStatus::Busy, "from the table");
+        assert_eq!(polled["feat-b"], PaneStatus::Idle, "from the multiplexer, which is believed");
+        assert_eq!(t.procs.reads(), 1);
+    }
+
+    /// For a multiplexer that reports for itself nothing changes: a pid file left over from a
+    /// time tracking was on is not looked at, and `ps` is not run.
+    #[test]
+    fn with_tracking_off_the_pid_file_and_the_process_table_are_ignored() {
+        let (mut splitter, mux, pids) = splitter_tracking("procs-off", false, None);
+        let procs = Arc::new(FakeProcs::default());
+        procs.set(shell_using(60.0));
+        splitter.set_process_table(procs.reader());
+        splitter.spawn_harness(cwd(), "feat-a", None).unwrap();
+        std::fs::write(pids.prepare("feat-a").unwrap().unwrap(), SHELL.to_string()).unwrap();
+        assert_eq!(polled(&splitter, SystemTime::now()), None, "no news is still no news");
+        mux.statuses.lock().unwrap().insert("p1".to_string(), PaneStatus::Idle);
+        assert_eq!(polled(&splitter, SystemTime::now()), Some(PaneStatus::Idle));
+        assert_eq!(procs.reads(), 0);
+    }
+
+    /// The setting can turn the pid tier on for a multiplexer that reports for itself, and off for
+    /// one that doesn't.
+    #[test]
+    fn the_setting_governs_the_pid_reading_as_it_governs_the_launch_line() {
+        for (mux_asks, setting, reads) in [(false, Some("1"), true), (true, Some("0"), false), (true, None, true)] {
+            let (mut splitter, _mux, pids) = splitter_tracking("procs-setting", mux_asks, setting);
+            let procs = Arc::new(FakeProcs::default());
+            procs.set(shell_using(0.0));
+            splitter.set_process_table(procs.reader());
+            splitter.spawn_harness(cwd(), "feat-a", None).unwrap();
+            std::fs::write(pids.prepare("feat-a").unwrap().unwrap(), SHELL.to_string()).unwrap();
+            let expected = reads.then_some(PaneStatus::Idle);
+            assert_eq!(polled(&splitter, SystemTime::now()), expected, "mux asks {mux_asks}, setting {setting:?}");
+        }
+    }
+
+    /// `ps` failing is not evidence of anything: the pane has no reading, and is not called dead.
+    #[test]
+    fn a_failed_ps_leaves_a_tracked_pane_with_no_reading_rather_than_dead() {
+        let t = tracked_lane("ps-fails");
+        *t.procs.fail_after.lock().unwrap() = Some(0);
+        assert_eq!(polled(&t.splitter, SystemTime::now()), None);
+        t.reports.write("feat-a", Reported::Busy, SystemTime::now()).unwrap();
+        assert_eq!(polled(&t.splitter, SystemTime::now()), Some(PaneStatus::Busy), "reports are unaffected");
+    }
+
+    // Corroboration, from the process table alone: an interrupted turn on a multiplexer that
+    // can't say the pane is quiet.
+
+    /// A tracked lane whose agent said `busy` a minute ago, whose shell is using no CPU and whose
+    /// multiplexer has nothing to say.
+    fn quiet_shell_with_an_old_busy_report(tag: &str) -> (Tracked, SystemTime) {
+        let t = tracked_lane(tag);
+        let said = SystemTime::now();
+        t.reports.write("feat-a", Reported::Busy, said).unwrap();
+        (t, said + Duration::from_secs(60))
+    }
+
+    /// The same as `a_pane_that_stays_quiet_retracts_an_old_busy_report_and_it_stays_retracted`,
+    /// with the quiet coming from the process table at every look.
+    #[test]
+    fn a_shell_that_stays_quiet_retracts_an_old_busy_report_and_it_stays_retracted() {
+        let (t, later) = quiet_shell_with_an_old_busy_report("retract");
+        assert_eq!(polled(&t.splitter, later), Some(PaneStatus::Idle));
+        assert_eq!(t.procs.reads(), 1 + QUIET_CONFIRMATIONS as u32, "one look, then each confirmation, each its own read");
+        assert_eq!(*t.mux.probes.lock().unwrap(), 1 + QUIET_CONFIRMATIONS as u32);
+        assert_eq!(t.reports.status("feat-a", later), Some(PaneStatus::Idle), "written back as an idle report");
+
+        // A later blip of CPU can't bring the stale busy back.
+        t.procs.set(shell_using(60.0));
+        assert_eq!(polled(&t.splitter, later + Duration::from_secs(1)), Some(PaneStatus::Idle));
+    }
+
+    #[test]
+    fn a_shell_that_shows_cpu_at_any_confirming_look_keeps_its_busy_report() {
+        for blip_at in 0..QUIET_CONFIRMATIONS {
+            let (t, later) = quiet_shell_with_an_old_busy_report("blip");
+            let mut script: Vec<_> = (0..1 + QUIET_CONFIRMATIONS).map(|_| shell_using(0.0)).collect();
+            script[1 + blip_at] = shell_using(60.0); // the poll's own look is first
+            *t.procs.queue.lock().unwrap() = script.into();
+            assert_eq!(polled(&t.splitter, later), Some(PaneStatus::Busy), "CPU at confirmation {}", blip_at + 1);
+            assert!(matches!(t.reports.said("feat-a", later), Some(Said::Fresh { status: PaneStatus::Busy, .. })), "untouched");
+        }
+    }
+
+    /// A look that can't be made confirms nothing.
+    #[test]
+    fn a_shell_that_cannot_be_read_while_confirming_keeps_its_busy_report() {
+        let (t, later) = quiet_shell_with_an_old_busy_report("ps-fails-confirming");
+        *t.procs.fail_after.lock().unwrap() = Some(1);
+        assert_eq!(polled(&t.splitter, later), Some(PaneStatus::Busy));
+        assert!(matches!(t.reports.said("feat-a", later), Some(Said::Fresh { status: PaneStatus::Busy, .. })));
+        assert_eq!(t.procs.reads(), 2, "the poll, then the one failed confirmation");
+    }
+
+    /// A shell that has gone during confirmation is not quiet, it is dead: the report stands (the
+    /// next poll says dead), rather than being overwritten with `idle`.
+    #[test]
+    fn a_shell_that_disappears_while_confirming_is_not_retracted_to_idle() {
+        let (t, later) = quiet_shell_with_an_old_busy_report("vanishes");
+        *t.procs.queue.lock().unwrap() = vec![shell_using(0.0), vec![(1, 0, 0.0)]].into();
+        assert_eq!(polled(&t.splitter, later), Some(PaneStatus::Busy));
+        assert!(matches!(t.reports.said("feat-a", later), Some(Said::Fresh { status: PaneStatus::Busy, .. })));
+        t.procs.set(vec![(1, 0, 0.0)]);
+        assert_eq!(polled(&t.splitter, later), Some(PaneStatus::Dead));
+    }
+
+    /// The multiplexer's reading lags, and the process table is no better: a recent report is left
+    /// alone and costs one read.
+    #[test]
+    fn a_recent_busy_report_over_a_quiet_shell_is_left_alone() {
+        let (t, _) = quiet_shell_with_an_old_busy_report("recent");
+        let soon = SystemTime::now() + Duration::from_secs(5);
+        assert_eq!(polled(&t.splitter, soon), Some(PaneStatus::Busy));
+        assert_eq!(t.procs.reads(), 1);
+    }
+
+    /// A busy shell is what the report said: nothing to doubt, no extra looks.
+    #[test]
+    fn a_busy_report_over_a_busy_shell_is_not_a_suspect() {
+        let (t, later) = quiet_shell_with_an_old_busy_report("agree");
+        t.procs.set(shell_using(60.0));
+        assert_eq!(polled(&t.splitter, later), Some(PaneStatus::Busy));
+        assert_eq!(t.procs.reads(), 1);
+        assert_eq!(*t.mux.probes.lock().unwrap(), 1);
+    }
+
+    /// The other tier is unchanged: a probe reading of its own is what confirms.
+    #[test]
+    fn corroboration_still_uses_the_multiplexers_reading_where_it_has_one() {
+        let (t, later) = quiet_shell_with_an_old_busy_report("probe-confirms");
+        t.procs.set(shell_using(60.0)); // would say busy, if it were asked
+        t.mux.statuses.lock().unwrap().insert("p1".to_string(), PaneStatus::Idle);
+        assert_eq!(polled(&t.splitter, later), Some(PaneStatus::Idle));
+        assert_eq!(t.procs.reads(), 0);
     }
 
     // The backend list is the one place backends are named. What can't be generated from it —

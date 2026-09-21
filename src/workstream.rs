@@ -306,6 +306,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Reports and pids are both one-file-per-branch directories in the state directory, keyed by
+    /// the repository, so each repository's are its own.
+    #[test]
+    fn reports_and_pids_live_in_sibling_directories_keyed_by_the_repository() {
+        let _guard = crate::SPLIT_BACKEND_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("KANSTACK_STATE_PATH", "/state");
+        let (reports, pids) = (reports_dir(Path::new("/repo/a")).unwrap(), pids_dir(Path::new("/repo/a")).unwrap());
+        assert_eq!(reports.parent(), Some(Path::new("/state")));
+        assert_eq!(pids.parent(), Some(Path::new("/state")));
+        assert_eq!(
+            reports.file_name().unwrap().to_string_lossy().strip_prefix("reports-"),
+            pids.file_name().unwrap().to_string_lossy().strip_prefix("pids-"),
+            "the same key: {reports:?} {pids:?}"
+        );
+        assert_ne!(pids, pids_dir(Path::new("/repo/b")).unwrap());
+        std::env::remove_var("KANSTACK_STATE_PATH");
+    }
+
+    /// The subcommands seed a fresh splitter from the registry, and the pid directory has to come
+    /// with it or a pane they spawn would never record its shell.
+    #[test]
+    fn adopting_into_a_splitter_hands_it_the_repositorys_pid_directory() {
+        use crate::harness::HarnessConfig;
+        use crate::mux::fake::FakeMux;
+        let _guard = crate::SPLIT_BACKEND_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("kanstack-workstream-pids-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("KANSTACK_STATE_PATH", &dir);
+        std::env::set_var("KANSTACK_TRACK_PIDS", "1");
+
+        let mux = FakeMux::new();
+        let mut splitter = Splitter::new(mux.clone(), HarnessConfig::new("claude"));
+        Registry::load(Path::new("/repo/a")).unwrap().adopt_into(&mut splitter);
+        splitter.spawn_harness(Path::new("/repo/a"), "feat-a", None).unwrap();
+        let line = mux.lines().remove(0);
+        let expected = pids_dir(Path::new("/repo/a")).unwrap();
+        assert!(line.contains(&format!("'{}/", expected.display())), "{line}");
+        assert!(expected.is_dir(), "made before the pane's shell writes into it");
+
+        std::env::remove_var("KANSTACK_TRACK_PIDS");
+        std::env::remove_var("KANSTACK_STATE_PATH");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_corrupt_registry_is_an_error_not_a_silent_reset() {
         let _guard = crate::SPLIT_BACKEND_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());

@@ -13,6 +13,7 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 
 use crate::harness_launch::shell_quote;
+use crate::pane_status::{PaneStatus, CPU_BUSY_THRESHOLD_PERCENT};
 use crate::workstream::{fnv1a, pids_dir};
 
 /// One row of `ps -A -o pid=,ppid=,pcpu=` output: a process, its parent, and its CPU%.
@@ -66,6 +67,23 @@ pub fn subtree_cpu(root_pid: u32, table: &[PsRow]) -> f64 {
 /// an entry (a zombie awaiting its parent's `wait` does, and so reads as present).
 pub fn pid_present(pid: u32, table: &[PsRow]) -> bool {
     table.iter().any(|&(row_pid, _, _)| row_pid == pid)
+}
+
+/// What the process table says about a pane whose shell recorded `pid`: `Dead` if that shell
+/// is gone from it, otherwise `Busy` when the shell and everything under it together use more
+/// than [`CPU_BUSY_THRESHOLD_PERCENT`], else `Idle`.
+///
+/// It is the pane's *shell* that is followed, not the harness: on a multiplexer whose panes end
+/// with the harness there is no difference, but where the shell outlives it a harness that has
+/// finished reads `Idle`, not `Dead`.
+pub fn reading_from_pid(pid: u32, table: &[PsRow]) -> PaneStatus {
+    if !pid_present(pid, table) {
+        PaneStatus::Dead
+    } else if subtree_cpu(pid, table) > CPU_BUSY_THRESHOLD_PERCENT {
+        PaneStatus::Busy
+    } else {
+        PaneStatus::Idle
+    }
 }
 
 /// Where a [`crate::splitter::Splitter`] gets the process table. The real one runs `ps`; a
@@ -312,5 +330,17 @@ mod tests {
             .unwrap();
         assert!(!out.status.success());
         assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    }
+
+    /// The three readings, and what each is made of.
+    #[test]
+    fn a_pid_reads_dead_when_absent_and_otherwise_busy_above_the_threshold_and_idle_at_or_below() {
+        let table = vec![(100, 1, 0.0), (200, 100, CPU_BUSY_THRESHOLD_PERCENT)];
+        assert_eq!(reading_from_pid(100, &table), PaneStatus::Idle, "exactly the threshold");
+        let table = vec![(100, 1, 0.0), (200, 100, CPU_BUSY_THRESHOLD_PERCENT + 0.01)];
+        assert_eq!(reading_from_pid(100, &table), PaneStatus::Busy, "the child's CPU counts");
+        assert_eq!(reading_from_pid(200, &table), PaneStatus::Busy);
+        assert_eq!(reading_from_pid(300, &table), PaneStatus::Dead);
+        assert_eq!(reading_from_pid(100, &[]), PaneStatus::Dead, "an empty table has no shell in it");
     }
 }
