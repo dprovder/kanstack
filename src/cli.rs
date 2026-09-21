@@ -15,6 +15,7 @@ use anyhow::{bail, Result};
 use serde::Serialize;
 
 use crate::but::But;
+use crate::model::{BranchStatus, MergeStatus, WorkspaceStatus};
 use crate::pane_status::PaneStatus;
 use crate::report::{Reported, Reports};
 use crate::splitter::Splitter;
@@ -188,6 +189,8 @@ pub const STATUS_SCHEMA: u32 = 1;
 struct StatusReport {
     schema: u32,
     workstreams: Vec<WorkstreamReport>,
+    /// The workspace as a whole. `null` when `but` could not be reached.
+    workspace: Option<WorkspaceReport>,
 }
 
 #[derive(Debug, Serialize)]
@@ -197,6 +200,91 @@ struct WorkstreamReport {
     agent: Option<String>,
     item: Option<String>,
     status: ReportStatus,
+    /// The lane's git state. `null` when `but` could not be reached, or the branch is not in
+    /// the workspace (deleted, or unapplied).
+    lane: Option<LaneReport>,
+}
+
+/// The state of the workspace itself, for an agent deciding whether to pull.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct WorkspaceReport {
+    /// How many commits the target branch has that the workspace doesn't: what `but pull`
+    /// would bring in.
+    behind: usize,
+    /// Changes in the working tree that no lane owns yet.
+    uncommitted: usize,
+}
+
+/// One lane's git state, from `but status`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct LaneReport {
+    commits: usize,
+    /// A commit on the lane is conflicted right now, and needs `but resolve`.
+    conflicted: bool,
+    /// Commits on the lane's remote branch that the lane doesn't have.
+    behind: usize,
+    /// What updating the lane from upstream would do; `null` when there is nothing to say.
+    rebase: Option<Rebase>,
+    /// The lane has landed upstream, and `but pull` will remove it. Commits on it can't be
+    /// changed any more.
+    landed: bool,
+    push: PushState,
+    /// Uncommitted files assigned to the lane's stack.
+    uncommitted: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum Rebase {
+    Clean,
+    /// Rebasing the lane onto upstream would conflict.
+    Conflicts,
+    Integrated,
+    Empty,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum PushState {
+    Pushed,
+    Unpushed,
+    NeedsForce,
+    LocalOnly,
+    Integrated,
+    Unknown,
+}
+
+/// `branch`'s git state in `status`, or `None` if the workspace has no such branch.
+fn lane_report(status: &WorkspaceStatus, branch: &str) -> Option<LaneReport> {
+    let (stack, lane) = status
+        .stacks
+        .iter()
+        .find_map(|stack| stack.branches.iter().find(|b| b.name == branch).map(|b| (stack, b)))?;
+    Some(LaneReport {
+        commits: lane.commits.len(),
+        conflicted: lane.commits.iter().any(|c| c.conflicted == Some(true)),
+        behind: lane.upstream_commits.len(),
+        rebase: lane.merge_status.map(|m| match m {
+            MergeStatus::Clean => Rebase::Clean,
+            MergeStatus::Conflicted { .. } => Rebase::Conflicts,
+            MergeStatus::Integrated => Rebase::Integrated,
+            MergeStatus::Empty => Rebase::Empty,
+        }),
+        landed: lane.branch_status == BranchStatus::Integrated || lane.merge_status == Some(MergeStatus::Integrated),
+        push: match lane.branch_status {
+            BranchStatus::NothingToPush => PushState::Pushed,
+            BranchStatus::UnpushedCommits => PushState::Unpushed,
+            BranchStatus::UnpushedCommitsRequiringForce => PushState::NeedsForce,
+            BranchStatus::CompletelyUnpushed => PushState::LocalOnly,
+            BranchStatus::Integrated => PushState::Integrated,
+            BranchStatus::Unknown => PushState::Unknown,
+        },
+        uncommitted: stack.assigned_changes.len(),
+    })
+}
+
+fn workspace_report(status: &WorkspaceStatus) -> WorkspaceReport {
+    WorkspaceReport { behind: status.upstream_state.behind, uncommitted: status.uncommitted_changes.len() }
 }
 
 /// [`PaneStatus`] plus `NoPane`, which is a fact about the registry rather than about a pane.
@@ -227,7 +315,11 @@ impl From<Option<PaneStatus>> for ReportStatus {
 /// (by branch, as `Splitter::poll_statuses` keys them). Taking a lookup rather than a
 /// splitter keeps this free of a real multiplexer; a lookup that knows nothing yields
 /// `unknown` for every pane.
-fn report(registry: &Registry, status_of: impl Fn(&str) -> Option<PaneStatus>) -> StatusReport {
+fn report(
+    registry: &Registry,
+    status_of: impl Fn(&str) -> Option<PaneStatus>,
+    git: Option<&WorkspaceStatus>,
+) -> StatusReport {
     let workstreams = registry
         .workstreams
         .iter()
@@ -240,9 +332,20 @@ fn report(registry: &Registry, status_of: impl Fn(&str) -> Option<PaneStatus>) -
                 Some(_) => status_of(&w.branch_id.0).into(),
                 None => ReportStatus::NoPane,
             },
+            lane: git.and_then(|status| lane_report(status, &w.branch_id.0)),
         })
         .collect();
-    StatusReport { schema: STATUS_SCHEMA, workstreams }
+    StatusReport { schema: STATUS_SCHEMA, workstreams, workspace: git.map(workspace_report) }
+}
+
+/// The workspace's git state, or nothing if `but` isn't reachable — `status --json` reports
+/// what it can either way. One `but status` call, so it is only made when there is a
+/// workstream to report on.
+fn git_state(registry: &Registry, cwd: &Path) -> Option<WorkspaceStatus> {
+    if registry.workstreams.is_empty() {
+        return None;
+    }
+    But::discover(cwd).ok()?.status().ok()
 }
 
 /// Pane statuses by branch, or nothing at all if there's no multiplexer to ask or the poll
@@ -337,7 +440,8 @@ pub fn run(command: Command, cwd: &Path, out: &mut impl Write) -> Result<()> {
         }
         Command::Status { json: true } => {
             let statuses = poll_or_nothing(&registry);
-            let report = report(&registry, |branch| statuses.get(branch).copied());
+            let git = git_state(&registry, cwd);
+            let report = report(&registry, |branch| statuses.get(branch).copied(), git.as_ref());
             writeln!(out, "{}", serde_json::to_string(&report)?)?;
         }
         Command::Status { json: false } => {
@@ -485,24 +589,24 @@ mod tests {
             // No entry for "planned": it has no pane, so nobody is asked.
             ("stray".to_string(), PaneStatus::Busy),
         ]);
-        let json = serde_json::to_string(&report(&five_workstreams(), |b| statuses.get(b).copied())).unwrap();
+        let json = serde_json::to_string(&report(&five_workstreams(), |b| statuses.get(b).copied(), None)).unwrap();
         assert_eq!(
             json,
             concat!(
                 r#"{"schema":1,"workstreams":["#,
-                r#"{"branch":"fix-login","pane":"%3","agent":"claude","item":"GH-4","status":"busy"},"#,
-                r#"{"branch":"add-search","pane":"%4","agent":"codex","item":null,"status":"idle"},"#,
-                r#"{"branch":"old-spike","pane":"%5","agent":null,"item":null,"status":"dead"},"#,
-                r#"{"branch":"mystery","pane":"%6","agent":"claude","item":null,"status":"unknown"},"#,
-                r#"{"branch":"planned","pane":null,"agent":null,"item":"GH-9","status":"no-pane"}"#,
-                r#"]}"#
+                r#"{"branch":"fix-login","pane":"%3","agent":"claude","item":"GH-4","status":"busy","lane":null},"#,
+                r#"{"branch":"add-search","pane":"%4","agent":"codex","item":null,"status":"idle","lane":null},"#,
+                r#"{"branch":"old-spike","pane":"%5","agent":null,"item":null,"status":"dead","lane":null},"#,
+                r#"{"branch":"mystery","pane":"%6","agent":"claude","item":null,"status":"unknown","lane":null},"#,
+                r#"{"branch":"planned","pane":null,"agent":null,"item":"GH-9","status":"no-pane","lane":null}"#,
+                r#"],"workspace":null}"#
             )
         );
     }
 
     #[test]
     fn a_pane_the_poll_did_not_mention_is_unknown_and_a_paneless_workstream_stays_no_pane() {
-        let nothing = report(&five_workstreams(), |_| None);
+        let nothing = report(&five_workstreams(), |_| None, None);
         let statuses: Vec<_> = nothing.workstreams.iter().map(|w| w.status).collect();
         assert_eq!(
             statuses,
@@ -518,8 +622,8 @@ mod tests {
 
     #[test]
     fn an_empty_registry_is_an_empty_list_not_prose() {
-        let json = serde_json::to_string(&report(&Registry::default(), |_| None)).unwrap();
-        assert_eq!(json, r#"{"schema":1,"workstreams":[]}"#);
+        let json = serde_json::to_string(&report(&Registry::default(), |_| None, None)).unwrap();
+        assert_eq!(json, r#"{"schema":1,"workstreams":[],"workspace":null}"#);
     }
 
     /// With no multiplexer to ask, `status --json` still lists everything and exits 0. Forcing
@@ -566,9 +670,9 @@ mod tests {
             String::from_utf8(out).unwrap(),
             concat!(
                 r#"{"schema":1,"workstreams":["#,
-                r#"{"branch":"fix-login","pane":"%3","agent":"claude","item":null,"status":"unknown"},"#,
-                r#"{"branch":"planned","pane":null,"agent":null,"item":null,"status":"no-pane"}"#,
-                "]}\n"
+                r#"{"branch":"fix-login","pane":"%3","agent":"claude","item":null,"status":"unknown","lane":null},"#,
+                r#"{"branch":"planned","pane":null,"agent":null,"item":null,"status":"no-pane","lane":null}"#,
+                "],\"workspace\":null}\n"
             )
         );
         assert!(human.is_err(), "the table still needs a backend");
@@ -733,7 +837,7 @@ mod tests {
     }
 
     fn fix_login(status: &str) -> String {
-        format!(r#"{{"schema":1,"workstreams":[{{"branch":"fix-login","pane":"%3","agent":"claude","item":null,"status":"{status}"}}]}}{}"#, "\n")
+        format!(r#"{{"schema":1,"workstreams":[{{"branch":"fix-login","pane":"%3","agent":"claude","item":null,"status":"{status}","lane":null}}],"workspace":null}}{}"#, "\n")
     }
 
     #[test]
@@ -773,7 +877,167 @@ mod tests {
     #[test]
     fn a_waiting_pane_is_waiting_in_both_the_table_and_the_json() {
         assert_eq!(label(Some(PaneStatus::Waiting)), "waiting");
-        let json = serde_json::to_string(&report(&five_workstreams(), |b| (b == "fix-login").then_some(PaneStatus::Waiting))).unwrap();
+        let json = serde_json::to_string(&report(&five_workstreams(), |b| (b == "fix-login").then_some(PaneStatus::Waiting), None)).unwrap();
         assert!(json.contains(r#""branch":"fix-login","pane":"%3","agent":"claude","item":"GH-4","status":"waiting""#), "{json}");
+    }
+
+    // Lane state. The unaltered tests read a real capture of `but status -f --json`
+    // (tests/fixtures/status.json: three clean, local-only lanes). It has no conflicted,
+    // behind or landed lane, so those cases change specific values in it — real shape,
+    // hand-set values, and labelled so.
+
+    const STATUS_FIXTURE: &str = include_str!("../tests/fixtures/status.json");
+
+    fn fixture() -> WorkspaceStatus {
+        crate::but::parse_status(STATUS_FIXTURE).unwrap()
+    }
+
+    /// The fixture with `change` applied to its JSON first.
+    fn altered(change: impl FnOnce(&mut serde_json::Value)) -> WorkspaceStatus {
+        let mut json: serde_json::Value = serde_json::from_str(STATUS_FIXTURE).unwrap();
+        change(&mut json);
+        crate::but::parse_status(&json.to_string()).unwrap()
+    }
+
+    fn lane<'a>(json: &'a mut serde_json::Value, name: &str) -> &'a mut serde_json::Value {
+        json["stacks"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .flat_map(|stack| stack["branches"].as_array_mut().unwrap().iter_mut())
+            .find(|b| b["name"] == name)
+            .unwrap()
+    }
+
+    #[test]
+    fn a_clean_local_lane_reads_from_a_real_capture() {
+        let status = fixture();
+        assert_eq!(
+            lane_report(&status, "feat-ui"),
+            Some(LaneReport {
+                commits: 2,
+                conflicted: false,
+                behind: 0,
+                rebase: None,
+                landed: false,
+                push: PushState::LocalOnly,
+                uncommitted: 0,
+            })
+        );
+        assert_eq!(lane_report(&status, "fix-flaky-tests").unwrap().commits, 1);
+        assert_eq!(workspace_report(&status), WorkspaceReport { behind: 0, uncommitted: 2 });
+    }
+
+    #[test]
+    fn a_branch_the_workspace_does_not_have_has_no_lane() {
+        assert_eq!(lane_report(&fixture(), "deleted-long-ago"), None);
+    }
+
+    #[test]
+    fn a_conflicted_lane_behind_upstream_that_needs_a_force_push() {
+        let status = altered(|json| {
+            let commit = json["stacks"][2]["branches"][0]["commits"][0].clone();
+            let mut conflicted = commit.clone();
+            conflicted["conflicted"] = true.into();
+            let feat_auth = lane(json, "feat-auth");
+            feat_auth["commits"][0] = conflicted;
+            feat_auth["upstreamCommits"] = serde_json::json!([commit.clone(), commit]);
+            feat_auth["branchStatus"] = "unpushedCommitsRequiringForce".into();
+            feat_auth["mergeStatus"] = serde_json::json!({"conflicted": {"rebasable": true}});
+            json["stacks"][2]["assignedChanges"] = serde_json::json!([
+                {"cliId": "a", "filePath": "x.rs", "changeType": "modified"},
+                {"cliId": "b", "filePath": "y.rs", "changeType": "added"},
+                {"cliId": "c", "filePath": "z.rs", "changeType": "removed"},
+            ]);
+            json["upstreamState"]["behind"] = 4.into();
+        });
+        assert_eq!(
+            lane_report(&status, "feat-auth"),
+            Some(LaneReport {
+                commits: 2,
+                conflicted: true,
+                behind: 2,
+                rebase: Some(Rebase::Conflicts),
+                landed: false,
+                push: PushState::NeedsForce,
+                uncommitted: 3,
+            })
+        );
+        assert_eq!(workspace_report(&status), WorkspaceReport { behind: 4, uncommitted: 2 });
+        // The other lanes are untouched by it.
+        assert!(!lane_report(&status, "feat-ui").unwrap().conflicted);
+    }
+
+    /// Either signal says a lane has landed, and `but pull` will remove it.
+    #[test]
+    fn a_landed_lane_is_flagged_by_either_of_its_two_signals() {
+        let by_branch_status = altered(|json| lane(json, "feat-ui")["branchStatus"] = "integrated".into());
+        let landed = lane_report(&by_branch_status, "feat-ui").unwrap();
+        assert!(landed.landed);
+        assert_eq!(landed.push, PushState::Integrated);
+
+        let by_merge_status = altered(|json| lane(json, "feat-ui")["mergeStatus"] = "integrated".into());
+        let landed = lane_report(&by_merge_status, "feat-ui").unwrap();
+        assert!(landed.landed);
+        assert_eq!(landed.rebase, Some(Rebase::Integrated));
+
+        assert!(!lane_report(&fixture(), "feat-ui").unwrap().landed);
+    }
+
+    #[test]
+    fn every_upstream_merge_status_and_push_status_has_its_own_word() {
+        for (wire, expected) in [("clean", Rebase::Clean), ("integrated", Rebase::Integrated), ("empty", Rebase::Empty)] {
+            let status = altered(|json| lane(json, "feat-ui")["mergeStatus"] = wire.into());
+            assert_eq!(lane_report(&status, "feat-ui").unwrap().rebase, Some(expected), "{wire}");
+        }
+        for (wire, expected) in [
+            ("nothingToPush", PushState::Pushed),
+            ("unpushedCommits", PushState::Unpushed),
+            ("unpushedCommitsRequiringForce", PushState::NeedsForce),
+            ("completelyUnpushed", PushState::LocalOnly),
+            ("integrated", PushState::Integrated),
+            ("somethingNewerThanThisClient", PushState::Unknown),
+        ] {
+            let status = altered(|json| lane(json, "feat-ui")["branchStatus"] = wire.into());
+            assert_eq!(lane_report(&status, "feat-ui").unwrap().push, expected, "{wire}");
+        }
+    }
+
+    /// The shape an agent parses: the lane object inside its workstream, the workspace beside
+    /// the list, kebab-case words, and `null` for what `but` had nothing to say about.
+    #[test]
+    fn the_json_carries_the_lane_and_the_workspace() {
+        let mut registry = Registry::default();
+        registry.upsert(workstream("feat-ui", Some("%3"), Some("claude"), None));
+        registry.upsert(workstream("gone", Some("%4"), None, None));
+        let status = altered(|json| {
+            lane(json, "feat-ui")["mergeStatus"] = serde_json::json!({"conflicted": {"rebasable": false}});
+            json["upstreamState"]["behind"] = 3.into();
+        });
+        let json = serde_json::to_string(&report(&registry, |_| Some(PaneStatus::Idle), Some(&status))).unwrap();
+        assert_eq!(
+            json,
+            concat!(
+                r#"{"schema":1,"workstreams":["#,
+                r#"{"branch":"feat-ui","pane":"%3","agent":"claude","item":null,"status":"idle","lane":"#,
+                r#"{"commits":2,"conflicted":false,"behind":0,"rebase":"conflicts","landed":false,"push":"local-only","uncommitted":0}},"#,
+                r#"{"branch":"gone","pane":"%4","agent":null,"item":null,"status":"idle","lane":null}"#,
+                r#"],"workspace":{"behind":3,"uncommitted":2}}"#
+            )
+        );
+    }
+
+    /// `but` being unreachable costs the lane and workspace objects, nothing else.
+    #[test]
+    fn without_but_the_lane_and_workspace_are_null_and_the_rest_is_unchanged() {
+        let mut registry = Registry::default();
+        registry.upsert(workstream("feat-ui", Some("%3"), Some("claude"), None));
+        assert!(git_state(&Registry::default(), Path::new("/nonexistent")).is_none(), "no workstreams: no reason to ask but");
+        assert!(git_state(&registry, Path::new("/nonexistent/not-a-repo")).is_none());
+        let json = serde_json::to_string(&report(&registry, |_| Some(PaneStatus::Busy), None)).unwrap();
+        assert_eq!(
+            json,
+            r#"{"schema":1,"workstreams":[{"branch":"feat-ui","pane":"%3","agent":"claude","item":null,"status":"busy","lane":null}],"workspace":null}"#
+        );
     }
 }

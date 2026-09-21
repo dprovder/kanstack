@@ -243,20 +243,45 @@ of `$KANSTACK_HARNESS` for this one pane.
 agent to parse:
 
 ```json
-{"schema":1,"workstreams":[
-  {"branch":"fix-login","pane":"%3","agent":"claude","item":"GH-4","status":"busy"},
-  {"branch":"planned","pane":null,"agent":null,"item":null,"status":"no-pane"}
-]}
+{"schema":1,
+ "workstreams":[
+  {"branch":"fix-login","pane":"%3","agent":"claude","item":"GH-4","status":"busy",
+   "lane":{"commits":3,"conflicted":false,"behind":0,"rebase":null,"landed":false,
+           "push":"unpushed","uncommitted":2}},
+  {"branch":"planned","pane":null,"agent":null,"item":null,"status":"no-pane","lane":null}
+ ],
+ "workspace":{"behind":2,"uncommitted":1}}
 ```
 
 Every key is always present (`null` when there's no value), one entry per registered
-workstream, in registry order. `status` is `busy`, `idle`, `waiting`, `dead`, `unknown` or `no-pane` (the
-workstream has no pane). New fields and new `status` values may be added under the same
-`schema` number, so ignore keys you don't know and read a `status` you don't recognize as
-`unknown`; it changes only if an existing field is renamed, removed or reinterpreted.
+workstream, in registry order. `status` is `busy`, `idle`, `waiting`, `dead`, `unknown` or
+`no-pane` (the workstream has no pane). New fields and new `status` values may be added under
+the same `schema` number, so ignore keys you don't know and read a `status` you don't
+recognize as `unknown`; it changes only if an existing field is renamed, removed or
+reinterpreted.
+
+`lane` is the branch's git state, from `but status`, so an agent can tell without running it:
+
+| field | meaning |
+| --- | --- |
+| `commits` | commits on the lane |
+| `conflicted` | a commit on the lane is conflicted now, and needs `but resolve` |
+| `behind` | commits on the lane's remote branch that the lane doesn't have |
+| `rebase` | what updating the lane from upstream would do: `clean`, `conflicts`, `integrated` or `empty`; `null` when there is nothing to say |
+| `landed` | the lane has landed upstream and `but pull` will remove it; its commits can't be changed |
+| `push` | `pushed`, `unpushed`, `needs-force`, `local-only`, `integrated` or `unknown` |
+| `uncommitted` | uncommitted files assigned to the lane's stack |
+
+`workspace.behind` is how many commits the target branch has that the workspace doesn't, which
+is what `but pull` would bring in; `workspace.uncommitted` counts changes no lane owns yet.
+`lane` and `workspace` are `null` when `but` can't be reached, and `lane` alone is `null` for
+a branch that is no longer in the workspace. Reading them costs one `but status` call.
+
 Unlike the table, `--json` works outside cmux, tmux and Orca, and when the multiplexer can't
 be reached: it still lists every workstream, with `unknown` for those that have a pane. An
-empty registry gives `{"schema":1,"workstreams":[]}`.
+empty registry gives `{"schema":1,"workstreams":[],"workspace":null}`. What it will not do is
+paper over a registry file that is corrupt or unreadable: that exits non-zero with the reason
+on stderr and nothing on stdout, because starting over would orphan every pane it tracks.
 
 ### Where busy, idle and waiting come from
 
