@@ -60,11 +60,15 @@ pub trait Harness: Sync {
 /// `StopFailure` ends one that died on an API error, which would otherwise read `busy` until
 /// the report expired.
 ///
-/// Interrupting a turn with Escape fires none of these — not `Stop`, and not when it is
-/// pressed on a permission prompt either (observed) — so the report would go on saying `busy`
-/// or `waiting` over a pane sitting at its prompt. What does fire is `Notification` with the
-/// `idle_prompt` type, once Claude has been left waiting for input, and that is what takes
-/// the state back to `idle`.
+/// Interrupting a turn with Escape fires none of these, and neither does answering a
+/// permission prompt with "No" (both observed against real Claude), so the report would go on
+/// saying `busy` or `waiting` over a pane sitting at its prompt. A `Notification` hook for the
+/// `idle_prompt` type looked like the recovery signal, and is deliberately not installed: it
+/// never fired in over 100 seconds, in cmux or in a clean tmux with no launch shim. What
+/// clears a stale `busy` is `crate::splitter`'s check that the pane has stayed quiet. A stale
+/// `waiting` is left standing until the next prompt: after "No" the turn simply ends and the
+/// pane is at rest, which from outside is indistinguishable from a prompt still pending, so
+/// only the agent could say — and it can't.
 ///
 /// Every hook is synchronous, a few milliseconds each. That is what keeps them in order:
 /// `PreToolUse` and `PermissionRequest` fire back to back, and if the first were async its
@@ -90,10 +94,6 @@ impl Harness for Claude {
         };
         let settings = serde_json::json!({
             "hooks": {
-                "Notification": [{
-                    "matcher": "idle_prompt",
-                    "hooks": [{ "type": "command", "command": format!("{report} idle"), "timeout": 5 }],
-                }],
                 "UserPromptSubmit": hook("busy"),
                 "PreToolUse": hook("busy"),
                 "PermissionRequest": hook("waiting"),
@@ -465,8 +465,7 @@ mod tests {
         let hooks = settings["hooks"].as_object().unwrap();
         let says = |event: &str| {
             let entry = &hooks[event][0];
-            let matcher = if event == "Notification" { "idle_prompt" } else { "" };
-            assert_eq!(entry["matcher"], matcher, "{event}");
+            assert_eq!(entry["matcher"], "", "{event}");
             let hook = &entry["hooks"][0];
             assert_eq!(hook["type"], "command", "{event}");
             assert_eq!(hook["timeout"], 5, "{event}");
@@ -483,8 +482,12 @@ mod tests {
         assert_eq!(says("PostToolUseFailure"), "busy");
         assert_eq!(says("Stop"), "idle");
         assert_eq!(says("StopFailure"), "idle", "a turn that dies on an API error must not read busy");
-        assert_eq!(says("Notification"), "idle", "only idle_prompt: what heals an interrupted turn");
-        assert_eq!(hooks.len(), 8, "no other events are hooked: {:?}", hooks.keys().collect::<Vec<_>>());
+        assert_eq!(
+            hooks.len(),
+            7,
+            "no other events are hooked — in particular not Notification/idle_prompt, which never fired: {:?}",
+            hooks.keys().collect::<Vec<_>>()
+        );
     }
 
     /// Only harnesses with a launch-time route are handed hooks; kanstack does not guess at

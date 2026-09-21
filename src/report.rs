@@ -86,8 +86,9 @@ struct Stored {
 /// What an agent's last report is worth right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Said {
-    /// Recent enough to believe, and this old.
-    Fresh { status: PaneStatus, age: Duration },
+    /// Recent enough to believe: this old, and written at this second (seconds since the
+    /// epoch), which identifies it for [`Reports::retract_busy`].
+    Fresh { status: PaneStatus, age: Duration, at: u64 },
     /// There is one, but it has run out. Different from nothing having been said: the agent
     /// reported, and then went quiet without saying it had stopped.
     Stale,
@@ -142,7 +143,7 @@ impl Reports {
         let at = UNIX_EPOCH + Duration::from_secs(stored.at);
         // A report from the future (clock skew) is as fresh as it gets.
         let age = now.duration_since(at).unwrap_or_default();
-        Some(if age <= stored.state.fresh_for() { Said::Fresh { status: stored.state.status(), age } } else { Said::Stale })
+        Some(if age <= stored.state.fresh_for() { Said::Fresh { status: stored.state.status(), age, at: stored.at } } else { Said::Stale })
     }
 
     /// [`Self::said`], but only what can still be believed.
@@ -151,6 +152,25 @@ impl Reports {
             Said::Fresh { status, .. } => Some(status),
             Said::Stale => None,
         }
+    }
+
+    /// Takes back a `busy` report that the pane's own quiet has shown to be stale, by writing
+    /// `idle` in its place — but only if the file still holds the very report the caller
+    /// looked at (`expected_at`, the second it was written) and it still says `busy`. A hook
+    /// that fired in between has written something newer, and that must win. Returns whether it
+    /// did.
+    ///
+    /// Interrupting a turn with Escape fires no hook, so nothing else ever retracts that
+    /// `busy`. Writing the correction back, rather than merely reading past it, is what keeps
+    /// a later CPU blip from resurrecting it.
+    pub fn retract_busy(&self, branch: &str, expected_at: u64, now: SystemTime) -> bool {
+        let Some(path) = self.file(branch) else { return false };
+        let Ok(raw) = std::fs::read_to_string(&path) else { return false };
+        let Ok(stored) = serde_json::from_str::<Stored>(&raw) else { return false };
+        if stored.state != Reported::Busy || stored.at != expected_at {
+            return false;
+        }
+        self.write(branch, Reported::Idle, now).is_ok()
     }
 
     /// Drops whatever `branch`'s agent said, because it was about a pane that no longer
@@ -287,5 +307,29 @@ mod tests {
         assert_eq!(reports.said("feat-a", later), Some(Said::Stale));
         assert_eq!(reports.status("feat-a", later), None, "a stale report is not believed");
         assert_eq!(reports.said("feat-b", later), None, "nobody ever said anything for feat-b");
+    }
+
+    #[test]
+    fn retracting_a_busy_report_writes_idle_but_only_for_the_report_that_was_looked_at() {
+        let reports = scratch("retract");
+        reports.write("feat-a", Reported::Busy, at(1000)).unwrap();
+        // A report written since — a hook fired between the decision and now — must win.
+        assert!(!reports.retract_busy("feat-a", 999, at(1030)), "not the report that was examined");
+        assert!(matches!(reports.said("feat-a", at(1031)), Some(Said::Fresh { status: PaneStatus::Busy, .. })));
+
+        assert!(reports.retract_busy("feat-a", 1000, at(1030)));
+        assert_eq!(reports.status("feat-a", at(1031)), Some(PaneStatus::Idle));
+        assert!(!reports.retract_busy("feat-a", 1030, at(1040)), "nothing busy is left to retract");
+    }
+
+    #[test]
+    fn only_a_busy_report_can_be_retracted() {
+        let reports = scratch("retract-kinds");
+        reports.write("waiting", Reported::Waiting, at(1000)).unwrap();
+        reports.write("idle", Reported::Idle, at(1000)).unwrap();
+        assert!(!reports.retract_busy("waiting", 1000, at(1030)), "a prompt is not a stale busy");
+        assert!(!reports.retract_busy("idle", 1000, at(1030)));
+        assert!(!reports.retract_busy("never-reported", 1000, at(1030)));
+        assert_eq!(reports.status("waiting", at(1031)), Some(PaneStatus::Waiting));
     }
 }

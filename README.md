@@ -316,16 +316,28 @@ themselves. `KANSTACK_STATUS_HOOKS=off` launches every harness without them.
 How a report and the multiplexer's reading combine:
 
 - A pane the multiplexer says is gone is always `dead`.
-- Otherwise a fresh report wins. `busy` and `idle` are believed for ten minutes, `waiting` for
-  twelve hours, since a prompt left overnight is exactly what it is for.
-- **Interrupting with Escape fires no hook** (checked against real Claude, on a running turn
-  and on a permission prompt), so a report can be left behind. After twenty seconds, a `busy`
-  report over a pane the multiplexer sees as quiet reads `idle`, and a `waiting` report over
-  one it sees as busy reads `busy`. A quiet pane never contradicts `waiting`, since only the
-  agent can tell those apart, so a prompt you dismissed with Escape can show `◆ needs you`
-  until you next type something.
+- Otherwise a fresh report wins, and one CPU reading never overrides it. `busy` and `idle` are
+  believed for ten minutes, `waiting` for twelve hours, since a prompt left overnight is
+  exactly what it is for.
+- **Escape fires no hook, and neither does answering a permission prompt with "No"** (checked
+  against real Claude), so a `busy` report can be left behind over a pane at its prompt. When
+  a `busy` report is over twenty seconds old and the pane reads idle, kanstack looks twice
+  more, over a couple of seconds; if the pane stays quiet it believes the pane, and writes
+  `idle` over the stale report so a later blip of CPU can't bring it back. (Real work dips
+  below the threshold for a moment now and then, which is why one quiet reading isn't enough.)
+  This costs a second or two only when such a contradiction exists.
+- **A stale `waiting` is not retracted.** After "No" or Escape on a prompt, the turn simply
+  ends, and a pane at rest looks exactly like one with a prompt pending. So `◆ needs you` stays
+  until you next type something. A false "needs you" costs a glance; a missed prompt could
+  cost hours.
 - A report that has run out reads `unknown` unless the multiplexer knows better, rather than
   leaving the last status standing.
+
+Verified against real Claude, one scenario each: a Write prompt (approved; "yes, don't ask
+again"; "no"), two prompts in one turn, a WebFetch prompt, plan mode's approval dialog, and an
+`AskUserQuestion` question all report `waiting`, and `PostToolUse` takes it back to `busy` on
+approval. After approving, `waiting` stays for as long as the tool runs, since nothing fires at
+the moment of approval. A prompt left for 80 seconds stays `waiting` throughout.
 
 Each command is its own process, so panes are tracked in a per-repository registry under
 `$XDG_STATE_HOME/kanstack` (`~/.local/state/kanstack`; `KANSTACK_STATE_PATH` relocates it).

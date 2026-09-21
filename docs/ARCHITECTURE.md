@@ -260,19 +260,41 @@ the error surfaces only when there are none.
   because the reason for it is an agent stuck on a prompt overnight. Expiry reads `unknown`,
   not "keep the last applied status": with nothing to contradict it, a stale `busy` would
   otherwise stand forever.
-- **Escape fires no hook.** Checked live against Claude 2026-09: interrupting a running turn
-  and pressing Escape on a permission prompt each left the report at `busy` / `waiting` over
-  a pane sitting at its prompt, and it stayed so. `Notification` with `idle_prompt` looked
-  like a recovery signal and is wired up, but did not fire in over two minutes under cmux
-  (whose launch shim sets `preferredNotifChannel: notifications_disabled`; that it is the
-  cause is a guess), so nothing relies on it. What does the work is corroboration in
-  `merge`: after `CORROBORATION_GRACE` (twenty seconds, since the multiplexer's reading lags)
-  a `busy` report over a pane the multiplexer sees idle reads `idle`, and a `waiting` report
-  over a busy one reads `busy`. A quiet pane never contradicts `waiting`: stopped on a prompt
-  and at rest look identical from outside, so that is the one thing only the agent can say,
-  and a prompt dismissed with Escape can show `waiting` until the next prompt. On a
-  multiplexer with no reading at all, nothing corroborates, so a stale `busy` stands until it
-  expires. That is one reason the pid-based fallback matters for Ghostty.
+- **Escape fires no hook, and neither does "No".** Checked live against Claude 2026-09:
+  interrupting a running turn, pressing Escape on a permission prompt, and answering a prompt
+  with "No" each fire nothing, leaving the report at `busy` or `waiting` over a pane at rest.
+  `Notification` with `idle_prompt` looked like a recovery signal and was tried: it never fired
+  in over 100 seconds, in cmux or in a clean tmux with no launch shim, so it is not installed.
+- **Corroboration, and why it is not one reading.** The only thing that clears a stale `busy`
+  is the pane staying quiet. `splitter::stale_busy_suspect` picks out a `busy` report older
+  than `CORROBORATION_GRACE` (twenty seconds; the multiplexer's reading lags) over a pane
+  reading idle, and `confirmed_quiet` looks again `QUIET_CONFIRMATIONS` times, `QUIET_GAP`
+  apart. Only if every look is quiet is the report retracted, by writing `idle` over it with
+  a compare-and-swap on the second it was written (`Reports::retract_busy`), so a hook that
+  fired in between wins. Writing it back is what stops a later CPU blip from resurrecting the
+  stale `busy`. Measured on tmux's `ps` CPU: a genuine 63-second turn dipped below the
+  threshold three times for under a second each, and a pane quiet after an interrupt blipped
+  back to busy twice in 110 seconds; a single-reading rule flickered on both. With
+  confirmation, a 44-second turn and a 100-second interrupted pane showed no flicker (one run
+  each, so evidence, not proof). It costs the confirmation looks (about 2.4 seconds) only when
+  a contradiction exists.
+- **`waiting` is never retracted, by design.** The reverse rule — an old `waiting` over a
+  busy pane reads `busy` — was tried and removed. It is redundant, because carrying on always
+  fires a hook (a new prompt, or the tool finishing), and it misfired: a prompt left for a
+  minute read `busy` on CPU blips alone. A prompt dismissed with "No" or Escape therefore
+  keeps `waiting` until the next prompt, though the pane is at rest. From outside a prompt
+  and rest are identical, so only the agent could say, and it can't. On a multiplexer with no
+  reading at all, nothing corroborates either rule, so a stale `busy` stands until it expires.
+  That is one reason the pid-based fallback matters for Ghostty.
+- **Scenarios verified live (Claude Code 2.1.278):** Write approved, "yes, don't ask again",
+  "no", two consecutive prompts, WebFetch, plan mode's `ExitPlanMode` dialog and
+  `AskUserQuestion` all fire `PermissionRequest` and report `waiting`; approval returns to
+  `busy` via `PostToolUse` and to `idle` via `Stop`. After approving, `waiting` persists while
+  the tool runs, since nothing fires at the moment of approval. Test-harness notes worth
+  keeping: run the panes in a tmux server started with `env -i` plus only HOME, USER, LOGNAME,
+  PATH (with cmux's shim directories removed), TERM and the KANSTACK_* variables — without
+  USER, Claude reports "Not logged in" because its keychain lookup is by account name — and the
+  first launch in a directory shows a trust screen whose default is "No, exit".
 - **`kanstack report` must print nothing.** Claude adds a `UserPromptSubmit` hook's stdout to
   what the model sees, and a silent `PermissionRequest` hook leaves the normal prompt alone
   (exit 0 with no decision) rather than approving or denying. It also returns before the

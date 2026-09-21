@@ -191,6 +191,13 @@ pub(crate) mod fake {
         pub fail_open: Mutex<bool>,
         /// Makes every `probe` fail while set.
         pub fail_probe: Mutex<bool>,
+        /// Answers for the next probes, one per call, before falling back to `statuses`.
+        pub probe_queue: Mutex<std::collections::VecDeque<HashMap<String, PaneStatus>>>,
+        /// How many times `probe` has been called.
+        pub probes: Mutex<u32>,
+        /// Makes every `probe` after this many calls fail, so a later look can fail while the
+        /// first succeeds.
+        pub fail_probe_after: Mutex<Option<u32>>,
         next: Mutex<u32>,
     }
 
@@ -248,8 +255,19 @@ pub(crate) mod fake {
         }
 
         fn probe(&self, panes: &[&str]) -> Result<HashMap<String, PaneStatus>> {
+            let calls = {
+                let mut probes = self.probes.lock().unwrap();
+                *probes += 1;
+                *probes
+            };
+            if self.fail_probe_after.lock().unwrap().is_some_and(|after| calls > after) {
+                anyhow::bail!("fake probe failed after {calls} calls");
+            }
             if *self.fail_probe.lock().unwrap() {
                 anyhow::bail!("fake probe failed");
+            }
+            if let Some(scripted) = self.probe_queue.lock().unwrap().pop_front() {
+                return Ok(panes.iter().filter_map(|p| scripted.get(*p).map(|s| (p.to_string(), *s))).collect());
             }
             let known = self.statuses.lock().unwrap();
             Ok(panes.iter().filter_map(|p| known.get(*p).map(|s| (p.to_string(), *s))).collect())
