@@ -625,4 +625,210 @@ mod tests {
         assert_eq!(workspace_uuid(listing, "workspace:10").as_deref(), Some("5C659CD2-D2CC-42BD-85B7-6B0D7166C924"));
         assert_eq!(workspace_uuid(listing, "workspace:2"), None, "workspace:1 must not match workspace:10 or vice versa");
     }
+
+    // What follows drives the real spawn/send/focus/stop/poll paths, through a `Splitter` as
+    // kanstack does, against a stand-in `cmux` that logs its arguments. Its replies are what
+    // a real cmux printed for the same commands; the poll's are the captured fixtures.
+
+    use std::sync::Arc;
+
+    use crate::harness::HarnessConfig;
+    use crate::mux::stand_in;
+    use crate::splitter::Splitter;
+
+    const WS: &str = "6AAD1488-99C9-4520-B89A-3E06E25ADB61";
+
+    fn with_fake_cmux(tag: &str, body: &str, extra: &[(&str, Option<&str>)], test: impl FnOnce(Splitter, &Path)) {
+        let (bin, log) = stand_in::install(tag, "cmux", body);
+        let mut vars = vec![
+            ("KANSTACK_CMUX_BIN", Some(bin.to_str().unwrap())),
+            // Unset, so kanstack looks like it is not in a cmux pane and geometry is not asked for.
+            ("CMUX_SURFACE_ID", None),
+            ("CMUX_WORKSPACE_ID", None),
+            ("KANSTACK_CMUX_DIRECTION", None),
+            ("KANSTACK_CMUX_CHAIN_DIRECTION", None),
+        ];
+        vars.extend_from_slice(extra);
+        stand_in::with_env(&vars, || {
+            let cmux = Cmux::discover().unwrap();
+            test(Splitter::new(Arc::new(cmux), HarnessConfig::new("claude")), &log)
+        });
+        stand_in::remove(&bin);
+    }
+
+    /// A splitting cmux: each `new-split` reports a fresh surface in `workspace:2`, and the
+    /// workspace lists under a UUID.
+    fn splitting(list_panels: &str) -> String {
+        format!(
+            r#"n=$(cat "$0.n" 2>/dev/null || echo 40)
+case "$1" in
+  new-split) n=$((n+1)); echo $n > "$0.n"; echo "OK surface:$n pane:7 workspace:2" ;;
+  --id-format) echo "* workspace:2 {WS}  title  [selected]" ;;
+  list-panels) {list_panels} ;;
+esac"#
+        )
+    }
+
+    const LISTS_A_TERMINAL: &str = r#"printf '* surface:41  terminal  [focused]  "x"\n'"#;
+
+    #[test]
+    fn the_first_lane_splits_up_pins_the_workspace_by_uuid_and_scopes_every_later_call() {
+        with_fake_cmux("first", &splitting(LISTS_A_TERMINAL), &[], |mut splitter, log| {
+            let pane = splitter.spawn_harness(Path::new("/repo"), "feat-a", Some("go")).unwrap();
+            assert_eq!(pane, "surface:41");
+            let lines = stand_in::log_lines(log);
+            assert_eq!(lines[0], "new-split up", "no workspace pinned yet, so none is named: {lines:#?}");
+            assert_eq!(lines[1], "--id-format both workspace list", "a ref is only an ordinal; the UUID is what is kept");
+            assert!(lines[2].starts_with(&format!("send --workspace {WS} --surface surface:41 cd '/repo' && claude ")), "{}", lines[2]);
+            assert_eq!(lines[3], format!("send-key --workspace {WS} --surface surface:41 enter"));
+            assert_eq!(lines[4], format!("rename-tab --workspace {WS} --surface surface:41 feat-a"));
+            assert_eq!(lines.len(), 5, "{lines:#?}");
+            assert_eq!(splitter.workspace().as_deref(), Some(WS));
+        });
+    }
+
+    #[test]
+    fn a_later_lane_chains_off_the_previous_surface_inside_the_pinned_workspace() {
+        with_fake_cmux("chain", &splitting(LISTS_A_TERMINAL), &[], |mut splitter, log| {
+            splitter.spawn_harness(Path::new("/repo"), "feat-a", None).unwrap();
+            splitter.spawn_harness(Path::new("/repo"), "feat-b", None).unwrap();
+            let lines = stand_in::log_lines(log);
+            assert_eq!(lines[5], format!("list-panels --workspace {WS}"), "the pinned workspace is checked to still exist");
+            assert_eq!(lines[6], format!("new-split right --surface surface:41 --workspace {WS}"), "{lines:#?}");
+        });
+    }
+
+    /// The first lane of a pinned workspace splits a surface inside it, wherever kanstack
+    /// itself happens to be running.
+    #[test]
+    fn a_pinned_workspace_makes_the_first_lane_split_a_surface_inside_it() {
+        with_fake_cmux("pinned", &splitting(LISTS_A_TERMINAL), &[], |mut splitter, log| {
+            splitter.set_workspace(Some(WS));
+            splitter.spawn_harness(Path::new("/repo"), "feat-a", None).unwrap();
+            let lines = stand_in::log_lines(log);
+            assert_eq!(lines[0], format!("list-panels --workspace {WS}"));
+            assert_eq!(lines[1], format!("new-split up --surface surface:41 --workspace {WS}"), "{lines:#?}");
+        });
+    }
+
+    /// A workspace closed since it was pinned is dropped: the lane falls back to the
+    /// environment and pins wherever that lands.
+    #[test]
+    fn a_pinned_workspace_that_no_longer_exists_is_dropped_and_replaced() {
+        let body = splitting(r#"echo "not found" >&2; exit 1"#);
+        with_fake_cmux("dropped", &body, &[], |mut splitter, log| {
+            splitter.set_workspace(Some("workspace:99"));
+            splitter.spawn_harness(Path::new("/repo"), "feat-a", None).unwrap();
+            let lines = stand_in::log_lines(log);
+            assert_eq!(lines[0], "list-panels --workspace workspace:99");
+            assert_eq!(lines[1], "new-split up", "the dead workspace must not be passed on: {lines:#?}");
+            assert_eq!(splitter.workspace().as_deref(), Some(WS));
+        });
+    }
+
+    #[test]
+    fn a_failed_split_reports_cmuxs_message_and_tracks_nothing() {
+        let body = r#"case "$1" in new-split) echo "no such workspace" >&2; exit 1 ;; esac"#;
+        with_fake_cmux("split-fails", body, &[], |mut splitter, log| {
+            let err = splitter.spawn_harness(Path::new("/repo"), "feat-a", None).unwrap_err().to_string();
+            assert!(err.contains("no such workspace"), "{err}");
+            assert!(!splitter.has_pane("feat-a"));
+            assert_eq!(stand_in::log_lines(log), ["new-split up"], "nothing may be typed into a surface that never opened");
+        });
+        with_fake_cmux("no-surface", r#"case "$1" in new-split) echo "OK" ;; esac"#, &[], |mut splitter, _| {
+            let err = splitter.spawn_harness(Path::new("/repo"), "feat-a", None).unwrap_err().to_string();
+            assert!(err.contains("did not report a surface"), "{err}");
+        });
+    }
+
+    /// The submit is its own key press: a newline in the same burst reads as part of a
+    /// paste to a TUI, and the text never sends.
+    #[test]
+    fn a_message_is_sent_and_then_submitted_with_its_own_enter() {
+        with_fake_cmux("send", "", &[], |mut splitter, log| {
+            splitter.set_workspace(Some(WS));
+            splitter.adopt("feat-a", "surface:5");
+            splitter.send_task("feat-a", "run the tests").unwrap();
+            assert_eq!(
+                stand_in::log_lines(log),
+                [format!("send --workspace {WS} --surface surface:5 run the tests"), format!("send-key --workspace {WS} --surface surface:5 enter")]
+            );
+        });
+    }
+
+    #[test]
+    fn focus_names_the_panel_inside_the_pinned_workspace() {
+        with_fake_cmux("focus", "", &[], |mut splitter, log| {
+            splitter.set_workspace(Some(WS));
+            splitter.adopt("feat-a", "surface:5");
+            splitter.focus("feat-a").unwrap();
+            assert_eq!(stand_in::log_lines(log), [format!("focus-panel --workspace {WS} --panel surface:5")]);
+        });
+    }
+
+    /// Whether closing an already-closed surface is an error isn't documented, so a failed
+    /// close only counts as stopped when the surface is verifiably gone from `pane.list`.
+    #[test]
+    fn stopping_closes_the_surface_and_only_forgives_a_failure_if_it_is_really_gone() {
+        with_fake_cmux("stop", "", &[], |mut splitter, log| {
+            splitter.adopt("feat-a", "surface:5");
+            splitter.stop("feat-a").unwrap();
+            assert_eq!(stand_in::log_lines(log), ["close-surface --surface surface:5"]);
+        });
+        let gone = r#"case "$1" in close-surface) echo "no such surface" >&2; exit 1 ;; rpc) echo '{"panes":[]}' ;; esac"#;
+        with_fake_cmux("stop-gone", gone, &[], |mut splitter, _| {
+            splitter.adopt("feat-a", "surface:5");
+            splitter.stop("feat-a").expect("a surface no longer in pane.list is what stop is after anyway");
+        });
+        let still_there = r#"case "$1" in close-surface) echo "busy" >&2; exit 1 ;; rpc) echo '{"panes":[{"surface_refs":["surface:5"]}]}' ;; esac"#;
+        with_fake_cmux("stop-live", still_there, &[], |mut splitter, _| {
+            splitter.adopt("feat-a", "surface:5");
+            let err = splitter.stop("feat-a").unwrap_err().to_string();
+            assert!(err.contains("close-surface"), "{err}");
+        });
+    }
+
+    fn fixtures_body() -> String {
+        format!(
+            r#"case "$1" in
+  rpc) cat '{}' ;;
+  top) cat '{}' ;;
+esac"#,
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cmux_pane_list.json"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cmux_top.json"),
+        )
+    }
+
+    /// The captured `pane.list` and `top` replies, read through the real process handling.
+    #[test]
+    fn polling_scopes_both_queries_to_the_workspace_and_reads_cpu_from_top() {
+        with_fake_cmux("poll", &fixtures_body(), &[], |mut splitter, log| {
+            splitter.set_workspace(Some(WS));
+            splitter.adopt("busy", "surface:33");
+            splitter.adopt("idle", "surface:34");
+            splitter.adopt("closed", "surface:999");
+            let statuses = splitter.poll_statuses().unwrap();
+            assert_eq!(statuses["busy"], PaneStatus::Busy);
+            assert_eq!(statuses["idle"], PaneStatus::Idle);
+            assert_eq!(statuses["closed"], PaneStatus::Dead);
+            assert_eq!(
+                stand_in::log_lines(log),
+                [format!("rpc pane.list {{\"workspace_id\":\"{WS}\"}}"), format!("top --workspace {WS} --json")]
+            );
+        });
+    }
+
+    /// With no workspace to scope `top` to, only existence is known: a closed surface is
+    /// dead, and a live one is left out, so the last known status stands.
+    #[test]
+    fn polling_without_a_workspace_knows_only_what_is_gone() {
+        with_fake_cmux("poll-unscoped", &fixtures_body(), &[], |mut splitter, log| {
+            splitter.adopt("live", "surface:33");
+            splitter.adopt("closed", "surface:999");
+            let statuses = splitter.poll_statuses().unwrap();
+            assert_eq!(statuses.get("closed"), Some(&PaneStatus::Dead));
+            assert!(!statuses.contains_key("live"), "{statuses:?}");
+            assert_eq!(stand_in::log_lines(log), ["rpc pane.list"], "top must not be asked without a workspace");
+        });
+    }
 }

@@ -122,6 +122,57 @@ pub(crate) fn command_exists(bin: &Path) -> bool {
     std::env::split_paths(&path_var).any(|dir| dir.join(bin).is_file())
 }
 
+/// Stand-in multiplexer binaries, for testing a backend's real process handling — the
+/// arguments it builds, the output it reads, the failures it copes with — without a real
+/// multiplexer. Only as faithful as the output each test scripts, so what a test prints
+/// should be copied from a real run.
+#[cfg(test)]
+pub(crate) mod stand_in {
+    use std::path::{Path, PathBuf};
+
+    /// Writes an executable `name` that appends its arguments to a log, one line per call,
+    /// then runs `body`. Returns it with the log's path. Both live in a directory unique to
+    /// `tag`, which a test removes with [`remove`].
+    pub fn install(tag: &str, name: &str, body: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("kanstack-{name}-stand-in-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (bin, log) = (dir.join(name), dir.join("log"));
+        std::fs::write(&bin, format!("#!/bin/sh\necho \"$@\" >> '{}'\n{body}\n", log.display())).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (bin, log)
+    }
+
+    pub fn remove(bin: &Path) {
+        let _ = std::fs::remove_dir_all(bin.parent().unwrap());
+    }
+
+    pub fn log_lines(log: &Path) -> Vec<String> {
+        std::fs::read_to_string(log).unwrap_or_default().lines().map(str::to_string).collect()
+    }
+
+    /// Runs `body` with each of `vars` swapped in (`None` unsets) and restored afterwards,
+    /// holding the lock every test that touches the backends' environment shares.
+    pub fn with_env(vars: &[(&str, Option<&str>)], body: impl FnOnce()) {
+        let _guard = crate::SPLIT_BACKEND_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old: Vec<_> = vars.iter().map(|(k, _)| (*k, std::env::var_os(k))).collect();
+        for (k, v) in vars {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        body();
+        for (k, v) in old {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+}
+
 /// A multiplexer with no multiplexer behind it, for testing everything above the trait. It
 /// records each call as one line in `log`, and answers `probe` from `statuses`.
 #[cfg(test)]

@@ -406,4 +406,163 @@ mod tests {
         let statuses = classify_statuses(&["%3"], &present, &HashMap::new(), &[]);
         assert!(!statuses.contains_key("%3"), "{statuses:?}");
     }
+
+    // What follows drives the real spawn/send/focus/stop/poll paths, through a `Splitter` as
+    // kanstack does, against a stand-in `tmux` that logs its arguments. Its replies are what
+    // a real tmux 3.6 printed for the same commands.
+
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use crate::harness::HarnessConfig;
+    use crate::mux::stand_in;
+    use crate::splitter::Splitter;
+
+    fn with_fake_tmux(tag: &str, body: &str, extra: &[(&str, Option<&str>)], test: impl FnOnce(Splitter, &Path)) {
+        let (bin, log) = stand_in::install(tag, "tmux", body);
+        let mut vars = vec![
+            ("KANSTACK_TMUX_BIN", Some(bin.to_str().unwrap())),
+            ("TMUX_PANE", Some("%0")),
+            ("KANSTACK_TMUX_DIRECTION", None),
+            ("KANSTACK_TMUX_CHAIN_DIRECTION", None),
+        ];
+        vars.extend_from_slice(extra);
+        stand_in::with_env(&vars, || {
+            let tmux = Tmux::discover().unwrap();
+            test(Splitter::new(Arc::new(tmux), HarnessConfig::new("claude")), &log)
+        });
+        stand_in::remove(&bin);
+    }
+
+    /// Answers a split with an id derived from the pane it was asked to split, so a chain of
+    /// splits can be told apart.
+    const SPLITS: &str = r#"case "$1" in split-window) echo "%9_after_$3" ;; esac"#;
+
+    #[test]
+    fn the_first_lane_splits_kanstacks_own_pane_and_is_typed_into_and_titled() {
+        with_fake_tmux("first", SPLITS, &[], |mut splitter, log| {
+            let pane = splitter.spawn_harness(Path::new("/repo"), "feat-a", Some("go")).unwrap();
+            assert_eq!(pane, "%9_after_%0");
+            let lines = stand_in::log_lines(log);
+            assert_eq!(lines[0], "split-window -t %0 -c /repo -v -b -P -F #{pane_id}", "{lines:#?}");
+            assert!(lines[1].starts_with("send-keys -t %9_after_%0 -l -- cd '/repo' && claude "), "{}", lines[1]);
+            assert_eq!(lines[2], "send-keys -t %9_after_%0 Enter", "Enter is its own key press");
+            assert_eq!(lines[3], "select-pane -t %9_after_%0 -T feat-a");
+            assert_eq!(lines.len(), 4, "{lines:#?}");
+        });
+    }
+
+    #[test]
+    fn a_later_lane_chains_off_the_previous_one_in_the_chain_direction() {
+        with_fake_tmux("chain", SPLITS, &[], |mut splitter, log| {
+            splitter.spawn_harness(Path::new("/repo"), "feat-a", None).unwrap();
+            splitter.spawn_harness(Path::new("/repo"), "feat-b", None).unwrap();
+            let splits: Vec<_> = stand_in::log_lines(log).into_iter().filter(|l| l.starts_with("split-window")).collect();
+            assert_eq!(splits[1], "split-window -t %9_after_%0 -c /repo -h -P -F #{pane_id}");
+        });
+    }
+
+    #[test]
+    fn the_directions_come_from_the_tmux_variables() {
+        let vars = [("KANSTACK_TMUX_DIRECTION", Some("below")), ("KANSTACK_TMUX_CHAIN_DIRECTION", Some("left"))];
+        with_fake_tmux("directions", SPLITS, &vars, |mut splitter, log| {
+            splitter.spawn_harness(Path::new("/repo"), "feat-a", None).unwrap();
+            splitter.spawn_harness(Path::new("/repo"), "feat-b", None).unwrap();
+            let splits: Vec<_> = stand_in::log_lines(log).into_iter().filter(|l| l.starts_with("split-window")).collect();
+            assert_eq!(splits[0], "split-window -t %0 -c /repo -v -P -F #{pane_id}");
+            assert_eq!(splits[1], "split-window -t %9_after_%0 -c /repo -h -b -P -F #{pane_id}");
+        });
+    }
+
+    #[test]
+    fn a_failed_split_reports_tmuxs_own_message_and_tracks_nothing() {
+        let body = r#"case "$1" in split-window) echo "no space for new pane" >&2; exit 1 ;; esac"#;
+        with_fake_tmux("split-fails", body, &[], |mut splitter, log| {
+            let err = splitter.spawn_harness(Path::new("/repo"), "feat-a", None).unwrap_err().to_string();
+            assert!(err.contains("no space for new pane"), "{err}");
+            assert!(!splitter.has_pane("feat-a"));
+            assert_eq!(stand_in::log_lines(log).len(), 1, "nothing may be typed into a pane that never opened");
+        });
+    }
+
+    #[test]
+    fn a_split_that_reports_no_pane_id_is_an_error() {
+        with_fake_tmux("no-id", r#"case "$1" in split-window) ;; esac"#, &[], |mut splitter, _| {
+            let err = splitter.spawn_harness(Path::new("/repo"), "feat-a", None).unwrap_err().to_string();
+            assert!(err.contains("did not report a pane id"), "{err}");
+            assert!(!splitter.has_pane("feat-a"));
+        });
+    }
+
+    /// The text goes in as literal keystrokes, so a message that happens to be the name of a
+    /// key is typed rather than pressed, and the submit is a separate key.
+    #[test]
+    fn a_message_is_typed_literally_and_submitted_with_its_own_enter() {
+        with_fake_tmux("send", "", &[], |mut splitter, log| {
+            splitter.adopt("feat-a", "%5");
+            splitter.send_task("feat-a", "Enter").unwrap();
+            splitter.send_task("feat-a", "--fix the tests").unwrap();
+            assert_eq!(
+                stand_in::log_lines(log),
+                ["send-keys -t %5 -l -- Enter", "send-keys -t %5 Enter", "send-keys -t %5 -l -- --fix the tests", "send-keys -t %5 Enter"]
+            );
+        });
+    }
+
+    /// `select-window` first: `select-pane` alone leaves a pane in another window out of sight.
+    #[test]
+    fn focus_selects_the_window_then_the_pane() {
+        with_fake_tmux("focus", "", &[], |mut splitter, log| {
+            splitter.adopt("feat-a", "%5");
+            splitter.focus("feat-a").unwrap();
+            assert_eq!(stand_in::log_lines(log), ["select-window -t %5", "select-pane -t %5"]);
+        });
+    }
+
+    #[test]
+    fn stopping_kills_the_pane_and_a_pane_already_gone_counts_as_stopped() {
+        with_fake_tmux("stop", "", &[], |mut splitter, log| {
+            splitter.adopt("feat-a", "%5");
+            splitter.stop("feat-a").unwrap();
+            assert_eq!(stand_in::log_lines(log), ["kill-pane -t %5"]);
+            assert!(!splitter.has_pane("feat-a"));
+        });
+        let gone = r#"case "$1" in kill-pane) echo "can't find pane: %5" >&2; exit 1 ;; esac"#;
+        with_fake_tmux("stop-gone", gone, &[], |mut splitter, _| {
+            splitter.adopt("feat-a", "%5");
+            splitter.stop("feat-a").expect("an already-closed pane is what stop is after anyway");
+        });
+        let broken = r#"case "$1" in kill-pane) echo "server exited unexpectedly" >&2; exit 1 ;; esac"#;
+        with_fake_tmux("stop-broken", broken, &[], |mut splitter, _| {
+            splitter.adopt("feat-a", "%5");
+            let err = splitter.stop("feat-a").unwrap_err().to_string();
+            assert!(err.contains("server exited unexpectedly"), "{err}");
+        });
+    }
+
+    /// A pane absent from `list-panes` is dead; one that is listed reads idle when nothing
+    /// under it is using CPU. The pid here is one no process has.
+    #[test]
+    fn polling_reads_present_panes_from_the_listing_and_absent_ones_as_dead() {
+        let body = r#"case "$1" in list-panes) printf '%%5 2000000000\n' ;; esac"#;
+        with_fake_tmux("poll", body, &[], |mut splitter, log| {
+            splitter.adopt("here", "%5");
+            splitter.adopt("gone", "%6");
+            let statuses = splitter.poll_statuses().unwrap();
+            assert_eq!(statuses["here"], PaneStatus::Idle);
+            assert_eq!(statuses["gone"], PaneStatus::Dead);
+            splitter.apply_statuses(statuses);
+            assert_eq!(splitter.pane_status("gone"), Some(PaneStatus::Dead));
+            assert_eq!(stand_in::log_lines(log), ["list-panes -a -F #{pane_id} #{pane_pid}"]);
+        });
+    }
+
+    #[test]
+    fn a_failed_listing_fails_the_poll_rather_than_calling_every_pane_dead() {
+        let body = r#"case "$1" in list-panes) echo "no server running" >&2; exit 1 ;; esac"#;
+        with_fake_tmux("poll-fails", body, &[], |mut splitter, _| {
+            splitter.adopt("here", "%5");
+            assert!(splitter.poll_statuses().unwrap_err().to_string().contains("no server running"));
+        });
+    }
 }
