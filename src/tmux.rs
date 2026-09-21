@@ -28,6 +28,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::mux::{command_exists, Multiplexer, OpenRequest};
 use crate::pane_status::{PaneStatus, CPU_BUSY_THRESHOLD_PERCENT};
+use crate::procs::{read_ps_table, subtree_cpu, PsRow};
 
 /// tmux, through its own CLI. Stateless: which pane belongs to which branch is
 /// `crate::splitter::Splitter`'s business, and this only knows how to act on a pane id.
@@ -192,53 +193,6 @@ fn parse_pane_list(list_out: &str) -> (HashSet<String>, HashMap<String, u32>) {
     (present, pane_pids)
 }
 
-/// One row of `ps -A -o pid=,ppid=,pcpu=` output: a process, its parent, and its CPU%.
-type PsRow = (u32, u32, f64);
-
-/// Parses `ps -A -o pid=,ppid=,pcpu=` output (the `=` suffixes suppress the header row,
-/// portable across macOS/BSD and GNU `ps`) into `(pid, ppid, cpu_percent)` rows.
-fn parse_ps_table(text: &str) -> Vec<PsRow> {
-    text.lines()
-        .filter_map(|line| {
-            let mut cols = line.split_whitespace();
-            let pid = cols.next()?.parse().ok()?;
-            let ppid = cols.next()?.parse().ok()?;
-            let cpu = cols.next()?.parse().ok()?;
-            Some((pid, ppid, cpu))
-        })
-        .collect()
-}
-
-fn read_ps_table() -> Result<Vec<PsRow>> {
-    let out = Command::new("ps")
-        .args(["-A", "-o", "pid=,ppid=,pcpu="])
-        .output()
-        .context("failed to spawn `ps`")?;
-    if !out.status.success() {
-        bail!("`ps` failed: {}", String::from_utf8_lossy(&out.stderr).trim());
-    }
-    Ok(parse_ps_table(&String::from_utf8_lossy(&out.stdout)))
-}
-
-/// Sums CPU% over `root_pid` and every one of its descendants in `table` — a harness
-/// process (e.g. `claude`) that spends its CPU in child processes rather than itself would
-/// otherwise read as idle even mid-generation.
-fn subtree_cpu(root_pid: u32, table: &[PsRow]) -> f64 {
-    let mut total = 0.0;
-    let mut frontier = vec![root_pid];
-    while let Some(pid) = frontier.pop() {
-        for &(row_pid, ppid, cpu) in table {
-            if row_pid == pid {
-                total += cpu;
-            }
-            if ppid == pid && row_pid != pid {
-                frontier.push(row_pid);
-            }
-        }
-    }
-    total
-}
-
 /// Pure classification step of [`Tmux::probe`], split out so it can be unit tested against
 /// synthetic `list-panes`/`ps` data without shelling out to either. A pane that is present
 /// but whose pid didn't come back this round is left out — no news, not a guess.
@@ -356,29 +310,6 @@ mod tests {
         assert_eq!(present, HashSet::from(["%0".to_string(), "%1".to_string()]));
         assert_eq!(pids.get("%0"), Some(&111));
         assert_eq!(pids.get("%1"), Some(&222));
-    }
-
-    #[test]
-    fn parse_ps_table_reads_pid_ppid_cpu() {
-        let table = parse_ps_table("  111   1   0.0\n  222 111  35.4\n");
-        assert_eq!(table, vec![(111, 1, 0.0), (222, 111, 35.4)]);
-    }
-
-    /// The harness's own CPU can sit near zero while it's actually busy generating, if all
-    /// the work happens in a child process — a real shape for e.g. a harness that shells
-    /// out to a language server or a build. Summing over the whole subtree catches that;
-    /// looking at `root_pid` alone would miss it.
-    #[test]
-    fn subtree_cpu_sums_a_harnesss_child_processes_too() {
-        // shell(pid 100) -> claude(pid 200) -> ripgrep(pid 300), all descendants of 100.
-        let table = vec![(100, 1, 0.1), (200, 100, 0.5), (300, 200, 40.0)];
-        assert_eq!(subtree_cpu(100, &table), 40.6);
-    }
-
-    #[test]
-    fn subtree_cpu_ignores_unrelated_processes() {
-        let table = vec![(100, 1, 5.0), (999, 1, 90.0)];
-        assert_eq!(subtree_cpu(100, &table), 5.0);
     }
 
     /// A tracked pane absent from `list-panes` entirely classifies as `Dead`, regardless
