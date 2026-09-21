@@ -198,6 +198,8 @@ pub(crate) mod fake {
         pub scope: Mutex<Option<String>>,
         /// Fails the next `open_pane` when set.
         pub fail_open: Mutex<bool>,
+        /// Makes every `close` fail while set.
+        pub fail_close: Mutex<bool>,
         /// Makes every `probe` fail while set.
         pub fail_probe: Mutex<bool>,
         /// Answers for the next probes, one per call, before falling back to `statuses`.
@@ -262,6 +264,9 @@ pub(crate) mod fake {
 
         fn close(&self, pane: &str) -> Result<()> {
             self.record(format!("close {pane}"));
+            if *self.fail_close.lock().unwrap() {
+                anyhow::bail!("fake close failed");
+            }
             Ok(())
         }
 

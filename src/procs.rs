@@ -9,6 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{bail, Context, Result};
 
@@ -95,6 +96,89 @@ pub fn real_ps() -> PsReader {
     Arc::new(read_ps_table)
 }
 
+/// `root` and every process below it in `table`, each once: what has to be ended to end a
+/// harness that has children of its own. Empty if `root` isn't in the table. A table whose
+/// parent links loop (a stale or torn read) still terminates.
+pub fn subtree(root: u32, table: &[PsRow]) -> Vec<u32> {
+    if !pid_present(root, table) {
+        return Vec::new();
+    }
+    let mut found = vec![root];
+    let mut frontier = vec![root];
+    while let Some(pid) = frontier.pop() {
+        for &(row_pid, ppid, _) in table {
+            if ppid == pid && row_pid != pid && !found.contains(&row_pid) {
+                found.push(row_pid);
+                frontier.push(row_pid);
+            }
+        }
+    }
+    found
+}
+
+/// How long a process has been running, from `ps -o etime=`, whose output is
+/// `[[dd-]hh:]mm:ss`. `None` for anything else.
+pub fn parse_etime(text: &str) -> Option<Duration> {
+    let text = text.trim();
+    let (days, clock) = match text.split_once('-') {
+        Some((days, clock)) => (days.parse::<u64>().ok()?, clock),
+        None => (0, text),
+    };
+    let parts: Vec<u64> = clock.split(':').map(|p| p.parse().ok()).collect::<Option<_>>()?;
+    let seconds = match parts.as_slice() {
+        [m, s] => m * 60 + s,
+        [h, m, s] => h * 3600 + m * 60 + s,
+        _ => return None,
+    };
+    Some(Duration::from_secs(days * 86_400 + seconds))
+}
+
+/// Where a [`crate::splitter::Splitter`] learns how long a process has been running, so it can
+/// tell the shell it recorded from a stranger that has since been given the same pid. `None`
+/// means there is no such process (or `ps` couldn't say).
+pub type AgeReader = Arc<dyn Fn(u32) -> Option<Duration> + Send + Sync>;
+
+/// An [`AgeReader`] that runs `ps -o etime=`.
+pub fn real_age() -> AgeReader {
+    Arc::new(|pid| {
+        let out = Command::new("ps").args(["-o", "etime=", "-p", &pid.to_string()]).output().ok()?;
+        out.status.success().then(|| parse_etime(&String::from_utf8_lossy(&out.stdout))).flatten()
+    })
+}
+
+/// Where a [`crate::splitter::Splitter`] ends processes. The real one sends `SIGTERM`; a test
+/// records what it was asked to end instead.
+pub type Killer = Arc<dyn Fn(&[u32]) + Send + Sync>;
+
+/// A [`Killer`] that runs `kill -TERM`. Best effort by design: a process that has already gone
+/// is the outcome wanted, so there is nothing to report.
+pub fn real_killer() -> Killer {
+    Arc::new(|pids| {
+        if pids.is_empty() {
+            return;
+        }
+        let _ = Command::new("kill")
+            .arg("-TERM")
+            .args(pids.iter().map(u32::to_string))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    })
+}
+
+/// Whether a process that has run for `age` (as of `now`) can be the shell that wrote a pid file
+/// at `written`: it must have been running by then. The shell writes the file the moment it
+/// starts, so a process that began after that is a different one that inherited the pid — the
+/// operating system reuses them — and ending it would be ending a stranger. `etime` counts
+/// whole seconds, so a couple are allowed.
+pub fn started_before(age: Duration, now: SystemTime, written: SystemTime) -> bool {
+    const SLACK: Duration = Duration::from_secs(2);
+    match now.checked_sub(age) {
+        Some(started) => started <= written + SLACK,
+        None => true, // said to have run longer than the clock goes back: certainly older
+    }
+}
+
 /// Whether process tracking applies, given what the multiplexer asks for and what
 /// `KANSTACK_TRACK_PIDS` says. `1`, `true`, `on` and `yes` force it on, whichever multiplexer
 /// this is (which is how it can be tried on one that needs no help); `0`, `false`, `off` and
@@ -161,6 +245,11 @@ impl Pids {
     pub fn read(&self, branch: &str) -> Option<u32> {
         let raw = std::fs::read_to_string(self.file(branch)?).ok()?;
         raw.trim().parse().ok().filter(|pid| *pid != 0)
+    }
+
+    /// When `branch`'s pid was recorded: when its file was last written.
+    pub fn written_at(&self, branch: &str) -> Option<SystemTime> {
+        std::fs::metadata(self.file(branch)?).ok()?.modified().ok()
     }
 
     /// Drops the pid recorded for `branch`, because it was about a pane that no longer exists:
@@ -342,5 +431,86 @@ mod tests {
         assert_eq!(reading_from_pid(200, &table), PaneStatus::Busy);
         assert_eq!(reading_from_pid(300, &table), PaneStatus::Dead);
         assert_eq!(reading_from_pid(100, &[]), PaneStatus::Dead, "an empty table has no shell in it");
+    }
+
+    // Ending a pane's processes.
+
+    #[test]
+    fn subtree_is_the_root_and_everything_below_it_and_nothing_else() {
+        //   100 ── 101 ── 102        200 (unrelated)
+        //     └─── 103               99  (100's parent)
+        let table: Vec<PsRow> = vec![(99, 1, 0.0), (100, 99, 0.0), (101, 100, 0.0), (102, 101, 0.0), (103, 100, 0.0), (200, 1, 0.0)];
+        let mut found = subtree(100, &table);
+        found.sort_unstable();
+        assert_eq!(found, [100, 101, 102, 103], "not its parent, not the unrelated process");
+        assert_eq!(subtree(102, &table), [102], "a leaf is just itself");
+        assert!(subtree(4242, &table).is_empty(), "a process that isn't there has nothing to end");
+    }
+
+    #[test]
+    fn subtree_terminates_on_a_table_whose_parent_links_loop() {
+        let table: Vec<PsRow> = vec![(1, 2, 0.0), (2, 1, 0.0), (3, 3, 0.0)];
+        let mut found = subtree(1, &table);
+        found.sort_unstable();
+        assert_eq!(found, [1, 2]);
+        assert_eq!(subtree(3, &table), [3], "a process that is its own parent");
+    }
+
+    #[test]
+    fn etime_parses_every_shape_ps_prints() {
+        assert_eq!(parse_etime("   05:23\n"), Some(Duration::from_secs(323)));
+        assert_eq!(parse_etime("01:05:23"), Some(Duration::from_secs(3923)));
+        assert_eq!(parse_etime("2-03:04:05"), Some(Duration::from_secs(2 * 86_400 + 3 * 3600 + 4 * 60 + 5)));
+        assert_eq!(parse_etime("00:00"), Some(Duration::ZERO));
+        for bad in ["", "   ", "abc", "12", "1:2:3:4", "x-01:02"] {
+            assert_eq!(parse_etime(bad), None, "{bad:?}");
+        }
+    }
+
+    /// The reason for the check: pids are reused, and a recorded one that now names an unrelated
+    /// process must not be ended.
+    #[test]
+    fn a_process_that_started_after_the_pid_was_recorded_is_a_stranger() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let written = now - Duration::from_secs(3600); // the pane opened an hour ago
+        assert!(started_before(Duration::from_secs(3600), now, written), "the shell that wrote it");
+        assert!(started_before(Duration::from_secs(3601), now, written), "or one started slightly earlier");
+        assert!(started_before(Duration::from_secs(3599), now, written), "etime counts whole seconds");
+        assert!(!started_before(Duration::from_secs(3590), now, written), "started ten seconds after: not it");
+        assert!(!started_before(Duration::from_secs(5), now, written), "started five seconds ago: a stranger holding a reused pid");
+        assert!(started_before(Duration::from_secs(u64::MAX / 2), now, written), "older than the clock: certainly earlier");
+    }
+
+    #[test]
+    fn a_pid_files_age_is_when_it_was_written() {
+        let dir = std::env::temp_dir().join(format!("kanstack-pids-age-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pids = Pids::in_dir(dir.clone());
+        assert_eq!(pids.written_at("feat-a"), None, "nothing recorded");
+        let file = pids.prepare("feat-a").unwrap().unwrap();
+        std::fs::write(&file, "1234").unwrap();
+        let long_ago = SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options().write(true).open(&file).unwrap().set_modified(long_ago).unwrap();
+        let written = pids.written_at("feat-a").unwrap();
+        assert!(written.duration_since(long_ago).unwrap_or_default() < Duration::from_secs(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The real functions, against a real process: `ps` reports how long it has run, `kill` ends
+    /// it, and afterwards `ps` no longer knows it. Nothing here is a stand-in.
+    #[test]
+    fn the_real_age_reader_and_killer_end_a_real_process() {
+        let mut child = Command::new("sleep").arg("300").spawn().expect("sleep starts");
+        let pid = child.id();
+        let age = real_age()(pid).expect("ps knows a process that is running");
+        assert!(age < Duration::from_secs(30), "a process started a moment ago: {age:?}");
+        assert!(started_before(age, SystemTime::now(), SystemTime::now()), "it started before now");
+
+        real_killer()(&[pid]);
+        let status = child.wait().expect("the child ends");
+        assert!(!status.success(), "it was ended by the signal, not by finishing: {status:?}");
+        assert_eq!(real_age()(pid), None, "and ps no longer knows it");
+        real_killer()(&[pid]); // ending what is already gone is not an error
+        real_killer()(&[]);
     }
 }

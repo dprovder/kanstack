@@ -246,10 +246,14 @@ A few things differ from the others:
   in the pane and your `~/.zshrc` has not run. kanstack passes along your `PATH` and every
   `KANSTACK_*` variable; other variables that exist only in your interactive shell won't
   reach the harness.
-- **Stopping a lane leaves its process running.** `kanstack stop` closes the pane through
-  AppleScript, which removes it from the window, but in Ghostty 1.3.1 that did not end the
-  process inside it: a `sleep` and a `cat` outlived their closed panes by many minutes
-  (closing a whole window did end its process). Quit the harness first if that matters.
+- **`kanstack stop` ends the harness itself.** Closing a pane through AppleScript removes it
+  from the window, but in Ghostty 1.3.1 that did not end the process inside it: a `sleep` and a
+  `cat` outlived their closed panes by many minutes (closing a whole window did end its
+  process). So `stop` also sends `SIGTERM` to the pane's recorded shell and everything below
+  it, even if closing the pane reported a problem. It only does so if that pid is still the
+  shell that recorded it: pids are reused, so a process that began after the pid file was
+  written is left alone. It is a plain `SIGTERM`, so a harness that ignores it keeps running,
+  and it needs a recorded pid, so a pane whose shell never wrote one is only closed.
 - **Don't expect a lane to start while the Mac is idle.** Once, with nobody at the machine,
   every new pane opened but ran nothing until someone was back; it isn't understood yet.
 - **Finding its own pane.** Ghostty gives a shell no id for its own pane, so for the first
@@ -412,7 +416,9 @@ turns it off. It has limits, and they matter:
   is every multiplexer that gives a pane a shell and returns to its prompt when the harness
   exits, a finished harness reads `idle`, not `dead`. `dead` only means the shell itself went.
 - A recorded pid could in principle be reused by an unrelated process after the shell exits,
-  which would read as a live pane. Not seen, and not guarded against.
+  which would read as a live pane. Not seen, and not guarded against when *reading* status.
+  `kanstack stop` does guard against it before ending anything (see above): it compares how
+  long the process has run with when the pid was recorded.
 
 Checked on tmux 3.6, with a `list-panes` wrapper that hides `pane_pid` so tmux could say only
 that panes exist, as Ghostty would: a shell running a CPU loop read `busy`, one running

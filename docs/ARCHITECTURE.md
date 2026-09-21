@@ -317,7 +317,8 @@ the error surfaces only when there are none.
   What it can't do: the CPU is a guess, as it is everywhere; it follows the shell, so where
   the shell outlives the harness (tmux, and any pane that returns to a prompt) a finished
   harness reads `Idle`, and `Dead` only means the shell exited; a recorded pid could in
-  principle be reused, and a zombie awaiting its parent's `wait` still has a `ps` row.
+  principle be reused (unguarded when reading status; `stop` guards it, below), and a zombie
+  awaiting its parent's `wait` still has a `ps` row.
   Checked on tmux 3.6 with the pane listing stripped of `pane_pid` (so the probe could only
   say a pane exists): `busy` for a CPU loop, `idle` for `sleep`, `idle` after killing the loop
   (shell left), `dead` after killing the shell in a `remain-on-exit` pane, and a stale `busy`
@@ -482,6 +483,20 @@ file is read too), launched with a scrubbed environment so it behaved as it does
   did end its process at once; `perform action "close_surface"` on a pane with a running
   process raises a confirmation dialog no script can answer. `Multiplexer::close` therefore only
   removes the pane, and ending the harness needs its pid.
+- **`Splitter::stop` ends the harness through its recorded pid**. Before
+  closing, it finds the recorded shell and everything below it in the process table; after
+  closing, it sends them `SIGTERM`, *even if the close failed*, since a pane that would not
+  close is where a harness is most likely still running. It only acts when process tracking
+  applies. **Pid reuse is the danger**: a recorded pid can end up naming an unrelated process,
+  and ending that would be ending a stranger. So the process's age (`ps -o etime=`) is compared
+  with when the pid file was written: the shell wrote it the moment it started, so a process
+  that began after that is not it. Checked against real processes: a real `sleep` is found,
+  aged and ended by the real functions, and on a private tmux whose `kill-pane` does nothing
+  (as Ghostty's close does) the old build left the harness running and the new one ended it.
+  Limits: it is a plain `SIGTERM`, so a harness that ignores it keeps running; an interactive
+  shell (a tmux pane's) ignores `SIGTERM` too, so there the harness underneath ends and the
+  shell stays until the multiplexer closes the pane; and anything a harness detaches from its
+  process tree is out of reach.
 - **Panes that never started** (observed, cause not established): during one stretch of about
   six minutes, with the machine idle, *every* pane created failed to run its command at all,
   including a bare `echo hi > file` split by hand with no kanstack involved, and stayed that way

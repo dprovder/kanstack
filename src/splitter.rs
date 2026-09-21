@@ -20,7 +20,10 @@ use crate::harness::HarnessConfig;
 use crate::mux::{configured_directions, normalize_direction, Multiplexer, OpenRequest};
 use crate::orca::Orca;
 use crate::pane_status::PaneStatus;
-use crate::procs::{reading_from_pid, real_ps, record_pid_prefix, tracking_applies, Pids, PsReader, PsRow};
+use crate::procs::{
+    reading_from_pid, real_age, real_killer, real_ps, record_pid_prefix, started_before, subtree, tracking_applies, AgeReader,
+    Killer, Pids, PsReader, PsRow,
+};
 use crate::report::{Reports, Said};
 use crate::tmux::Tmux;
 
@@ -176,6 +179,11 @@ pub struct Splitter {
     /// Where the process table comes from, for a pane whose process is tracked: `ps`, except
     /// in a test.
     ps: PsReader,
+    /// How long a process has been running, to tell a pane's recorded shell from a stranger
+    /// that has since been given its pid: `ps`, except in a test.
+    age: AgeReader,
+    /// How a pane's processes are ended when it is stopped: `SIGTERM`, except in a test.
+    kill: Killer,
     /// How long to wait between the looks that confirm a pane is really quiet.
     quiet_gap: Duration,
 }
@@ -196,6 +204,8 @@ impl Splitter {
             pids: Pids::default(),
             track_setting: std::env::var("KANSTACK_TRACK_PIDS").ok(),
             ps: real_ps(),
+            age: real_age(),
+            kill: real_killer(),
             quiet_gap: QUIET_GAP,
         }
     }
@@ -339,6 +349,12 @@ impl Splitter {
         self.ps = read;
     }
 
+    #[cfg(test)]
+    fn set_process_hooks(&mut self, age: AgeReader, kill: Killer) {
+        self.age = age;
+        self.kill = kill;
+    }
+
     /// Where to read what agents report about themselves. Without it, statuses come from the
     /// multiplexer alone.
     pub fn set_reports(&mut self, reports: Reports) {
@@ -408,9 +424,36 @@ impl Splitter {
         if self.last_anchor.as_deref() == Some(pane.id.as_str()) {
             self.last_anchor = None;
         }
+        // What to end is worked out first: once the pane is closed and its pid forgotten there
+        // is nothing left to find it by.
+        let to_end = self.processes_to_end(branch);
         self.reports.forget(branch);
         self.pids.forget(branch);
-        self.mux.close(&pane.id)
+        let closed = self.mux.close(&pane.id);
+        // Closing a pane doesn't always end what runs in it — Ghostty drops the pane from its
+        // list but leaves the process holding its terminal, measured running for eighteen
+        // minutes — and a harness left running is an agent still spending. So it is ended
+        // too, and even if closing the pane reported a problem.
+        (self.kill)(&to_end);
+        closed
+    }
+
+    /// The processes under `branch`'s pane that stopping it must end: the shell that recorded its
+    /// pid and everything below it. Only when process tracking applies, and only if that pid is
+    /// still the shell that wrote it, not an unrelated process that has since been given it.
+    fn processes_to_end(&self, branch: &str) -> Vec<u32> {
+        if !self.tracks_pids() {
+            return Vec::new();
+        }
+        let (Some(pid), Some(written)) = (self.pids.read(branch), self.pids.written_at(branch)) else { return Vec::new() };
+        let Some(age) = (self.age)(pid) else { return Vec::new() };
+        if !started_before(age, SystemTime::now(), written) {
+            return Vec::new();
+        }
+        match (self.ps)() {
+            Ok(table) => subtree(pid, &table),
+            Err(_) => Vec::new(),
+        }
     }
 
     /// Sends `text` followed by Enter into `branch`'s tracked pane — the same
@@ -1894,5 +1937,136 @@ mod tests {
                 );
             }
         }
+    }
+
+    // Stopping a pane must end what runs in it, not only close it.
+
+    type Killed = Arc<std::sync::Mutex<Vec<Vec<u32>>>>;
+
+    //   100 (the pane's shell) ── 101 (the harness) ── 102 (a tool it runs)      200 (unrelated)
+    fn process_tree() -> Vec<PsRow> {
+        vec![(1, 0, 0.0), (100, 1, 0.0), (101, 100, 4.0), (102, 101, 9.0), (200, 1, 30.0)]
+    }
+
+    /// A tracked splitter with a `feat-a` pane whose shell (pid 100) recorded itself `age` ago and
+    /// has been running for `age`, over `process_tree`, with every attempt to end a process
+    /// recorded.
+    fn stoppable(tag: &str, mux_asks: bool, age: Duration) -> (Splitter, Arc<FakeMux>, Pids, Killed) {
+        let (mut splitter, mux, pids) = splitter_tracking(tag, mux_asks, None);
+        splitter.spawn_harness(cwd(), "feat-a", None).unwrap();
+        let file = pids.prepare("feat-a").unwrap().unwrap();
+        std::fs::write(&file, "100").unwrap();
+        let written = SystemTime::now() - age;
+        std::fs::File::options().write(true).open(&file).unwrap().set_modified(written).unwrap();
+        let killed: Killed = Arc::default();
+        let recorder = killed.clone();
+        splitter.set_process_hooks(
+            Arc::new(move |pid| (pid == 100).then_some(age)),
+            Arc::new(move |pids: &[u32]| recorder.lock().unwrap().push(pids.to_vec())),
+        );
+        splitter.set_process_table(Arc::new(|| Ok(process_tree())));
+        (splitter, mux, pids, killed)
+    }
+
+    fn ended(killed: &Killed) -> Vec<u32> {
+        let mut all: Vec<u32> = killed.lock().unwrap().concat();
+        all.sort_unstable();
+        all
+    }
+
+    /// Ghostty drops a closed pane from its list and leaves the process running.
+    #[test]
+    fn stopping_a_tracked_pane_ends_its_shell_and_everything_under_it_and_closes_it() {
+        let (mut splitter, mux, pids, killed) = stoppable("end", true, Duration::from_secs(100));
+        splitter.stop("feat-a").unwrap();
+        assert_eq!(ended(&killed), [100, 101, 102], "the shell, the harness and its tool — not the unrelated process");
+        assert!(mux.lines().contains(&"close p1".to_string()), "{:#?}", mux.lines());
+        assert_eq!(pids.read("feat-a"), None, "and the pid is forgotten");
+    }
+
+    #[test]
+    fn a_pane_opened_by_another_process_is_ended_the_same_way() {
+        let (mut splitter, _mux, _pids, killed) = stoppable("adopted", true, Duration::from_secs(100));
+        splitter.stop("feat-a").unwrap();
+        assert!(!ended(&killed).is_empty());
+        // ...and one this process adopted from the registry, as `kanstack stop` does.
+        let (mut splitter, _mux, pids, killed) = {
+            let (mut splitter, mux, pids) = splitter_tracking("adopted2", true, None);
+            let file = pids.prepare("feat-b").unwrap().unwrap();
+            std::fs::write(&file, "100").unwrap();
+            std::fs::File::options().write(true).open(&file).unwrap().set_modified(SystemTime::now() - Duration::from_secs(50)).unwrap();
+            let killed: Killed = Arc::default();
+            let recorder = killed.clone();
+            splitter.set_process_hooks(
+                Arc::new(|pid| (pid == 100).then_some(Duration::from_secs(50))),
+                Arc::new(move |pids: &[u32]| recorder.lock().unwrap().push(pids.to_vec())),
+            );
+            splitter.set_process_table(Arc::new(|| Ok(process_tree())));
+            splitter.adopt("feat-b", "p7");
+            (splitter, mux, pids, killed)
+        };
+        splitter.stop("feat-b").unwrap();
+        assert_eq!(ended(&killed), [100, 101, 102]);
+        assert_eq!(pids.read("feat-b"), None);
+    }
+
+    /// Pids are reused. A recorded one that now names a process which began after it was written
+    /// belongs to someone else, and ending it would be ending a stranger.
+    #[test]
+    fn a_recorded_pid_that_now_belongs_to_a_stranger_is_left_alone() {
+        let (mut splitter, _mux, _pids, killed) = stoppable("stranger", true, Duration::from_secs(3600));
+        // The file was written an hour ago; the process holding pid 100 has run for five seconds.
+        splitter.set_process_hooks(
+            Arc::new(|pid| (pid == 100).then_some(Duration::from_secs(5))),
+            {
+                let recorder = killed.clone();
+                Arc::new(move |pids: &[u32]| recorder.lock().unwrap().push(pids.to_vec()))
+            },
+        );
+        splitter.stop("feat-a").unwrap();
+        assert!(ended(&killed).is_empty(), "{:?}", ended(&killed));
+    }
+
+    #[test]
+    fn nothing_is_ended_where_process_tracking_does_not_apply() {
+        let (mut splitter, mux, _pids, killed) = stoppable("untracked", false, Duration::from_secs(100));
+        splitter.stop("feat-a").unwrap();
+        assert!(ended(&killed).is_empty(), "a multiplexer that can close a pane properly needs no help");
+        assert!(mux.lines().contains(&"close p1".to_string()));
+    }
+
+    #[test]
+    fn nothing_is_ended_when_there_is_no_recorded_pid_or_no_such_process_or_no_process_table() {
+        // No pid file: the shell never wrote it.
+        let (mut splitter, _mux, pids, killed) = stoppable("no-file", true, Duration::from_secs(100));
+        pids.forget("feat-a");
+        splitter.stop("feat-a").unwrap();
+        assert!(ended(&killed).is_empty());
+
+        // The recorded shell is already gone.
+        let (mut splitter, _mux, _pids, killed) = stoppable("gone", true, Duration::from_secs(100));
+        splitter.set_process_hooks(Arc::new(|_| None), {
+            let recorder = killed.clone();
+            Arc::new(move |pids: &[u32]| recorder.lock().unwrap().push(pids.to_vec()))
+        });
+        splitter.stop("feat-a").unwrap();
+        assert!(ended(&killed).is_empty());
+
+        // `ps` can't be read: better to end nothing than to guess.
+        let (mut splitter, _mux, _pids, killed) = stoppable("no-ps", true, Duration::from_secs(100));
+        splitter.set_process_table(Arc::new(|| anyhow::bail!("ps failed")));
+        splitter.stop("feat-a").unwrap();
+        assert!(ended(&killed).is_empty());
+    }
+
+    /// A pane that failed to close is the case where the harness is most likely still running.
+    #[test]
+    fn a_failed_close_still_ends_the_processes_and_still_reports_the_failure() {
+        let (mut splitter, mux, _pids, killed) = stoppable("close-fails", true, Duration::from_secs(100));
+        *mux.fail_close.lock().unwrap() = true;
+        let err = splitter.stop("feat-a").unwrap_err().to_string();
+        assert!(err.contains("fake close failed"), "{err}");
+        assert_eq!(ended(&killed), [100, 101, 102]);
+        assert!(!splitter.has_pane("feat-a"), "the lane is forgotten regardless");
     }
 }
