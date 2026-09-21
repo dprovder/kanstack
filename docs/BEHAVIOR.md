@@ -63,6 +63,13 @@ the incoming commits plus each lane's outcome — `rebases cleanly`, `already in
 `conflicts` — before anything moves. Worktree conflicts are called out too, and the dialog
 turns red and says "rebase anyway" when either is true.
 
+The header's `base` and "behind upstream" count come from the commit graph, not from
+`but status`: `mergeBase` there is GitButler's recorded target, which a land was observed to
+advance without moving the workspace commit, leaving `base` equal to upstream while every
+lane was twelve commits behind. Git's answer is the merge base of `HEAD` (the workspace
+commit) and the upstream tip, and the count of commits between them. When a land leaves the
+workspace behind, the rebase preview opens straight after it.
+
 Note `r` here is *rebase*, whereas GitButler's own TUI binds `r` to squash — worth knowing
 if you use both.
 

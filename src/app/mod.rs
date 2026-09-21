@@ -631,11 +631,19 @@ impl App {
                 }
             }
         }
-        match but.diff_uncommitted() {
+        let mut board = match but.diff_uncommitted() {
             Ok(d) => Board::from_status_diff_and_commits(s, &d, cache),
             // Counts are a nicety; a board without them beats no board.
             Err(_) => Board::from_status(s),
+        };
+        // `but status` cannot say where the workspace sits (see `workspace_position`), so
+        // the header's base and behind count come from the commit graph. If Git cannot
+        // answer, what `but` reported stands rather than the header going blank.
+        if let Ok(pos) = but.workspace_position(&s.upstream_state.latest_commit.commit_id) {
+            board.base_short_id = pos.base.chars().take(7).collect();
+            board.behind = pos.behind;
         }
+        board
     }
 
     pub fn refresh(&mut self) {
