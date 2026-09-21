@@ -315,7 +315,8 @@ themselves. `KANSTACK_STATUS_HOOKS=off` launches every harness without them.
 
 How a report and the multiplexer's reading combine:
 
-- A pane the multiplexer says is gone is always `dead`.
+- A pane the multiplexer says is gone is always `dead`, and so is one whose shell kanstack is
+  tracking itself (see below) and has exited.
 - Otherwise a fresh report wins, and one CPU reading never overrides it. `busy` and `idle` are
   believed for ten minutes, `waiting` for twelve hours, since a prompt left overnight is
   exactly what it is for.
@@ -330,8 +331,53 @@ How a report and the multiplexer's reading combine:
   ends, and a pane at rest looks exactly like one with a prompt pending. So `◆ needs you` stays
   until you next type something. A false "needs you" costs a glance; a missed prompt could
   cost hours.
-- A report that has run out reads `unknown` unless the multiplexer knows better, rather than
-  leaving the last status standing.
+- A report that has run out reads `unknown` unless the multiplexer, or the process table
+  below, knows better, rather than leaving the last status standing.
+
+#### When the multiplexer can't say: kanstack watches the process itself
+
+Some multiplexers can only say whether a pane exists (Ghostty's scripting is one), and some
+keep a pane listed after its command has exited, so neither busy, idle nor "it finished" can
+come from them. For those, kanstack follows the pane's process itself. The launch line starts
+with `sh -c 'printf %s "$PPID" > "$0"' <file> && `, so the pane's own shell writes its pid to
+a small file, one per branch, under `pids-<repo>` next to the reports, before it runs the
+harness. (`$PPID` rather than `$$` because it means the same in every shell, fish included; the
+file's path is passed as an argument so a path with spaces or a quote needs no extra quoting.)
+Each poll then reads `ps` once, and only if some pane with a pid needs it:
+
+- the shell is not in the process table: `dead`. This is how a finished harness is noticed
+  where its pane stays listed;
+- otherwise the shell and everything under it together using more than 3% CPU: `busy`, else
+  `idle`, the same threshold the tmux and cmux readings use.
+
+It ranks below the multiplexer's own busy or idle reading (used only where that has none) and,
+like it, below a fresh report. It also takes part in the stale-`busy` check above, so an
+interrupted turn is corrected on such a multiplexer too, from the process table's look at the
+pane. A pane whose shell hasn't written its pid yet, or whose pid file can't be read, simply has
+no reading. Like a report, the pid file is deleted when a new pane opens on the branch and on
+`stop`.
+
+It is on where the multiplexer asks for it, and `KANSTACK_TRACK_PIDS=1` (`true`, `on`, `yes`)
+turns it on for any of them, which is how to try it under tmux; `0` (`false`, `off`, `no`)
+turns it off. It has limits, and they matter:
+
+- CPU is a guess, exactly as it is for tmux and cmux: a harness waiting on the network reads
+  `idle`, and a busy one that happens to dip reads `idle` for a moment.
+- It follows the pane's *shell*, not the harness. Where the shell outlives the harness, which
+  is every multiplexer that gives a pane a shell and returns to its prompt when the harness
+  exits, a finished harness reads `idle`, not `dead`. `dead` only means the shell itself went.
+- A recorded pid could in principle be reused by an unrelated process after the shell exits,
+  which would read as a live pane. Not seen, and not guarded against.
+
+Checked on tmux 3.6, with a `list-panes` wrapper that hides `pane_pid` so tmux could say only
+that panes exist, as Ghostty would: a shell running a CPU loop read `busy`, one running
+`sleep` read `idle`, killing the loop's process left `idle`, and killing a shell in a pane
+kept listed with `remain-on-exit` read `dead` (tmux's own reading of that pane says `idle`).
+With a `busy` report over a quiet shell, the status went from `busy` to `idle` on the first
+poll after twenty seconds, which took 2.7 seconds, and the report was rewritten as `idle`; the
+same report over a shell running a CPU loop stayed `busy` and cost nothing. The pid file held
+the pane shell's pid under zsh, bash, dash, ksh and tcsh. Fish is not among them; it was not
+installed. Not yet checked against Ghostty itself.
 
 Verified against real Claude, one scenario each: a Write prompt (approved; "yes, don't ask
 again"; "no"), two prompts in one turn, a WebFetch prompt, plan mode's approval dialog, and an

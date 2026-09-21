@@ -81,6 +81,12 @@ environment:
                      except that inside an Orca terminal but not a cmux or tmux pane,
                      orca goes first). Mainly for a machine with several installed where
                      the first isn't actually the one kanstack is running inside right now.
+  KANSTACK_TRACK_PIDS  whether kanstack follows each pane's shell process itself, for its
+                     busy/idle/dead status: the pane's shell writes its pid before it starts
+                     the harness, and `ps` is read for it. Off unless the multiplexer can't
+                     say for itself (Ghostty); `1`, `true`, `on` or `yes` turns it on for any
+                     of them, `0`, `false`, `off` or `no` turns it off. It sees the shell,
+                     not the harness: a finished harness reads idle until the shell exits.
   KANSTACK_HARNESS   command typed into that terminal (default: `claude`)
   KANSTACK_HARNESS_SYSTEM_FLAG  the harness's flag for appending to its own default
                      system prompt, e.g. `--append-system-prompt` (default: whatever's
@@ -352,6 +358,11 @@ fn run(
 mod tests {
     use super::HELP;
     use kanstack::splitter::BACKENDS;
+
+    #[test]
+    fn help_documents_process_tracking() {
+        assert!(HELP.contains("KANSTACK_TRACK_PIDS"));
+    }
 
     /// `--help` documents each backend by hand, since its variables differ, so a new one
     /// must be added there — this fails until it is.

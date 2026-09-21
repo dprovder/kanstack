@@ -228,7 +228,9 @@ Two independent axes, each one file plus one line, with the shared logic written
   `KANSTACK_<NAME>_DIRECTION` variables, and the wizard must offer it. Its environment variables come for free:
   `KANSTACK_<NAME>_DIRECTION` and `KANSTACK_<NAME>_CHAIN_DIRECTION`, with defaults from
   `default_directions()`. `probe` returns only the panes it could classify; leaving one out
-  means "no news", and the caller keeps what it knew. Test everything above the trait
+  means "no news", and the caller keeps what it knew. A backend that can only say whether a
+  pane exists returns `true` from `tracks_pids()` and everything else follows (below); it need
+  only report a pane that is gone as `Dead`. Test everything above the trait
   against `mux::fake::FakeMux`, and the backend itself against a stand-in binary that logs
   its arguments (see `orca.rs`'s tests).
 - **A harness** is a `Harness` impl (`src/harness.rs`): one unit struct, one entry in
@@ -240,10 +242,13 @@ Two independent axes, each one file plus one line, with the shared logic written
 
 ### Where a pane's status comes from
 
-Two sources, combined by `splitter::merge`. A `Multiplexer::probe` is the backend's own
+Three sources, combined by `splitter::merge`. A `Multiplexer::probe` is the backend's own
 reading of the pane. A *report* is what the agent said about itself, through `kanstack report
-busy|idle|waiting`, which a harness's hooks run (`src/report.rs`). The rule, in order: a pane
-the multiplexer says is gone is `dead`, whatever was reported; a fresh report wins, except
+busy|idle|waiting`, which a harness's hooks run (`src/report.rs`). For a backend that can't
+probe activity there is a third, the process table (below). The first and third are together
+the pane's *native* reading, which `Splitter::native_readings` derives in one place, for the
+poll and for the confirming looks alike. The rule, in order: a pane that is gone (the
+multiplexer says so, or the pid tier finds its shell gone) is `dead`, whatever was reported; a fresh report wins, except
 where what the multiplexer sees contradicts it (below); an expired report is `unknown` unless
 the multiplexer knows better; with neither, the pane is left out of the result and the last
 known status is kept. If the probe itself fails, statuses come from fresh reports alone, and
@@ -285,7 +290,39 @@ the error surfaces only when there are none.
   keeps `waiting` until the next prompt, though the pane is at rest. From outside a prompt
   and rest are identical, so only the agent could say, and it can't. On a multiplexer with no
   reading at all, nothing corroborates either rule, so a stale `busy` stands until it expires.
-  That is one reason the pid-based fallback matters for Ghostty.
+  That is one reason the pid tier below exists: it gives such a multiplexer a reading, and
+  corroboration uses it.
+- **The process table, for a multiplexer that can't say (`Multiplexer::tracks_pids`).** Ghostty
+  can only say whether a pane exists, and a pane whose command has exited stays listed
+  (measured: still listed 9 seconds later), so kanstack follows the process itself
+  (`src/procs.rs`). When tracking applies, `spawn_harness_with` puts
+  `sh -c 'printf %s "$PPID" > "$0"' <file> && ` in front of the launch line, so the pane's own
+  shell records its pid in `pids-<repo>/<fnv1a(branch)>.pid` (`workstream::pids_dir`; one file
+  per branch beside the reports, for the same reason: the writer is another process). `$PPID`
+  because it is the parent of the `sh` and so the pane's shell whatever that shell is, where
+  `$$` is spelled differently in fish; the path is `sh`'s `$0` so it is quoted once, not
+  inside another quote. The directory is created from Rust first, since the shell would not,
+  and the file is forgotten before a new pane opens and on `stop`, exactly as a report is.
+  Tracking applies when the multiplexer asks or `KANSTACK_TRACK_PIDS` is `1`/`true`/`on`/`yes`,
+  and not when it is `0`/`false`/`off`/`no` (read when the `Splitter` is made). The setting is
+  how the feature is exercised on tmux; it is also why there is a test double for `ps`.
+  For a tracked pane with a pid file, the reading is `Dead` if the pid is not in `ps`, else
+  `Busy` or `Idle` by `subtree_cpu` against `CPU_BUSY_THRESHOLD_PERCENT`. It is used only when
+  the probe gave no `Busy`/`Idle` for the pane: a probe `Dead` wins, and a probe `Busy` or `Idle`
+  wins over it. `ps` is read at most once per `native_readings` call (a poll, or one
+  confirming look), lazily, and if it fails the panes that needed it have no reading. If the
+  probe itself fails, the pid tier is not consulted: statuses come from reports alone, as
+  before.
+  What it can't do: the CPU is a guess, as it is everywhere; it follows the shell, so where
+  the shell outlives the harness (tmux, and any pane that returns to a prompt) a finished
+  harness reads `Idle`, and `Dead` only means the shell exited; a recorded pid could in
+  principle be reused, and a zombie awaiting its parent's `wait` still has a `ps` row.
+  Checked on tmux 3.6 with the pane listing stripped of `pane_pid` (so the probe could only
+  say a pane exists): `busy` for a CPU loop, `idle` for `sleep`, `idle` after killing the loop
+  (shell left), `dead` after killing the shell in a `remain-on-exit` pane, and a stale `busy`
+  report retracted after 2.7 seconds (`QUIET_CONFIRMATIONS` looks at `QUIET_GAP`, each a fresh
+  `ps`) while the same report over a CPU-bound shell stood. The pid file matched the pane's
+  shell under zsh, bash, dash, ksh and tcsh; fish is untested (not installed).
 - **Scenarios verified live (Claude Code 2.1.278):** Write approved, "yes, don't ask again",
   "no", two consecutive prompts, WebFetch, plan mode's `ExitPlanMode` dialog and
   `AskUserQuestion` all fire `PermissionRequest` and report `waiting`; approval returns to
