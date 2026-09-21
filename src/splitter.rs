@@ -1,6 +1,6 @@
 //! The harness-split state kanstack keeps, whichever multiplexer it is in — `cmux` if
-//! present, else plain `tmux`, else `orca` (see `crate::cmux`, `crate::tmux`, `crate::orca`),
-//! paired with the harness it launches (`crate::harness`).
+//! present, else plain `tmux`, else `orca`, else Ghostty (see `crate::cmux`, `crate::tmux`,
+//! `crate::orca`, `crate::ghostty`), paired with the harness it launches (`crate::harness`).
 //!
 //! A [`Multiplexer`] only opens, types into, focuses, closes and probes panes. Which branch a
 //! pane belongs to, where the next one splits off, and what a pane's last known status was
@@ -15,6 +15,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::{anyhow, bail, Result};
 
 use crate::cmux::Cmux;
+use crate::ghostty::Ghostty;
 use crate::harness::HarnessConfig;
 use crate::mux::{configured_directions, normalize_direction, Multiplexer, OpenRequest};
 use crate::orca::Orca;
@@ -119,14 +120,19 @@ fn discover_orca() -> Option<Arc<dyn Multiplexer>> {
     Orca::discover().map(|m| Arc::new(m) as Arc<dyn Multiplexer>)
 }
 
+fn discover_ghostty() -> Option<Arc<dyn Multiplexer>> {
+    Ghostty::discover().map(|m| Arc::new(m) as Arc<dyn Multiplexer>)
+}
+
 /// Every backend, in the order automatic discovery tries them.
 pub const BACKENDS: &[BackendEntry] = &[
     BackendEntry { name: "cmux", label: "cmux", discover: discover_cmux, detection: crate::cmux::detection },
     BackendEntry { name: "tmux", label: "tmux", discover: discover_tmux, detection: crate::tmux::detection },
     BackendEntry { name: "orca", label: "Orca", discover: discover_orca, detection: crate::orca::detection },
+    BackendEntry { name: "ghostty", label: "Ghostty", discover: discover_ghostty, detection: crate::ghostty::detection },
 ];
 
-/// The backends' names as prose: `cmux, tmux or Orca`.
+/// The backends' names as prose: `cmux, tmux, Orca or Ghostty`.
 pub fn describe_backends() -> String {
     let labels: Vec<&str> = BACKENDS.iter().map(|b| b.label).collect();
     match labels.as_slice() {
@@ -194,15 +200,16 @@ impl Splitter {
         }
     }
 
-    /// Tries `Cmux::discover` first, then `Tmux::discover`, then `Orca::discover` — see each
-    /// for what makes a backend usable at all. `None` means none is available, same as any
-    /// alone.
+    /// Tries `Cmux::discover` first, then `Tmux::discover`, then `Orca::discover`, then
+    /// `Ghostty::discover` — see each for what makes a backend usable at all. `None` means none
+    /// is available, same as any alone.
     ///
-    /// `KANSTACK_SPLIT_BACKEND=cmux`/`tmux`/`orca` skips the other backends' detection
+    /// `KANSTACK_SPLIT_BACKEND=cmux`/`tmux`/`orca`/`ghostty` skips the other backends' detection
     /// entirely, rather than just reordering the fallback: `Cmux::discover` only checks
     /// whether the `cmux` binary is on `PATH`, not whether kanstack is actually running
-    /// inside a cmux pane (unlike `Tmux::discover`, which requires `$TMUX_PANE`, and
-    /// `Orca::discover`, which requires `$ORCA_TERMINAL_HANDLE`), so a machine with both
+    /// inside a cmux pane (unlike `Tmux::discover`, which requires `$TMUX_PANE`,
+    /// `Orca::discover`, which requires `$ORCA_TERMINAL_HANDLE`, and `Ghostty::discover`, which
+    /// requires `TERM_PROGRAM=ghostty`), so a machine with both
     /// binaries installed — cmux for unrelated reasons, tmux the one actually in use right
     /// now — would otherwise have cmux win by default and fail at spawn time instead of
     /// falling through. The override exists for exactly that ambiguity; an unrecognized
@@ -213,6 +220,12 @@ impl Splitter {
     /// same cmux-installed-but-not-in-use ambiguity, and here there *is* a positive signal
     /// that Orca is the one in use, so it is tried ahead of cmux's bare `PATH` check. Inside
     /// a tmux or cmux pane in an Orca terminal, the default order is left as it was.
+    ///
+    /// The same goes for Ghostty, and for the same reason: `TERM_PROGRAM=ghostty` with no
+    /// `$CMUX_SURFACE_ID` and no `$TMUX_PANE` is a positive sign that plain Ghostty is what
+    /// kanstack is in, so it goes ahead of cmux's bare `PATH` check too. (cmux, a Ghostty
+    /// fork, sets `TERM_PROGRAM=ghostty` as well, which is why `$CMUX_SURFACE_ID` is part of
+    /// that sign.) Ghostty is otherwise last.
     ///
     /// The harness launched into new panes is `$KANSTACK_HARNESS` (default `claude`), read
     /// here once rather than by each backend.
@@ -230,6 +243,12 @@ impl Splitter {
         if Orca::running_inside() && !in_cmux_or_tmux {
             if let Some(orca) = discover_orca() {
                 return Some(orca);
+            }
+        }
+        // `running_inside` already rules out cmux and tmux panes.
+        if Ghostty::running_inside() {
+            if let Some(ghostty) = discover_ghostty() {
+                return Some(ghostty);
             }
         }
         BACKENDS.iter().find_map(|b| (b.discover)())
@@ -538,8 +557,15 @@ mod tests {
     /// once since `discover` here spans both backends' env surface. Held for the whole
     /// call via `SPLIT_BACKEND_ENV_LOCK`, not just the swap, so this can't interleave with
     /// either of those other two files' own env-mutating tests.
+    ///
+    /// `TERM_PROGRAM` is cleared unless a test sets it, so these don't depend on whether the
+    /// developer is running `cargo test` inside Ghostty.
     fn with_env(vars: &[(&str, Option<&str>)], body: impl FnOnce()) {
         let _guard = crate::SPLIT_BACKEND_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut vars = vars.to_vec();
+        if !vars.iter().any(|(k, _)| *k == "TERM_PROGRAM") {
+            vars.push(("TERM_PROGRAM", None));
+        }
         let old: Vec<_> = vars.iter().map(|(k, _)| (*k, std::env::var_os(k))).collect();
         for (k, v) in vars {
             match v {
@@ -726,6 +752,117 @@ mod tests {
             },
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `KANSTACK_SPLIT_BACKEND=ghostty` pins Ghostty, and like the other pins doesn't fall
+    /// through to a backend that would otherwise qualify when Ghostty itself isn't usable.
+    /// (Off macOS there is no Ghostty backend at all, so the positive half is macOS only.)
+    #[test]
+    fn discover_honors_an_explicit_ghostty_override_without_falling_back() {
+        let usable = [
+            ("KANSTACK_SPLIT_BACKEND", Some("ghostty")),
+            ("KANSTACK_OSASCRIPT_BIN", Some("/nonexistent/not-osascript")),
+            ("KANSTACK_CMUX_BIN", Some("/nonexistent/not-cmux")),
+            ("KANSTACK_TMUX_BIN", Some("/nonexistent/not-tmux")),
+            ("TMUX_PANE", None),
+            ("CMUX_SURFACE_ID", None),
+        ];
+        if cfg!(target_os = "macos") {
+            let mut inside = usable.to_vec();
+            inside.push(("TERM_PROGRAM", Some("ghostty")));
+            with_env(&inside, || assert_eq!(Splitter::discover().map(|s| s.label()), Some("ghostty")));
+        }
+        let mut elsewhere = usable.to_vec();
+        elsewhere.push(("TERM_PROGRAM", Some("Apple_Terminal")));
+        with_env(&elsewhere, || {
+            assert!(
+                Splitter::discover().is_none(),
+                "ghostty was pinned but this isn't a Ghostty window, so this must not fall back to cmux"
+            );
+        });
+    }
+
+    /// Inside plain Ghostty (`TERM_PROGRAM=ghostty`, not a cmux or tmux pane) a merely
+    /// installed cmux must not win: Ghostty is tried ahead of cmux's bare `PATH` check.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn discover_prefers_ghostty_over_a_merely_installed_cmux_inside_ghostty() {
+        with_env(
+            &[
+                ("KANSTACK_SPLIT_BACKEND", None),
+                ("TERM_PROGRAM", Some("ghostty")),
+                ("KANSTACK_OSASCRIPT_BIN", Some("/nonexistent/not-osascript")),
+                ("KANSTACK_CMUX_BIN", Some("/nonexistent/not-cmux")),
+                ("CMUX_SURFACE_ID", None),
+                ("KANSTACK_TMUX_BIN", Some("/nonexistent/not-tmux")),
+                ("TMUX_PANE", None),
+                ("ORCA_TERMINAL_HANDLE", None),
+            ],
+            || assert_eq!(Splitter::discover().map(|s| s.label()), Some("ghostty")),
+        );
+    }
+
+    /// cmux is a Ghostty fork and sets `TERM_PROGRAM=ghostty` too, and tmux in Ghostty has a
+    /// pane of its own: with `$CMUX_SURFACE_ID` or `$TMUX_PANE` set the default order stands.
+    #[test]
+    fn discover_leaves_the_default_order_alone_inside_a_cmux_or_tmux_pane_in_ghostty() {
+        let base = [
+            ("KANSTACK_SPLIT_BACKEND", None),
+            ("TERM_PROGRAM", Some("ghostty")),
+            ("KANSTACK_OSASCRIPT_BIN", Some("/nonexistent/not-osascript")),
+            ("KANSTACK_CMUX_BIN", Some("/nonexistent/not-cmux")),
+            ("KANSTACK_TMUX_BIN", Some("/nonexistent/not-tmux")),
+            ("ORCA_TERMINAL_HANDLE", None),
+        ];
+        let mut in_cmux = base.to_vec();
+        in_cmux.extend([("CMUX_SURFACE_ID", Some("ABC")), ("TMUX_PANE", None)]);
+        with_env(&in_cmux, || assert_eq!(Splitter::discover().map(|s| s.label()), Some("cmux")));
+
+        let mut in_tmux = base.to_vec();
+        in_tmux.extend([("CMUX_SURFACE_ID", None), ("TMUX_PANE", Some("%3"))]);
+        with_env(&in_tmux, || assert_eq!(Splitter::discover().map(|s| s.label()), Some("cmux")));
+    }
+
+    /// Ghostty is last in the chain: in Ghostty with nothing else usable (no cmux on `PATH`,
+    /// no tmux pane) it is what is found, and outside Ghostty nothing is.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn discover_finds_ghostty_last_and_only_inside_ghostty() {
+        let dir = std::env::temp_dir().join(format!("kanstack-splitter-ghostty-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = [
+            ("KANSTACK_SPLIT_BACKEND", None),
+            ("PATH", Some(dir.to_str().unwrap())),
+            ("KANSTACK_CMUX_BIN", None),
+            ("KANSTACK_TMUX_BIN", None),
+            ("TMUX_PANE", None),
+            ("CMUX_SURFACE_ID", None),
+            ("ORCA_TERMINAL_HANDLE", None),
+            ("KANSTACK_OSASCRIPT_BIN", Some("/nonexistent/not-osascript")),
+        ];
+        let mut inside = base.to_vec();
+        inside.push(("TERM_PROGRAM", Some("ghostty")));
+        with_env(&inside, || assert_eq!(Splitter::discover().map(|s| s.label()), Some("ghostty")));
+
+        let mut outside = base.to_vec();
+        outside.push(("TERM_PROGRAM", Some("Apple_Terminal")));
+        with_env(&outside, || assert!(Splitter::discover().is_none()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The Ghostty backend is macOS only: `discover` is `None` anywhere else, whatever the
+    /// environment says.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn discover_never_finds_ghostty_off_macos() {
+        with_env(
+            &[
+                ("KANSTACK_SPLIT_BACKEND", Some("ghostty")),
+                ("TERM_PROGRAM", Some("ghostty")),
+                ("KANSTACK_OSASCRIPT_BIN", Some("/nonexistent/not-osascript")),
+            ],
+            || assert!(Splitter::discover().is_none()),
+        );
     }
 
     /// `running_inside_host` gates the board's background poll, and for Orca it is read off
@@ -1727,7 +1864,7 @@ mod tests {
 
     #[test]
     fn backends_are_described_as_prose_from_the_list() {
-        assert_eq!(describe_backends(), "cmux, tmux or Orca");
+        assert_eq!(describe_backends(), "cmux, tmux, Orca or Ghostty");
     }
 
     #[test]
