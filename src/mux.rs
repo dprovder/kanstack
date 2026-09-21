@@ -189,6 +189,8 @@ pub(crate) mod fake {
         pub scope: Mutex<Option<String>>,
         /// Fails the next `open_pane` when set.
         pub fail_open: Mutex<bool>,
+        /// Makes every `probe` fail while set.
+        pub fail_probe: Mutex<bool>,
         next: Mutex<u32>,
     }
 
@@ -246,6 +248,9 @@ pub(crate) mod fake {
         }
 
         fn probe(&self, panes: &[&str]) -> Result<HashMap<String, PaneStatus>> {
+            if *self.fail_probe.lock().unwrap() {
+                anyhow::bail!("fake probe failed");
+            }
             let known = self.statuses.lock().unwrap();
             Ok(panes.iter().filter_map(|p| known.get(*p).map(|s| (p.to_string(), *s))).collect())
         }

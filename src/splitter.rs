@@ -271,7 +271,17 @@ impl Splitter {
             return Ok(HashMap::new());
         }
         let ids: Vec<&str> = self.panes.values().map(|p| p.id.as_str()).collect();
-        let by_pane = self.mux.probe(&ids)?;
+        let by_pane = match self.mux.probe(&ids) {
+            Ok(by_pane) => by_pane,
+            // The multiplexer couldn't be read — no server, a permission refused — but what
+            // agents said about themselves is still good. Only whether a pane is gone is
+            // unknowable, so that is all that is lost. The error surfaces only when there is
+            // nothing at all to report instead.
+            Err(err) => {
+                let reported = self.reported_statuses(now);
+                return if reported.is_empty() { Err(err) } else { Ok(reported) };
+            }
+        };
         Ok(self
             .panes
             .iter()
@@ -284,6 +294,11 @@ impl Splitter {
                 Some((branch.clone(), status))
             })
             .collect())
+    }
+
+    /// Every lane whose agent has said something recent about itself, keyed by branch.
+    fn reported_statuses(&self, now: SystemTime) -> HashMap<String, PaneStatus> {
+        self.panes.keys().filter_map(|branch| Some((branch.clone(), self.reports.status(branch, now)?))).collect()
     }
 
     /// Merges a `poll_statuses` result back in, keyed by branch. Entries for lanes deleted
@@ -771,5 +786,24 @@ mod tests {
         reports.write("feat-a", Reported::Busy, now).unwrap();
         splitter.stop("feat-a").unwrap();
         assert_eq!(reports.status("feat-a", now), None);
+    }
+
+    /// If the multiplexer can't be read, an agent's own word is still the best there is —
+    /// and a permission the user refused once shouldn't blank every status.
+    #[test]
+    fn a_failed_probe_still_yields_what_agents_reported() {
+        let (splitter, mux, reports) = splitter_with_reports("probe-fails");
+        let now = SystemTime::now();
+        *mux.fail_probe.lock().unwrap() = true;
+        reports.write("feat-a", Reported::Busy, now).unwrap();
+        assert_eq!(polled(&splitter, now), Some(PaneStatus::Busy));
+    }
+
+    #[test]
+    fn a_failed_probe_with_nothing_reported_is_still_an_error() {
+        let (splitter, mux, _reports) = splitter_with_reports("probe-fails-silent");
+        *mux.fail_probe.lock().unwrap() = true;
+        let err = splitter.poll_statuses_at(SystemTime::now()).unwrap_err().to_string();
+        assert!(err.contains("fake probe failed"), "{err}");
     }
 }

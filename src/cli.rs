@@ -689,4 +689,67 @@ mod tests {
             run(Command::Report { state: Reported::Busy, branch: Some("a".into()) }, repo, &mut Vec::new()).unwrap();
         });
     }
+
+    // `status --json` where a backend IS found, against a stand-in `tmux`. The neighbouring
+    // test covers no backend at all; these cover the poll itself succeeding and failing.
+
+    /// The JSON `status --json` prints for one registered workstream, `fix-login` in `%3`,
+    /// with `tmux list-panes` answering `list_panes` (a shell fragment), and an agent report
+    /// of `reported` written first if given.
+    fn status_json_with_tmux(tag: &str, list_panes: &str, reported: Option<Reported>) -> String {
+        use crate::mux::stand_in;
+        let (bin, _log) = stand_in::install(tag, "tmux", &format!(r#"case "$1" in list-panes) {list_panes} ;; esac"#));
+        let state = std::env::temp_dir().join(format!("kanstack-cli-{tag}-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state);
+        let mut json = String::new();
+        stand_in::with_env(
+            &[
+                ("KANSTACK_STATE_PATH", Some(state.to_str().unwrap())),
+                ("KANSTACK_SPLIT_BACKEND", Some("tmux")),
+                ("KANSTACK_TMUX_BIN", Some(bin.to_str().unwrap())),
+                ("TMUX_PANE", Some("%0")),
+            ],
+            || {
+                let repo = Path::new("/repo/status-json-backend");
+                let mut registry = Registry::load(repo).unwrap();
+                registry.upsert(workstream("fix-login", Some("%3"), Some("claude"), None));
+                registry.save().unwrap();
+                if let Some(state) = reported {
+                    Reports::for_repo(repo).write("fix-login", state, SystemTime::now()).unwrap();
+                }
+                let mut out = Vec::new();
+                run(Command::Status { json: true }, repo, &mut out).expect("status --json must not fail here");
+                json = String::from_utf8(out).unwrap();
+            },
+        );
+        stand_in::remove(&bin);
+        let _ = std::fs::remove_dir_all(&state);
+        json
+    }
+
+    fn fix_login(status: &str) -> String {
+        format!(r#"{{"schema":1,"workstreams":[{{"branch":"fix-login","pane":"%3","agent":"claude","item":null,"status":"{status}"}}]}}{}"#, "\n")
+    }
+
+    #[test]
+    fn status_json_reads_a_reachable_backend() {
+        // A pane that is listed, with a pid nothing is running under: idle.
+        assert_eq!(status_json_with_tmux("json-ok", r#"printf '%%3 2000000000\n'"#, None), fix_login("idle"));
+        // A pane that is not listed: dead.
+        assert_eq!(status_json_with_tmux("json-dead", r#"printf '%%9 2000000000\n'"#, None), fix_login("dead"));
+    }
+
+    /// A backend that is found but cannot answer degrades exactly as an absent one does.
+    #[test]
+    fn status_json_degrades_to_unknown_when_the_backend_is_found_but_the_poll_fails() {
+        let failing = r#"echo "no server running" >&2; exit 1"#;
+        assert_eq!(status_json_with_tmux("json-poll-fails", failing, None), fix_login("unknown"));
+    }
+
+    /// The multiplexer being unreadable must not hide what the agent itself said.
+    #[test]
+    fn status_json_keeps_a_fresh_agent_report_when_the_poll_fails() {
+        let failing = r#"echo "no server running" >&2; exit 1"#;
+        assert_eq!(status_json_with_tmux("json-report", failing, Some(Reported::Busy)), fix_login("busy"));
+    }
 }
