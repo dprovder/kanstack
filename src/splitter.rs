@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, bail, Result};
 
@@ -19,8 +19,45 @@ use crate::harness::HarnessConfig;
 use crate::mux::{configured_directions, normalize_direction, Multiplexer, OpenRequest};
 use crate::orca::Orca;
 use crate::pane_status::PaneStatus;
-use crate::report::Reports;
+use crate::report::{Reports, Said};
 use crate::tmux::Tmux;
+
+/// How old a report must be before what the multiplexer sees is allowed to contradict it. A
+/// fresh one is taken at its word: the multiplexer's reading lags, and a `waiting` written a
+/// moment ago will be met by a CPU reading from before the prompt appeared.
+const CORROBORATION_GRACE: Duration = Duration::from_secs(20);
+
+/// A lane's status from the multiplexer's reading of its pane (`native`) and what its agent
+/// last said about itself (`said`). `None` means neither has news, and the caller keeps what
+/// it knew.
+///
+/// - A pane the multiplexer says is gone is `Dead`, whatever was reported: a crashed agent
+///   can't have said it stopped.
+/// - Otherwise a fresh report wins. It comes from the harness itself, where the multiplexer
+///   only infers from CPU, or from nothing at all.
+/// - **Except** where what the multiplexer sees contradicts it, once the report has had
+///   [`CORROBORATION_GRACE`] to be current. Interrupting a turn with Escape fires no hook —
+///   observed, on a turn and on a permission prompt — so a report can be left behind over a
+///   pane that has since gone quiet (`busy` over an idle pane) or got going again (`waiting`
+///   over a busy one). Waiting over idle is *not* contradicted: a pane stopped on a prompt
+///   and one at rest look the same from outside.
+/// - A report that has run out is worth nothing, and must not leave the last thing it said
+///   standing: where no multiplexer can contradict it, an agent that never said it had
+///   stopped would read `busy` forever. It is `Unknown` unless the multiplexer knows better.
+fn merge(native: Option<PaneStatus>, said: Option<Said>) -> Option<PaneStatus> {
+    if native == Some(PaneStatus::Dead) {
+        return Some(PaneStatus::Dead);
+    }
+    match said {
+        Some(Said::Fresh { status, age }) => Some(match (status, native) {
+            (PaneStatus::Busy, Some(PaneStatus::Idle)) if age >= CORROBORATION_GRACE => PaneStatus::Idle,
+            (PaneStatus::Waiting, Some(PaneStatus::Busy)) if age >= CORROBORATION_GRACE => PaneStatus::Busy,
+            _ => status,
+        }),
+        Some(Said::Stale) => Some(native.unwrap_or(PaneStatus::Unknown)),
+        None => native,
+    }
+}
 
 /// One lane's pane, as this process knows it.
 #[derive(Debug, Clone)]
@@ -287,11 +324,7 @@ impl Splitter {
             .iter()
             .filter_map(|(branch, pane)| {
                 let native = by_pane.get(&pane.id).copied();
-                let status = match native {
-                    Some(PaneStatus::Dead) => PaneStatus::Dead,
-                    _ => self.reports.status(branch, now).or(native)?,
-                };
-                Some((branch.clone(), status))
+                Some((branch.clone(), merge(native, self.reports.said(branch, now))?))
             })
             .collect())
     }
@@ -767,7 +800,11 @@ mod tests {
         let later = then + FRESH_FOR + Duration::from_secs(1);
         assert_eq!(polled(&splitter, later), Some(PaneStatus::Idle));
         mux.statuses.lock().unwrap().clear();
-        assert_eq!(polled(&splitter, later), None, "stale and no other reading: no news");
+        assert_eq!(
+            polled(&splitter, later),
+            Some(PaneStatus::Unknown),
+            "stale with nothing else to go on is unknown, not left as whatever was last applied"
+        );
     }
 
     #[test]
@@ -805,5 +842,104 @@ mod tests {
         *mux.fail_probe.lock().unwrap() = true;
         let err = splitter.poll_statuses_at(SystemTime::now()).unwrap_err().to_string();
         assert!(err.contains("fake probe failed"), "{err}");
+    }
+
+    /// A pane blocked on a prompt burns no CPU, so the multiplexer reads it as idle — or, with
+    /// a stale reading, busy. Only the agent knows it is waiting on the user.
+    #[test]
+    fn a_fresh_waiting_report_wins_over_either_multiplexer_reading() {
+        for native in [PaneStatus::Busy, PaneStatus::Idle] {
+            let (splitter, mux, reports) = splitter_with_reports("waiting");
+            let now = SystemTime::now();
+            mux.statuses.lock().unwrap().insert("p1".to_string(), native);
+            reports.write("feat-a", Reported::Waiting, now).unwrap();
+            assert_eq!(polled(&splitter, now), Some(PaneStatus::Waiting), "over {native:?}");
+        }
+    }
+
+    /// Nothing else can retract a `busy` an agent never took back — a turn interrupted with
+    /// Escape fires no hook — so once it runs out the pane must stop claiming it.
+    #[test]
+    fn an_expired_report_reads_unknown_rather_than_leaving_the_last_status_standing() {
+        let (mut splitter, mux, reports) = splitter_with_reports("expired");
+        let then = SystemTime::now();
+        reports.write("feat-a", Reported::Busy, then).unwrap();
+        let fresh = splitter.poll_statuses_at(then).unwrap();
+        splitter.apply_statuses(fresh);
+        assert_eq!(splitter.pane_status("feat-a"), Some(PaneStatus::Busy));
+
+        let later = then + FRESH_FOR + Duration::from_secs(1);
+        splitter.apply_statuses(splitter.poll_statuses_at(later).unwrap());
+        assert_eq!(splitter.pane_status("feat-a"), Some(PaneStatus::Unknown));
+
+        // ...unless the multiplexer can say.
+        mux.statuses.lock().unwrap().insert("p1".to_string(), PaneStatus::Idle);
+        splitter.apply_statuses(splitter.poll_statuses_at(later).unwrap());
+        assert_eq!(splitter.pane_status("feat-a"), Some(PaneStatus::Idle));
+    }
+
+    // The merge rule as a table: what the multiplexer sees, what the agent said and how long
+    // ago, and the status that results.
+
+    fn fresh(status: PaneStatus, secs: u64) -> Option<Said> {
+        Some(Said::Fresh { status, age: Duration::from_secs(secs) })
+    }
+
+    #[test]
+    fn merge_believes_a_fresh_report_over_the_multiplexer() {
+        use PaneStatus::*;
+        assert_eq!(merge(Some(Idle), fresh(Busy, 1)), Some(Busy));
+        assert_eq!(merge(Some(Busy), fresh(Idle, 1)), Some(Idle));
+        assert_eq!(merge(Some(Idle), fresh(Waiting, 1)), Some(Waiting));
+        assert_eq!(merge(None, fresh(Busy, 1)), Some(Busy), "a multiplexer with no reading at all");
+        assert_eq!(merge(None, fresh(Busy, 3000)), Some(Busy), "with nothing to contradict it, it stands");
+    }
+
+    /// Escape fires no hook, so an interrupted turn leaves `busy` over a pane at rest.
+    #[test]
+    fn merge_lets_a_quiet_pane_contradict_an_old_busy_report_but_not_a_new_one() {
+        use PaneStatus::*;
+        assert_eq!(merge(Some(Idle), fresh(Busy, 19)), Some(Busy), "the multiplexer's reading lags");
+        assert_eq!(merge(Some(Idle), fresh(Busy, 20)), Some(Idle));
+        assert_eq!(merge(Some(Idle), fresh(Busy, 500)), Some(Idle));
+        assert_eq!(merge(Some(Busy), fresh(Busy, 500)), Some(Busy), "agreement");
+    }
+
+    /// Escape on a permission prompt fires no hook either; if the pane is busy again the
+    /// user carried on.
+    #[test]
+    fn merge_lets_a_busy_pane_contradict_an_old_waiting_report() {
+        use PaneStatus::*;
+        assert_eq!(merge(Some(Busy), fresh(Waiting, 19)), Some(Waiting));
+        assert_eq!(merge(Some(Busy), fresh(Waiting, 20)), Some(Busy));
+    }
+
+    /// A pane stopped on a prompt and one at rest look identical from outside, so a quiet
+    /// pane says nothing against `waiting` — that is the one thing only the agent can tell us.
+    #[test]
+    fn merge_never_lets_an_idle_pane_contradict_waiting() {
+        use PaneStatus::*;
+        assert_eq!(merge(Some(Idle), fresh(Waiting, 100_000)), Some(Waiting));
+    }
+
+    #[test]
+    fn merge_reports_a_closed_pane_dead_whatever_was_said() {
+        use PaneStatus::*;
+        for said in [fresh(Busy, 1), fresh(Waiting, 1), fresh(Idle, 1), Some(Said::Stale)] {
+            assert_eq!(merge(Some(Dead), said), Some(Dead));
+        }
+    }
+
+    #[test]
+    fn merge_reads_a_stale_report_as_unknown_unless_the_multiplexer_knows() {
+        use PaneStatus::*;
+        assert_eq!(merge(None, Some(Said::Stale)), Some(Unknown));
+        assert_eq!(merge(Some(Idle), Some(Said::Stale)), Some(Idle));
+    }
+
+    #[test]
+    fn merge_with_nothing_said_is_the_multiplexers_reading_or_no_news() {
+        assert_eq!(merge(Some(PaneStatus::Busy), None), Some(PaneStatus::Busy));
+        assert_eq!(merge(None, None), None);
     }
 }

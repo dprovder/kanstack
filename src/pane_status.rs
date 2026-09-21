@@ -14,6 +14,10 @@ pub enum PaneStatus {
     /// May mean the harness returned to a resting prompt, or never got a chance to start —
     /// a single poll cannot tell those apart from this alone.
     Idle,
+    /// Stopped in the middle of a turn, waiting for the user — a permission prompt. Only an
+    /// agent can say so (see `crate::report`): from outside, a pane blocked on a dialog looks
+    /// exactly like one that is idle.
+    Waiting,
     /// No longer present in the backend's pane listing at all — the tab/pane was closed,
     /// by the user or by the terminal multiplexer itself.
     Dead,

@@ -235,12 +235,14 @@ Two independent axes, each one file plus one line, with the shared logic written
 
 ### Where a pane's status comes from
 
-Two sources, combined in `Splitter::poll_statuses`. A `Multiplexer::probe` is the backend's
-own reading of the pane. A *report* is what the agent said about itself, through
-`kanstack report busy|idle`, which a harness's hooks run (`src/report.rs`). The rule: a pane
-the multiplexer says is gone is `dead`, whatever was reported; otherwise a fresh report wins;
-otherwise the probe stands; with neither, the pane is left out of the result and the last
-known status is kept.
+Two sources, combined by `splitter::merge`. A `Multiplexer::probe` is the backend's own
+reading of the pane. A *report* is what the agent said about itself, through `kanstack report
+busy|idle|waiting`, which a harness's hooks run (`src/report.rs`). The rule, in order: a pane
+the multiplexer says is gone is `dead`, whatever was reported; a fresh report wins, except
+where what the multiplexer sees contradicts it (below); an expired report is `unknown` unless
+the multiplexer knows better; with neither, the pane is left out of the result and the last
+known status is kept. If the probe itself fails, statuses come from fresh reports alone, and
+the error surfaces only when there are none.
 
 - **One file per branch, not a field in the registry.** Hooks fire on every turn from several
   processes at once, and the registry is rewritten whole, so sharing it would lose updates.
@@ -248,25 +250,53 @@ known status is kept.
   so any branch name is a valid one. `spawn` and `stop` delete the file, before the harness
   starts, so a fast agent's first report can't be erased and a new pane can't inherit an old
   one's last word.
-- **A report expires** (`report::FRESH_FOR`, ten minutes), because a crashed agent never
-  reports that it stopped. Expiry falls back to the probe rather than to a guess.
+- **Reports expire**, `busy` and `idle` after ten minutes (`report::FRESH_FOR`) because a
+  crashed agent never says it stopped, `waiting` after twelve hours (`WAITING_FRESH_FOR`)
+  because the reason for it is an agent stuck on a prompt overnight. Expiry reads `unknown`,
+  not "keep the last applied status": with nothing to contradict it, a stale `busy` would
+  otherwise stand forever.
+- **Escape fires no hook.** Checked live against Claude 2026-09: interrupting a running turn
+  and pressing Escape on a permission prompt each left the report at `busy` / `waiting` over
+  a pane sitting at its prompt, and it stayed so. `Notification` with `idle_prompt` looked
+  like a recovery signal and is wired up, but did not fire in over two minutes under cmux
+  (whose launch shim sets `preferredNotifChannel: notifications_disabled`; that it is the
+  cause is a guess), so nothing relies on it. What does the work is corroboration in
+  `merge`: after `CORROBORATION_GRACE` (twenty seconds, since the multiplexer's reading lags)
+  a `busy` report over a pane the multiplexer sees idle reads `idle`, and a `waiting` report
+  over a busy one reads `busy`. A quiet pane never contradicts `waiting`: stopped on a prompt
+  and at rest look identical from outside, so that is the one thing only the agent can say,
+  and a prompt dismissed with Escape can show `waiting` until the next prompt. On a
+  multiplexer with no reading at all, nothing corroborates, so a stale `busy` stands until it
+  expires. That is one reason the pid-based fallback matters for Ghostty.
 - **`kanstack report` must print nothing.** Claude adds a `UserPromptSubmit` hook's stdout to
-  what the model sees. It also returns before the registry is read, so a broken registry
-  can't make a per-turn hook noisy.
+  what the model sees, and a silent `PermissionRequest` hook leaves the normal prompt alone
+  (exit 0 with no decision) rather than approving or denying. It also returns before the
+  registry is read, so a broken registry can't make a per-turn hook noisy.
+- **Every hook is synchronous.** `PreToolUse` and `PermissionRequest` fire back to back, and
+  an async `busy` could land after the `waiting` and hide the prompt. A few milliseconds per
+  event buys strict ordering.
 - **Harnesses get hooks through `Harness::status_hooks`**, which returns launch arguments and
   environment, so a harness whose route is a flag, an environment variable or a config
   override can all be expressed the same way. The lane's name travels as `$KANSTACK_BRANCH`,
   so the hook commands are identical for every lane. Only Claude has one, through
-  `--settings <json>`, which hooks merge across rather than replace. Adding another needs a
-  route that works *per launch* and touches no file the user owns; that has to be verified
-  for each harness, not assumed from its docs.
+  `--settings <json>`, which hooks merge across rather than replace. A route has to work per
+  launch and touch no file the user owns, and has to be verified for each harness, not
+  assumed from its docs.
 - **A hooked launch line is always spilled to files.** The settings JSON pushes it past the
   typed-line limit (`harness_launch::MAX_TYPED_LINE`), so every hooked launch uses the
   read-into-variables path a long prompt takes. It is byte-exact and tested, but it is now the
   common path rather than the rare one.
-- **What is not covered yet:** a state for "waiting on an approval prompt" (Claude's
-  `PermissionRequest` and `Notification` hooks would give it; it reads `busy` today, as it
-  does under Orca), and any harness other than Claude.
+
+**Codex has a per-launch route, and it is deliberately not used.** Verified against Codex
+0.155.1 (the `codex` installed on the author's machine was a 2025 build with no `-c` override
+and no hooks at all): `-c 'hooks.UserPromptSubmit=[{hooks=[{type="command",command='''…'''}]}]'`
+and the same for `Stop` merge with the user's hooks and fire in `exec` and in the TUI, with a
+JSON payload on stdin. But they only run with `--dangerously-bypass-hook-trust`, which trusts
+*every* enabled hook, including any a hostile repository ships in its own config. Handing
+that flag to every launched Codex to get a status light is the wrong trade. `notify` set with
+`-c` needs no such flag, but fires only at turn end, and a reporter that says `idle` and never
+`busy` is actively harmful under this rule: its stale `idle` would outrank the multiplexer's
+correct `busy`. Any harness hooked here must report both edges.
 
 ### The three backends today
 

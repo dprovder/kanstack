@@ -1,4 +1,4 @@
-//! What an agent says about itself: `kanstack report busy` / `idle`.
+//! What an agent says about itself: `kanstack report busy` / `idle` / `waiting`.
 //!
 //! A multiplexer can only guess at whether a harness is working, from CPU or from whatever
 //! idle detection it happens to have — and some can't guess at all. A harness that can run a
@@ -23,10 +23,16 @@ use serde::{Deserialize, Serialize};
 use crate::pane_status::PaneStatus;
 use crate::workstream::{fnv1a, reports_dir};
 
-/// How long a report is believed. Long enough to span a turn that is busy the whole time
-/// (harnesses that can also report per tool call keep it fresh), short enough that a crashed
-/// agent stops reading as busy soon after.
+/// How long a `busy` or `idle` report is believed. Long enough to span a turn that is busy
+/// the whole time (harnesses that can also report per tool call keep it fresh), short enough
+/// that a crashed agent stops reading as busy soon after.
 pub const FRESH_FOR: Duration = Duration::from_secs(10 * 60);
+
+/// How long a `waiting` report is believed. Much longer, because the point of it is an agent
+/// that has been stuck on a prompt overnight: expiring it after ten minutes would report that
+/// agent as fine just when it most needs someone. What clears a stale one is the agent
+/// saying something else, not time.
+pub const WAITING_FRESH_FOR: Duration = Duration::from_secs(12 * 60 * 60);
 
 /// What an agent can say about itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,6 +42,9 @@ pub enum Reported {
     Busy,
     /// A turn has ended and it is waiting for the next prompt.
     Idle,
+    /// A turn is stopped partway, waiting for the user to answer something — a permission
+    /// prompt. Unlike `Idle`, nothing will happen until they do.
+    Waiting,
 }
 
 impl Reported {
@@ -43,7 +52,16 @@ impl Reported {
         match word {
             "busy" => Some(Reported::Busy),
             "idle" => Some(Reported::Idle),
+            "waiting" => Some(Reported::Waiting),
             _ => None,
+        }
+    }
+
+    /// How long a report of this state is believed.
+    fn fresh_for(self) -> Duration {
+        match self {
+            Reported::Busy | Reported::Idle => FRESH_FOR,
+            Reported::Waiting => WAITING_FRESH_FOR,
         }
     }
 
@@ -51,6 +69,7 @@ impl Reported {
         match self {
             Reported::Busy => PaneStatus::Busy,
             Reported::Idle => PaneStatus::Idle,
+            Reported::Waiting => PaneStatus::Waiting,
         }
     }
 }
@@ -62,6 +81,16 @@ struct Stored {
     state: Reported,
     /// Seconds since the Unix epoch.
     at: u64,
+}
+
+/// What an agent's last report is worth right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Said {
+    /// Recent enough to believe, and this old.
+    Fresh { status: PaneStatus, age: Duration },
+    /// There is one, but it has run out. Different from nothing having been said: the agent
+    /// reported, and then went quiet without saying it had stopped.
+    Stale,
 }
 
 /// Where one repository's reports live. Cheap to clone; a default one (no directory) reads
@@ -104,16 +133,24 @@ impl Reports {
         Ok(())
     }
 
-    /// What `branch`'s agent last said, as a status, if that was within [`FRESH_FOR`] of
-    /// `now`. A missing, unreadable or malformed file is "nothing said" — a report is only a
-    /// hint, so a bad one must never get in the way of the multiplexer's own reading.
-    pub fn status(&self, branch: &str, now: SystemTime) -> Option<PaneStatus> {
+    /// What `branch`'s agent last said, and whether it can still be believed as of `now`. A
+    /// missing, unreadable or malformed file is "nothing said" — a report is only a hint, so
+    /// a bad one must never get in the way of the multiplexer's own reading.
+    pub fn said(&self, branch: &str, now: SystemTime) -> Option<Said> {
         let raw = std::fs::read_to_string(self.file(branch)?).ok()?;
         let stored: Stored = serde_json::from_str(&raw).ok()?;
-        let said = UNIX_EPOCH + Duration::from_secs(stored.at);
+        let at = UNIX_EPOCH + Duration::from_secs(stored.at);
         // A report from the future (clock skew) is as fresh as it gets.
-        let age = now.duration_since(said).unwrap_or_default();
-        (age <= FRESH_FOR).then(|| stored.state.status())
+        let age = now.duration_since(at).unwrap_or_default();
+        Some(if age <= stored.state.fresh_for() { Said::Fresh { status: stored.state.status(), age } } else { Said::Stale })
+    }
+
+    /// [`Self::said`], but only what can still be believed.
+    pub fn status(&self, branch: &str, now: SystemTime) -> Option<PaneStatus> {
+        match self.said(branch, now)? {
+            Said::Fresh { status, .. } => Some(status),
+            Said::Stale => None,
+        }
     }
 
     /// Drops whatever `branch`'s agent said, because it was about a pane that no longer
@@ -144,8 +181,10 @@ mod tests {
         let reports = scratch("roundtrip");
         reports.write("feat-a", Reported::Busy, at(1000)).unwrap();
         reports.write("feat-b", Reported::Idle, at(1000)).unwrap();
+        reports.write("feat-w", Reported::Waiting, at(1000)).unwrap();
         assert_eq!(reports.status("feat-a", at(1001)), Some(PaneStatus::Busy));
         assert_eq!(reports.status("feat-b", at(1001)), Some(PaneStatus::Idle));
+        assert_eq!(reports.status("feat-w", at(1001)), Some(PaneStatus::Waiting));
         assert_eq!(reports.status("feat-c", at(1001)), None, "nobody said anything for feat-c");
     }
 
@@ -218,10 +257,35 @@ mod tests {
     }
 
     #[test]
-    fn only_busy_and_idle_can_be_reported() {
+    fn only_busy_idle_and_waiting_can_be_reported() {
         assert_eq!(Reported::parse("busy"), Some(Reported::Busy));
         assert_eq!(Reported::parse("idle"), Some(Reported::Idle));
+        assert_eq!(Reported::parse("waiting"), Some(Reported::Waiting));
         assert_eq!(Reported::parse("dead"), None);
         assert_eq!(Reported::parse(""), None);
+    }
+
+    /// A prompt someone hasn't got to yet is not a stale report; a busy agent that stopped
+    /// talking is.
+    #[test]
+    fn a_waiting_report_outlives_a_busy_one() {
+        let reports = scratch("lifetimes");
+        reports.write("busy", Reported::Busy, at(1000)).unwrap();
+        reports.write("waiting", Reported::Waiting, at(1000)).unwrap();
+        let later = at(1000 + FRESH_FOR.as_secs() + 1);
+        assert_eq!(reports.said("busy", later), Some(Said::Stale));
+        assert!(matches!(reports.said("waiting", later), Some(Said::Fresh { status: PaneStatus::Waiting, .. })));
+        let much_later = at(1000 + WAITING_FRESH_FOR.as_secs() + 1);
+        assert_eq!(reports.said("waiting", much_later), Some(Said::Stale));
+    }
+
+    #[test]
+    fn a_stale_report_is_not_the_same_as_nothing_said() {
+        let reports = scratch("stale-vs-none");
+        reports.write("feat-a", Reported::Idle, at(1000)).unwrap();
+        let later = at(1000 + FRESH_FOR.as_secs() + 1);
+        assert_eq!(reports.said("feat-a", later), Some(Said::Stale));
+        assert_eq!(reports.status("feat-a", later), None, "a stale report is not believed");
+        assert_eq!(reports.said("feat-b", later), None, "nobody ever said anything for feat-b");
     }
 }

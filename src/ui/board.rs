@@ -4,6 +4,7 @@ pub(super) fn pane_status_label(status: PaneStatus) -> &'static str {
     match status {
         PaneStatus::Busy => "● busy",
         PaneStatus::Idle => "○ idle",
+        PaneStatus::Waiting => "◆ needs you",
         PaneStatus::Dead => "✕ pane closed",
         PaneStatus::Unknown => "… pane",
     }
@@ -13,6 +14,7 @@ pub(super) fn pane_status_tone(status: PaneStatus) -> Tone {
     match status {
         PaneStatus::Busy => Tone::Accent,
         PaneStatus::Idle => Tone::Neutral,
+        PaneStatus::Waiting => Tone::Warn,
         PaneStatus::Dead => Tone::Bad,
         PaneStatus::Unknown => Tone::Neutral,
     }

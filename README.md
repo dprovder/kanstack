@@ -250,32 +250,45 @@ agent to parse:
 ```
 
 Every key is always present (`null` when there's no value), one entry per registered
-workstream, in registry order. `status` is `busy`, `idle`, `dead`, `unknown` or `no-pane` (the
-workstream has no pane). New fields may be added under the same `schema` number, so ignore keys
-you don't know; it changes only if an existing field is renamed, removed or reinterpreted.
+workstream, in registry order. `status` is `busy`, `idle`, `waiting`, `dead`, `unknown` or `no-pane` (the
+workstream has no pane). New fields and new `status` values may be added under the same
+`schema` number, so ignore keys you don't know and read a `status` you don't recognize as
+`unknown`; it changes only if an existing field is renamed, removed or reinterpreted.
 Unlike the table, `--json` works outside cmux, tmux and Orca, and when the multiplexer can't
 be reached: it still lists every workstream, with `unknown` for those that have a pane. An
 empty registry gives `{"schema":1,"workstreams":[]}`.
 
-### Where busy and idle come from
+### Where busy, idle and waiting come from
 
 The multiplexer's own reading (CPU for cmux and tmux, Orca's idle detection) is a guess, and
-some multiplexers can't make one. So a harness can say for itself: `kanstack report busy` when
-a turn starts, `kanstack report idle` when it ends, from any script or hook. `<branch>`
-defaults to `$KANSTACK_BRANCH`, which kanstack sets in every pane it launches; it prints
-nothing, needs no multiplexer, and never reads the registry, so it is safe to run on every
-turn.
+some multiplexers can't make one. So a harness can say for itself: `kanstack report busy`
+when a turn starts, `idle` when it ends, and `waiting` when it stops on a permission prompt,
+from any script or hook. `<branch>` defaults to `$KANSTACK_BRANCH`, which kanstack sets in
+every pane it launches; it prints nothing, needs no multiplexer, and never reads the
+registry, so it is safe to run on every turn. `waiting` is something only an agent can say:
+a pane stopped on a prompt looks exactly like one at rest. The board shows it as
+`◆ needs you`.
 
 For Claude Code, kanstack does this for you: it launches `claude` with `--settings` carrying
-hooks for the start of a turn, each tool call and the end of a turn. They run alongside your
-own hooks rather than replacing them, and nothing on disk is edited. Other harnesses get no
-hooks, because kanstack doesn't yet know a way to hand them any at launch; they keep the
-multiplexer's reading, and can call `kanstack report` themselves. `KANSTACK_STATUS_HOOKS=off`
-launches every harness without them.
+hooks for the start and end of a turn, each tool call, permission prompts, and turns that die
+on an API error. They run alongside your own hooks rather than replacing them, and nothing on
+disk is edited. Other harnesses get no hooks, because kanstack doesn't yet know a safe way to
+hand them any at launch; they keep the multiplexer's reading, and can call `kanstack report`
+themselves. `KANSTACK_STATUS_HOOKS=off` launches every harness without them.
 
-A fresh report beats the multiplexer's reading, except that a pane the multiplexer says is
-gone is always `dead`. A report is believed for ten minutes and then ignored, since an agent
-that crashed mid-turn never says it stopped.
+How a report and the multiplexer's reading combine:
+
+- A pane the multiplexer says is gone is always `dead`.
+- Otherwise a fresh report wins. `busy` and `idle` are believed for ten minutes, `waiting` for
+  twelve hours, since a prompt left overnight is exactly what it is for.
+- **Interrupting with Escape fires no hook** (checked against real Claude, on a running turn
+  and on a permission prompt), so a report can be left behind. After twenty seconds, a `busy`
+  report over a pane the multiplexer sees as quiet reads `idle`, and a `waiting` report over
+  one it sees as busy reads `busy`. A quiet pane never contradicts `waiting`, since only the
+  agent can tell those apart, so a prompt you dismissed with Escape can show `◆ needs you`
+  until you next type something.
+- A report that has run out reads `unknown` unless the multiplexer knows better, rather than
+  leaving the last status standing.
 
 Each command is its own process, so panes are tracked in a per-repository registry under
 `$XDG_STATE_HOME/kanstack` (`~/.local/state/kanstack`; `KANSTACK_STATE_PATH` relocates it).

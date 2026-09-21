@@ -50,14 +50,29 @@ pub trait Harness: Sync {
 ///
 /// Hooks come in through `--settings <json>`, which is a settings layer of its own: the
 /// hooks in it run alongside the user's and the project's, they don't replace them, so
-/// nothing on disk is touched. `UserPromptSubmit` and `Stop` are synchronous — a few
-/// milliseconds, and it means the state is written before the turn runs and before the
-/// harness returns to its prompt. `PreToolUse` is async, only to keep a long turn's report
-/// fresh (see `crate::report::FRESH_FOR`), and a late one can't land after `Stop`'s because
-/// a tool call is followed by at least one more model round trip.
+/// nothing on disk is touched.
 ///
-/// `report` prints nothing on success, which matters here: `UserPromptSubmit`'s stdout is
-/// added to what the model sees.
+/// Which event says what: `UserPromptSubmit` starts a turn, and each tool call reasserts
+/// `busy` before (`PreToolUse`) and after (`PostToolUse`, `PostToolUseFailure`) it, which
+/// both keeps a long turn's report fresh (see `crate::report::FRESH_FOR`) and takes the state
+/// back from `waiting` once a permission prompt has been answered. `PermissionRequest` fires
+/// after `PreToolUse` and before the prompt shows, and reports `waiting`. `Stop` ends a turn;
+/// `StopFailure` ends one that died on an API error, which would otherwise read `busy` until
+/// the report expired.
+///
+/// Interrupting a turn with Escape fires none of these — not `Stop`, and not when it is
+/// pressed on a permission prompt either (observed) — so the report would go on saying `busy`
+/// or `waiting` over a pane sitting at its prompt. What does fire is `Notification` with the
+/// `idle_prompt` type, once Claude has been left waiting for input, and that is what takes
+/// the state back to `idle`.
+///
+/// Every hook is synchronous, a few milliseconds each. That is what keeps them in order:
+/// `PreToolUse` and `PermissionRequest` fire back to back, and if the first were async its
+/// `busy` could land after the second's `waiting` and hide the prompt.
+///
+/// `report` prints nothing and exits 0, which matters twice over: `UserPromptSubmit`'s
+/// stdout is added to what the model sees, and a `PermissionRequest` hook that stays silent
+/// leaves the normal prompt alone rather than approving or denying anything.
 struct Claude;
 impl Harness for Claude {
     fn id(&self) -> &'static str {
@@ -67,22 +82,25 @@ impl Harness for Claude {
         NoteDelivery::Flag("--append-system-prompt".to_string())
     }
     fn status_hooks(&self, report: &str) -> Option<LaunchExtras> {
-        let hook = |state: &str, is_async: bool| {
-            let mut command = serde_json::json!({
-                "type": "command",
-                "command": format!("{report} {state}"),
-                "timeout": 5,
-            });
-            if is_async {
-                command["async"] = serde_json::Value::Bool(true);
-            }
-            serde_json::json!([{ "matcher": "", "hooks": [command] }])
+        let hook = |state: &str| {
+            serde_json::json!([{
+                "matcher": "",
+                "hooks": [{ "type": "command", "command": format!("{report} {state}"), "timeout": 5 }],
+            }])
         };
         let settings = serde_json::json!({
             "hooks": {
-                "UserPromptSubmit": hook("busy", false),
-                "PreToolUse": hook("busy", true),
-                "Stop": hook("idle", false),
+                "Notification": [{
+                    "matcher": "idle_prompt",
+                    "hooks": [{ "type": "command", "command": format!("{report} idle"), "timeout": 5 }],
+                }],
+                "UserPromptSubmit": hook("busy"),
+                "PreToolUse": hook("busy"),
+                "PermissionRequest": hook("waiting"),
+                "PostToolUse": hook("busy"),
+                "PostToolUseFailure": hook("busy"),
+                "Stop": hook("idle"),
+                "StopFailure": hook("idle"),
             }
         });
         Some(LaunchExtras { args: vec!["--settings".to_string(), settings.to_string()], env: Vec::new() })
@@ -442,23 +460,31 @@ mod tests {
     }
 
     #[test]
-    fn claude_reports_busy_when_a_turn_starts_and_works_and_idle_when_it_ends() {
+    fn claude_reports_what_each_event_means() {
         let settings = claude_settings();
-        let hook = |event: &str| settings["hooks"][event][0]["hooks"][0].clone();
+        let hooks = settings["hooks"].as_object().unwrap();
+        let says = |event: &str| {
+            let entry = &hooks[event][0];
+            let matcher = if event == "Notification" { "idle_prompt" } else { "" };
+            assert_eq!(entry["matcher"], matcher, "{event}");
+            let hook = &entry["hooks"][0];
+            assert_eq!(hook["type"], "command", "{event}");
+            assert_eq!(hook["timeout"], 5, "{event}");
+            // Every hook is synchronous: `PreToolUse` and `PermissionRequest` fire back to
+            // back, and an async `busy` could land after the `waiting` and hide the prompt.
+            assert!(hook.get("async").is_none(), "{event} must not be async");
+            hook["command"].as_str().unwrap().strip_prefix("'/opt/kanstack' report ").unwrap().to_string()
+        };
 
-        assert_eq!(hook("UserPromptSubmit")["command"], "'/opt/kanstack' report busy");
-        assert_eq!(hook("Stop")["command"], "'/opt/kanstack' report idle");
-        assert_eq!(hook("PreToolUse")["command"], "'/opt/kanstack' report busy");
-        // Only the keep-alive is async: `idle` must be recorded before the harness is back at
-        // its prompt, and `busy` before the turn runs.
-        assert_eq!(hook("PreToolUse")["async"], true);
-        assert!(hook("UserPromptSubmit").get("async").is_none());
-        assert!(hook("Stop").get("async").is_none());
-        for event in ["UserPromptSubmit", "PreToolUse", "Stop"] {
-            assert_eq!(hook(event)["type"], "command", "{event}");
-            assert_eq!(settings["hooks"][event][0]["matcher"], "", "{event}");
-        }
-        assert_eq!(settings["hooks"].as_object().unwrap().len(), 3, "no other events are hooked");
+        assert_eq!(says("UserPromptSubmit"), "busy");
+        assert_eq!(says("PreToolUse"), "busy");
+        assert_eq!(says("PermissionRequest"), "waiting");
+        assert_eq!(says("PostToolUse"), "busy", "takes the state back from waiting once a prompt is answered");
+        assert_eq!(says("PostToolUseFailure"), "busy");
+        assert_eq!(says("Stop"), "idle");
+        assert_eq!(says("StopFailure"), "idle", "a turn that dies on an API error must not read busy");
+        assert_eq!(says("Notification"), "idle", "only idle_prompt: what heals an interrupted turn");
+        assert_eq!(hooks.len(), 8, "no other events are hooked: {:?}", hooks.keys().collect::<Vec<_>>());
     }
 
     /// Only harnesses with a launch-time route are handed hooks; kanstack does not guess at

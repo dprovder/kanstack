@@ -30,15 +30,16 @@ kanstack spawn <branch> [--agent <name>] [--prompt \"...\"]
 kanstack send <branch|session> \"...\"
     type a message into a pane and submit it
 kanstack status [--json]
-    list every workstream and whether its pane is busy, idle, or dead. --json prints one
+    list every workstream and whether its pane is busy, idle, waiting on you, or dead. --json prints one
     JSON document instead (schema in the README) and, unlike the table, still lists every
     workstream when no multiplexer is reachable, with their panes' status \"unknown\"
 kanstack focus <branch|session>
     bring a pane to the front
 kanstack stop <branch|session>
     close a pane, ending its harness, and forget the workstream
-kanstack report <busy|idle> [<branch>]
-    say what the agent on <branch> is doing, for `status` and the board to show. This is
+kanstack report <busy|idle|waiting> [<branch>]
+    say what the agent on <branch> is doing, for `status` and the board to show; waiting
+    means stopped on a permission prompt. This is
     what the hooks kanstack gives a harness run (claude's, today); anything else can call it
     too. <branch> defaults to $KANSTACK_BRANCH, which kanstack sets in a pane it launches.
     Prints nothing, and needs no multiplexer. KANSTACK_STATUS_HOOKS=off stops kanstack
@@ -114,9 +115,10 @@ pub fn parse(name: &str, args: Vec<String>) -> Result<Option<Command>> {
         "focus" => Command::Focus { target: one("<branch|session>")? },
         "stop" => Command::Stop { target: one("<branch|session>")? },
         "report" => {
-            let word = one("<busy|idle>")?;
-            let state = Reported::parse(&word)
-                .ok_or_else(|| anyhow::anyhow!("`kanstack report` takes busy or idle, not {word:?}\n\n{HELP}"))?;
+            let word = one("<busy|idle|waiting>")?;
+            let state = Reported::parse(&word).ok_or_else(|| {
+                anyhow::anyhow!("`kanstack report` takes busy, idle or waiting, not {word:?}\n\n{HELP}")
+            })?;
             Command::Report { state, branch: positional.next() }
         }
         other => bail!("unknown subcommand {other:?}"),
@@ -169,6 +171,7 @@ fn label(status: Option<PaneStatus>) -> &'static str {
     match status {
         Some(PaneStatus::Busy) => "busy",
         Some(PaneStatus::Idle) => "idle",
+        Some(PaneStatus::Waiting) => "waiting",
         Some(PaneStatus::Dead) => "dead",
         Some(PaneStatus::Unknown) | None => "unknown",
     }
@@ -202,6 +205,7 @@ struct WorkstreamReport {
 enum ReportStatus {
     Busy,
     Idle,
+    Waiting,
     Dead,
     Unknown,
     NoPane,
@@ -212,6 +216,7 @@ impl From<Option<PaneStatus>> for ReportStatus {
         match status {
             Some(PaneStatus::Busy) => ReportStatus::Busy,
             Some(PaneStatus::Idle) => ReportStatus::Idle,
+            Some(PaneStatus::Waiting) => ReportStatus::Waiting,
             Some(PaneStatus::Dead) => ReportStatus::Dead,
             Some(PaneStatus::Unknown) | None => ReportStatus::Unknown,
         }
@@ -751,5 +756,24 @@ mod tests {
     fn status_json_keeps_a_fresh_agent_report_when_the_poll_fails() {
         let failing = r#"echo "no server running" >&2; exit 1"#;
         assert_eq!(status_json_with_tmux("json-report", failing, Some(Reported::Busy)), fix_login("busy"));
+    }
+
+    #[test]
+    fn report_accepts_waiting_and_names_all_three_words_when_given_another() {
+        assert_eq!(
+            parse("report", args(&["waiting", "fix-login"])).unwrap(),
+            Some(Command::Report { state: Reported::Waiting, branch: Some("fix-login".into()) })
+        );
+        let err = parse("report", args(&["asleep"])).unwrap_err().to_string();
+        assert!(err.contains("busy, idle or waiting"), "{err}");
+    }
+
+    /// A pane blocked on a permission prompt is its own status, not `idle` — it will not
+    /// move until the user does.
+    #[test]
+    fn a_waiting_pane_is_waiting_in_both_the_table_and_the_json() {
+        assert_eq!(label(Some(PaneStatus::Waiting)), "waiting");
+        let json = serde_json::to_string(&report(&five_workstreams(), |b| (b == "fix-login").then_some(PaneStatus::Waiting))).unwrap();
+        assert!(json.contains(r#""branch":"fix-login","pane":"%3","agent":"claude","item":"GH-4","status":"waiting""#), "{json}");
     }
 }
