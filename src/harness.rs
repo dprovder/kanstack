@@ -35,12 +35,16 @@ pub trait Harness: Sync {
 
     /// What to put on this harness's launch line so that it runs `report` — a shell-ready
     /// command, `'/path/to/kanstack' report` — as its turns go by: `report busy` when a turn
-    /// starts and while it works, `report idle` when it ends (see `crate::report`).
+    /// starts and while it works, `report idle` when it ends (see `crate::report`). `branch`
+    /// is baked into that command literally, not left to `$KANSTACK_BRANCH`: a harness's own
+    /// hook runner may not hand its hook subprocesses the environment it was launched with
+    /// (confirmed for Claude, whose hooks saw no `KANSTACK_BRANCH` despite the launched
+    /// process itself having it), so the command must be self-contained.
     ///
     /// `None`, the default, means kanstack knows no way to hand this harness hooks when it
     /// launches it. That costs nothing but accuracy: the multiplexer's own reading of the
     /// pane is used instead, and anything can still call `kanstack report` itself.
-    fn status_hooks(&self, _report: &str) -> Option<LaunchExtras> {
+    fn status_hooks(&self, _report: &str, _branch: &str) -> Option<LaunchExtras> {
         None
     }
 }
@@ -85,11 +89,11 @@ impl Harness for Claude {
     fn note_delivery(&self) -> NoteDelivery {
         NoteDelivery::Flag("--append-system-prompt".to_string())
     }
-    fn status_hooks(&self, report: &str) -> Option<LaunchExtras> {
+    fn status_hooks(&self, report: &str, branch: &str) -> Option<LaunchExtras> {
         let hook = |state: &str| {
             serde_json::json!([{
                 "matcher": "",
-                "hooks": [{ "type": "command", "command": format!("{report} {state}"), "timeout": 5 }],
+                "hooks": [{ "type": "command", "command": format!("{report} {state} {}", shell_quote(branch)), "timeout": 5 }],
             }])
         };
         let settings = serde_json::json!({
@@ -276,12 +280,13 @@ impl HarnessConfig {
             Some(h) if h != self.command => (h, resolve_note_delivery_for_override(h)),
             Some(_) | None => (self.command.as_str(), self.note_delivery.clone()),
         };
-        // Hooks tell `kanstack report` which lane they are for through the environment, so
-        // the hook commands themselves are the same for every lane.
+        // The hook commands themselves name `name` directly (see `Harness::status_hooks`);
+        // `KANSTACK_BRANCH` is set here too, but only for a human running `kanstack report`
+        // by hand from this same pane, since the harness's own hooks can't be trusted to see it.
         let extras = self
             .report_command
             .as_deref()
-            .and_then(|report| for_command(command).status_hooks(report))
+            .and_then(|report| for_command(command).status_hooks(report, name))
             .map(|mut extras| {
                 extras.env.push(("KANSTACK_BRANCH".to_string(), name.to_string()));
                 extras
@@ -454,7 +459,7 @@ mod tests {
     const REPORT: &str = "'/opt/kanstack' report";
 
     fn claude_settings() -> serde_json::Value {
-        let extras = for_command("claude").status_hooks(REPORT).expect("claude takes hooks at launch");
+        let extras = for_command("claude").status_hooks(REPORT, "feat-x").expect("claude takes hooks at launch");
         assert_eq!(extras.args[0], "--settings");
         serde_json::from_str(&extras.args[1]).expect("--settings takes JSON")
     }
@@ -472,7 +477,10 @@ mod tests {
             // Every hook is synchronous: `PreToolUse` and `PermissionRequest` fire back to
             // back, and an async `busy` could land after the `waiting` and hide the prompt.
             assert!(hook.get("async").is_none(), "{event} must not be async");
-            hook["command"].as_str().unwrap().strip_prefix("'/opt/kanstack' report ").unwrap().to_string()
+            // The branch is baked into the command literally: Claude's own hook runner does
+            // not hand hook subprocesses `KANSTACK_BRANCH`, even though the launched process
+            // itself has it (confirmed against real Claude).
+            hook["command"].as_str().unwrap().strip_prefix("'/opt/kanstack' report ").unwrap().strip_suffix(" 'feat-x'").unwrap().to_string()
         };
 
         assert_eq!(says("UserPromptSubmit"), "busy");
@@ -495,7 +503,7 @@ mod tests {
     #[test]
     fn harnesses_without_a_known_launch_time_route_get_no_hooks() {
         for name in ["codex", "pi", "opencode", "kiro", "gemini", "./my-wrapper.sh"] {
-            assert_eq!(for_command(name).status_hooks(REPORT), None, "{name}");
+            assert_eq!(for_command(name).status_hooks(REPORT, "feat-x"), None, "{name}");
         }
     }
 
