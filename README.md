@@ -503,6 +503,12 @@ disk is edited. Other harnesses get no hooks, because kanstack doesn't yet know 
 hand them any at launch; they keep the multiplexer's reading, and can call `kanstack report`
 themselves. `KANSTACK_STATUS_HOOKS=off` launches every harness without them.
 
+The same `--settings` also carries a second, narrower `PreToolUse` hook — `kanstack claim`,
+matching only `Edit`/`Write`/`MultiEdit` — that can deny a file edit outright when another live
+lane is already busy editing the exact same file, instead of letting both land and reconciling
+the collision afterward. See [docs/automation.md](docs/automation.md#concurrency-guarantees)
+for what problem this solves and its limits (whole-file granularity, Claude Code only for now).
+
 How a report and the multiplexer's reading combine:
 
 - A pane the multiplexer says is gone is always `dead`, and so is one whose shell kanstack is

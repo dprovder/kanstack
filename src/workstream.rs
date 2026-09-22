@@ -111,6 +111,15 @@ pub fn events_path(repo: &Path) -> Option<PathBuf> {
     Some(dir.join(format!("events-{key:016x}.jsonl")))
 }
 
+/// Where `repo`'s file-edit claims live — one small file per claimed path, see
+/// `crate::claims`. A sibling of `reports_dir`/`pids_dir`, same reasoning: a hook writes one
+/// of these on every file-editing tool call, from whichever lane's pane is running it, so
+/// sharing the registry would lose updates the same way reports would.
+pub fn claims_dir(repo: &Path) -> Option<PathBuf> {
+    let (dir, key) = repo_state(repo)?;
+    Some(dir.join(format!("claims-{key:016x}")))
+}
+
 /// The state directory, and the key identifying `repo` within it.
 fn repo_state(repo: &Path) -> Option<(PathBuf, u64)> {
     let dir = std::env::var_os("KANSTACK_STATE_PATH")
@@ -405,6 +414,22 @@ mod tests {
             events.file_name().unwrap().to_string_lossy().strip_suffix(".jsonl").and_then(|s| s.strip_prefix("events-")),
         );
         assert_ne!(events, events_path(Path::new("/repo/b")).unwrap());
+        std::env::remove_var("KANSTACK_STATE_PATH");
+    }
+
+    /// Claims are also keyed by the repository, a sibling of `reports`/`pids`/`events` — same
+    /// key, its own directory (one file per claimed path, not per branch).
+    #[test]
+    fn the_claims_directory_is_a_sibling_keyed_by_the_repository() {
+        let _guard = crate::SPLIT_BACKEND_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("KANSTACK_STATE_PATH", "/state");
+        let (reports, claims) = (reports_dir(Path::new("/repo/a")).unwrap(), claims_dir(Path::new("/repo/a")).unwrap());
+        assert_eq!(claims.parent(), Some(Path::new("/state")));
+        assert_eq!(
+            reports.file_name().unwrap().to_string_lossy().strip_prefix("reports-"),
+            claims.file_name().unwrap().to_string_lossy().strip_prefix("claims-"),
+        );
+        assert_ne!(claims, claims_dir(Path::new("/repo/b")).unwrap());
         std::env::remove_var("KANSTACK_STATE_PATH");
     }
 

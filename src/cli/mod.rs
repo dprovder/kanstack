@@ -7,7 +7,7 @@
 //! a fresh [`Splitter`] with it, acts, and writes back whatever changed.
 //!
 //! Each subcommand's argument parsing and dispatch logic lives in its own sibling module
-//! (`spawn`, `send`, `status`, `focus`, `stop`, `report_cmd`, `prune`), so work on one
+//! (`spawn`, `send`, `status`, `focus`, `stop`, `report_cmd`, `prune`, `claim`), so work on one
 //! subcommand touches one file. What's shared across more than one of them — the [`Command`]
 //! enum and its [`parse`], the generic `--json` result envelope, and small helpers like
 //! [`seeded_splitter`] — stays here.
@@ -26,6 +26,7 @@ mod exit;
 pub use exit::{dispatch, error_code, invalid_arguments, report_error, ErrorCode};
 use exit::{tag, ErrorCode::*, RESULT_SCHEMA};
 
+mod claim;
 mod events;
 mod focus;
 mod prune;
@@ -38,7 +39,7 @@ mod stop;
 pub use prune::PRUNE_SCHEMA;
 pub use status::STATUS_SCHEMA;
 
-pub const SUBCOMMANDS: &[&str] = &["spawn", "send", "status", "focus", "stop", "report", "prune", "events"];
+pub const SUBCOMMANDS: &[&str] = &["spawn", "send", "status", "focus", "stop", "report", "prune", "events", "claim"];
 
 pub const HELP: &str = "\
 kanstack spawn <branch> [--agent <name>] [--prompt \"...\"] [--item <ref>]
@@ -83,6 +84,16 @@ kanstack events [--since <offset>] [--follow] [--json]
     killed, instead of exiting once caught up. Needs no multiplexer and never touches the
     workstream registry. Always prints raw JSON lines on success; --json only changes how a
     failure is reported, same as every other subcommand
+kanstack claim [<branch>] [--json]
+    read a Claude Code PreToolUse hook payload from stdin and decide whether the Edit/Write/
+    MultiEdit it names may proceed: denies it (Claude's own hookSpecificOutput JSON, on stdout)
+    only when another branch holds a fresh, live claim on the exact same file (see
+    docs/automation.md's \"Concurrency guarantees\"), otherwise records this branch's own claim
+    and prints nothing. This is what the PreToolUse hook kanstack gives Claude Code runs, not
+    something to type by hand; <branch> defaults to $KANSTACK_BRANCH, same as `report`. Exact
+    file path only — two lanes editing different parts of the same file are still blocked from
+    each other. Never fails outward: a broken claims file or malformed stdin always allows the
+    edit rather than risk blocking one by mistake
 
 <session> is a pane id as `kanstack status` prints it. These need to run inside the
 multiplexer the panes live in (see README).
@@ -110,6 +121,7 @@ pub enum Command {
     Report { state: Reported, branch: Option<String>, json: bool },
     Prune { json: bool },
     Events { since: u64, follow: bool, json: bool },
+    Claim { branch: Option<String>, json: bool },
 }
 
 impl Command {
@@ -124,6 +136,7 @@ impl Command {
             Command::Report { .. } => "report",
             Command::Prune { .. } => "prune",
             Command::Events { .. } => "events",
+            Command::Claim { .. } => "claim",
         }
     }
 
@@ -136,7 +149,8 @@ impl Command {
             | Command::Stop { json, .. }
             | Command::Report { json, .. }
             | Command::Prune { json }
-            | Command::Events { json, .. } => *json,
+            | Command::Events { json, .. }
+            | Command::Claim { json, .. } => *json,
         }
     }
 }
@@ -228,6 +242,7 @@ pub fn parse(name: &str, args: Vec<String>) -> Result<Option<Command>> {
         }
         "prune" => Command::Prune { json },
         "events" => Command::Events { since: since.unwrap_or(0), follow, json },
+        "claim" => Command::Claim { branch: positional.next(), json },
         other => bail!("unknown subcommand {other:?}"),
     };
     if positional.next().is_some() {
@@ -324,6 +339,10 @@ pub fn run(command: Command, cwd: &Path, out: &mut impl Write) -> Result<()> {
         Command::Report { state, branch, json } => report_cmd::run(state, branch, json, cwd, out),
         Command::Prune { json } => prune::run(json, cwd, out),
         Command::Events { since, follow, json: _ } => events::run(since, follow, cwd, out),
+        // Also not routed through the registry-loading machinery, for the same reason as
+        // `Report`: this runs from a harness's `PreToolUse` hook, on every file-editing tool
+        // call, so it must stay fast and must never fail outward — see `claim`'s module doc.
+        Command::Claim { branch, json: _ } => claim::run(branch, cwd, out),
     }
 }
 
@@ -597,6 +616,20 @@ mod tests {
         );
         let err = parse("report", args(&["asleep"])).unwrap_err().to_string();
         assert!(err.contains("busy, idle or waiting"), "{err}");
+    }
+
+    #[test]
+    fn claim_takes_an_optional_branch_and_json_flag() {
+        assert_eq!(parse("claim", args(&[])).unwrap(), Some(Command::Claim { branch: None, json: false }));
+        assert_eq!(
+            parse("claim", args(&["fix-login"])).unwrap(),
+            Some(Command::Claim { branch: Some("fix-login".into()), json: false })
+        );
+        assert_eq!(
+            parse("claim", args(&["fix-login", "--json"])).unwrap(),
+            Some(Command::Claim { branch: Some("fix-login".into()), json: true })
+        );
+        assert!(parse("claim", args(&["a", "b"])).is_err(), "claim takes at most one positional argument");
     }
 
     #[test]

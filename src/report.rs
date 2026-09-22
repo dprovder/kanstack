@@ -20,6 +20,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::claims::Claims;
 use crate::events::EventLog;
 use crate::pane_status::PaneStatus;
 use crate::workstream::{fnv1a, reports_dir};
@@ -103,16 +104,19 @@ pub struct Reports {
     /// Where a report [`Self::write`]s also rings the events-log doorbell — see
     /// `crate::events`. Best-effort, like the report itself.
     events: EventLog,
+    /// What `crate::claims::Claims::release_all` a branch going idle, or being forgotten
+    /// entirely, drops — see [`Self::write`] and [`Self::forget`]. Best-effort, like `events`.
+    claims: Claims,
 }
 
 impl Reports {
     pub fn for_repo(repo: &Path) -> Self {
-        Reports { dir: reports_dir(repo), events: EventLog::for_repo(repo) }
+        Reports { dir: reports_dir(repo), events: EventLog::for_repo(repo), claims: Claims::for_repo(repo) }
     }
 
     #[cfg(test)]
     pub(crate) fn in_dir(dir: PathBuf) -> Self {
-        Reports { dir: Some(dir), events: EventLog::default() }
+        Reports { dir: Some(dir), events: EventLog::default(), claims: Claims::default() }
     }
 
     /// One file per branch, named by a hash of it so any branch name — slashes and all — is a
@@ -136,6 +140,13 @@ impl Reports {
         std::fs::write(&tmp, serde_json::to_string(&stored)? + "\n")?;
         std::fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))?;
         self.events.record_report(branch, state, now);
+        // A turn ending is the ordinary way a lane stops being "actively editing" anything —
+        // see `crate::claims`'s module doc. Not for `Busy` (still going) or `Waiting` (stopped
+        // mid-turn on a prompt, not done with the file it was touching) — only `Idle` means the
+        // turn that held these claims has actually finished.
+        if state == Reported::Idle {
+            self.claims.release_all(branch);
+        }
         Ok(())
     }
 
@@ -179,11 +190,14 @@ impl Reports {
     }
 
     /// Drops whatever `branch`'s agent said, because it was about a pane that no longer
-    /// exists: a new pane must not inherit the old one's last word.
+    /// exists: a new pane must not inherit the old one's last word. Also drops every file
+    /// claim `branch` holds (see `crate::claims`) for the same reason — a pane that's gone,
+    /// or about to be replaced, can't still be mid-edit of anything.
     pub fn forget(&self, branch: &str) {
         if let Some(path) = self.file(branch) {
             let _ = std::fs::remove_file(path);
         }
+        self.claims.release_all(branch);
     }
 }
 
@@ -361,5 +375,65 @@ mod tests {
 
         std::env::remove_var("KANSTACK_STATE_PATH");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Same reasoning as the events-log test above: `Claims::release_all` only does anything
+    /// with somewhere to look, so this goes through `Reports::for_repo` rather than `scratch`'s
+    /// `Reports::in_dir`.
+    fn with_claims_state(tag: &str, body: impl FnOnce(&Path, &crate::claims::Claims)) {
+        let _guard = crate::SPLIT_BACKEND_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("kanstack-reports-claims-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("KANSTACK_STATE_PATH", &dir);
+        let repo = Path::new("/repo/reports-claims");
+        body(repo, &crate::claims::Claims::for_repo(repo));
+        std::env::remove_var("KANSTACK_STATE_PATH");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A turn ending is the ordinary way a lane stops being mid-edit of anything — see
+    /// `crate::claims`'s module doc — so writing `idle` must drop whatever files this branch
+    /// had claimed, but leave another branch's claims alone.
+    #[test]
+    fn writing_idle_releases_the_branchs_own_claims_only() {
+        with_claims_state("idle", |repo, claims| {
+            claims.claim("/repo/src/lib.rs", "fix-login", at(1000)).unwrap();
+            claims.claim("/repo/src/other.rs", "add-search", at(1000)).unwrap();
+
+            Reports::for_repo(repo).write("fix-login", Reported::Idle, at(1001)).unwrap();
+
+            assert_eq!(claims.holder("/repo/src/lib.rs", at(1002)), None, "fix-login's own claim is gone");
+            assert_eq!(claims.holder("/repo/src/other.rs", at(1002)), Some("add-search".to_string()), "another branch's claim is untouched");
+        });
+    }
+
+    /// A turn merely running (`Busy`) or stopped on a prompt (`Waiting`) is not "done with the
+    /// file" — only `Idle` releases claims.
+    #[test]
+    fn writing_busy_or_waiting_does_not_release_claims() {
+        with_claims_state("busy-waiting", |repo, claims| {
+            claims.claim("/repo/src/lib.rs", "fix-login", at(1000)).unwrap();
+            let reports = Reports::for_repo(repo);
+            reports.write("fix-login", Reported::Busy, at(1001)).unwrap();
+            assert_eq!(claims.holder("/repo/src/lib.rs", at(1002)), Some("fix-login".to_string()));
+            reports.write("fix-login", Reported::Waiting, at(1002)).unwrap();
+            assert_eq!(claims.holder("/repo/src/lib.rs", at(1003)), Some("fix-login".to_string()));
+        });
+    }
+
+    /// `forget` — called when a pane is stopped, or reused for a fresh spawn (see
+    /// `crate::splitter::Splitter::stop`/`prepare_launch`) — drops the branch's claims too: a
+    /// pane that's gone, or about to be replaced, can't still be mid-edit of anything.
+    #[test]
+    fn forgetting_a_branch_also_releases_its_claims() {
+        with_claims_state("forget", |repo, claims| {
+            claims.claim("/repo/src/lib.rs", "fix-login", at(1000)).unwrap();
+            claims.claim("/repo/src/other.rs", "add-search", at(1000)).unwrap();
+
+            Reports::for_repo(repo).forget("fix-login");
+
+            assert_eq!(claims.holder("/repo/src/lib.rs", at(1001)), None);
+            assert_eq!(claims.holder("/repo/src/other.rs", at(1001)), Some("add-search".to_string()));
+        });
     }
 }

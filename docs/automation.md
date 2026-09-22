@@ -106,6 +106,18 @@ several agents against overlapping files should expect this and have a recovery 
 reroute to a different file region, or serialize those two lanes — kanstack itself doesn't
 prevent or resolve it.
 
+**A preventive check exists for one harness.** For Claude Code specifically, kanstack installs
+a `PreToolUse` hook (`kanstack claim`) that can deny an `Edit`/`Write`/`MultiEdit` outright,
+before it lands, when another live lane already holds a fresh claim on the exact same file and
+is currently busy — vetoing the collision above before it happens, rather than reconciling it
+after. It matches on the whole file, not a line range, so two lanes editing different parts of
+the same file are still blocked from each other; a claim clears itself out on a short timeout
+or when the holding lane goes idle, so this never becomes a lock an orchestrator has to clear
+by hand. Only Claude Code has this wired up today — every other supported harness can block a
+tool call by some equivalent mechanism, but none of them are hooked up yet, so an orchestrator
+running codex/pi/opencode/kiro/gemini lanes against overlapping files still needs the recovery
+plan above.
+
 ## Lifecycle semantics
 
 - **Idempotent, safe to retry:** `stop` (closing an already-gone pane succeeds; a second

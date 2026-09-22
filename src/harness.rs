@@ -44,6 +44,13 @@ pub trait Harness: Sync {
     /// `None`, the default, means kanstack knows no way to hand this harness hooks when it
     /// launches it. That costs nothing but accuracy: the multiplexer's own reading of the
     /// pane is used instead, and anything can still call `kanstack report` itself.
+    ///
+    /// This is also where [`Claude`]'s `PreToolUse` claim-check hook (`kanstack claim`, see
+    /// `crate::claims` and `crate::cli::claim`) lives, for the one harness that has it wired
+    /// up so far. Every harness kanstack knows about can block a tool call by some equivalent
+    /// mechanism (confirmed in the design discussion that led to that module) — a
+    /// `// TODO(claims)` on each impl below marks where its own version of this hook would
+    /// go; none of the others are wired up yet, a deliberate v1 limitation, not an oversight.
     fn status_hooks(&self, _report: &str, _branch: &str) -> Option<LaunchExtras> {
         None
     }
@@ -81,6 +88,16 @@ pub trait Harness: Sync {
 /// `report` prints nothing and exits 0, which matters twice over: `UserPromptSubmit`'s
 /// stdout is added to what the model sees, and a `PermissionRequest` hook that stays silent
 /// leaves the normal prompt alone rather than approving or denying anything.
+///
+/// A second `PreToolUse` entry, matching only `Edit|Write|MultiEdit`, runs `kanstack claim`
+/// (see `crate::claims`, `crate::cli::claim`) — the preflight file-claim check that can deny
+/// the tool call outright when another lane is already mid-edit of the same file, via
+/// `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny",...}}` on
+/// stdout, confirmed against Claude Code's own hooks documentation (only exit code 2 blocks
+/// unconditionally there; this JSON form is the one that can't misfire from an unrelated
+/// non-zero exit, so `claim` never uses exit code 2). It runs alongside the existing
+/// matcher-`""` entry, which still reports `busy` for every tool call regardless of which one
+/// this narrower matcher catches.
 struct Claude;
 impl Harness for Claude {
     fn id(&self) -> &'static str {
@@ -90,16 +107,22 @@ impl Harness for Claude {
         NoteDelivery::Flag("--append-system-prompt".to_string())
     }
     fn status_hooks(&self, report: &str, branch: &str) -> Option<LaunchExtras> {
-        let hook = |state: &str| {
-            serde_json::json!([{
-                "matcher": "",
-                "hooks": [{ "type": "command", "command": format!("{report} {state} {}", shell_quote(branch)), "timeout": 5 }],
-            }])
+        let entry = |matcher: &str, command: String| {
+            serde_json::json!({ "matcher": matcher, "hooks": [{ "type": "command", "command": command, "timeout": 5 }] })
         };
+        let hook = |state: &str| serde_json::json!([entry("", format!("{report} {state} {}", shell_quote(branch)))]);
+        // `report` is always `"<quoted-exe> report"` (see `reporter_command`); the claim-check
+        // hook needs the same executable, running a different subcommand — the exe is
+        // recovered by stripping the trailing subcommand name back off.
+        let exe = report.strip_suffix(" report").unwrap_or(report);
+        let pre_tool_use = serde_json::json!([
+            entry("", format!("{report} busy {}", shell_quote(branch))),
+            entry("Edit|Write|MultiEdit", format!("{exe} claim {}", shell_quote(branch))),
+        ]);
         let settings = serde_json::json!({
             "hooks": {
                 "UserPromptSubmit": hook("busy"),
-                "PreToolUse": hook("busy"),
+                "PreToolUse": pre_tool_use,
                 "PermissionRequest": hook("waiting"),
                 "PostToolUse": hook("busy"),
                 "PostToolUseFailure": hook("busy"),

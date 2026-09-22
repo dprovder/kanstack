@@ -198,7 +198,7 @@ fn lifecycle_event(command: &Command) -> Option<(&'static str, Option<String>)> 
         // `prune` can remove several workstreams or none; one event marks that it ran rather
         // than guessing which branches it touched.
         Command::Prune { .. } => Some(("prune", None)),
-        Command::Send { .. } | Command::Status { .. } | Command::Focus { .. } | Command::Report { .. } | Command::Events { .. } => None,
+        Command::Send { .. } | Command::Status { .. } | Command::Focus { .. } | Command::Report { .. } | Command::Events { .. } | Command::Claim { .. } => None,
     }
 }
 
@@ -351,6 +351,7 @@ mod tests {
             "report rings the doorbell itself, from Reports::write"
         );
         assert_eq!(lifecycle_event(&Command::Events { since: 0, follow: false, json: false }), None);
+        assert_eq!(lifecycle_event(&Command::Claim { branch: None, json: false }), None);
     }
 
     /// `dispatch` is what `main` actually calls, and it's the one place that knows both a

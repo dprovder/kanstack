@@ -8,6 +8,7 @@ pub mod app;
 pub mod board;
 pub mod cli;
 pub mod but;
+pub mod claims;
 pub mod config;
 pub mod diff;
 pub mod harness;
