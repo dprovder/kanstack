@@ -13,6 +13,7 @@ pub mod gemini;
 pub mod kiro;
 pub mod launch;
 pub mod opencode;
+pub mod pi;
 
 use std::path::Path;
 
@@ -153,17 +154,6 @@ impl Harness for Codex {
     }
 }
 
-/// Same confirmed `--append-system-prompt <text>` as Claude.
-struct Pi;
-impl Harness for Pi {
-    fn id(&self) -> &'static str {
-        "pi"
-    }
-    fn note_delivery(&self) -> NoteDelivery {
-        NoteDelivery::Flag("--append-system-prompt".to_string())
-    }
-}
-
 /// Anything not in [`KNOWN`]: a wrapper script, a harness kanstack hasn't heard of. Gets
 /// the delivery that works everywhere.
 struct Generic;
@@ -175,7 +165,7 @@ impl Harness for Generic {
 
 /// Every harness kanstack recognizes by name, in the order `--setup` prefers them when
 /// several are installed.
-pub const KNOWN: &[&dyn Harness] = &[&Claude, &Codex, &Pi, &opencode::OpenCode, &kiro::Kiro, &gemini::Gemini];
+pub const KNOWN: &[&dyn Harness] = &[&Claude, &Codex, &pi::Pi, &opencode::OpenCode, &kiro::Kiro, &gemini::Gemini];
 
 static GENERIC: Generic = Generic;
 
@@ -408,14 +398,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_note_delivery_covers_claude_and_pi() {
+    fn resolve_note_delivery_uses_append_system_prompt_for_claude() {
         with_system_flag_env(None, || {
             assert_eq!(
                 resolve_note_delivery("claude"),
-                NoteDelivery::Flag("--append-system-prompt".to_string())
-            );
-            assert_eq!(
-                resolve_note_delivery("pi"),
                 NoteDelivery::Flag("--append-system-prompt".to_string())
             );
         });
