@@ -1,5 +1,5 @@
 //! Fallback bridge to plain `tmux`, for a harness split on machines without `cmux` (see
-//! `crate::cmux`) but where kanstack is itself running inside a real tmux pane.
+//! `crate::mux::cmux`) but where kanstack is itself running inside a real tmux pane.
 //!
 //! `Tmux::discover` requires `$TMUX_PANE` — the pane id tmux sets for every process it
 //! spawns — precisely because the whole scheme is "split off kanstack's own pane": with no

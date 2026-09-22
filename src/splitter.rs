@@ -1,5 +1,5 @@
 //! The harness-split state kanstack keeps, whichever multiplexer it is in — `cmux` if
-//! present, else plain `tmux`, else `orca`, else Ghostty (see `crate::cmux`, `crate::mux::tmux`,
+//! present, else plain `tmux`, else `orca`, else Ghostty (see `crate::mux::cmux`, `crate::mux::tmux`,
 //! `crate::orca`, `crate::ghostty`), paired with the harness it launches (`crate::harness`).
 //!
 //! A [`Multiplexer`] only opens, types into, focuses, closes and probes panes. Which branch a
@@ -14,9 +14,9 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, bail, Result};
 
-use crate::cmux::Cmux;
 use crate::ghostty::Ghostty;
 use crate::harness::HarnessConfig;
+use crate::mux::cmux::Cmux;
 use crate::mux::tmux::Tmux;
 use crate::mux::{configured_directions, normalize_direction, Multiplexer, OpenRequest};
 use crate::orca::Orca;
@@ -129,7 +129,7 @@ fn discover_ghostty() -> Option<Arc<dyn Multiplexer>> {
 
 /// Every backend, in the order automatic discovery tries them.
 pub const BACKENDS: &[BackendEntry] = &[
-    BackendEntry { name: "cmux", label: "cmux", discover: discover_cmux, detection: crate::cmux::detection },
+    BackendEntry { name: "cmux", label: "cmux", discover: discover_cmux, detection: crate::mux::cmux::detection },
     BackendEntry { name: "tmux", label: "tmux", discover: discover_tmux, detection: crate::mux::tmux::detection },
     BackendEntry { name: "orca", label: "Orca", discover: discover_orca, detection: crate::orca::detection },
     BackendEntry { name: "ghostty", label: "Ghostty", discover: discover_ghostty, detection: crate::ghostty::detection },

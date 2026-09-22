@@ -609,8 +609,8 @@ mod tests {
         });
     }
 
-    const PANE_LIST_FIXTURE: &str = include_str!("../tests/fixtures/cmux_pane_list.json");
-    const TOP_FIXTURE: &str = include_str!("../tests/fixtures/cmux_top.json");
+    const PANE_LIST_FIXTURE: &str = include_str!("../../tests/fixtures/cmux_pane_list.json");
+    const TOP_FIXTURE: &str = include_str!("../../tests/fixtures/cmux_top.json");
 
     /// A tracked surface that's present in `pane.list` and shows CPU usage above
     /// [`CPU_BUSY_THRESHOLD_PERCENT`] in `cmux top` (a real, actively-generating `claude`
