@@ -12,6 +12,7 @@
 //! `surface:12`, Orca's terminal handle.
 
 pub mod cmux;
+pub mod ghostty;
 pub mod orca;
 pub mod tmux;
 

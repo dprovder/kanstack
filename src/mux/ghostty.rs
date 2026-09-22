@@ -1,5 +1,5 @@
 //! Optional bridge to the Ghostty terminal app (<https://ghostty.org>), the fourth harness-split
-//! backend beside `crate::cmux`, `crate::tmux` and `crate::orca`. macOS only: it drives the
+//! backend beside `crate::mux::cmux`, `crate::mux::tmux` and `crate::mux::orca`. macOS only: it drives the
 //! app through the AppleScript dictionary Ghostty 1.3 added, by way of `osascript`.
 //!
 //! **What was measured, against what.** Everything below marked (measured) was run against
