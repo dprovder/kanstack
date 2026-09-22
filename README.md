@@ -282,16 +282,18 @@ agent in one pane can start and talk to others. Run these inside the cmux, tmux,
 panes live in:
 
 ```sh
-kanstack spawn <branch> [--agent codex] [--prompt "..."]   # creates <branch> if it doesn't exist
-kanstack send <branch|session> "..."
+kanstack spawn <branch> [--agent codex] [--prompt "..."] [--json]   # creates <branch> if it doesn't exist
+kanstack send <branch|session> "..." [--json]
 kanstack status [--json]
-kanstack focus <branch|session>
-kanstack stop <branch|session>                             # closes the pane, ends its harness
-kanstack report <busy|idle> [<branch>]                     # what an agent says about itself
+kanstack focus <branch|session> [--json]
+kanstack stop <branch|session> [--json]                     # closes the pane, ends its harness
+kanstack report <busy|idle> [<branch>] [--json]              # what an agent says about itself
 kanstack prune [--json]                                     # forgets workstreams whose pane is confirmed gone
 ```
 
-`<session>` is a pane id as `kanstack status` prints it. `spawn` splits off the pane you run it
+Every one of these takes `--json`, for a script or another agent to drive kanstack without
+parsing human-readable text — see "Exit codes, and `--json` for every subcommand" below for
+the shared envelope and error contract. `<session>` is a pane id as `kanstack status` prints it. `spawn` splits off the pane you run it
 from, to its right; `KANSTACK_SPAWN_DIRECTION` (`left`, `right`, `above` or `below`, and
 saveable in the config file) changes that without touching where the board puts its lanes. `--agent` runs that harness instead
 of `$KANSTACK_HARNESS` for this one pane.
@@ -324,7 +326,8 @@ agent to parse:
            "push":"unpushed","uncommitted":0}},
   {"branch":"planned","pane":null,"agent":null,"item":null,"status":"no-pane","lane":null}
  ],
- "workspace":{"behind":2,"uncommitted":1,"fetched":"2026-09-21T03:07:40.977+00:00"}}
+ "workspace":{"behind":2,"uncommitted":1,"fetched":"2026-09-21T03:07:40.977+00:00"},
+ "workspace_blocked":null}
 ```
 
 Every key is always present (`null` when there's no value), one entry per registered
@@ -363,11 +366,21 @@ tens of milliseconds more than plain `but status`; `-u` is the only way `but` fi
 each state (`tests/fixtures/status_lane_*.json`), except the assigned-files count, which this
 `but` cannot produce from the command line and is hand-set in its test.
 
+`workspace_blocked` is set — to `but`'s own explanation, kept verbatim — when the workspace is
+locked by a stray commit on `gitbutler/workspace` (see "A commit on the workspace head locks
+everything" in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)): `but` refuses every subcommand
+until it's fixed, `but teardown` or a reset among them, which is worth telling apart from
+`but` merely being unreachable — not installed, not a repo, a transient failure — since it
+names one specific, fixable cause instead of "try again". `workspace` is `null` whenever this
+is set too, since a blocked `but` refuses `status` along with everything else. `null` in the
+ordinary case.
+
 Unlike the table, `--json` works outside cmux, tmux, Orca and Ghostty, and when the multiplexer can't
 be reached: it still lists every workstream, with `unknown` for those that have a pane. An
-empty registry gives `{"schema":1,"workstreams":[],"workspace":null}`. What it will not do is
-paper over a registry file that is corrupt or unreadable: that exits non-zero with the reason
-on stderr and nothing on stdout, because starting over would orphan every pane it tracks.
+empty registry gives `{"schema":1,"workstreams":[],"workspace":null,"workspace_blocked":null}`.
+What it will not do is paper over a registry file that is corrupt or unreadable: that exits
+non-zero with the reason on stderr (or, under `--json`, the error document below) and nothing
+on stdout, because starting over would orphan every pane it tracks.
 
 **`kanstack prune [--json]`** forgets workstreams whose pane the poll has confirmed gone —
 closed outside kanstack, the process died — the same `dead` reading `status` shows. It only
@@ -382,6 +395,52 @@ no risk of it wiping the registry just because it wasn't run from inside a pane 
 
 The table form prints one `pruned <branch>` line per branch removed, or `nothing to prune`.
 `schema` versions independently of `status --json`'s.
+
+### Exit codes, and `--json` for every subcommand
+
+`spawn`, `send`, `focus`, `stop` and `report` take `--json` too, for the same reason
+`status`/`prune` do: something driving kanstack from a script or another agent shouldn't have
+to parse human-readable text. Success is one document on stdout, this shape for every command
+but `status` and `prune` (which keep the shapes documented above, independently versioned):
+
+```json
+{"schema":1,"ok":true,"command":"spawn","workstream":"fix-login",
+ "result":{"created":true,"pane":"%7","agent":"claude","workspace":null}}
+```
+
+`workstream` is always the branch the command acted on. `result` is command-specific:
+`spawn`'s `created` says whether the branch was new; `workspace` is the multiplexer's
+workspace the pane opened in, when the backend has one (cmux does; tmux, Orca and Ghostty
+don't) — same idea as `spawn`'s own text output, `(workspace:1)`. `send`/`focus`/`stop` give
+back `{"pane":"..."}`, the pane the command acted on (`null` for `stop` on a workstream that
+had none to close). `report`'s is `{"state":"busy"}` — but only when `--json` is given;
+without it, `report` still prints nothing at all, same as before this existed, since Claude
+adds a `UserPromptSubmit` hook's stdout to what the model sees.
+
+A failure is one document too, with the same `command` and a `null`-free `error`:
+
+```json
+{"schema":1,"ok":false,"command":"spawn",
+ "error":{"code":"workstream_exists","message":"fix-login already has a pane open — use `kanstack send`, `focus` or `stop`"}}
+```
+
+Without `--json`, a failure is unchanged from before: the same text on stderr, nothing on
+stdout. Either way, the process exit code says what kind of thing went wrong — coarser than
+`error.code`, since several conditions share one:
+
+| exit | meaning | `error.code` |
+| --- | --- | --- |
+| `0` | success | — |
+| `1` | internal: a bug, a corrupt registry, an I/O failure below everything else | `internal` |
+| `2` | invalid arguments — caught before anything ran | `invalid_arguments` |
+| `3` | nothing to act on: the target names no workstream, or it has no pane | `unknown_workstream`, `no_pane` |
+| `4` | conflict: `spawn` on a branch that already has a live pane | `workstream_exists` |
+| `5` | an external dependency is unavailable or refused: the split backend, `but`, the harness, or delivering a message to a pane | `multiplexer_unavailable`, `harness_unavailable`, `but_failed`, `delivery_failed` |
+
+`error.code` is the precise reason within that bucket, so a caller that needs the finer
+distinction `--json` gives never has to pattern-match prose to get it. `harness_unavailable`
+is reserved — kanstack has no harness-availability preflight today, it just types a launch
+line into a pane — defined now so a later check has somewhere to report to.
 
 ### Where busy, idle and waiting come from
 
