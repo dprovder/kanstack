@@ -51,8 +51,10 @@ if it doesn't, spawn.
 `kanstack stop` and `kanstack prune` are hard to undo — `stop` ends the
 harness and closes the pane; `prune` forgets any workstream whose pane is
 confirmed gone. Before either, read `kanstack status --json` (or
-`kanstack events --follow` if you're waiting on a specific workstream to
-finish rather than polling) so you know what you're about to end. Don't stop
+`kanstack events --follow --new` if you're waiting on a specific workstream
+to finish rather than polling — `--new` skips straight to the log's current
+end so you don't sit through the whole backlog first) so you know what
+you're about to end. Don't stop
 a workstream just because it's `idle` — idle often means it's waiting for
 your next `send`, not that it's done. `waiting` means it's stopped on a
 permission prompt and needs a human, not a `stop`.

@@ -2,7 +2,8 @@
 //! and a lifecycle change (spawn/stop/prune) — so an external orchestrator driving kanstack
 //! doesn't have to poll `kanstack status` in a loop to notice one. No daemon, no server, no
 //! push channel: just a JSONL file another process can `tail -f`, or poll from a byte offset
-//! with `kanstack events --since <offset>` (see `crate::cli::events`). One file per
+//! with `kanstack events --since <offset>` — or skip the backlog entirely and start from the
+//! log's current end with `kanstack events --new` (see `crate::cli::events`). One file per
 //! repository (see [`crate::workstream::events_path`]), the same convention as
 //! `reports_dir`/`pids_dir`/`state_path`.
 //!

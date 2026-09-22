@@ -350,7 +350,7 @@ mod tests {
             None,
             "report rings the doorbell itself, from Reports::write"
         );
-        assert_eq!(lifecycle_event(&Command::Events { since: 0, follow: false, json: false }), None);
+        assert_eq!(lifecycle_event(&Command::Events { since: 0, follow: false, new: false, json: false }), None);
         assert_eq!(lifecycle_event(&Command::Claim { branch: None, json: false }), None);
     }
 

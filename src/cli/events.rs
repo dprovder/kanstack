@@ -7,6 +7,15 @@
 //! that already is the machine-readable shape this exists to hand a caller; `--json` here only
 //! changes how a *failure* is reported (the same generic envelope every other subcommand
 //! uses), not how success looks.
+//!
+//! Two ways to pick where to start reading: `--since <offset>` (an exact byte offset, e.g. one
+//! a prior run printed with `wc -c`, to resume exactly where it left off) or `--new` (skip the
+//! entire backlog and start from the log's current length, for a caller that only cares what
+//! happens from now on and doesn't have — or want to bother tracking — a prior offset). They're
+//! mutually exclusive; rejected together by `crate::cli::parse`. Neither is a persistent
+//! cursor: both only pick the starting point for this one invocation, and `--new` in
+//! particular re-resolves "now" fresh every time it runs, same as starting a `tail -f` — it
+//! does not remember anything between invocations.
 
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -21,17 +30,28 @@ use crate::workstream::events_path;
 /// daemon, so simplicity wins over the latency a watch would save.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-pub(super) fn run(since: u64, follow: bool, cwd: &Path, out: &mut impl Write) -> Result<()> {
+pub(super) fn run(since: u64, follow: bool, new: bool, cwd: &Path, out: &mut impl Write) -> Result<()> {
     let Some(path) = events_path(cwd) else {
         anyhow::bail!("no home directory to keep events in");
     };
-    let mut offset = emit_new(&path, since, out)?;
+    let mut offset = if new { current_len(&path)? } else { emit_new(&path, since, out)? };
     if !follow {
         return Ok(());
     }
     loop {
         std::thread::sleep(POLL_INTERVAL);
         offset = emit_new(&path, offset, out)?;
+    }
+}
+
+/// `path`'s current length, or `0` if it doesn't exist yet — the starting offset for `--new`:
+/// skip everything already logged and start from the end, same "not an error" treatment as
+/// `emit_new` gives a missing log.
+fn current_len(path: &Path) -> Result<u64> {
+    match std::fs::metadata(path) {
+        Ok(m) => Ok(m.len()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
     }
 }
 
@@ -75,7 +95,7 @@ mod tests {
     fn a_missing_log_prints_nothing_and_is_not_an_error() {
         with_state("missing", |repo| {
             let mut out = Vec::new();
-            crate::cli::run(Command::Events { since: 0, follow: false, json: false }, repo, &mut out).unwrap();
+            crate::cli::run(Command::Events { since: 0, follow: false, new: false, json: false }, repo, &mut out).unwrap();
             assert!(out.is_empty());
         });
     }
@@ -87,7 +107,7 @@ mod tests {
             crate::report::Reports::for_repo(repo).write("fix-login", crate::report::Reported::Idle, std::time::SystemTime::UNIX_EPOCH).unwrap();
 
             let mut out = Vec::new();
-            crate::cli::run(Command::Events { since: 0, follow: false, json: false }, repo, &mut out).unwrap();
+            crate::cli::run(Command::Events { since: 0, follow: false, new: false, json: false }, repo, &mut out).unwrap();
             let printed = String::from_utf8(out).unwrap();
             assert_eq!(printed.lines().count(), 2);
             assert!(printed.lines().next().unwrap().contains(r#""state":"busy""#));
@@ -103,7 +123,7 @@ mod tests {
             crate::report::Reports::for_repo(repo).write("fix-login", crate::report::Reported::Idle, std::time::SystemTime::UNIX_EPOCH).unwrap();
 
             let mut out = Vec::new();
-            crate::cli::run(Command::Events { since: first_len, follow: false, json: false }, repo, &mut out).unwrap();
+            crate::cli::run(Command::Events { since: first_len, follow: false, new: false, json: false }, repo, &mut out).unwrap();
             let printed = String::from_utf8(out).unwrap();
             assert_eq!(printed.lines().count(), 1, "{printed}");
             assert!(printed.contains(r#""state":"idle""#), "{printed}");
@@ -118,8 +138,80 @@ mod tests {
         with_state("since-too-far", |repo| {
             crate::report::Reports::for_repo(repo).write("fix-login", crate::report::Reported::Busy, std::time::SystemTime::UNIX_EPOCH).unwrap();
             let mut out = Vec::new();
-            crate::cli::run(Command::Events { since: 1_000_000, follow: false, json: false }, repo, &mut out).unwrap();
+            crate::cli::run(Command::Events { since: 1_000_000, follow: false, new: false, json: false }, repo, &mut out).unwrap();
             assert!(out.is_empty());
         });
+    }
+
+    /// `--new` (`new: true`) skips the whole backlog: nothing logged before the call is
+    /// printed, even though `since` is left at its default of 0.
+    #[test]
+    fn new_skips_the_existing_backlog_and_prints_nothing_by_itself() {
+        with_state("new-skips-backlog", |repo| {
+            crate::report::Reports::for_repo(repo).write("fix-login", crate::report::Reported::Busy, std::time::SystemTime::UNIX_EPOCH).unwrap();
+            crate::report::Reports::for_repo(repo).write("fix-login", crate::report::Reported::Idle, std::time::SystemTime::UNIX_EPOCH).unwrap();
+
+            let mut out = Vec::new();
+            crate::cli::run(Command::Events { since: 0, follow: false, new: true, json: false }, repo, &mut out).unwrap();
+            assert!(out.is_empty(), "--new must not replay anything logged before it ran");
+        });
+    }
+
+    /// `--new` with `--follow`: only what's appended *after* the command starts comes back,
+    /// none of the backlog that was already there. `--follow` never returns on its own, so
+    /// this drives it on a background thread and inspects what it's written so far through a
+    /// shared buffer, rather than waiting for (or joining) it.
+    #[test]
+    fn new_with_follow_only_emits_what_is_appended_after_it_starts() {
+        with_state("new-follow", |repo| {
+            crate::report::Reports::for_repo(repo).write("fix-login", crate::report::Reported::Busy, std::time::SystemTime::UNIX_EPOCH).unwrap();
+
+            let out = SharedBuf::default();
+            let repo_owned = repo.to_path_buf();
+            let mut out_for_thread = out.clone();
+            std::thread::spawn(move || {
+                let _ = crate::cli::run(
+                    Command::Events { since: 0, follow: true, new: true, json: false },
+                    &repo_owned,
+                    &mut out_for_thread,
+                );
+            });
+
+            // Give the follow loop a moment to resolve "current end of log" as its starting
+            // offset before the log grows, so the idle report below lands strictly after it.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            crate::report::Reports::for_repo(repo).write("fix-login", crate::report::Reported::Idle, std::time::SystemTime::UNIX_EPOCH).unwrap();
+            // Longer than POLL_INTERVAL, so the poll loop has had a chance to pick it up.
+            std::thread::sleep(std::time::Duration::from_millis(700));
+
+            let printed = String::from_utf8(out.contents()).unwrap();
+            assert!(!printed.contains(r#""state":"busy""#), "must not replay the pre-existing backlog: {printed}");
+            assert!(printed.contains(r#""state":"idle""#), "{printed}");
+        });
+    }
+}
+
+/// A `Write` sink shared between the test thread driving `--follow` and the one inspecting
+/// what it's printed so far, since `--follow` never returns to hand its output back normally.
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+#[cfg(test)]
+impl SharedBuf {
+    fn contents(&self) -> Vec<u8> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+#[cfg(test)]
+impl Write for SharedBuf {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }

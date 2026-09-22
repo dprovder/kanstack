@@ -289,7 +289,7 @@ kanstack focus <branch|session> [--json]
 kanstack stop <branch|session> [--json]                     # closes the pane, ends its harness
 kanstack report <busy|idle> [<branch>] [--json]              # what an agent says about itself
 kanstack prune [--json]                                     # forgets workstreams whose pane is confirmed gone
-kanstack events [--since <offset>] [--follow] [--json]      # tails the append-only events log
+kanstack events [--since <offset>|--new] [--follow] [--json]  # tails the append-only events log
 ```
 
 Every one of these takes `--json`, for a script or another agent to drive kanstack without
@@ -407,7 +407,13 @@ orchestrator can `tail -f` directly, or read through `kanstack events`:
 kanstack events                       # print everything logged so far
 kanstack events --since 4096          # print only what was appended after byte 4096
 kanstack events --follow              # keep printing new lines as they arrive, like tail -f
+kanstack events --new --follow        # skip the backlog, then stream only what's appended from now on
 ```
+
+`--new` and `--since <offset>` are mutually exclusive ways to pick where to start; `--new`
+resolves "now" to the log's current length when the command runs, so it doesn't require
+tracking an offset between invocations — handy for an orchestrator that just wants to watch
+for whatever happens next.
 
 Two commands write to it. `kanstack report <busy|idle|waiting>` appends one line every time
 it's called:

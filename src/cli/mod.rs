@@ -74,16 +74,18 @@ kanstack prune [--json]
     forget workstreams whose pane is confirmed gone (closed outside kanstack, the process
     died). Only removes ones the poll came back and said were dead — never ones it
     couldn't ask, which stay registered. --json prints one JSON document instead of lines
-kanstack events [--since <offset>] [--follow] [--json]
+kanstack events [--since <offset>|--new] [--follow] [--json]
     print the append-only events log (schema in the README): a report state change and a
     spawn/stop/prune lifecycle change, one JSON line each, so a caller doesn't have to poll
     `status` in a loop to notice one — a doorbell, not the payload; go read `status --json`
     for what actually happened. --since <offset> starts from that byte offset instead of the
     beginning (print the offset a prior run left off at, e.g. with `wc -c`, to resume where it
-    left off); --follow keeps printing new lines as they're appended (like `tail -f`) until
-    killed, instead of exiting once caught up. Needs no multiplexer and never touches the
-    workstream registry. Always prints raw JSON lines on success; --json only changes how a
-    failure is reported, same as every other subcommand
+    left off); --new skips the entire backlog and starts from the log's current end, for
+    `--follow` without replaying history (mutually exclusive with --since). --follow keeps
+    printing new lines as they're appended (like `tail -f`) until killed, instead of exiting
+    once caught up. Needs no multiplexer and never touches the workstream registry. Always
+    prints raw JSON lines on success; --json only changes how a failure is reported, same as
+    every other subcommand
 kanstack claim [<branch>] [--json]
     read a PreToolUse/BeforeTool hook payload from stdin (Claude Code or Gemini CLI, told apart
     by the payload's own hook_event_name) and decide whether the edit it names may proceed:
@@ -121,7 +123,7 @@ pub enum Command {
     Stop { target: String, json: bool },
     Report { state: Reported, branch: Option<String>, json: bool },
     Prune { json: bool },
-    Events { since: u64, follow: bool, json: bool },
+    Events { since: u64, follow: bool, new: bool, json: bool },
     Claim { branch: Option<String>, json: bool },
 }
 
@@ -165,6 +167,7 @@ pub fn parse(name: &str, args: Vec<String>) -> Result<Option<Command>> {
     let mut positional = Vec::new();
     let mut since = None;
     let mut follow = false;
+    let mut new = false;
     let mut agent = None;
     let mut prompt = None;
     let mut item = None;
@@ -195,6 +198,12 @@ pub fn parse(name: &str, args: Vec<String>) -> Result<Option<Command>> {
                     bail!("--follow takes no value\n\n{HELP}");
                 }
                 follow = true;
+            }
+            "--new" if name == "events" => {
+                if inline.is_some() {
+                    bail!("--new takes no value\n\n{HELP}");
+                }
+                new = true;
             }
             "--item" if name == "spawn" => item = Some(flag("--item", inline.as_deref(), &mut args)?),
             "--above" if name == "spawn" => above = Some(flag("--above", inline.as_deref(), &mut args)?),
@@ -242,7 +251,12 @@ pub fn parse(name: &str, args: Vec<String>) -> Result<Option<Command>> {
             Command::Report { state, branch: positional.next(), json }
         }
         "prune" => Command::Prune { json },
-        "events" => Command::Events { since: since.unwrap_or(0), follow, json },
+        "events" => {
+            if since.is_some() && new {
+                bail!("`kanstack events` takes --since or --new, not both\n\n{HELP}");
+            }
+            Command::Events { since: since.unwrap_or(0), follow, new, json }
+        }
         "claim" => Command::Claim { branch: positional.next(), json },
         other => bail!("unknown subcommand {other:?}"),
     };
@@ -339,7 +353,7 @@ pub fn run(command: Command, cwd: &Path, out: &mut impl Write) -> Result<()> {
         // not make it noisy or slow, and report_cmd::run never reads the registry at all.
         Command::Report { state, branch, json } => report_cmd::run(state, branch, json, cwd, out),
         Command::Prune { json } => prune::run(json, cwd, out),
-        Command::Events { since, follow, json: _ } => events::run(since, follow, cwd, out),
+        Command::Events { since, follow, new, json: _ } => events::run(since, follow, new, cwd, out),
         // Also not routed through the registry-loading machinery, for the same reason as
         // `Report`: this runs from a harness's `PreToolUse` hook, on every file-editing tool
         // call, so it must stay fast and must never fail outward — see `claim`'s module doc.
@@ -642,19 +656,40 @@ mod tests {
 
     #[test]
     fn parse_accepts_events_with_since_follow_and_json() {
-        assert_eq!(parse("events", args(&[])).unwrap(), Some(Command::Events { since: 0, follow: false, json: false }));
+        assert_eq!(
+            parse("events", args(&[])).unwrap(),
+            Some(Command::Events { since: 0, follow: false, new: false, json: false })
+        );
         assert_eq!(
             parse("events", args(&["--since", "4096"])).unwrap(),
-            Some(Command::Events { since: 4096, follow: false, json: false })
+            Some(Command::Events { since: 4096, follow: false, new: false, json: false })
         );
         assert_eq!(
             parse("events", args(&["--since=4096", "--follow", "--json"])).unwrap(),
-            Some(Command::Events { since: 4096, follow: true, json: true })
+            Some(Command::Events { since: 4096, follow: true, new: false, json: true })
         );
         assert!(parse("events", args(&["--since", "not-a-number"])).is_err());
         assert!(parse("events", args(&["extra"])).is_err(), "events takes no positional arguments");
         assert!(parse("status", args(&["--since", "1"])).is_err(), "--since is events-only");
         assert!(parse("status", args(&["--follow"])).is_err(), "--follow is events-only");
+        assert!(parse("status", args(&["--new"])).is_err(), "--new is events-only");
+    }
+
+    #[test]
+    fn parse_accepts_events_new_and_rejects_it_combined_with_since() {
+        assert_eq!(
+            parse("events", args(&["--new"])).unwrap(),
+            Some(Command::Events { since: 0, follow: false, new: true, json: false })
+        );
+        assert_eq!(
+            parse("events", args(&["--new", "--follow"])).unwrap(),
+            Some(Command::Events { since: 0, follow: true, new: true, json: false })
+        );
+        assert!(parse("events", args(&["--new=x"])).is_err(), "--new takes no value");
+        assert!(
+            parse("events", args(&["--since", "4096", "--new"])).is_err(),
+            "--since and --new are mutually exclusive"
+        );
     }
 
     // Cross-cutting behavior of the shared `resolve_branch`/`target_with_pane` helpers above,
