@@ -506,8 +506,12 @@ themselves. `KANSTACK_STATUS_HOOKS=off` launches every harness without them.
 The same `--settings` also carries a second, narrower `PreToolUse` hook — `kanstack claim`,
 matching only `Edit`/`Write`/`MultiEdit` — that can deny a file edit outright when another live
 lane is already busy editing the exact same file, instead of letting both land and reconciling
-the collision afterward. See [docs/automation.md](docs/automation.md#concurrency-guarantees)
-for what problem this solves and its limits (whole-file granularity, Claude Code only for now).
+the collision afterward. Gemini CLI gets the same `kanstack claim` check too, via its own
+`BeforeTool` hook and settings mechanism (no `--settings` flag exists for it — see
+`crate::harness::gemini::Gemini::status_hooks`); `kanstack claim` tells the two harnesses'
+differently-shaped deny decisions apart from the hook payload itself, not a flag. See
+[docs/automation.md](docs/automation.md#concurrency-guarantees) for what problem this solves,
+its limits (whole-file granularity), and why the other four supported harnesses don't have it.
 
 How a report and the multiplexer's reading combine:
 

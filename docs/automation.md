@@ -106,17 +106,24 @@ several agents against overlapping files should expect this and have a recovery 
 reroute to a different file region, or serialize those two lanes — kanstack itself doesn't
 prevent or resolve it.
 
-**A preventive check exists for one harness.** For Claude Code specifically, kanstack installs
-a `PreToolUse` hook (`kanstack claim`) that can deny an `Edit`/`Write`/`MultiEdit` outright,
+**A preventive check exists for two harnesses.** For Claude Code and Gemini CLI, kanstack
+installs a `PreToolUse`/`BeforeTool` hook (`kanstack claim`) that can deny an edit outright,
 before it lands, when another live lane already holds a fresh claim on the exact same file and
 is currently busy — vetoing the collision above before it happens, rather than reconciling it
 after. It matches on the whole file, not a line range, so two lanes editing different parts of
 the same file are still blocked from each other; a claim clears itself out on a short timeout
 or when the holding lane goes idle, so this never becomes a lock an orchestrator has to clear
-by hand. Only Claude Code has this wired up today — every other supported harness can block a
-tool call by some equivalent mechanism, but none of them are hooked up yet, so an orchestrator
-running codex/pi/opencode/kiro/gemini lanes against overlapping files still needs the recovery
-plan above.
+by hand. Claude gets this through the same `--settings` flag as its status hooks; Gemini has no
+such flag, so kanstack instead points `GEMINI_CLI_SYSTEM_SETTINGS_PATH` at a small settings
+file it writes per branch (see `crate::harness::gemini::Gemini::status_hooks`) — additive,
+same as Claude's, but with no cleanup path yet, so stray small JSON files accumulate under
+kanstack's state directory across a repository's lifetime. `Codex`, `Pi`, `OpenCode` and `Kiro`
+each have a blocking hook of their own, confirmed against their current docs, but none is
+wireable the same lightweight way — a required on-disk plugin/extension file with
+arbitrary-code-execution risk (Pi, OpenCode), an edit payload with no usable file-path field
+(Codex's `apply_patch`, a raw multi-file patch string), or exit-code-2-only blocking with no
+JSON alternative (Kiro) — so an orchestrator running codex/pi/opencode/kiro lanes against
+overlapping files still needs the recovery plan above.
 
 ## Lifecycle semantics
 

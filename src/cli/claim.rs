@@ -1,40 +1,58 @@
-//! `kanstack claim` — the `PreToolUse` hook Claude Code runs before an `Edit`/`Write`/
-//! `MultiEdit` (see `crate::harness::Claude::status_hooks`), reading its JSON payload from
-//! stdin and deciding whether the tool call may proceed. The preventive half of the
-//! cross-lane collision problem docs/automation.md's "Concurrency guarantees" section
-//! describes — vetoing a colliding edit *before* it lands, rather than reconciling the fused
-//! hunks after the fact (issue #9's job). See `crate::claims` for the on-disk claim itself;
-//! this module is just the decision Claude Code's hook contract wraps around it.
+//! `kanstack claim` — the `PreToolUse`/`BeforeTool` hook Claude Code and Gemini CLI each run
+//! before an edit-shaped tool call (see `crate::harness::claude::Claude::status_hooks` and
+//! `crate::harness::gemini::Gemini::status_hooks`), reading its JSON payload from stdin and
+//! deciding whether the tool call may proceed. The preventive half of the cross-lane collision
+//! problem docs/automation.md's "Concurrency guarantees" section describes — vetoing a
+//! colliding edit *before* it lands, rather than reconciling the fused hunks after the fact
+//! (issue #9's job). See `crate::claims` for the on-disk claim itself; this module is just the
+//! decision each hook contract wraps around it.
 //!
 //! ## The hook payload
 //!
-//! Confirmed against Claude Code's own hooks documentation: `PreToolUse` gets a JSON object on
-//! stdin with (among other fields this ignores) `tool_name` and `tool_input`, and for
-//! `Edit`/`Write`/`MultiEdit`, `tool_input.file_path` is the file being touched — the one
-//! field [`file_path_from_hook_payload`] reads.
+//! Confirmed against Claude Code's and Gemini CLI's own hooks documentation, independently:
+//! both send a JSON object on stdin with (among other fields this ignores) `hook_event_name`,
+//! `tool_name` and `tool_input`, and for Claude's `Edit`/`Write`/`MultiEdit` and Gemini's
+//! `write_file`/`replace`, `tool_input.file_path` is the file being touched — the one field
+//! [`file_path_from_hook_payload`] reads. The two harnesses' payloads line up closely enough
+//! that this needed no per-harness parsing at all; only the decision shape below differs.
 //!
 //! ## The decision
 //!
-//! To deny, this prints Claude's own `PreToolUse` decision JSON on stdout and exits `0`:
+//! To deny, this prints a decision JSON on stdout and exits `0` — which shape depends on which
+//! harness is asking, told apart by the payload's own `hook_event_name` (see [`DecisionShape`]),
+//! not a flag: the hook command is the literal same invocation, `kanstack claim <branch>`,
+//! either way.
 //!
+//! Claude Code's `PreToolUse` shape:
 //! ```text
 //! {"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny",
 //!  "permissionDecisionReason":"..."}}
 //! ```
+//! Gemini CLI's `BeforeTool` shape — flat, no wrapper, confirmed against its own hooks
+//! reference:
+//! ```text
+//! {"decision":"deny","reason":"..."}
+//! ```
 //!
-//! Deliberately the JSON form, not exit code `2`: Claude Code's docs are explicit that exit
-//! code `2` blocks a `PreToolUse` tool call *unconditionally*, "whether or not you print JSON"
-//! — the one exit code that can't be second-guessed by anything else the process does. That
-//! makes it exactly the wrong tool here: everything in [`run`] is built to fail open (see
-//! below), and a codepath that can turn an unrelated bug into an unconditional block is the
-//! one thing fail-open cannot tolerate. The JSON form has no such override — malformed JSON,
-//! a timeout, or any exit code other than `2` is *always* non-blocking, so a broken decision
-//! can only ever fail toward allowing the edit, never toward blocking one that shouldn't be.
+//! Deliberately the JSON form, not exit code `2`, for both: Claude Code's docs are explicit
+//! that exit code `2` blocks a `PreToolUse` tool call *unconditionally*, "whether or not you
+//! print JSON" — the one exit code that can't be second-guessed by anything else the process
+//! does. Gemini's own docs draw the same line, if less absolutely: exit `0` with stdout JSON is
+//! "preferred for all logic," while exit `2` is a separate, stderr-only path. Either way, that
+//! makes exit code `2` exactly the wrong tool here: everything in [`run`] is built to fail open
+//! (see below), and a codepath that can turn an unrelated bug into an unconditional block is
+//! the one thing fail-open cannot tolerate. The JSON form has no such override — malformed
+//! JSON, a timeout, or any exit code other than `2` is *always* non-blocking, so a broken
+//! decision can only ever fail toward allowing the edit, never toward blocking one that
+//! shouldn't be.
 //!
-//! To allow, this prints nothing and exits `0` — Claude Code's documented behavior for "the
+//! To allow, this prints nothing and exits `0` — both harnesses' documented behavior for "the
 //! hook has no decision" is to fall through to the normal permission flow, i.e. the edit
 //! proceeds exactly as if this hook didn't exist. Same convention `crate::report`'s hooks
 //! already use.
+//!
+//! `Codex`, `Pi`, `OpenCode` and `Kiro` are not wired to this at all — see
+//! `crate::harness::Harness::status_hooks`'s doc comment for why each one was left out.
 //!
 //! ## Fail open, unconditionally
 //!
@@ -79,8 +97,34 @@ pub(super) fn run(branch: Option<String>, cwd: &Path, out: &mut impl Write) -> R
         return Ok(());
     }
     let Some(file_path) = file_path_from_hook_payload(&raw) else { return Ok(()) };
-    decide(&branch, &file_path, &Claims::for_repo(cwd), &Reports::for_repo(cwd), SystemTime::now(), out);
+    let shape = DecisionShape::from_hook_payload(&raw);
+    decide(&branch, &file_path, shape, &Claims::for_repo(cwd), &Reports::for_repo(cwd), SystemTime::now(), out);
     Ok(())
+}
+
+/// Which harness's deny-decision JSON to print, told apart by the payload's own
+/// `hook_event_name` rather than a flag — see the module doc's "The decision".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecisionShape {
+    /// `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny",...}}`
+    /// — Claude Code's shape, and the fallback for anything unrecognized (including a missing
+    /// or unparseable `hook_event_name`), since Claude is the harness this was built for first
+    /// and every existing caller already expects this exact shape.
+    Claude,
+    /// `{"decision":"deny","reason":"..."}` — Gemini CLI's own flat shape, no wrapper.
+    Gemini,
+}
+
+impl DecisionShape {
+    fn from_hook_payload(raw: &str) -> Self {
+        let event = serde_json::from_str::<serde_json::Value>(raw)
+            .ok()
+            .and_then(|v| v.get("hook_event_name")?.as_str().map(str::to_string));
+        match event.as_deref() {
+            Some("BeforeTool") => DecisionShape::Gemini,
+            _ => DecisionShape::Claude,
+        }
+    }
 }
 
 /// `branch`, or `$KANSTACK_BRANCH` when the hook command (see `Harness::status_hooks`) didn't
@@ -108,10 +152,10 @@ fn file_path_from_hook_payload(raw: &str) -> Option<String> {
 /// `crate::report::Reports`, not merely the claim's own freshness) is `Busy` — a fresh claim
 /// from a branch that has since gone idle, or whose report has itself expired, is not a live
 /// collision. Otherwise, takes (or renews) `branch`'s own claim and allows.
-fn decide(branch: &str, file_path: &str, claims: &Claims, reports: &Reports, now: SystemTime, out: &mut impl Write) {
+fn decide(branch: &str, file_path: &str, shape: DecisionShape, claims: &Claims, reports: &Reports, now: SystemTime, out: &mut impl Write) {
     if let Some(holder) = claims.holder(file_path, now) {
         if holder != branch && reports.status(&holder, now) == Some(PaneStatus::Busy) {
-            deny(&holder, file_path, out);
+            deny(&holder, file_path, shape, out);
             return;
         }
     }
@@ -120,17 +164,24 @@ fn decide(branch: &str, file_path: &str, claims: &Claims, reports: &Reports, now
     let _ = claims.claim(file_path, branch, now);
 }
 
-fn deny(holder: &str, file_path: &str, out: &mut impl Write) {
-    let decision = serde_json::json!({
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",
-            "permissionDecisionReason": format!(
-                "kanstack: {holder} is already editing {file_path} in another lane. Retry \
-                 once it moves on, ask it to hand the file off, or edit something else."
-            ),
-        }
-    });
+fn deny(holder: &str, file_path: &str, shape: DecisionShape, out: &mut impl Write) {
+    let reason = format!(
+        "kanstack: {holder} is already editing {file_path} in another lane. Retry \
+         once it moves on, ask it to hand the file off, or edit something else."
+    );
+    let decision = match shape {
+        DecisionShape::Claude => serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason,
+            }
+        }),
+        DecisionShape::Gemini => serde_json::json!({
+            "decision": "deny",
+            "reason": reason,
+        }),
+    };
     if let Ok(line) = serde_json::to_string(&decision) {
         let _ = writeln!(out, "{line}");
     }
@@ -183,13 +234,29 @@ mod tests {
         assert_eq!(file_path_from_hook_payload(""), None);
     }
 
+    // Which harness's decision shape to use.
+
+    #[test]
+    fn decision_shape_reads_gemini_from_its_own_event_name() {
+        let raw = r#"{"hook_event_name":"BeforeTool","tool_name":"write_file","tool_input":{"file_path":"/a/b.ts"}}"#;
+        assert_eq!(DecisionShape::from_hook_payload(raw), DecisionShape::Gemini);
+    }
+
+    #[test]
+    fn decision_shape_defaults_to_claude_for_everything_else() {
+        let claude = r#"{"hook_event_name":"PreToolUse","tool_name":"Edit","tool_input":{"file_path":"/a/b.ts"}}"#;
+        assert_eq!(DecisionShape::from_hook_payload(claude), DecisionShape::Claude);
+        assert_eq!(DecisionShape::from_hook_payload("{ not json"), DecisionShape::Claude, "malformed input must still fail toward Claude's shape, the one every existing caller expects");
+        assert_eq!(DecisionShape::from_hook_payload(r#"{"tool_name":"Edit"}"#), DecisionShape::Claude, "no hook_event_name at all");
+    }
+
     // The decision itself.
 
     #[test]
     fn an_unclaimed_file_is_allowed_and_claimed() {
         let (claims, reports) = scratch("unclaimed");
         let mut out = Vec::new();
-        decide("feat-a", "/repo/src/lib.rs", &claims, &reports, at(1000), &mut out);
+        decide("feat-a", "/repo/src/lib.rs", DecisionShape::Claude, &claims, &reports, at(1000), &mut out);
         assert!(out.is_empty(), "allow prints nothing");
         assert_eq!(claims.holder("/repo/src/lib.rs", at(1001)), Some("feat-a".to_string()));
     }
@@ -198,9 +265,9 @@ mod tests {
     fn a_second_tool_call_from_the_same_branch_is_always_allowed() {
         let (claims, reports) = scratch("same-branch");
         reports.write("feat-a", crate::report::Reported::Busy, at(999)).unwrap();
-        decide("feat-a", "/repo/src/lib.rs", &claims, &reports, at(1000), &mut Vec::new());
+        decide("feat-a", "/repo/src/lib.rs", DecisionShape::Claude, &claims, &reports, at(1000), &mut Vec::new());
         let mut out = Vec::new();
-        decide("feat-a", "/repo/src/lib.rs", &claims, &reports, at(1001), &mut out);
+        decide("feat-a", "/repo/src/lib.rs", DecisionShape::Claude, &claims, &reports, at(1001), &mut out);
         assert!(out.is_empty(), "a branch never blocks its own claim");
     }
 
@@ -213,7 +280,7 @@ mod tests {
         reports.write("feat-a", crate::report::Reported::Busy, at(1000)).unwrap();
 
         let mut out = Vec::new();
-        decide("feat-b", "/repo/src/lib.rs", &claims, &reports, at(1001), &mut out);
+        decide("feat-b", "/repo/src/lib.rs", DecisionShape::Claude, &claims, &reports, at(1001), &mut out);
 
         let printed = String::from_utf8(out).unwrap();
         let decision: serde_json::Value = serde_json::from_str(printed.trim_end()).unwrap();
@@ -234,7 +301,7 @@ mod tests {
         reports.write("feat-a", crate::report::Reported::Idle, at(1000)).unwrap();
 
         let mut out = Vec::new();
-        decide("feat-b", "/repo/src/lib.rs", &claims, &reports, at(1001), &mut out);
+        decide("feat-b", "/repo/src/lib.rs", DecisionShape::Claude, &claims, &reports, at(1001), &mut out);
         assert!(out.is_empty(), "an idle holder's claim does not block");
         assert_eq!(claims.holder("/repo/src/lib.rs", at(1002)), Some("feat-b".to_string()), "feat-b took the claim instead");
     }
@@ -245,7 +312,7 @@ mod tests {
         let (claims, reports) = scratch("no-report");
         claims.claim("/repo/src/lib.rs", "feat-a", at(1000)).unwrap();
         let mut out = Vec::new();
-        decide("feat-b", "/repo/src/lib.rs", &claims, &reports, at(1001), &mut out);
+        decide("feat-b", "/repo/src/lib.rs", DecisionShape::Claude, &claims, &reports, at(1001), &mut out);
         assert!(out.is_empty());
     }
 
@@ -259,7 +326,7 @@ mod tests {
 
         let past = at(1000 + crate::claims::FRESH_FOR.as_secs() + 1);
         let mut out = Vec::new();
-        decide("feat-b", "/repo/src/lib.rs", &claims, &reports, past, &mut out);
+        decide("feat-b", "/repo/src/lib.rs", DecisionShape::Claude, &claims, &reports, past, &mut out);
         assert!(out.is_empty());
         assert_eq!(claims.holder("/repo/src/lib.rs", past), Some("feat-b".to_string()));
     }
@@ -272,8 +339,27 @@ mod tests {
         claims.claim("/repo/src/lib.rs", "feat-a", at(1000)).unwrap();
         reports.write("feat-a", crate::report::Reported::Busy, at(1000)).unwrap();
         let mut out = Vec::new();
-        decide("feat-b", "/repo/src/other.rs", &claims, &reports, at(1001), &mut out);
+        decide("feat-b", "/repo/src/other.rs", DecisionShape::Claude, &claims, &reports, at(1001), &mut out);
         assert!(out.is_empty());
+    }
+
+    /// Same core scenario as Claude's, but Gemini's own flat decision shape — confirmed against
+    /// its hooks reference, no `hookSpecificOutput` wrapper.
+    #[test]
+    fn a_fresh_claim_from_a_busy_branch_denies_the_call_in_geminis_own_shape() {
+        let (claims, reports) = scratch("deny-gemini");
+        claims.claim("/repo/src/lib.rs", "feat-a", at(1000)).unwrap();
+        reports.write("feat-a", crate::report::Reported::Busy, at(1000)).unwrap();
+
+        let mut out = Vec::new();
+        decide("feat-b", "/repo/src/lib.rs", DecisionShape::Gemini, &claims, &reports, at(1001), &mut out);
+
+        let printed = String::from_utf8(out).unwrap();
+        let decision: serde_json::Value = serde_json::from_str(printed.trim_end()).unwrap();
+        assert_eq!(decision["decision"], "deny");
+        assert!(decision.get("hookSpecificOutput").is_none(), "flat, not Claude's wrapper: {decision:?}");
+        let reason = decision["reason"].as_str().unwrap();
+        assert!(reason.contains("feat-a") && reason.contains("/repo/src/lib.rs"), "{reason}");
     }
 
     // Fail-open behavior of `own_branch` and the payload parser feeding `run`.

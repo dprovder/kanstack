@@ -20,12 +20,13 @@
 //! "region" to compare against another lane's). See the module doc on `crate::cli::claim` for
 //! the rest of the false-positive/false-negative tradeoffs.
 //!
-//! **Claude Code only, for now.** `crate::harness::Claude` is the only [`crate::harness::Harness`]
-//! that installs the `PreToolUse` hook this reads and writes through; every other supported
-//! harness (codex, pi, opencode, kiro, gemini) can block a tool call by some equivalent
-//! mechanism, confirmed in the design discussion that led to this module, but wiring them is
-//! deliberately left for later — see the `// TODO` on each `Harness` impl's own
-//! `status_hooks`.
+//! **Claude Code and Gemini CLI, for now.** `crate::harness::claude::Claude` and
+//! `crate::harness::gemini::Gemini` are the only [`crate::harness::Harness`] implementors that
+//! install the `PreToolUse`/`BeforeTool` hook this reads and writes through (see
+//! `crate::cli::claim::DecisionShape` for how the hook itself tells the two apart). `codex`,
+//! `pi`, `opencode` and `kiro` can each block a tool call by some equivalent mechanism,
+//! confirmed against their own current docs, but none is wireable the same lightweight way —
+//! see `crate::harness::Harness::status_hooks`'s doc comment for why each was left out.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

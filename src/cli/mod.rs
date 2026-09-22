@@ -85,15 +85,16 @@ kanstack events [--since <offset>] [--follow] [--json]
     workstream registry. Always prints raw JSON lines on success; --json only changes how a
     failure is reported, same as every other subcommand
 kanstack claim [<branch>] [--json]
-    read a Claude Code PreToolUse hook payload from stdin and decide whether the Edit/Write/
-    MultiEdit it names may proceed: denies it (Claude's own hookSpecificOutput JSON, on stdout)
-    only when another branch holds a fresh, live claim on the exact same file (see
-    docs/automation.md's \"Concurrency guarantees\"), otherwise records this branch's own claim
-    and prints nothing. This is what the PreToolUse hook kanstack gives Claude Code runs, not
-    something to type by hand; <branch> defaults to $KANSTACK_BRANCH, same as `report`. Exact
-    file path only — two lanes editing different parts of the same file are still blocked from
-    each other. Never fails outward: a broken claims file or malformed stdin always allows the
-    edit rather than risk blocking one by mistake
+    read a PreToolUse/BeforeTool hook payload from stdin (Claude Code or Gemini CLI, told apart
+    by the payload's own hook_event_name) and decide whether the edit it names may proceed:
+    denies it (that harness's own decision JSON, on stdout) only when another branch holds a
+    fresh, live claim on the exact same file (see docs/automation.md's \"Concurrency
+    guarantees\"), otherwise records this branch's own claim and prints nothing. This is what
+    the claim-check hook kanstack gives Claude Code and Gemini CLI runs, not something to type
+    by hand; <branch> defaults to $KANSTACK_BRANCH, same as `report`. Exact file path only —
+    two lanes editing different parts of the same file are still blocked from each other. Never
+    fails outward: a broken claims file or malformed stdin always allows the edit rather than
+    risk blocking one by mistake
 
 <session> is a pane id as `kanstack status` prints it. These need to run inside the
 multiplexer the panes live in (see README).

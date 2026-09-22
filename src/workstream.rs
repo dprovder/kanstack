@@ -120,6 +120,20 @@ pub fn claims_dir(repo: &Path) -> Option<PathBuf> {
     Some(dir.join(format!("claims-{key:016x}")))
 }
 
+/// Where `repo`'s Gemini CLI `PreToolUse`-equivalent hook settings live — one small
+/// `settings.json` per branch, written at launch time and pointed at via
+/// `GEMINI_CLI_SYSTEM_SETTINGS_PATH` (see `crate::harness::gemini::Gemini::status_hooks`).
+/// A sibling of `claims_dir`/`reports_dir`, same repository key, its own directory since it's
+/// one file per branch, not per repository. Unlike `claims_dir`/`reports_dir`, nothing prunes
+/// these once a branch stops — Gemini reads the file once at its own startup, not on every
+/// tool call, so there is no hot path to hang a release on the way `Claims::release_all` hangs
+/// off `Reports::write`/`forget`; a handful of small stray JSON files left behind is the
+/// accepted cost, not yet wired to `stop`/`prune`.
+pub fn gemini_hooks_dir(repo: &Path) -> Option<PathBuf> {
+    let (dir, key) = repo_state(repo)?;
+    Some(dir.join(format!("gemini-hooks-{key:016x}")))
+}
+
 /// The state directory, and the key identifying `repo` within it.
 fn repo_state(repo: &Path) -> Option<(PathBuf, u64)> {
     let dir = std::env::var_os("KANSTACK_STATE_PATH")
@@ -430,6 +444,21 @@ mod tests {
             claims.file_name().unwrap().to_string_lossy().strip_prefix("claims-"),
         );
         assert_ne!(claims, claims_dir(Path::new("/repo/b")).unwrap());
+        std::env::remove_var("KANSTACK_STATE_PATH");
+    }
+
+    /// Same shape, for Gemini's hook settings files.
+    #[test]
+    fn the_gemini_hooks_directory_is_a_sibling_keyed_by_the_repository() {
+        let _guard = crate::SPLIT_BACKEND_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("KANSTACK_STATE_PATH", "/state");
+        let (reports, gemini) = (reports_dir(Path::new("/repo/a")).unwrap(), gemini_hooks_dir(Path::new("/repo/a")).unwrap());
+        assert_eq!(gemini.parent(), Some(Path::new("/state")));
+        assert_eq!(
+            reports.file_name().unwrap().to_string_lossy().strip_prefix("reports-"),
+            gemini.file_name().unwrap().to_string_lossy().strip_prefix("gemini-hooks-"),
+        );
+        assert_ne!(gemini, gemini_hooks_dir(Path::new("/repo/b")).unwrap());
         std::env::remove_var("KANSTACK_STATE_PATH");
     }
 
