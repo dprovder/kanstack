@@ -22,6 +22,17 @@ use crate::harness::Harness;
 /// Also worth flagging for whoever revisits this: Kiro's payload uses `tool_input.path`, not
 /// `tool_input.file_path` (confirmed via kirodotdev/Kiro issue #7500's own JSON example) — one
 /// more reason porting it isn't a drop-in even setting the two points above aside.
+///
+/// **`busy`/`idle` self-reporting checked too, same root cause.** `kiro.dev/docs/hooks/types/`
+/// lists `promptSubmit` (a plausible `busy`, though its "can block" status wasn't tested for
+/// firing cleanly as a pure side effect) and `agentStop` ("triggers when the agent has
+/// completed its turn," a solid `idle`) — `agentSpawn` also exists but reads as a one-time
+/// session-activation event, not confirmed to re-fire per turn, so it's the weaker `busy`
+/// candidate of the two. None of that matters yet: Kiro's full CLI reference and environment
+/// variable docs were checked again, specifically for this purpose, and still have nothing
+/// resembling Gemini's `GEMINI_CLI_SYSTEM_SETTINGS_PATH` escape hatch — hooks configure only
+/// through static `.kiro/hooks/*.json` files with no CLI-flag or env-var injection path at
+/// launch, exit-code semantics aside. No `waiting`-equivalent event was found either.
 pub struct Kiro;
 impl Harness for Kiro {
     fn id(&self) -> &'static str {
