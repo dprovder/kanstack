@@ -38,8 +38,8 @@ use crate::harness::Harness;
 ///   (`hooks` included) with the lower tiers rather than replacing them — additive, like every
 ///   other status hook here. That file still has to exist on disk, though, which
 ///   `LaunchExtras`'s plain `args`/`env` can't do on its own — see
-///   `crate::workstream::gemini_hooks_dir`'s doc comment for what this writes and the
-///   cleanup gap it leaves.
+///   `crate::workstream::gemini_hooks_dir`'s doc comment for what this writes and
+///   `crate::report::Reports::forget` for where it gets cleaned back up.
 ///
 /// The same settings file also carries `busy`/`idle` self-reporting (`kanstack report`, see
 /// `crate::report`), confirmed against the same hooks reference:
@@ -199,6 +199,27 @@ mod tests {
             let a = crate::harness::for_command("gemini").status_hooks(REPORT, "feat-x", Path::new("/repo/a")).unwrap();
             let b = crate::harness::for_command("gemini").status_hooks(REPORT, "feat-x", Path::new("/repo/b")).unwrap();
             assert_ne!(a.env[0].1, b.env[0].1);
+        });
+    }
+
+    /// `crate::report::Reports::forget` — called on `Splitter::stop` and on respawn — must
+    /// clean up the settings file `status_hooks` writes, or it accumulates forever (see
+    /// `crate::workstream::gemini_hooks_dir`'s doc comment). Not released on `Idle`: Gemini
+    /// reads this file once at its own process startup, not per turn, so there is nothing to
+    /// gain from dropping it while the process is merely idle between turns.
+    #[test]
+    fn forgetting_a_branch_removes_its_gemini_settings_file_but_leaves_others() {
+        with_scratch_state("forget", |_state| {
+            let repo = Path::new("/repo/gemini-forget");
+            let a = crate::harness::for_command("gemini").status_hooks(REPORT, "feat-a", repo).unwrap();
+            let b = crate::harness::for_command("gemini").status_hooks(REPORT, "feat-b", repo).unwrap();
+            let (path_a, path_b) = (std::path::PathBuf::from(&a.env[0].1), std::path::PathBuf::from(&b.env[0].1));
+            assert!(path_a.exists() && path_b.exists(), "both settings files were written at launch");
+
+            crate::report::Reports::for_repo(repo).forget("feat-a");
+
+            assert!(!path_a.exists(), "stop/respawn must clean up feat-a's settings file");
+            assert!(path_b.exists(), "feat-b's settings file is untouched");
         });
     }
 }

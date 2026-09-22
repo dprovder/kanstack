@@ -116,8 +116,8 @@ or when the holding lane goes idle, so this never becomes a lock an orchestrator
 by hand. Claude gets this through the same `--settings` flag as its status hooks; Gemini has no
 such flag, so kanstack instead points `GEMINI_CLI_SYSTEM_SETTINGS_PATH` at a small settings
 file it writes per branch (see `crate::harness::gemini::Gemini::status_hooks`) — additive,
-same as Claude's, but with no cleanup path yet, so stray small JSON files accumulate under
-kanstack's state directory across a repository's lifetime. `Codex`, `Pi`, `OpenCode` and `Kiro`
+same as Claude's, and cleaned up the same way claims are: `kanstack stop` and a respawn both
+delete it (see `crate::report::Reports::forget`). `Codex`, `Pi`, `OpenCode` and `Kiro`
 each have a blocking hook of their own, confirmed against their current docs, but none is
 wireable the same lightweight way — a required on-disk plugin/extension file with
 arbitrary-code-execution risk (Pi, OpenCode), an edit payload with no usable file-path field

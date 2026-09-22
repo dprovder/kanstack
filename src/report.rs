@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::claims::Claims;
 use crate::events::EventLog;
 use crate::mux::pane_status::PaneStatus;
-use crate::workstream::{fnv1a, reports_dir};
+use crate::workstream::{fnv1a, gemini_hooks_dir, reports_dir};
 
 /// How long a `busy` or `idle` report is believed. Long enough to span a turn that is busy
 /// the whole time (harnesses that can also report per tool call keep it fresh), short enough
@@ -107,16 +107,26 @@ pub struct Reports {
     /// What `crate::claims::Claims::release_all` a branch going idle, or being forgotten
     /// entirely, drops — see [`Self::write`] and [`Self::forget`]. Best-effort, like `events`.
     claims: Claims,
+    /// Where a branch's Gemini `GEMINI_CLI_SYSTEM_SETTINGS_PATH` file (see
+    /// `crate::harness::gemini::Gemini::status_hooks`) lives, so [`Self::forget`] can delete it.
+    /// Unlike `claims`, not touched by [`Self::write`] — see `crate::workstream::gemini_hooks_dir`'s
+    /// doc comment for why only `forget` releases it.
+    gemini_hooks_dir: Option<PathBuf>,
 }
 
 impl Reports {
     pub fn for_repo(repo: &Path) -> Self {
-        Reports { dir: reports_dir(repo), events: EventLog::for_repo(repo), claims: Claims::for_repo(repo) }
+        Reports {
+            dir: reports_dir(repo),
+            events: EventLog::for_repo(repo),
+            claims: Claims::for_repo(repo),
+            gemini_hooks_dir: gemini_hooks_dir(repo),
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn in_dir(dir: PathBuf) -> Self {
-        Reports { dir: Some(dir), events: EventLog::default(), claims: Claims::default() }
+        Reports { dir: Some(dir), events: EventLog::default(), claims: Claims::default(), gemini_hooks_dir: None }
     }
 
     /// One file per branch, named by a hash of it so any branch name — slashes and all — is a
@@ -192,12 +202,20 @@ impl Reports {
     /// Drops whatever `branch`'s agent said, because it was about a pane that no longer
     /// exists: a new pane must not inherit the old one's last word. Also drops every file
     /// claim `branch` holds (see `crate::claims`) for the same reason — a pane that's gone,
-    /// or about to be replaced, can't still be mid-edit of anything.
+    /// or about to be replaced, can't still be mid-edit of anything. And, if `branch` is a
+    /// Gemini lane, deletes its `GEMINI_CLI_SYSTEM_SETTINGS_PATH` file (see
+    /// `crate::harness::gemini::Gemini::status_hooks`) — a stopped or respawning pane has no
+    /// further use for settings written for the process that just ended. Best-effort, like the
+    /// claim release beside it: a file that's already gone, or can't be removed, is not an
+    /// error here.
     pub fn forget(&self, branch: &str) {
         if let Some(path) = self.file(branch) {
             let _ = std::fs::remove_file(path);
         }
         self.claims.release_all(branch);
+        if let Some(dir) = &self.gemini_hooks_dir {
+            let _ = std::fs::remove_file(dir.join(format!("{:016x}.json", fnv1a(branch.as_bytes()))));
+        }
     }
 }
 

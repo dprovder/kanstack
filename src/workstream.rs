@@ -124,11 +124,12 @@ pub fn claims_dir(repo: &Path) -> Option<PathBuf> {
 /// `settings.json` per branch, written at launch time and pointed at via
 /// `GEMINI_CLI_SYSTEM_SETTINGS_PATH` (see `crate::harness::gemini::Gemini::status_hooks`).
 /// A sibling of `claims_dir`/`reports_dir`, same repository key, its own directory since it's
-/// one file per branch, not per repository. Unlike `claims_dir`/`reports_dir`, nothing prunes
-/// these once a branch stops — Gemini reads the file once at its own startup, not on every
-/// tool call, so there is no hot path to hang a release on the way `Claims::release_all` hangs
-/// off `Reports::write`/`forget`; a handful of small stray JSON files left behind is the
-/// accepted cost, not yet wired to `stop`/`prune`.
+/// one file per branch, not per repository. Unlike `claims_dir`, this is *not* released on
+/// `Reports::write`'s `Idle` — Gemini reads the file once at its own process startup, not on
+/// every turn, so removing it while merely idle-between-turns would be pointless (already
+/// loaded for that process's lifetime) and risks breaking a later `kanstack send` if Gemini
+/// somehow re-reads it later. It is released on `Reports::forget` instead, the same
+/// stop/respawn choke point `Claims::release_all` also hangs off — see [`Reports::forget`].
 pub fn gemini_hooks_dir(repo: &Path) -> Option<PathBuf> {
     let (dir, key) = repo_state(repo)?;
     Some(dir.join(format!("gemini-hooks-{key:016x}")))
