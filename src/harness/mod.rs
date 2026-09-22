@@ -9,6 +9,7 @@
 //! of this: [`HarnessConfig::launch_line`] turns a harness choice into the finished line,
 //! and a backend just types it.
 
+pub mod gemini;
 pub mod launch;
 
 use std::path::Path;
@@ -183,17 +184,6 @@ impl Harness for Kiro {
     }
 }
 
-/// Its only mechanism, `GEMINI_SYSTEM_MD`, is an env var pointing at a file that *fully
-/// replaces* the default system prompt rather than appending to it — using it would strip
-/// Gemini CLI's own built-in behavior instructions, worse than sending nothing. So the note
-/// is folded into the initial message.
-struct Gemini;
-impl Harness for Gemini {
-    fn id(&self) -> &'static str {
-        "gemini"
-    }
-}
-
 /// Anything not in [`KNOWN`]: a wrapper script, a harness kanstack hasn't heard of. Gets
 /// the delivery that works everywhere.
 struct Generic;
@@ -205,7 +195,7 @@ impl Harness for Generic {
 
 /// Every harness kanstack recognizes by name, in the order `--setup` prefers them when
 /// several are installed.
-pub const KNOWN: &[&dyn Harness] = &[&Claude, &Codex, &Pi, &OpenCode, &Kiro, &Gemini];
+pub const KNOWN: &[&dyn Harness] = &[&Claude, &Codex, &Pi, &OpenCode, &Kiro, &gemini::Gemini];
 
 static GENERIC: Generic = Generic;
 
@@ -479,7 +469,6 @@ mod tests {
             assert_eq!(resolve_note_delivery("opencode"), NoteDelivery::FoldIntoMessage);
             assert_eq!(resolve_note_delivery("kiro"), NoteDelivery::FoldIntoMessage);
             assert_eq!(resolve_note_delivery("kiro-cli"), NoteDelivery::FoldIntoMessage);
-            assert_eq!(resolve_note_delivery("gemini"), NoteDelivery::FoldIntoMessage);
             // Genuinely unrecognized commands get the same safe fallback.
             assert_eq!(resolve_note_delivery("./my-custom-harness.sh"), NoteDelivery::FoldIntoMessage);
         });
