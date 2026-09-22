@@ -2035,6 +2035,68 @@ mod tests {
         assert!(app.message.as_ref().is_some_and(|(m, _)| m.contains("no harness-split backend found")));
     }
 
+    /// Attaches a `FakeMux`-backed splitter to `app`, mimicking a harness-split backend
+    /// being available — the branch modal's split checkbox, and everything gated on
+    /// `splitter_available`, need one to have anything to test.
+    fn with_fake_splitter(app: &mut App) {
+        use crate::harness::HarnessConfig;
+        use crate::mux::fake::FakeMux;
+        app.splitter = Some(Splitter::new(FakeMux::new(), HarnessConfig::new("claude")));
+    }
+
+    /// `begin_branch` still defaults a parallel lane's split checkbox on, but a stacked
+    /// branch now defaults it *off* — the long-standing "stacking never opens a pane"
+    /// behavior stays what `b` does unless you opt in with shift-tab, even though the
+    /// checkbox is no longer hidden for it.
+    #[test]
+    fn begin_branch_defaults_the_split_checkbox_on_for_a_parallel_lane_and_off_for_a_stacked_one() {
+        let mut app = App::from_board(board());
+        with_fake_splitter(&mut app);
+
+        app.col = 0; // the backlog — no lane selected, so `b` means a parallel lane
+        app.begin_branch();
+        assert_eq!(app.stack_onto, None);
+        assert!(app.open_harness, "a parallel lane still defaults to opening a pane");
+
+        app.col = 1; // "feat-auth" — a lane is selected, so `b` means stacking
+        app.begin_branch();
+        assert_eq!(app.stack_onto.as_deref(), Some("feat-auth"));
+        assert!(!app.open_harness, "stacking still defaults to sharing the base's pane, not opening a new one");
+    }
+
+    /// The split row used to be hidden entirely while stacking, and toggling it was a
+    /// no-op. Now it's shown whenever a splitter is available, stacked or not, and
+    /// actually flips.
+    #[test]
+    fn the_split_row_is_visible_and_toggleable_while_stacking_now() {
+        let mut app = App::from_board(board());
+        with_fake_splitter(&mut app);
+        app.col = 1;
+        app.begin_branch();
+        assert!(app.branch_modal_split_row_visible(), "a splitter is available, so the row shows even while stacking");
+        assert!(!app.open_harness);
+        assert!(!app.will_prompt_for_harness_message());
+
+        app.toggle_open_harness();
+        assert!(app.open_harness, "toggling must actually flip it now, not no-op the way it used to while stacking");
+        assert!(app.will_prompt_for_harness_message());
+    }
+
+    /// `pending_branch_action` names the split backend for a stacked branch too, once it
+    /// opts in — previously it only ever said "stack on X", whatever the checkbox held,
+    /// since stacking never had one to check.
+    #[test]
+    fn pending_branch_action_names_the_split_backend_once_a_stacked_branch_opts_in() {
+        let mut app = App::from_board(board());
+        with_fake_splitter(&mut app);
+        app.col = 1;
+        app.begin_branch();
+        assert_eq!(app.pending_branch_action(), "stack on feat-auth");
+
+        app.toggle_open_harness();
+        assert_eq!(app.pending_branch_action(), "stack on feat-auth · opens fake");
+    }
+
     /// `Down` in the modal moves the row cursor one row at a time — name, then action —
     /// rather than jumping straight past it to the message step.
     #[test]

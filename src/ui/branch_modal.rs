@@ -96,8 +96,8 @@ pub(super) fn draw_branch_modal(f: &mut Frame, app: &App, area: Rect, hits: &mut
         "←/→ tab",
         content_width,
     ));
-    // A stacked branch never opens its own split regardless of `open_harness` (see
-    // `toggle_open_harness`), so the row that would toggle it is just noise there.
+    // Shown for a stacked branch as much as a parallel one now — see
+    // `App::toggle_open_harness` — hidden only when there's no split backend at all.
     let split_row = if app.branch_modal_split_row_visible() {
         let (glyph, style) = if app.open_harness {
             ("[x] open harness split", theme::tone(crate::board::Tone::Accent))

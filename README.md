@@ -152,10 +152,10 @@ repo is thrown away when you're done. `esc` or `q` leaves any time.
 | `U` | unapply this lane — its whole stack leaves, `a` brings it back |
 | `d` | delete this lane — asks first |
 | `r` | rebase onto the updated target — shows what will happen |
-| `f` | resolve conflicts on this lane — `o`/`t` take ours/theirs per file, `A` resolves the whole commit with AI |
+| `f` | resolve conflicts on this lane — `o`/`t` take ours/theirs per file, `A` hands the branch's conflicts to the lane's coding agent as a task |
 | `tab` | on the unassigned lane: group its cards by folder, or back to a flat list |
 | `⏎` | open the diff beside the board — `←` goes back, `m` commits or amends one hunk |
-| `b` | new branch — stacks on the selected lane, `tab` for a parallel lane with a harness split (`cmux`, `tmux` as a fallback, `orca`, or `ghostty`); asks for an optional initial message before creating anything, so `esc` cancels the whole branch |
+| `b` | new branch — stacks on the selected lane, `tab` for a parallel lane; `shift-tab` opens a harness split (`cmux`, `tmux` as a fallback, `orca`, or `ghostty`) — on by default for a parallel lane, off by default while stacking, groups with the base's pane if it already has one; asks for an optional initial message before creating anything, so `esc` cancels the whole branch |
 | `t` | send a task to this lane's split pane — spawns one first if it isn't open yet |
 | `s` | stack this whole lane onto another — rewrites history |
 | `p` | push this lane — shows what it will do first |
@@ -305,6 +305,12 @@ stack's agents stay visually together. By default that's a real tab alongside th
 orthogonal to the ordinary chain direction — so a horizontal lane chain gets a vertical stack
 split and vice versa — which still reads as its own cluster rather than continuing the chain.
 Saveable in the config file, same as the other standing preferences above.
+
+The board's own `b`/`shift-tab` groups the same way when you stack a branch with the split
+checkbox checked and its base already has a pane open — same `KANSTACK_STACK_PANES` choice,
+same fallback for Orca and Ghostty. Unlike a parallel lane, the checkbox defaults off for a
+stacked branch, so `b` keeps its long-standing "stacking shares the base's pane" behavior
+unless you opt in.
 
 `kanstack status --json` prints one JSON document instead of the table, for a script or an
 agent to parse:

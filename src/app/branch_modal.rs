@@ -48,6 +48,11 @@ impl App {
     /// Defaults to stacking when a lane is selected and to a parallel lane otherwise,
     /// because that is what pressing the key *there* most likely means. Tab overrides it,
     /// so neither choice requires navigating somewhere else first.
+    ///
+    /// The split checkbox defaults on for a parallel lane, same as always, but off for a
+    /// stacked one — stacking still means "the same lane of work" far more often than "hand
+    /// this off to another agent", so the long-standing "stacking never opens a pane"
+    /// behavior stays the default; shift-tab opts in per branch.
     pub(super) fn begin_branch(&mut self) {
         self.branch_input.clear();
         self.harness_message_input.clear();
@@ -56,7 +61,7 @@ impl App {
             .columns
             .get(self.col)
             .and_then(|c| c.branch_name.clone());
-        self.open_harness = true;
+        self.open_harness = self.stack_onto.is_none();
         self.branch_modal_row = BranchModalRow::Name;
         self.branch_name_missing = false;
         self.mode = Mode::Branch;
@@ -87,26 +92,25 @@ impl App {
         }
     }
 
-    /// Opts a parallel lane out of its harness split for this one branch, without touching
-    /// the standing `KANSTACK_CMUX_*`/`KANSTACK_TMUX_*` config. No-op while stacking, since
-    /// a stacked branch never opens one to opt out of.
+    /// Opts a branch — stacked or parallel — in or out of opening its own harness pane,
+    /// without touching the standing `KANSTACK_CMUX_*`/`KANSTACK_TMUX_*` config. A stacked
+    /// branch whose base already has a pane open groups with it (see
+    /// `Splitter::spawn_stacked_harness_with`) rather than sharing it outright the way it
+    /// used to unconditionally; one whose base has none, or that isn't stacked at all, just
+    /// opens a plain one, same as a parallel lane always has.
     pub(super) fn toggle_open_harness(&mut self) {
         if self.splitter.is_none() {
             self.notify("no harness-split backend found (cmux, tmux, orca or ghostty)", Notice::Info);
             return;
         }
-        if self.stack_onto.is_some() {
-            return;
-        }
         self.open_harness = !self.open_harness;
     }
 
-    /// Whether the modal's split-checkbox row is shown at all right now — a stacked branch
-    /// never opens its own split (see `toggle_open_harness`), so the row that would toggle
-    /// it is left out entirely rather than shown disabled. Shared between the row
-    /// navigation below and `draw_branch_modal`'s own layout, so the two can't drift apart.
+    /// Whether the modal's split-checkbox row is shown at all right now. Shared between the
+    /// row navigation below and `draw_branch_modal`'s own layout, so the two can't drift
+    /// apart.
     pub fn branch_modal_split_row_visible(&self) -> bool {
-        self.splitter_available() && self.stack_onto.is_none()
+        self.splitter_available()
     }
 
     /// `Down` in the name step: moves the row cursor along Name → Action → Split (skipping
@@ -146,13 +150,14 @@ impl App {
 
     /// What `b` will do, in the same spirit as the move footer: say it before doing it.
     pub fn pending_branch_action(&self) -> String {
-        match &self.stack_onto {
+        let target = match &self.stack_onto {
             Some(anchor) => format!("stack on {anchor}"),
-            None if self.splitter.is_some() && self.open_harness => {
-                format!("new parallel lane · opens {}", self.splitter.as_ref().unwrap().label())
-            }
-            None if self.splitter.is_some() => "new parallel lane · no split".to_string(),
             None => "new parallel lane".to_string(),
+        };
+        match &self.splitter {
+            Some(splitter) if self.open_harness => format!("{target} · opens {}", splitter.label()),
+            Some(_) if self.stack_onto.is_none() => format!("{target} · no split"),
+            _ => target,
         }
     }
 
@@ -169,11 +174,12 @@ impl App {
     /// Whether naming a branch right now has an optional initial-harness-message step to
     /// offer (`Down` on the name field, see `advance_to_harness_message`) — and, from
     /// `confirm_branch`, whether Enter there should open the harness too even without one.
-    /// True only for a parallel lane (a stacked one shares its base's tab) that hasn't
-    /// opted out of a split with shift-tab, and only when a split backend is actually
-    /// configured at all.
+    /// True for a stacked branch as much as a parallel one now, as long as the split
+    /// checkbox is on (see `toggle_open_harness`; unchecked by default for a stacked
+    /// branch, checked by default for a parallel one — see `begin_branch`) and a split
+    /// backend is actually configured at all.
     pub fn will_prompt_for_harness_message(&self) -> bool {
-        self.stack_onto.is_none() && self.open_harness && self.splitter.is_some()
+        self.open_harness && self.splitter.is_some()
     }
 
     /// The branch name to show in the branch-creation modal: the live `branch_input`
@@ -270,10 +276,17 @@ impl App {
     }
 
     /// Creates `name` via `but branch new`, rebuilds the board, and — when `open_harness`
-    /// is set — spawns its split pane, optionally seeded with `initial_message`. Shared by
-    /// `confirm_branch` (Enter on the name field — a stacked branch, or a parallel one
-    /// created with no message) and `confirm_harness_message` (Enter after `Down` opted
-    /// into typing one).
+    /// is set — spawns its pane, optionally seeded with `initial_message`. Shared by
+    /// `confirm_branch` (Enter on the name field — a stacked or parallel branch created
+    /// with no message) and `confirm_harness_message` (Enter after `Down` opted into typing
+    /// one).
+    ///
+    /// When `anchor` (the base being stacked onto) already has a pane open, the new one
+    /// groups with it (`Splitter::spawn_stacked_harness_with` — a real tab by default, or a
+    /// split orthogonal to the ordinary chain direction; see `KANSTACK_STACK_PANES`) rather
+    /// than sharing it outright. A dead pane doesn't count as "already has one" — nothing
+    /// to group with, so it opens a plain pane instead, same as `anchor` being `None` (a
+    /// parallel lane, or a stacked branch whose base never opened one) always has.
     pub(super) fn create_branch(&mut self, name: &str, anchor: Option<&str>, initial_message: Option<&str>, open_harness: bool) {
         let Some(but) = &self.but else {
             self.notify("snapshot is read-only", Notice::Info);
@@ -307,7 +320,15 @@ impl App {
                 if open_harness {
                     if let Some(splitter) = &mut self.splitter {
                         let label = splitter.label();
-                        match splitter.spawn_harness(&cwd, name, initial_message) {
+                        // A dead pane isn't "already has one" — nothing to group with.
+                        let group_anchor = anchor
+                            .filter(|a| splitter.pane_status(a) != Some(crate::pane_status::PaneStatus::Dead))
+                            .and_then(|a| splitter.pane_id(a));
+                        let spawned = match &group_anchor {
+                            Some(pane_id) => splitter.spawn_stacked_harness_with(&cwd, name, initial_message, None, pane_id),
+                            None => splitter.spawn_harness(&cwd, name, initial_message),
+                        };
+                        match spawned {
                             Ok(pane) => {
                                 crate::workstream::record_spawn(&cwd, name, &pane, None, splitter.workspace().as_deref());
                                 self.notify(format!("created {name} — harness open"), Notice::Success);
