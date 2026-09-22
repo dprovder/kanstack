@@ -152,6 +152,7 @@ repo is thrown away when you're done. `esc` or `q` leaves any time.
 | `U` | unapply this lane — its whole stack leaves, `a` brings it back |
 | `d` | delete this lane — asks first |
 | `r` | rebase onto the updated target — shows what will happen |
+| `f` | resolve conflicts on this lane — `o`/`t` take ours/theirs per file, `A` resolves the whole commit with AI |
 | `tab` | on the unassigned lane: group its cards by folder, or back to a flat list |
 | `⏎` | open the diff beside the board — `←` goes back, `m` commits or amends one hunk |
 | `b` | new branch — stacks on the selected lane, `tab` for a parallel lane with a harness split (`cmux`, `tmux` as a fallback, `orca`, or `ghostty`); asks for an optional initial message before creating anything, so `esc` cancels the whole branch |
@@ -314,7 +315,7 @@ reinterpreted.
 | field | meaning |
 | --- | --- |
 | `commits` | commits on the lane |
-| `conflicted` | a commit on the lane is conflicted now, and needs `but resolve`. This only happens once `but pull` has rebased the lane; before that, `rebase` is the warning |
+| `conflicted` | a commit on the lane is conflicted now — `f` opens the picker. This only happens once `but pull` has rebased the lane; before that, `rebase` is the warning |
 | `behind` | commits on the lane's remote branch that the lane doesn't have |
 | `rebase` | what updating the lane from upstream would do: `clean`, `conflicts`, `integrated` or `empty`; `null` when there is nothing to say, which includes right after `but pull`, when the update has already happened |
 | `landed` | the lane has landed upstream and `but pull` will remove it; its commits can't be changed |

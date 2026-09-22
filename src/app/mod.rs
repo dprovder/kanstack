@@ -39,6 +39,7 @@ mod moving;
 mod pr;
 mod push_land;
 mod rebase;
+mod resolve;
 mod restack;
 mod setup_required;
 mod task_dispatch;
@@ -50,6 +51,7 @@ pub use branch_modal::{BranchModalRow, BranchUi};
 pub use drawer::BranchPreview;
 pub use pr::{PendingPr, PrModalRow};
 pub use push_land::PendingLand;
+pub use resolve::ResolveView;
 
 use branch_modal::PendingBranch;
 use delete::DeleteTarget;
@@ -119,6 +121,12 @@ pub enum Mode {
     UnapplyConfirm,
     /// Looking at what rebasing onto the updated target would do.
     RebaseConfirm,
+    /// Picking through a conflicted lane's files, one at a time — see [`ResolveView`].
+    /// Entered on a conflicted commit (rebase and pull are the two ways to reach one), left
+    /// once nothing on the branch is conflicted any more or by cancelling outright; unlike
+    /// most confirm modes there is nothing to undo on the way out, since nothing here has
+    /// run until a file is actually resolved.
+    ResolveConflict,
     /// Reading a diff, hunk by hunk.
     Diff,
     Help,
@@ -223,6 +231,8 @@ pub struct App {
     pub pr_running: Option<PendingPr>,
     /// What a rebase onto the updated target would do, valid while `mode == RebaseConfirm`.
     pub pull_preview: Option<PullPreview>,
+    /// The conflict picker's state, valid while `mode == ResolveConflict`.
+    pub resolve_view: Option<ResolveView>,
     /// The diff being read, valid while `mode == Diff`.
     pub diff: Option<DiffView>,
     /// Whether the diff takes the whole width. Split by default so the board stays
@@ -448,6 +458,7 @@ impl App {
             pr_target: None,
             pr_running: None,
             pull_preview: None,
+            resolve_view: None,
             diff: None,
             diff_full: false,
             move_source: None,
@@ -510,6 +521,7 @@ impl App {
             pr_target: None,
             pr_running: None,
             pull_preview: None,
+            resolve_view: None,
             diff: None,
             diff_full: false,
             move_source: None,
@@ -697,6 +709,7 @@ impl App {
         self.push_preview = None;
         self.land_check = None;
         self.pull_preview = None;
+        self.resolve_view = None;
         self.pr_target = None;
         self.move_source = None;
         self.selected.clear();
@@ -1211,6 +1224,7 @@ impl App {
             Mode::PrRunning => return self.handle_key_pr_running(key),
             Mode::Diff => return self.handle_key_diff(key),
             Mode::RebaseConfirm => return self.handle_key_rebase_confirm(key),
+            Mode::ResolveConflict => return self.handle_key_resolve_confirm(key),
             Mode::DeleteConfirm => return self.handle_key_delete_confirm(key),
             Mode::UnapplyConfirm => return self.handle_key_unapply_confirm(key),
             Mode::Branches => return self.handle_key_branches(key),
@@ -1334,6 +1348,7 @@ impl App {
             K::Char('a') if self.mode == Mode::Normal => self.toggle_branch_drawer(),
             K::Char('U') if self.mode == Mode::Normal => self.begin_unapply(),
             K::Char('r') if self.mode == Mode::Normal => self.begin_rebase(),
+            K::Char('f') if self.mode == Mode::Normal => self.begin_resolve(),
             K::Tab if self.mode == Mode::Normal => self.toggle_unassigned_grouping(),
             K::Enter if self.mode == Mode::Normal => self.open_diff(),
             K::Enter if self.mode == Mode::Restacking => self.confirm_restack(),

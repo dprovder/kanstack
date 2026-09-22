@@ -28,6 +28,7 @@ mod move_commits;
 mod pr;
 mod push;
 mod rebase;
+mod resolve;
 mod setup;
 mod skill;
 mod undo;

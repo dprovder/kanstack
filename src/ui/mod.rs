@@ -29,6 +29,7 @@ mod footer;
 mod header;
 mod help;
 mod pr;
+mod resolve;
 
 use board::draw_board;
 use branch_modal::draw_branch_modal;
@@ -42,6 +43,7 @@ use footer::draw_footer;
 use header::draw_header;
 use help::draw_help;
 use pr::{draw_pr_modal, draw_pr_running};
+use resolve::draw_resolve_confirm;
 
 /// How wide the unapplied-branches drawer is, when there is room for it. Branch names run
 /// long, so this is wider than the board's own minimum lane; it is halved against the board
@@ -133,6 +135,7 @@ pub fn draw(f: &mut Frame, app: &App) -> HitMap {
         Mode::DeleteConfirm => draw_delete_confirm(f, app, f.area(), &mut hits),
         Mode::UnapplyConfirm => draw_unapply_confirm(f, app, f.area(), &mut hits),
         Mode::RebaseConfirm => draw_rebase_confirm(f, app, f.area(), &mut hits),
+        Mode::ResolveConflict => draw_resolve_confirm(f, app, f.area(), &mut hits),
         Mode::Blocked => draw_blocked(f, app, f.area()),
         Mode::SetupRequired => draw_not_set_up(f, app, f.area()),
         Mode::Branch | Mode::HarnessMessage if app.branch_ui == BranchUi::Modal => {

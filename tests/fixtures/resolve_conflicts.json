@@ -1,0 +1,34 @@
+{
+    "commit_id": "1015035c60aaa4a8e6c808b936c941e7147d37e8",
+    "branch": "my-feature",
+    "files": [
+        {
+            "path": "file.txt",
+            "change": {
+                "path": "file.txt",
+                "pathBytes": [102, 105, 108, 101, 46, 116, 120, 116],
+                "status": {
+                    "type": "Modification",
+                    "subject": {
+                        "previousState": {"id": "8984c0582c502cefad99513f0e9a47fc81821151", "kind": "Blob"},
+                        "state": {"id": "3f81d94c79867f6a142494c44e6b6c6a263a5209", "kind": "Blob"},
+                        "flags": null
+                    }
+                }
+            },
+            "hunks": [
+                {
+                    "id": "ba8d1444910609aa-0",
+                    "line": 1,
+                    "contextBefore": "",
+                    "ours": "line1-upstream",
+                    "base": "line1",
+                    "theirs": "line1-feature",
+                    "contextAfter": ""
+                }
+            ],
+            "mergedText": "<<<<<<< auto resolved\nline1-upstream\n||||||| original base\nline1\n=======\nline1-feature\n>>>>>>> as authored\n"
+        }
+    ],
+    "manual": []
+}

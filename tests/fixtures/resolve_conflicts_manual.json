@@ -1,0 +1,11 @@
+{
+    "commit_id": "baff99a08de154b6034798ca3f1d4d2ec46a9efd",
+    "branch": "my-feature",
+    "files": [],
+    "manual": [
+        {
+            "path": "file.txt",
+            "reason": "The conflict involves a deletion or rename."
+        }
+    ]
+}

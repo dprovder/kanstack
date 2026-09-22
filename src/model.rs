@@ -414,6 +414,51 @@ pub struct ConflictingFile {
     pub upstream_commits: Vec<MergeCheckCommit>,
 }
 
+/// Output of `but resolve conflicts <target> --json`: one commit's conflicts, without
+/// entering resolution mode. Casing is mixed on the wire like `MergeCheck` above — the top
+/// level is snake_case, `files`/`hunks` entries are camelCase — verified live against
+/// 0.22.3. Only the fields the picker actually reads are bound; `but`'s reply also carries
+/// per-hunk base text, line numbers and a pre-merged conflict-marker rendering, none of
+/// which a plain ours/theirs picker needs.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResolveConflicts {
+    /// Needed for [`crate::but::But::resolve_ai`], which — unlike `resolve apply` — refuses
+    /// a branch name and insists on the commit id (verified live: 0.22.3 replies `'<branch>'
+    /// does not refer to a commit`). Stale after every successful apply, so callers always
+    /// re-fetch this rather than caching it across a mutation.
+    pub commit_id: String,
+    pub branch: String,
+    #[serde(default)]
+    pub files: Vec<ConflictFile>,
+    /// Conflicts `resolve apply --ours/--theirs` (and `--ai`) both refuse outright —
+    /// verified live: a delete/rename conflict fails with "Resolve this commit in edit mode
+    /// instead" even under `--ai`. Shown so the picker can say why a file has no ours/theirs
+    /// choice, rather than silently omitting it.
+    #[serde(default)]
+    pub manual: Vec<ManualConflict>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ManualConflict {
+    pub path: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConflictFile {
+    pub path: String,
+    #[serde(default)]
+    pub hunks: Vec<ConflictHunk>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConflictHunk {
+    #[serde(default)]
+    pub ours: String,
+    #[serde(default)]
+    pub theirs: String,
+}
+
 /// Output of `but branch list --json`.
 ///
 /// The one command that sees branches the board otherwise cannot: `but status` reports
