@@ -256,6 +256,37 @@ impl Multiplexer for Cmux {
         Ok(surface_ref)
     }
 
+    /// Adds `req.launch` as a new surface — cmux's own word for what shows as a tab — in
+    /// the pane already holding `req.after` (always `Some` for this call), rather than
+    /// `new-split`'s new pane. Measured live against a running cmux: `new-surface --pane
+    /// <pane-ref>` answers `OK surface:N pane:M workspace:K` (parsed the same `extract_ref`
+    /// way as `new-split`'s own `OK surface:N …`), leaves whichever surface was already
+    /// selected in that pane alone rather than stealing focus, and every other operation —
+    /// `send`/`send-key` (via `type_and_submit`), `rename-tab`, `focus-panel`,
+    /// `close-surface` — already addresses a surface directly and is unaffected by how many
+    /// share its pane, so none of them need to change for this.
+    ///
+    /// `--pane` wants the pane (the split region), not the surface — a bare surface ref
+    /// isn't a valid `--pane` target — so the anchor's containing pane is looked up in
+    /// `pane.list` first, the same source [`Self::occupant_in_direction`] already reads for
+    /// `open_pane`'s own placement.
+    fn open_tab(&self, req: &OpenRequest<'_>) -> Result<String> {
+        let anchor = req.after.expect("open_tab is only ever called with an anchor");
+        let list_out = self.run(&["rpc", "pane.list"])?;
+        let pane = pane_containing_surface(&list_out, anchor)
+            .with_context(|| format!("no cmux pane found holding {anchor}"))?;
+
+        let cwd_str = req.cwd.to_string_lossy().into_owned();
+        let out = self.run_scoped(&["new-surface", "--pane", &pane, "--working-directory", cwd_str.as_str()])?;
+        let surface_ref = extract_ref(&out, "surface:")
+            .with_context(|| format!("`cmux new-surface` did not report a surface: {out:?}"))?
+            .to_string();
+
+        self.type_and_submit(&surface_ref, req.launch)?;
+        self.run_scoped(&["rename-tab", "--surface", &surface_ref, req.title])?;
+        Ok(surface_ref)
+    }
+
     fn type_line(&self, pane: &str, text: &str) -> Result<()> {
         self.type_and_submit(pane, text)
     }
@@ -495,6 +526,15 @@ fn extract_ref<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
     text.split_whitespace().find(|tok| tok.starts_with(prefix))
 }
 
+/// The cmux pane (split region) ref containing `surface_ref`, from a `pane.list`
+/// response — what `new-surface --pane` needs, since a surface's own ref isn't a valid
+/// `--pane` target. `None` if the response is malformed or no pane lists that surface —
+/// the caller reports that as the anchor no longer existing, rather than guessing a pane.
+fn pane_containing_surface(list_json: &str, surface_ref: &str) -> Option<String> {
+    let list: PaneListResponse = serde_json::from_str(list_json).ok()?;
+    list.panes.into_iter().find(|p| p.surface_refs.iter().any(|s| s == surface_ref)).map(|p| p.pane_ref)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -634,6 +674,14 @@ mod tests {
         assert_eq!(workspace_uuid(listing, "workspace:2"), None, "workspace:1 must not match workspace:10 or vice versa");
     }
 
+    #[test]
+    fn pane_containing_surface_finds_the_pane_that_lists_it() {
+        assert_eq!(pane_containing_surface(PANE_LIST_FIXTURE, "surface:35").as_deref(), Some("pane:7"));
+        assert_eq!(pane_containing_surface(PANE_LIST_FIXTURE, "surface:33").as_deref(), Some("pane:13"));
+        assert_eq!(pane_containing_surface(PANE_LIST_FIXTURE, "surface:999"), None, "no pane lists a surface that isn't there");
+        assert_eq!(pane_containing_surface("not json", "surface:33"), None);
+    }
+
     // What follows drives the real spawn/send/focus/stop/poll paths, through a `Splitter` as
     // kanstack does, against a stand-in `cmux` that logs its arguments. Its replies are what
     // a real cmux printed for the same commands; the poll's are the captured fixtures.
@@ -703,6 +751,42 @@ esac"#
             let lines = stand_in::log_lines(log);
             assert_eq!(lines[5], format!("list-panels --workspace {WS}"), "the pinned workspace is checked to still exist");
             assert_eq!(lines[6], format!("new-split right --surface surface:41 --workspace {WS}"), "{lines:#?}");
+        });
+    }
+
+    /// A stacked spawn (`KANSTACK_STACK_PANES` unset, so the default `tabbed`) adds a new
+    /// surface to the anchor's own pane rather than splitting a new one — measured live
+    /// against a real cmux, see `open_tab`'s doc comment.
+    #[test]
+    fn a_stacked_spawn_adds_a_tab_to_the_anchors_pane_and_is_typed_into_and_titled() {
+        let body = r#"case "$1" in
+  rpc) printf '{"panes":[{"ref":"pane:7","pixel_frame":{"height":1,"width":1,"x":0,"y":0},"surface_ids":[],"selected_surface_ref":"surface:9","surface_refs":["surface:9"]}]}' ;;
+  new-surface) echo "OK surface:99 pane:7 workspace:2" ;;
+esac"#;
+        let vars = [("KANSTACK_STACK_PANES", None)];
+        with_fake_cmux("tabs", body, &vars, |mut splitter, log| {
+            let pane = splitter.spawn_stacked_harness_with(Path::new("/repo"), "feat-top", Some("go"), None, "surface:9").unwrap();
+            assert_eq!(pane, "surface:99");
+            let lines = stand_in::log_lines(log);
+            assert_eq!(lines[0], "rpc pane.list");
+            assert_eq!(lines[1], "new-surface --pane pane:7 --working-directory /repo");
+            assert!(lines[2].starts_with("send --surface surface:99 cd '/repo' && claude "), "{}", lines[2]);
+            assert_eq!(lines[3], "send-key --surface surface:99 enter");
+            assert_eq!(lines[4], "rename-tab --surface surface:99 feat-top");
+            assert_eq!(lines.len(), 5, "{lines:#?}");
+        });
+    }
+
+    #[test]
+    fn a_tab_whose_anchor_has_no_pane_is_an_error() {
+        let body = r#"case "$1" in rpc) echo '{"panes":[]}' ;; esac"#;
+        let vars = [("KANSTACK_STACK_PANES", None)];
+        with_fake_cmux("no-pane", body, &vars, |mut splitter, log| {
+            let err =
+                splitter.spawn_stacked_harness_with(Path::new("/repo"), "feat-top", None, None, "surface:9").unwrap_err().to_string();
+            assert!(err.contains("no cmux pane found holding surface:9"), "{err}");
+            assert!(!splitter.has_pane("feat-top"));
+            assert_eq!(stand_in::log_lines(log).len(), 1, "nothing may be typed once the pane can't be found");
         });
     }
 

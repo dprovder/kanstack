@@ -213,6 +213,9 @@ A few things differ from the other two:
 - **`t` doesn't wait for the harness.** In testing, Orca accepted a message sent to a
   terminal with no agent running, so pressing `t` before the harness has finished starting
   can type the task into whatever is there — wait for it to be ready, as with the others.
+- **No real tab support yet for a stacked branch's pane.** `KANSTACK_STACK_PANES=tabbed`
+  (the default) falls back to the orthogonal split below, the same as `=split` — see
+  "Driving panes from a script or an agent" above.
 
 Orca support was written against Orca's CLI reference and source, and exercised against
 Orca's headless runtime (`orcad`) — splitting, launching, focusing, closing and the
@@ -264,6 +267,9 @@ A few things differ from the others:
   `KANSTACK_GHOSTTY_CHAIN_DIRECTION` default to `above` and `right`, as for tmux. A new pane
   takes keyboard focus.
 - **Labels.** The new pane is titled with the branch name until the harness sets its own title.
+- **No real tab support yet for a stacked branch's pane.** `KANSTACK_STACK_PANES=tabbed`
+  (the default) falls back to the orthogonal split, the same as `=split` — see "Driving
+  panes from a script or an agent" above.
 
 What is said above about how Ghostty behaves was measured against Ghostty 1.3.1, including a
 `kanstack spawn` run from a shell and a lane started from the board; [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
@@ -288,6 +294,17 @@ kanstack report <busy|idle> [<branch>]                     # what an agent says 
 from, to its right; `KANSTACK_SPAWN_DIRECTION` (`left`, `right`, `above` or `below`, and
 saveable in the config file) changes that without touching where the board puts its lanes. `--agent` runs that harness instead
 of `$KANSTACK_HARNESS` for this one pane.
+
+**Handing off to a stacked branch.** `spawn <branch>` works on a branch already stacked on
+another, and when that other branch already has a pane open — an agent finishing its own
+turn and spawning a successor on the branch stacked above it, say — the new pane is grouped
+with the sibling's instead of chaining off wherever the last spawn happened to land, so a
+stack's agents stay visually together. By default that's a real tab alongside the sibling
+(tmux and cmux both have one; Orca and Ghostty don't yet, and fall back to the split below).
+`KANSTACK_STACK_PANES=split` places it as a split instead, off the sibling, in the direction
+orthogonal to the ordinary chain direction — so a horizontal lane chain gets a vertical stack
+split and vice versa — which still reads as its own cluster rather than continuing the chain.
+Saveable in the config file, same as the other standing preferences above.
 
 `kanstack status --json` prints one JSON document instead of the table, for a script or an
 agent to parse:

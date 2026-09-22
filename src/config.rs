@@ -18,6 +18,7 @@ const KEYS: &[&str] = &[
     "KANSTACK_SPLIT_BACKEND",
     "KANSTACK_BRANCH_UI",
     "KANSTACK_SPAWN_DIRECTION",
+    "KANSTACK_STACK_PANES",
 ];
 
 /// Where the config file lives: `KANSTACK_CONFIG_PATH` if set — also the test seam, so

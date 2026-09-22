@@ -133,6 +133,12 @@ environment:
                       (default), a dedicated box showing the name, the pending action, and
                       the message all together, or `footer`, squeezed into the one-line
                       footer like every other prompt
+  KANSTACK_STACK_PANES  how `kanstack spawn` places a pane for a branch stacked on top of
+                      one that already has a pane open: grouped with the sibling as a real
+                      tab (`tabbed`, the default; tmux and cmux so far — the others fall
+                      back to the split below) or split off it (`split`), in the direction
+                      orthogonal to the ordinary chain direction so the pair reads as its
+                      own cluster rather than continuing the chain
 
 capture a snapshot for a bug report:
   but status -f --json > board.json && kanstack --snapshot board.json

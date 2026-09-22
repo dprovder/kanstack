@@ -137,6 +137,40 @@ impl Multiplexer for Tmux {
         Ok(pane_id)
     }
 
+    /// Opens a new tmux *window* right after the one `req.after` (always `Some` for this
+    /// call) sits in, rather than splitting it — tmux's own tab equivalent, switched between
+    /// with `select-window`/the status bar instead of sharing screen space.
+    ///
+    /// `new-window -t` refuses a pane id directly ("can't specify pane here", measured
+    /// against tmux 3.6b) — only a window or session target — so the anchor's window is
+    /// resolved first with `display-message`. `-a` inserts the new window right after that
+    /// one (moving later windows up), rather than appending it at the end of the whole
+    /// session, so a stack's tabs stay together (measured). Otherwise the same shape as
+    /// [`Self::open_pane`]: typed rather than passed as the window's command (same quoting
+    /// reasons `split-window` isn't either), then best-effort titled — `rename-window`
+    /// rather than `select-pane -T`, since the window name is what actually shows as a tab
+    /// in tmux's status bar (measured).
+    fn open_tab(&self, req: &OpenRequest<'_>) -> Result<String> {
+        let anchor = req.after.expect("open_tab is only ever called with an anchor");
+        let window = self.run(&["display-message", "-p", "-t", anchor, "#{window_id}"])?.trim().to_string();
+        if window.is_empty() {
+            bail!("`tmux display-message` did not report {anchor}'s window");
+        }
+
+        let cwd_str = req.cwd.to_string_lossy().into_owned();
+        let pane_id = self
+            .run(&["new-window", "-a", "-t", &window, "-c", cwd_str.as_str(), "-P", "-F", "#{pane_id}"])?
+            .trim()
+            .to_string();
+        if pane_id.is_empty() {
+            bail!("`tmux new-window` did not report a pane id");
+        }
+
+        self.type_and_submit(&pane_id, req.launch)?;
+        let _ = self.run(&["rename-window", "-t", &pane_id, req.title]);
+        Ok(pane_id)
+    }
+
     fn type_line(&self, pane: &str, text: &str) -> Result<()> {
         self.type_and_submit(pane, text)
     }
@@ -433,6 +467,41 @@ mod tests {
             let err = splitter.spawn_harness(Path::new("/repo"), "feat-a", None).unwrap_err().to_string();
             assert!(err.contains("did not report a pane id"), "{err}");
             assert!(!splitter.has_pane("feat-a"));
+        });
+    }
+
+    /// Answers `display-message` with a fixed window id and `new-window` with an id derived
+    /// from the window it was inserted after, so the two calls can be told apart in the log
+    /// the same way `SPLITS` tells splits apart by their anchor.
+    const TABS: &str = r#"case "$1" in display-message) echo "@0" ;; new-window) echo "%9_tab_after_$4" ;; esac"#;
+
+    /// A stacked spawn (`KANSTACK_STACK_PANES` unset, so the default `tabbed`) opens a new
+    /// window after the sibling's rather than splitting it, and titles that window rather
+    /// than the pane.
+    #[test]
+    fn a_stacked_spawn_opens_a_tab_after_the_siblings_window_and_is_typed_into_and_titled() {
+        let vars = [("KANSTACK_STACK_PANES", None)];
+        with_fake_tmux("tabs", TABS, &vars, |mut splitter, log| {
+            let pane = splitter.spawn_stacked_harness_with(Path::new("/repo"), "feat-top", Some("go"), None, "%3").unwrap();
+            assert_eq!(pane, "%9_tab_after_@0");
+            let lines = stand_in::log_lines(log);
+            assert_eq!(lines[0], "display-message -p -t %3 #{window_id}");
+            assert_eq!(lines[1], "new-window -a -t @0 -c /repo -P -F #{pane_id}");
+            assert!(lines[2].starts_with("send-keys -t %9_tab_after_@0 -l -- cd '/repo' && claude "), "{}", lines[2]);
+            assert_eq!(lines[3], "send-keys -t %9_tab_after_@0 Enter", "Enter is its own key press");
+            assert_eq!(lines[4], "rename-window -t %9_tab_after_@0 feat-top");
+            assert_eq!(lines.len(), 5, "{lines:#?}");
+        });
+    }
+
+    #[test]
+    fn a_tab_whose_anchor_window_cannot_be_resolved_is_an_error() {
+        let vars = [("KANSTACK_STACK_PANES", None)];
+        with_fake_tmux("no-window", r#"case "$1" in display-message) ;; esac"#, &vars, |mut splitter, log| {
+            let err = splitter.spawn_stacked_harness_with(Path::new("/repo"), "feat-top", None, None, "%3").unwrap_err().to_string();
+            assert!(err.contains("did not report"), "{err}");
+            assert!(!splitter.has_pane("feat-top"));
+            assert_eq!(stand_in::log_lines(log).len(), 1, "nothing may be typed once the window can't be found");
         });
     }
 

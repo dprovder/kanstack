@@ -316,19 +316,7 @@ impl Splitter {
         initial_message: Option<&str>,
         harness: Option<&str>,
     ) -> Result<String> {
-        let mut launch = self.harness.launch_line(cwd, name, initial_message, harness)?;
-        // Before the harness starts, not after: a fast one could report before we got back,
-        // and the last word of a previous pane on this branch must not outlive it. The same
-        // goes for the pid of a previous pane's shell.
-        self.reports.forget(name);
-        self.pids.forget(name);
-        if self.tracks_pids() {
-            // Best-effort, like the registry: a state directory that can't be made must not
-            // stop the pane opening, only leave it untracked.
-            if let Ok(Some(file)) = self.pids.prepare(name) {
-                launch = format!("{}{launch}", record_pid_prefix(&file));
-            }
-        }
+        let launch = self.prepare_launch(cwd, name, initial_message, harness)?;
         let id = self.mux.open_pane(&OpenRequest {
             cwd,
             title: name,
@@ -340,6 +328,61 @@ impl Splitter {
         self.panes.insert(name.to_string(), Pane { id: id.clone(), status: PaneStatus::Unknown });
         self.last_anchor = Some(id.clone());
         Ok(id)
+    }
+
+    /// Opens a pane for lane `name` grouped with `group_anchor` — another pane already open
+    /// for a sibling branch in the same GitButler stack — instead of chaining off whatever
+    /// this process last spawned. Used only by `kanstack spawn` (see `crate::cli`), the one
+    /// place a stacked branch can get a pane of its own alongside a sibling's: the interactive
+    /// `b` flow never does (see `crate::app::branch_modal`).
+    ///
+    /// A real tab alongside `group_anchor`, or a split off it in the direction orthogonal to
+    /// the ordinary lane chain, depending on `KANSTACK_STACK_PANES` (see
+    /// [`crate::mux::StackPlacement`]) — either way, deliberately grouped with the sibling
+    /// rather than the last thing *this process* spawned, and deliberately not becoming what
+    /// the next *unrelated* lane chains off: `self.last_anchor` is left untouched.
+    pub fn spawn_stacked_harness_with(
+        &mut self,
+        cwd: &Path,
+        name: &str,
+        initial_message: Option<&str>,
+        harness: Option<&str>,
+        group_anchor: &str,
+    ) -> Result<String> {
+        let launch = self.prepare_launch(cwd, name, initial_message, harness)?;
+        let stack_direction = crate::mux::orthogonal_direction(&self.chain_direction);
+        let req = OpenRequest {
+            cwd,
+            title: name,
+            launch: &launch,
+            after: Some(group_anchor),
+            first_direction: &self.first_direction,
+            chain_direction: stack_direction,
+        };
+        let id = match crate::mux::StackPlacement::from_env() {
+            crate::mux::StackPlacement::Tabbed => self.mux.open_tab(&req)?,
+            crate::mux::StackPlacement::Split => self.mux.open_pane(&req)?,
+        };
+        self.panes.insert(name.to_string(), Pane { id: id.clone(), status: PaneStatus::Unknown });
+        Ok(id)
+    }
+
+    /// The shared first half of both spawn methods: the launch line, with the harness's
+    /// stale state for `name` forgotten first — a fast harness could report before we got
+    /// back, and the last word of a previous pane on this branch must not outlive it — and,
+    /// where process tracking applies, the pid-recording prefix folded in.
+    fn prepare_launch(&mut self, cwd: &Path, name: &str, initial_message: Option<&str>, harness: Option<&str>) -> Result<String> {
+        let mut launch = self.harness.launch_line(cwd, name, initial_message, harness)?;
+        self.reports.forget(name);
+        self.pids.forget(name);
+        if self.tracks_pids() {
+            // Best-effort, like the registry: a state directory that can't be made must not
+            // stop the pane opening, only leave it untracked.
+            if let Ok(Some(file)) = self.pids.prepare(name) {
+                launch = format!("{}{launch}", record_pid_prefix(&file));
+            }
+        }
+        Ok(launch)
     }
 
     /// Stands in for `ps`, so what a test reads from the process table doesn't depend on what is
@@ -1049,6 +1092,52 @@ mod tests {
         let lines = mux.lines();
         assert!(lines[0].contains("&& codex "), "{lines:#?}");
         assert!(lines[1].contains("&& claude "), "{lines:#?}");
+    }
+
+    /// The default (`KANSTACK_STACK_PANES` unset): a real tab alongside the sibling, in the
+    /// direction orthogonal to the ordinary chain — and, unlike `spawn_harness`, it must not
+    /// move `last_anchor`: the next *unrelated* lane must still chain off what this process
+    /// last spawned for itself, not off a sibling's pane borrowed for grouping.
+    #[test]
+    fn a_stacked_spawn_defaults_to_a_tab_orthogonal_to_the_chain_and_leaves_the_anchor_alone() {
+        with_env(&[("KANSTACK_STACK_PANES", None)], || {
+            let (mut splitter, mux) = fake_splitter();
+            splitter.spawn_harness(cwd(), "feat-base", None).unwrap();
+            let tab = splitter.spawn_stacked_harness_with(cwd(), "feat-top", None, None, "p1").unwrap();
+            assert_eq!(tab, "p2");
+            assert!(mux.lines()[1].starts_with("tab p2 alongside p1 in /repo as feat-top:"), "{:#?}", mux.lines());
+
+            // The default chain direction is `right` (horizontal), so the orthogonal stack
+            // split direction would be `down` — but this asserts the tab path was taken at
+            // all, which `set_anchor` below is what actually exercises the direction with.
+            splitter.spawn_harness(cwd(), "feat-c", None).unwrap();
+            assert!(mux.lines()[2].starts_with("open p3 right of p1"), "unrelated lanes must still chain off the last real spawn, not the borrowed tab anchor: {:#?}", mux.lines());
+        });
+    }
+
+    /// `KANSTACK_STACK_PANES=split` splits off the sibling instead of tabbing, in the
+    /// direction orthogonal to the ordinary chain direction.
+    #[test]
+    fn a_stacked_spawn_can_be_configured_to_split_orthogonally_instead_of_tabbing() {
+        with_env(&[("KANSTACK_STACK_PANES", Some("split"))], || {
+            let (mut splitter, mux) = fake_splitter();
+            splitter.spawn_harness(cwd(), "feat-base", None).unwrap();
+            splitter.spawn_stacked_harness_with(cwd(), "feat-top", None, None, "p1").unwrap();
+            // Default chain direction is `right` (horizontal) — orthogonal is `down`.
+            assert!(mux.lines()[1].starts_with("open p2 down of p1"), "{:#?}", mux.lines());
+        });
+    }
+
+    /// A vertical chain direction (`up`, kanstack's own default first-lane direction) flips
+    /// the orthogonal stack split to horizontal (`right`).
+    #[test]
+    fn the_orthogonal_split_direction_follows_the_chain_directions_axis() {
+        with_env(&[("KANSTACK_STACK_PANES", Some("split")), ("KANSTACK_FAKE_CHAIN_DIRECTION", Some("up"))], || {
+            let (mut splitter, mux) = fake_splitter();
+            splitter.spawn_harness(cwd(), "feat-base", None).unwrap();
+            splitter.spawn_stacked_harness_with(cwd(), "feat-top", None, None, "p1").unwrap();
+            assert!(mux.lines()[1].starts_with("open p2 right of p1"), "{:#?}", mux.lines());
+        });
     }
 
     /// Statuses come back keyed by branch, and a pane the backend had no news about is left

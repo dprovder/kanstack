@@ -62,6 +62,22 @@ pub trait Multiplexer: Send + Sync {
     /// the caller believing a pane exists.
     fn open_pane(&self, req: &OpenRequest<'_>) -> Result<String>;
 
+    /// Opens `req.launch` as a new tab alongside `req.after` (always `Some` for this call) —
+    /// the same window or tab group as that pane, switchable rather than a visible split —
+    /// where the backend has such a thing. See `crate::splitter::Splitter::spawn_stacked_harness_with`,
+    /// the only caller: grouping a stacked branch's pane with a sibling's, for
+    /// `KANSTACK_STACK_PANES=tabbed` (the default).
+    ///
+    /// The default falls back to [`Self::open_pane`]'s ordinary split, using whatever
+    /// direction the caller already put in `req.chain_direction` — which is exactly what
+    /// `KANSTACK_STACK_PANES=split` asks for anyway, so a backend with no real tab concept
+    /// (Orca, Ghostty, today) degrades to that split instead of erroring or silently doing
+    /// nothing. Not an oversight: only tmux and cmux override this so far, because only
+    /// those two could be verified live against the real thing before shipping.
+    fn open_tab(&self, req: &OpenRequest<'_>) -> Result<String> {
+        self.open_pane(req)
+    }
+
     /// Types `text` into `pane` as literal input, then submits it. The submit is a separate
     /// key press rather than a trailing newline in the same burst, which a TUI reads as part
     /// of a paste and never submits.
@@ -110,6 +126,40 @@ pub fn normalize_direction(raw: &str) -> String {
         other => other,
     }
     .to_string()
+}
+
+/// The direction at right angles to `direction`: `up`/`down` become `right`, everything else
+/// (`left`/`right`, or anything unrecognized) becomes `down`. Used to place a stacked
+/// branch's pane so it reads as its own cluster next to the sibling it groups with, rather
+/// than continuing the ordinary lane chain along the same axis — see
+/// `crate::splitter::Splitter::spawn_stacked_harness_with`.
+pub fn orthogonal_direction(direction: &str) -> &'static str {
+    match normalize_direction(direction).as_str() {
+        "up" | "down" => "right",
+        _ => "down",
+    }
+}
+
+/// How a stacked branch's pane is placed next to the sibling it groups with —
+/// `KANSTACK_STACK_PANES`, read fresh at every spawn like every other kanstack tunable (see
+/// `crate::config`'s module doc comment).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StackPlacement {
+    /// A real tab alongside the sibling, where the backend has one ([`Multiplexer::open_tab`]).
+    /// The default: it's what keeps a stack's agents visually together without also eating
+    /// screen space the way a split would.
+    Tabbed,
+    /// A split off the sibling, in [`orthogonal_direction`] of the ordinary chain direction.
+    Split,
+}
+
+impl StackPlacement {
+    pub fn from_env() -> Self {
+        match std::env::var("KANSTACK_STACK_PANES").as_deref() {
+            Ok("split") => StackPlacement::Split,
+            _ => StackPlacement::Tabbed,
+        }
+    }
 }
 
 /// The first-lane and chained directions for `mux`: `KANSTACK_<NAME>_DIRECTION` and
@@ -252,6 +302,20 @@ pub(crate) mod fake {
             Ok(id)
         }
 
+        /// Recorded distinctly from `open_pane`, so a test can tell `spawn_stacked_harness_with`
+        /// really asked for a tab rather than falling back to a split.
+        fn open_tab(&self, req: &OpenRequest<'_>) -> Result<String> {
+            if *self.fail_open.lock().unwrap() {
+                anyhow::bail!("fake open failed");
+            }
+            let mut next = self.next.lock().unwrap();
+            *next += 1;
+            let id = format!("p{}", *next);
+            let anchor = req.after.expect("open_tab is only ever called with an anchor");
+            self.record(format!("tab {id} alongside {anchor} in {} as {}: {}", req.cwd.display(), req.title, req.launch));
+            Ok(id)
+        }
+
         fn type_line(&self, pane: &str, text: &str) -> Result<()> {
             self.record(format!("type {pane}: {text}"));
             Ok(())
@@ -307,6 +371,31 @@ pub(crate) mod fake {
 mod tests {
     use super::fake::FakeMux;
     use super::*;
+
+    #[test]
+    fn orthogonal_direction_flips_the_axis() {
+        assert_eq!(orthogonal_direction("up"), "right");
+        assert_eq!(orthogonal_direction("down"), "right");
+        assert_eq!(orthogonal_direction("above"), "right", "normalizes before switching on it");
+        assert_eq!(orthogonal_direction("left"), "down");
+        assert_eq!(orthogonal_direction("right"), "down");
+    }
+
+    #[test]
+    fn stack_placement_from_env_defaults_to_tabbed() {
+        let _guard = crate::SPLIT_BACKEND_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("KANSTACK_STACK_PANES");
+        assert_eq!(StackPlacement::from_env(), StackPlacement::Tabbed);
+
+        std::env::set_var("KANSTACK_STACK_PANES", "split");
+        assert_eq!(StackPlacement::from_env(), StackPlacement::Split);
+
+        // Unrecognized falls back to the default, same as `KANSTACK_BRANCH_UI`/
+        // `KANSTACK_SPLIT_BACKEND` do for their own unrecognized values.
+        std::env::set_var("KANSTACK_STACK_PANES", "bogus");
+        assert_eq!(StackPlacement::from_env(), StackPlacement::Tabbed);
+        std::env::remove_var("KANSTACK_STACK_PANES");
+    }
 
     #[test]
     fn normalize_direction_accepts_above_and_below() {
