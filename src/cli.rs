@@ -19,15 +19,17 @@ use crate::model::{BranchStatus, MergeStatus, WorkspaceStatus};
 use crate::pane_status::PaneStatus;
 use crate::report::{Reported, Reports};
 use crate::splitter::Splitter;
-use crate::workstream::{AgentId, BranchId, PaneId, Registry, Workstream};
+use crate::workstream::{AgentId, BranchId, PaneId, Registry, WorkItemRef, Workstream};
 
 pub const SUBCOMMANDS: &[&str] = &["spawn", "send", "status", "focus", "stop", "report"];
 
 pub const HELP: &str = "\
-kanstack spawn <branch> [--agent <name>] [--prompt \"...\"]
+kanstack spawn <branch> [--agent <name>] [--prompt \"...\"] [--item <ref>]
     open a harness pane on <branch>, creating the branch first if it doesn't exist.
     --agent runs that harness (e.g. codex) instead of $KANSTACK_HARNESS; --prompt is
-    the harness's first message
+    the harness's first message; --item attaches an opaque work-item reference (e.g.
+    github:#42) to the workstream, carried in `status`/`status --json` and never
+    interpreted or fetched by kanstack itself
 kanstack send <branch|session> \"...\"
     type a message into a pane and submit it
 kanstack status [--json]
@@ -52,7 +54,7 @@ multiplexer the panes live in (see README).
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    Spawn { branch: String, agent: Option<String>, prompt: Option<String> },
+    Spawn { branch: String, agent: Option<String>, prompt: Option<String>, item: Option<String> },
     Send { target: String, text: String },
     Status { json: bool },
     Focus { target: String },
@@ -69,6 +71,7 @@ pub fn parse(name: &str, args: Vec<String>) -> Result<Option<Command>> {
     let mut positional = Vec::new();
     let mut agent = None;
     let mut prompt = None;
+    let mut item = None;
     let mut json = false;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -85,6 +88,7 @@ pub fn parse(name: &str, args: Vec<String>) -> Result<Option<Command>> {
         match key.as_str() {
             "--agent" if name == "spawn" => agent = Some(flag("--agent", inline.as_deref(), &mut args)?),
             "--prompt" if name == "spawn" => prompt = Some(flag("--prompt", inline.as_deref(), &mut args)?),
+            "--item" if name == "spawn" => item = Some(flag("--item", inline.as_deref(), &mut args)?),
             "--json" if name == "status" => {
                 if inline.is_some() {
                     bail!("--json takes no value\n\n{HELP}");
@@ -103,7 +107,7 @@ pub fn parse(name: &str, args: Vec<String>) -> Result<Option<Command>> {
             .ok_or_else(|| anyhow::anyhow!("`kanstack {name}` needs a {what}\n\n{HELP}"))
     };
     let command = match name {
-        "spawn" => Command::Spawn { branch: one("<branch>")?, agent, prompt },
+        "spawn" => Command::Spawn { branch: one("<branch>")?, agent, prompt, item },
         "send" => {
             let target = one("<branch|session>")?;
             let text = positional.collect::<Vec<_>>().join(" ");
@@ -549,7 +553,7 @@ mod tests {
     fn spawn_takes_a_branch_and_optional_agent_and_prompt() {
         assert_eq!(
             parse("spawn", args(&["fix-login"])).unwrap(),
-            Some(Command::Spawn { branch: "fix-login".into(), agent: None, prompt: None })
+            Some(Command::Spawn { branch: "fix-login".into(), agent: None, prompt: None, item: None })
         );
         assert_eq!(
             parse("spawn", args(&["--agent", "codex", "fix-login", "--prompt", "fix the flaky test"])).unwrap(),
@@ -557,12 +561,37 @@ mod tests {
                 branch: "fix-login".into(),
                 agent: Some("codex".into()),
                 prompt: Some("fix the flaky test".into()),
+                item: None,
             })
         );
         assert_eq!(
             parse("spawn", args(&["b", "--agent=codex"])).unwrap(),
-            Some(Command::Spawn { branch: "b".into(), agent: Some("codex".into()), prompt: None })
+            Some(Command::Spawn { branch: "b".into(), agent: Some("codex".into()), prompt: None, item: None })
         );
+    }
+
+    #[test]
+    fn spawn_takes_an_opaque_item_reference() {
+        assert_eq!(
+            parse("spawn", args(&["fix-parser", "--item", "github:#42"])).unwrap(),
+            Some(Command::Spawn {
+                branch: "fix-parser".into(),
+                agent: None,
+                prompt: None,
+                item: Some("github:#42".into()),
+            })
+        );
+        assert_eq!(
+            parse("spawn", args(&["fix-parser", "--item=linear:ENG-7"])).unwrap(),
+            Some(Command::Spawn {
+                branch: "fix-parser".into(),
+                agent: None,
+                prompt: None,
+                item: Some("linear:ENG-7".into()),
+            })
+        );
+        assert!(parse("spawn", args(&["b", "--item"])).is_err(), "--item requires a value");
+        assert!(parse("send", args(&["b", "--item", "GH-1"])).is_err(), "--item is spawn-only");
     }
 
     #[test]
@@ -718,6 +747,57 @@ mod tests {
             )
         );
         assert!(human.is_err(), "the table still needs a backend");
+    }
+
+    /// `--item` is opaque end to end: whatever string `spawn` is given is exactly what
+    /// `status --json` reports back, with no parsing, provider special-casing or fetching
+    /// in between.
+    #[test]
+    fn spawn_item_round_trips_through_status_json() {
+        let Some(Command::Spawn { item, .. }) =
+            parse("spawn", args(&["fix-parser", "--item", "github:#42"])).unwrap()
+        else {
+            panic!("expected a Spawn command");
+        };
+        assert_eq!(item, Some("github:#42".to_string()));
+
+        let _guard = crate::SPLIT_BACKEND_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("kanstack-cli-spawn-item-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let vars = [
+            ("KANSTACK_STATE_PATH", Some(dir.to_str().unwrap())),
+            ("KANSTACK_SPLIT_BACKEND", Some("tmux")),
+            ("TMUX_PANE", None),
+        ];
+        let old: Vec<_> = vars.iter().map(|(k, _)| (*k, std::env::var_os(k))).collect();
+        for (k, v) in vars {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+
+        let repo = Path::new("/repo/spawn-item");
+        let mut registry = Registry::load(repo).unwrap();
+        // Mirrors what `run`'s `Command::Spawn` arm does with the parsed `--item`: fold it
+        // into the `Workstream` that gets upserted, without ever interpreting the string.
+        registry.upsert(workstream("fix-parser", Some("%3"), Some("claude"), item.as_deref()));
+        registry.save().unwrap();
+
+        let mut out = Vec::new();
+        let result = run(Command::Status { json: true }, repo, &mut out);
+
+        for (k, v) in old {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        result.unwrap();
+        let json = String::from_utf8(out).unwrap();
+        assert!(json.contains(r#""branch":"fix-parser","pane":"%3","agent":"claude","item":"github:#42""#), "{json}");
     }
 
     #[test]

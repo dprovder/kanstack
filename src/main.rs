@@ -29,7 +29,7 @@ usage:
   kanstack [options]
   kanstack spawn|send|status|focus|stop ...   drive harness panes without the board:
 
-  kanstack spawn <branch> [--agent <name>] [--prompt \"...\"]
+  kanstack spawn <branch> [--agent <name>] [--prompt \"...\"] [--item <ref>]
   kanstack send <branch|session> \"...\"
   kanstack status
   kanstack focus <branch|session>
