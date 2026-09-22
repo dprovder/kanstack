@@ -334,9 +334,14 @@ fn reporter_command(exe: Option<&Path>, setting: Option<&str>) -> Option<String>
     Some(format!("{} report", shell_quote(&exe?.to_string_lossy())))
 }
 
+/// Test helpers shared across the harness registry tests (here) and each harness's own
+/// tests (`crate::harness::claude`, `crate::harness::gemini`, ...) — the same role
+/// `crate::mux::stand_in`/`crate::mux::fake` play for the multiplexer backends.
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod test_support {
+    use std::path::{Path, PathBuf};
+
+    use super::HarnessConfig;
 
     /// Serializes every `with_system_flag_env` call against every other one — `cargo
     /// test` runs tests concurrently on separate threads by default, but
@@ -346,7 +351,7 @@ mod tests {
 
     /// Runs `body` with `KANSTACK_HARNESS_SYSTEM_FLAG` swapped out and restored
     /// afterwards, so this doesn't leak into other tests running in the same process.
-    fn with_system_flag_env(value: Option<&str>, body: impl FnOnce()) {
+    pub(crate) fn with_system_flag_env(value: Option<&str>, body: impl FnOnce()) {
         // Held for the whole call, not just the swap, so `body` (which reads the var via
         // `resolve_note_delivery`) can't be interleaved with another test's swap either.
         let _guard = SYSTEM_FLAG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -361,6 +366,55 @@ mod tests {
             None => std::env::remove_var("KANSTACK_HARNESS_SYSTEM_FLAG"),
         }
     }
+
+    pub(crate) const REPORT: &str = "'/opt/kanstack' report";
+
+    /// A directory holding stand-ins named `claude` and `codex` that print the environment
+    /// variable hooks rely on, then each argument they were started with.
+    pub(crate) fn stand_in_harnesses(tag: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("kanstack-harness-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["claude", "codex"] {
+            let path = dir.join(name);
+            std::fs::write(&path, "#!/bin/sh\nprintf '%s\\n' \"$KANSTACK_BRANCH\"\nfor a in \"$@\"; do printf '%s\\0' \"$a\"; done\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        dir
+    }
+
+    /// Runs the launch line for `config` under `sh`, as a pane's shell would, and returns
+    /// `$KANSTACK_BRANCH` as the harness saw it and the arguments it was started with. The
+    /// line is too long to type once it carries hooks, so this also runs the spill-to-files
+    /// path for real.
+    pub(crate) fn launched(config: &HarnessConfig, harness: Option<&str>, message: Option<&str>) -> (String, Vec<String>) {
+        // `sh` and `cat` are found through `PATH`, which the backends' discovery tests swap.
+        let _guard = crate::SPLIT_BACKEND_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let line = config.launch_line(Path::new("/tmp"), "feat-x", message, harness).unwrap();
+        // Cleared, not just left alone: this process may itself be running inside a pane
+        // kanstack launched (dogfooding kanstack from kanstack), which would otherwise leak
+        // its own `$KANSTACK_BRANCH` into the child and mask exactly the "no lane variable
+        // leaks to the harness" behavior this helper exists to check.
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&line)
+            .env_remove("KANSTACK_BRANCH")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{line:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        let (branch, args) = stdout.split_once('\n').unwrap();
+        let mut args: Vec<String> = args.split('\0').map(str::to_string).collect();
+        assert_eq!(args.pop().as_deref(), Some(""), "every argument ends in a NUL");
+        (branch.to_string(), args)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_support::{launched, stand_in_harnesses, with_system_flag_env, REPORT};
 
     #[test]
     fn known_harnesses_have_distinct_names_and_keep_the_setup_priority_order() {
@@ -481,8 +535,6 @@ mod tests {
 
     // Status hooks.
 
-    const REPORT: &str = "'/opt/kanstack' report";
-
     fn claude_settings() -> serde_json::Value {
         let extras = for_command("claude").status_hooks(REPORT, "feat-x").expect("claude takes hooks at launch");
         assert_eq!(extras.args[0], "--settings");
@@ -530,47 +582,6 @@ mod tests {
         for name in ["codex", "pi", "opencode", "kiro", "gemini", "./my-wrapper.sh"] {
             assert_eq!(for_command(name).status_hooks(REPORT, "feat-x"), None, "{name}");
         }
-    }
-
-    /// A directory holding stand-ins named `claude` and `codex` that print the environment
-    /// variable hooks rely on, then each argument they were started with.
-    fn stand_in_harnesses(tag: &str) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("kanstack-harness-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        for name in ["claude", "codex"] {
-            let path = dir.join(name);
-            std::fs::write(&path, "#!/bin/sh\nprintf '%s\\n' \"$KANSTACK_BRANCH\"\nfor a in \"$@\"; do printf '%s\\0' \"$a\"; done\n").unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        dir
-    }
-
-    /// Runs the launch line for `config` under `sh`, as a pane's shell would, and returns
-    /// `$KANSTACK_BRANCH` as the harness saw it and the arguments it was started with. The
-    /// line is too long to type once it carries hooks, so this also runs the spill-to-files
-    /// path for real.
-    fn launched(config: &HarnessConfig, harness: Option<&str>, message: Option<&str>) -> (String, Vec<String>) {
-        // `sh` and `cat` are found through `PATH`, which the backends' discovery tests swap.
-        let _guard = crate::SPLIT_BACKEND_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let line = config.launch_line(Path::new("/tmp"), "feat-x", message, harness).unwrap();
-        // Cleared, not just left alone: this process may itself be running inside a pane
-        // kanstack launched (dogfooding kanstack from kanstack), which would otherwise leak
-        // its own `$KANSTACK_BRANCH` into the child and mask exactly the "no lane variable
-        // leaks to the harness" behavior this helper exists to check.
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(&line)
-            .env_remove("KANSTACK_BRANCH")
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "{line:?} failed: {}", String::from_utf8_lossy(&out.stderr));
-        let stdout = String::from_utf8(out.stdout).unwrap();
-        let (branch, args) = stdout.split_once('\n').unwrap();
-        let mut args: Vec<String> = args.split('\0').map(str::to_string).collect();
-        assert_eq!(args.pop().as_deref(), Some(""), "every argument ends in a NUL");
-        (branch.to_string(), args)
     }
 
     #[test]
