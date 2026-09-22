@@ -626,6 +626,7 @@ version = "0.0.2"
 dependencies = [
  "anyhow",
  "ignore",
+ "libc",
  "notify",
  "ratatui",
  "serde",

@@ -21,6 +21,9 @@ path = "src/main.rs"
 anyhow = "1.0"
 # Filesystem watching, so the board follows the repo instead of waiting for a keypress.
 ignore = "0.4"
+# flock(2) for the workstream registry's cross-process lock (src/workstream.rs); already
+# resolved transitively, so this adds no new code to the tree.
+libc = "0.2"
 notify = "8"
 ratatui = "0.30"
 serde = { version = "1.0", features = ["derive"] }

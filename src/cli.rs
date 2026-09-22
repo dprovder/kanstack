@@ -422,105 +422,118 @@ pub fn run(command: Command, cwd: &Path, out: &mut impl Write) -> Result<()> {
         return Reports::for_repo(cwd).write(&branch, *state, SystemTime::now());
     }
 
-    let mut registry = Registry::load(cwd)?;
     match command {
-        Command::Spawn { branch, agent, prompt } => {
-            let but = But::discover(cwd)?;
-            let mut splitter = seeded_splitter(&registry)?;
-            // Its own setting, not the board's `KANSTACK_*_DIRECTION`: the board's `above`
-            // assumes kanstack is the pane at the bottom, but here the caller is usually an
-            // agent's pane, and a new lane belongs beside it.
-            splitter.set_first_direction(&spawn_direction(std::env::var("KANSTACK_SPAWN_DIRECTION").ok().as_deref())?);
+        Command::Spawn { branch, agent, prompt, item } => {
+            // Locked for the whole load-mutate-save, including the pane spawn itself: two
+            // `kanstack spawn`s racing here must serialize rather than each load the same
+            // registry and have the loser's `upsert` vanish under the winner's save.
+            let lines = Registry::with_lock(cwd, |registry| {
+                let mut lines = Vec::new();
+                let but = But::discover(cwd)?;
+                let mut splitter = seeded_splitter(registry)?;
+                // Its own setting, not the board's `KANSTACK_*_DIRECTION`: the board's `above`
+                // assumes kanstack is the pane at the bottom, but here the caller is usually an
+                // agent's pane, and a new lane belongs beside it.
+                splitter
+                    .set_first_direction(&spawn_direction(std::env::var("KANSTACK_SPAWN_DIRECTION").ok().as_deref())?);
 
-            // Fetched before the poll below decides anything: whether `branch` is stacked on
-            // top of a sibling that already has a pane open determines which anchor the new
-            // pane groups with, not just whether the branch itself needs creating.
-            let status = but.status()?;
-            let exists = status.stacks.iter().flat_map(|s| &s.branches).any(|b| b.name == branch);
-            if !exists {
-                but.branch_new(&branch, None)?;
-                writeln!(out, "created {branch}")?;
-            }
-
-            // One poll answers every question below: is the branch's old pane still alive,
-            // is a stack sibling's, and which live pane should the new one split off absent
-            // either. A failed poll leaves every pane "unknown", which counts as alive —
-            // refusing a spawn is the safer error.
-            let statuses = splitter.poll_statuses().unwrap_or_default();
-            let dead = |b: &BranchId| statuses.get(&b.0) == Some(&PaneStatus::Dead);
-
-            if let Some(w) = registry.get(&branch) {
-                if w.pane_id.is_some() && !dead(&w.branch_id) {
-                    bail!("{branch} already has a pane open — use `kanstack send`, `focus` or `stop`");
+                // Fetched before the poll below decides anything: whether `branch` is stacked on
+                // top of a sibling that already has a pane open determines which anchor the new
+                // pane groups with, not just whether the branch itself needs creating.
+                let status = but.status()?;
+                let exists = status.stacks.iter().flat_map(|s| &s.branches).any(|b| b.name == branch);
+                if !exists {
+                    but.branch_new(&branch, None)?;
+                    lines.push(format!("created {branch}"));
                 }
-            }
 
-            // A sibling in the same GitButler stack with a live pane already open — group
-            // with it (`Splitter::spawn_stacked_harness_with`) rather than the generic
-            // "last live pane" fallback below, which knows nothing about which branches are
-            // actually stacked together. The first live sibling in stack order wins; a stack
-            // rarely has more than one pane open at a time anyway.
-            let group_with = status
-                .stacks
-                .iter()
-                .find(|s| s.branches.iter().any(|b| b.name == branch))
-                .and_then(|s| {
-                    s.branches.iter().filter(|b| b.name != branch).find_map(|b| {
-                        let w = registry.get(&b.name)?;
-                        let pane = w.pane_id.as_ref()?;
-                        (!dead(&w.branch_id)).then(|| pane.clone())
-                    })
-                });
+                // One poll answers every question below: is the branch's old pane still alive,
+                // is a stack sibling's, and which live pane should the new one split off absent
+                // either. A failed poll leaves every pane "unknown", which counts as alive —
+                // refusing a spawn is the safer error.
+                let statuses = splitter.poll_statuses().unwrap_or_default();
+                let dead = |b: &BranchId| statuses.get(&b.0) == Some(&PaneStatus::Dead);
 
-            if group_with.is_none() {
-                if let Some(last_live) = registry
-                    .workstreams
+                if let Some(w) = registry.get(&branch) {
+                    if w.pane_id.is_some() && !dead(&w.branch_id) {
+                        bail!("{branch} already has a pane open — use `kanstack send`, `focus` or `stop`");
+                    }
+                }
+
+                // A sibling in the same GitButler stack with a live pane already open — group
+                // with it (`Splitter::spawn_stacked_harness_with`) rather than the generic
+                // "last live pane" fallback below, which knows nothing about which branches are
+                // actually stacked together. The first live sibling in stack order wins; a stack
+                // rarely has more than one pane open at a time anyway.
+                let group_with = status
+                    .stacks
                     .iter()
-                    .rev()
-                    .find(|w| w.branch_id.0 != branch && w.pane_id.is_some() && !dead(&w.branch_id))
-                {
-                    splitter.set_anchor(&last_live.pane_id.as_ref().unwrap().0);
-                }
-            }
+                    .find(|s| s.branches.iter().any(|b| b.name == branch))
+                    .and_then(|s| {
+                        s.branches.iter().filter(|b| b.name != branch).find_map(|b| {
+                            let w = registry.get(&b.name)?;
+                            let pane = w.pane_id.as_ref()?;
+                            (!dead(&w.branch_id)).then(|| pane.clone())
+                        })
+                    });
 
-            let pane = match &group_with {
-                Some(anchor) => {
-                    splitter.spawn_stacked_harness_with(but.cwd(), &branch, prompt.as_deref(), agent.as_deref(), &anchor.0)?
+                if group_with.is_none() {
+                    if let Some(last_live) = registry
+                        .workstreams
+                        .iter()
+                        .rev()
+                        .find(|w| w.branch_id.0 != branch && w.pane_id.is_some() && !dead(&w.branch_id))
+                    {
+                        splitter.set_anchor(&last_live.pane_id.as_ref().unwrap().0);
+                    }
                 }
-                None => splitter.spawn_harness_with(but.cwd(), &branch, prompt.as_deref(), agent.as_deref())?,
-            };
-            let agent = agent
-                .or_else(|| std::env::var("KANSTACK_HARNESS").ok())
-                .unwrap_or_else(|| "claude".to_string());
-            if let Some(workspace) = splitter.workspace() {
-                registry.workspace = Some(workspace);
-            }
-            let item = registry.get(&branch).and_then(|w| w.item.clone());
-            registry.upsert(Workstream {
-                branch_id: BranchId(branch.clone()),
-                pane_id: Some(PaneId(pane.clone())),
-                agent: Some(AgentId(agent.clone())),
-                item,
-            });
-            registry.save()?;
-            match &registry.workspace {
-                Some(workspace) => writeln!(out, "spawned {agent} on {branch} in {pane} ({workspace})")?,
-                None => writeln!(out, "spawned {agent} on {branch} in {pane}")?,
+
+                let pane = match &group_with {
+                    Some(anchor) => splitter
+                        .spawn_stacked_harness_with(but.cwd(), &branch, prompt.as_deref(), agent.as_deref(), &anchor.0)?,
+                    None => splitter.spawn_harness_with(but.cwd(), &branch, prompt.as_deref(), agent.as_deref())?,
+                };
+                let agent = agent
+                    .or_else(|| std::env::var("KANSTACK_HARNESS").ok())
+                    .unwrap_or_else(|| "claude".to_string());
+                if let Some(workspace) = splitter.workspace() {
+                    registry.workspace = Some(workspace);
+                }
+                let item = item
+                    .map(WorkItemRef)
+                    .or_else(|| registry.get(&branch).and_then(|w| w.item.clone()));
+                registry.upsert(Workstream {
+                    branch_id: BranchId(branch.clone()),
+                    pane_id: Some(PaneId(pane.clone())),
+                    agent: Some(AgentId(agent.clone())),
+                    item,
+                });
+                lines.push(match &registry.workspace {
+                    Some(workspace) => format!("spawned {agent} on {branch} in {pane} ({workspace})"),
+                    None => format!("spawned {agent} on {branch} in {pane}"),
+                });
+                Ok(lines)
+            })?;
+            for line in lines {
+                writeln!(out, "{line}")?;
             }
         }
         Command::Send { target, text } => {
+            let registry = Registry::load(cwd)?;
             let splitter = seeded_splitter(&registry)?;
             let (w, _) = target_with_pane(&registry, &target)?;
             splitter.send_task(&w.branch_id.0, &text)?;
             writeln!(out, "sent to {}", w.branch_id)?;
         }
         Command::Status { json: true } => {
+            let registry = Registry::load(cwd)?;
             let statuses = poll_or_nothing(&registry);
             let git = git_state(&registry, cwd);
             let report = report(&registry, |branch| statuses.get(branch).copied(), git.as_ref());
             writeln!(out, "{}", serde_json::to_string(&report)?)?;
         }
         Command::Status { json: false } => {
+            let registry = Registry::load(cwd)?;
             if registry.workstreams.is_empty() {
                 writeln!(out, "no workstreams — `kanstack spawn <branch>` starts one")?;
                 return Ok(());
@@ -546,6 +559,7 @@ pub fn run(command: Command, cwd: &Path, out: &mut impl Write) -> Result<()> {
             }
         }
         Command::Focus { target } => {
+            let registry = Registry::load(cwd)?;
             let splitter = seeded_splitter(&registry)?;
             let (w, _) = target_with_pane(&registry, &target)?;
             splitter.focus(&w.branch_id.0)?;
@@ -553,17 +567,22 @@ pub fn run(command: Command, cwd: &Path, out: &mut impl Write) -> Result<()> {
         }
         Command::Report { .. } => unreachable!("handled before the registry is loaded"),
         Command::Stop { target } => {
-            let branch = registry
-                .resolve(&target)
-                .map(|w| w.branch_id.0.clone())
-                .ok_or_else(|| anyhow::anyhow!("no workstream for {target:?} — `kanstack status` lists them"))?;
-            // A workstream with no pane has nothing to close; forgetting it is the stop.
-            if registry.get(&branch).is_some_and(|w| w.pane_id.is_some()) {
-                let mut splitter = seeded_splitter(&registry)?;
-                splitter.stop(&branch)?;
-            }
-            registry.remove(&branch);
-            registry.save()?;
+            // Locked for the same reason as `Spawn`: resolving the target, stopping the pane
+            // and forgetting the workstream must land as one save, not two processes' saves
+            // interleaved.
+            let branch = Registry::with_lock(cwd, |registry| {
+                let branch = registry
+                    .resolve(&target)
+                    .map(|w| w.branch_id.0.clone())
+                    .ok_or_else(|| anyhow::anyhow!("no workstream for {target:?} — `kanstack status` lists them"))?;
+                // A workstream with no pane has nothing to close; forgetting it is the stop.
+                if registry.get(&branch).is_some_and(|w| w.pane_id.is_some()) {
+                    let mut splitter = seeded_splitter(registry)?;
+                    splitter.stop(&branch)?;
+                }
+                registry.remove(&branch);
+                Ok(branch)
+            })?;
             writeln!(out, "stopped {branch}")?;
         }
         Command::Prune { json } => {

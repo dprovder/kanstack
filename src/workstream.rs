@@ -11,6 +11,8 @@
 //! One file per repository (see [`state_path`]), so two repositories can each have a
 //! `fix-login` branch without one's pane answering for the other's.
 
+use std::fs::{File, OpenOptions};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -74,6 +76,15 @@ pub fn state_path(repo: &Path) -> Option<PathBuf> {
     Some(dir.join(format!("workstreams-{key:016x}.json")))
 }
 
+/// The advisory-lock file guarding `repo`'s registry — a sibling of [`state_path`], not the
+/// registry file itself, so a lock attempt never has to worry about the file it's locking
+/// being renamed out from under it mid-hold (which [`Registry::save`]'s temp-file-and-rename
+/// would otherwise do to any lock taken on the registry file directly).
+fn lock_path(repo: &Path) -> Option<PathBuf> {
+    let (dir, key) = repo_state(repo)?;
+    Some(dir.join(format!("workstreams-{key:016x}.lock")))
+}
+
 /// Where the reports agents make about themselves for the repository at `repo` live — one
 /// small file per branch, see `crate::report`. A directory beside the registry rather than
 /// a field in it: hooks write these often and from several processes at once, and the
@@ -113,6 +124,38 @@ fn repo_state(repo: &Path) -> Option<(PathBuf, u64)> {
 /// releases — an upgrade must not orphan every registry on disk.
 pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf29ce484222325, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x100000001b3))
+}
+
+/// An exclusive hold on `repo`'s registry, for the duration of a load-mutate-save that must
+/// not interleave with another process's. Backed by `flock(2)` on a sibling lock file (not
+/// the registry itself — see [`lock_path`]), which the kernel releases the moment this is
+/// dropped, closed handle and all, so a command that errors partway through still unlocks;
+/// there is deliberately no manual unlock to forget to call.
+pub struct RegistryLock(#[allow(dead_code, reason = "held only for its Drop, which releases the flock")] File);
+
+impl RegistryLock {
+    fn acquire(repo: &Path) -> Result<Self> {
+        let path = lock_path(repo).ok_or_else(|| anyhow::anyhow!("no home directory to keep workstreams in"))?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            // Its content is never read or written — only the fd matters, for `flock` — so
+            // there's nothing to truncate.
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        // Blocks until whichever other `kanstack` process holds this releases it, rather than
+        // racing it for the registry file. Same-process double-acquire (e.g. nested
+        // `with_lock` calls) would deadlock here, which is intentional: it means the code
+        // grew a hold longer than intended.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| format!("locking {}", path.display()));
+        }
+        Ok(RegistryLock(file))
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -183,6 +226,22 @@ impl Registry {
         Ok(())
     }
 
+    /// Runs `f` against `repo`'s registry, freshly loaded, saving whatever it left behind —
+    /// all under one [`RegistryLock`] hold, so two `kanstack` processes doing this at once
+    /// serialize instead of one's save clobbering the other's (the load-modify-save race a
+    /// bare [`Self::load`]/[`Self::save`] pair can't protect against on its own). `f` failing
+    /// skips the save, same as a bare `load`-then-`?`-riddled-mutation-then-`save` would.
+    ///
+    /// A read that never saves (`status`, the board's own poll) can keep calling
+    /// [`Self::load`] directly — nothing to serialize when there's no write to lose.
+    pub fn with_lock<T>(repo: &Path, f: impl FnOnce(&mut Registry) -> Result<T>) -> Result<T> {
+        let _lock = RegistryLock::acquire(repo)?;
+        let mut registry = Self::load(repo)?;
+        let result = f(&mut registry)?;
+        registry.save()?;
+        Ok(result)
+    }
+
     pub fn get(&self, branch: &str) -> Option<&Workstream> {
         self.workstreams.iter().find(|w| w.branch_id.0 == branch)
     }
@@ -223,18 +282,19 @@ impl Registry {
 /// Records a pane the board just opened, so the subcommands can find it. Best-effort: a
 /// registry that can't be written must not undo a pane that did open.
 pub fn record_spawn(repo: &Path, branch: &str, pane_id: &str, agent: Option<&str>, workspace: Option<&str>) {
-    let Ok(mut registry) = Registry::load(repo) else { return };
-    if let Some(workspace) = workspace {
-        registry.workspace = Some(workspace.to_string());
-    }
-    let existing = registry.get(branch).cloned();
-    registry.upsert(Workstream {
-        branch_id: BranchId(branch.to_string()),
-        pane_id: Some(PaneId(pane_id.to_string())),
-        agent: agent.map(|a| AgentId(a.to_string())),
-        item: existing.and_then(|w| w.item),
+    let _ = Registry::with_lock(repo, |registry| {
+        if let Some(workspace) = workspace {
+            registry.workspace = Some(workspace.to_string());
+        }
+        let existing = registry.get(branch).cloned();
+        registry.upsert(Workstream {
+            branch_id: BranchId(branch.to_string()),
+            pane_id: Some(PaneId(pane_id.to_string())),
+            agent: agent.map(|a| AgentId(a.to_string())),
+            item: existing.and_then(|w| w.item),
+        });
+        Ok(())
     });
-    let _ = registry.save();
 }
 
 #[cfg(test)]
@@ -383,6 +443,112 @@ mod tests {
         r.save().unwrap();
         let again = Registry::load(Path::new("/repo/d")).unwrap();
         assert_eq!((again.workspace.as_deref(), again.workstreams.len()), (Some("workspace:2"), 1));
+
+        std::env::remove_var("KANSTACK_STATE_PATH");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Concurrency safety: `Registry::with_lock` exists because a bare `load`, mutate, `save`
+    // is a classic lost-update race between two `kanstack` processes. The next test
+    // reproduces that race directly, to show what's being fixed; the one after shows
+    // `with_lock` closing it even under the same forced overlap.
+
+    /// Without any lock, two processes that each load before either saves clobber one
+    /// another: the second `save` has no idea the first one happened, so it writes over it.
+    /// Modeled sequentially rather than with real threads — two processes never share a pid,
+    /// but `save`'s temp file name is derived from one, so racing this same test in threads
+    /// would trip over that instead of the lost-update bug it's meant to demonstrate.
+    #[test]
+    fn without_a_lock_two_concurrent_load_mutate_saves_can_lose_an_update() {
+        let _guard = crate::SPLIT_BACKEND_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("kanstack-workstream-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("KANSTACK_STATE_PATH", &dir);
+        let repo = Path::new("/repo/race");
+        Registry::load(repo).unwrap().save().unwrap();
+
+        // Both "processes" load the same pre-mutation snapshot before either has saved.
+        let mut one = Registry::load(repo).unwrap();
+        let mut two = Registry::load(repo).unwrap();
+        one.upsert(ws("one", Some("one")));
+        two.upsert(ws("two", Some("two")));
+        one.save().unwrap();
+        two.save().unwrap();
+
+        let after = Registry::load(repo).unwrap();
+        assert_eq!(after.workstreams.len(), 1, "two's save clobbered one's update: {after:?}");
+
+        std::env::remove_var("KANSTACK_STATE_PATH");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same forced overlap as above — a sleep between load and save, wider than any real
+    /// scheduling accident would need — but now through `with_lock`. Three mutations, echoing
+    /// `kanstack spawn one`/`two`/`three` launched at once: every one of them must still be on
+    /// disk afterwards.
+    #[test]
+    fn with_lock_serializes_concurrent_mutations_so_none_are_lost() {
+        let _guard = crate::SPLIT_BACKEND_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("kanstack-workstream-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("KANSTACK_STATE_PATH", &dir);
+        let repo = Path::new("/repo/locked");
+        Registry::load(repo).unwrap().save().unwrap();
+
+        let branches = ["one", "two", "three"];
+        std::thread::scope(|scope| {
+            for branch in branches {
+                scope.spawn(move || {
+                    Registry::with_lock(repo, |registry| {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        registry.upsert(ws(branch, Some(branch)));
+                        Ok(())
+                    })
+                    .unwrap();
+                });
+            }
+        });
+
+        let after = Registry::load(repo).unwrap();
+        for branch in branches {
+            assert!(after.get(branch).is_some(), "{branch} was lost to a concurrent save: {after:?}");
+        }
+        assert_eq!(after.workstreams.len(), branches.len());
+
+        std::env::remove_var("KANSTACK_STATE_PATH");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A closure that errors partway through must neither save its half-done mutation nor
+    /// leave the lock held — the latter checked by having a second `with_lock` prove it can
+    /// still get in, bounded so a regression hangs this test instead of the whole suite.
+    #[test]
+    fn a_failed_mutation_is_not_saved_and_its_lock_is_released() {
+        let _guard = crate::SPLIT_BACKEND_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("kanstack-workstream-lockerr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("KANSTACK_STATE_PATH", &dir);
+        let repo = Path::new("/repo/lockerr");
+
+        let err = Registry::with_lock(repo, |registry| -> Result<()> {
+            registry.upsert(ws("doomed", Some("%1")));
+            anyhow::bail!("simulated failure partway through")
+        });
+        assert!(err.is_err());
+        assert!(Registry::load(repo).unwrap().get("doomed").is_none(), "a failed mutation must not be saved");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let repo_owned = repo.to_path_buf();
+        std::thread::spawn(move || {
+            let _ = Registry::with_lock(&repo_owned, |registry| {
+                registry.upsert(ws("ok", Some("%2")));
+                Ok(())
+            });
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a lock left over from the failed call would hang this instead of releasing");
+        assert!(Registry::load(repo).unwrap().get("ok").is_some());
 
         std::env::remove_var("KANSTACK_STATE_PATH");
         let _ = std::fs::remove_dir_all(&dir);
