@@ -288,6 +288,7 @@ kanstack status [--json]
 kanstack focus <branch|session>
 kanstack stop <branch|session>                             # closes the pane, ends its harness
 kanstack report <busy|idle> [<branch>]                     # what an agent says about itself
+kanstack prune [--json]                                     # forgets workstreams whose pane is confirmed gone
 ```
 
 `<session>` is a pane id as `kanstack status` prints it. `spawn` splits off the pane you run it
@@ -367,6 +368,20 @@ be reached: it still lists every workstream, with `unknown` for those that have 
 empty registry gives `{"schema":1,"workstreams":[],"workspace":null}`. What it will not do is
 paper over a registry file that is corrupt or unreadable: that exits non-zero with the reason
 on stderr and nothing on stdout, because starting over would orphan every pane it tracks.
+
+**`kanstack prune [--json]`** forgets workstreams whose pane the poll has confirmed gone —
+closed outside kanstack, the process died — the same `dead` reading `status` shows. It only
+ever removes a `dead` one: a poll that comes back `unknown`, because no multiplexer is
+reachable right now or it failed to answer, leaves every workstream alone rather than
+guessing. That makes it safe to run from anywhere, on a schedule or before every `spawn`, with
+no risk of it wiping the registry just because it wasn't run from inside a pane this time.
+
+```json
+{"schema":1,"pruned":["old-spike"]}
+```
+
+The table form prints one `pruned <branch>` line per branch removed, or `nothing to prune`.
+`schema` versions independently of `status --json`'s.
 
 ### Where busy, idle and waiting come from
 

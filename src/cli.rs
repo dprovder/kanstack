@@ -21,7 +21,7 @@ use crate::report::{Reported, Reports};
 use crate::splitter::Splitter;
 use crate::workstream::{AgentId, BranchId, PaneId, Registry, WorkItemRef, Workstream};
 
-pub const SUBCOMMANDS: &[&str] = &["spawn", "send", "status", "focus", "stop", "report"];
+pub const SUBCOMMANDS: &[&str] = &["spawn", "send", "status", "focus", "stop", "report", "prune"];
 
 pub const HELP: &str = "\
 kanstack spawn <branch> [--agent <name>] [--prompt \"...\"] [--item <ref>]
@@ -47,6 +47,10 @@ kanstack report <busy|idle|waiting> [<branch>]
     too. <branch> defaults to $KANSTACK_BRANCH, which kanstack sets in a pane it launches.
     Prints nothing, and needs no multiplexer. KANSTACK_STATUS_HOOKS=off stops kanstack
     handing harnesses those hooks
+kanstack prune [--json]
+    forget workstreams whose pane is confirmed gone (closed outside kanstack, the process
+    died). Only removes ones the poll came back and said were dead — never ones it
+    couldn't ask, which stay registered. --json prints one JSON document instead of lines
 
 <session> is a pane id as `kanstack status` prints it. These need to run inside the
 multiplexer the panes live in (see README).
@@ -60,6 +64,7 @@ pub enum Command {
     Focus { target: String },
     Stop { target: String },
     Report { state: Reported, branch: Option<String> },
+    Prune { json: bool },
 }
 
 /// Parses the arguments after subcommand `name`. `Ok(None)` means help was asked for and
@@ -89,7 +94,7 @@ pub fn parse(name: &str, args: Vec<String>) -> Result<Option<Command>> {
             "--agent" if name == "spawn" => agent = Some(flag("--agent", inline.as_deref(), &mut args)?),
             "--prompt" if name == "spawn" => prompt = Some(flag("--prompt", inline.as_deref(), &mut args)?),
             "--item" if name == "spawn" => item = Some(flag("--item", inline.as_deref(), &mut args)?),
-            "--json" if name == "status" => {
+            "--json" if name == "status" || name == "prune" => {
                 if inline.is_some() {
                     bail!("--json takes no value\n\n{HELP}");
                 }
@@ -126,6 +131,7 @@ pub fn parse(name: &str, args: Vec<String>) -> Result<Option<Command>> {
             })?;
             Command::Report { state, branch: positional.next() }
         }
+        "prune" => Command::Prune { json },
         other => bail!("unknown subcommand {other:?}"),
     };
     if positional.next().is_some() {
@@ -374,6 +380,30 @@ fn poll_or_nothing(registry: &Registry) -> HashMap<String, PaneStatus> {
     seeded_splitter(registry).and_then(|s| s.poll_statuses()).unwrap_or_default()
 }
 
+/// The `"schema"` of `kanstack prune --json`, versioned independently of [`STATUS_SCHEMA`].
+pub const PRUNE_SCHEMA: u32 = 1;
+
+#[derive(Debug, Serialize)]
+struct PruneReport {
+    schema: u32,
+    pruned: Vec<String>,
+}
+
+/// Branches in `registry` whose pane the poll has confirmed gone — present in the registry
+/// with a pane id, but reported [`PaneStatus::Dead`]. Anything the poll has nothing to say
+/// about (no multiplexer reachable, the branch missing from its answer, `Unknown`) is left
+/// alone: absence of a reading is never grounds to forget a workstream, only a reading of
+/// `Dead` is — see `poll_or_nothing`, whose empty map when no backend is found makes this
+/// naturally prune nothing rather than everything.
+fn stale_branches(registry: &Registry, statuses: &HashMap<String, PaneStatus>) -> Vec<String> {
+    registry
+        .workstreams
+        .iter()
+        .filter(|w| w.pane_id.is_some() && statuses.get(&w.branch_id.0) == Some(&PaneStatus::Dead))
+        .map(|w| w.branch_id.0.clone())
+        .collect()
+}
+
 pub fn run(command: Command, cwd: &Path, out: &mut impl Write) -> Result<()> {
     // Before the registry is even read: this runs from a harness's hooks, on every turn, and
     // a registry problem must not make it noisy or slow. And it writes nothing to `out` —
@@ -535,6 +565,33 @@ pub fn run(command: Command, cwd: &Path, out: &mut impl Write) -> Result<()> {
             registry.remove(&branch);
             registry.save()?;
             writeln!(out, "stopped {branch}")?;
+        }
+        Command::Prune { json } => {
+            // Best-effort, like `poll_or_nothing` itself: no multiplexer reachable, or a poll
+            // that fails, must prune nothing rather than error out — an orchestrator calling
+            // this routinely shouldn't have to special-case "not currently inside a pane". The
+            // poll itself reads outside the lock (a plain `load`, same as `status`); only the
+            // remove-and-save below needs it, same as every other mutating subcommand.
+            let registry = Registry::load(cwd)?;
+            let statuses = poll_or_nothing(&registry);
+            let stale = stale_branches(&registry, &statuses);
+            if !stale.is_empty() {
+                Registry::with_lock(cwd, |registry| {
+                    for branch in &stale {
+                        registry.remove(branch);
+                    }
+                    Ok(())
+                })?;
+            }
+            if json {
+                writeln!(out, "{}", serde_json::to_string(&PruneReport { schema: PRUNE_SCHEMA, pruned: stale })?)?;
+            } else if stale.is_empty() {
+                writeln!(out, "nothing to prune")?;
+            } else {
+                for branch in &stale {
+                    writeln!(out, "pruned {branch}")?;
+                }
+            }
         }
     }
     Ok(())
@@ -1228,5 +1285,141 @@ mod tests {
             json,
             r#"{"schema":1,"workstreams":[{"branch":"feat-ui","pane":"%3","agent":"claude","item":null,"status":"busy","lane":null}],"workspace":null}"#
         );
+    }
+
+    // `kanstack prune` — forgetting workstreams whose pane is confirmed gone.
+
+    #[test]
+    fn parse_accepts_prune_with_an_optional_json_flag() {
+        assert_eq!(parse("prune", args(&[])).unwrap(), Some(Command::Prune { json: false }));
+        assert_eq!(parse("prune", args(&["--json"])).unwrap(), Some(Command::Prune { json: true }));
+        assert!(parse("prune", args(&["extra"])).is_err(), "prune takes no positional arguments");
+    }
+
+    /// A poll that confirms a pane gone (`Dead`) marks its branch stale; anything the poll
+    /// merely has nothing to say about — busy, idle, waiting, unknown, or no entry at all —
+    /// must not be, and neither should a workstream with no pane to poll in the first place.
+    #[test]
+    fn stale_branches_picks_only_a_confirmed_dead_pane() {
+        let statuses = HashMap::from([
+            ("fix-login".to_string(), PaneStatus::Busy),
+            ("add-search".to_string(), PaneStatus::Idle),
+            ("old-spike".to_string(), PaneStatus::Dead),
+            ("mystery".to_string(), PaneStatus::Unknown),
+            // No entry for "planned": it has no pane to poll in the first place.
+        ]);
+        assert_eq!(stale_branches(&five_workstreams(), &statuses), vec!["old-spike".to_string()]);
+    }
+
+    /// An empty status map — what `poll_or_nothing` returns when no multiplexer is reachable
+    /// or the poll failed — must never be read as "every pane is gone".
+    #[test]
+    fn stale_branches_prunes_nothing_when_the_poll_has_nothing_to_say() {
+        assert_eq!(stale_branches(&five_workstreams(), &HashMap::new()), Vec::<String>::new());
+    }
+
+    /// Runs `kanstack prune` against a stand-in `tmux` whose `list-panes` answers
+    /// `list_panes`, with `workstreams` pre-loaded into the registry. Returns what it printed
+    /// and the registry as `prune` left it on disk.
+    fn prune_with_tmux(tag: &str, list_panes: &str, workstreams: Vec<Workstream>, json: bool) -> (String, Registry) {
+        use crate::mux::stand_in;
+        let (bin, _log) = stand_in::install(tag, "tmux", &format!(r#"case "$1" in list-panes) {list_panes} ;; esac"#));
+        let state = std::env::temp_dir().join(format!("kanstack-cli-{tag}-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state);
+        let (mut printed, mut after) = (String::new(), Registry::default());
+        stand_in::with_env(
+            &[
+                ("KANSTACK_STATE_PATH", Some(state.to_str().unwrap())),
+                ("KANSTACK_SPLIT_BACKEND", Some("tmux")),
+                ("KANSTACK_TMUX_BIN", Some(bin.to_str().unwrap())),
+                ("TMUX_PANE", Some("%0")),
+            ],
+            || {
+                let repo = Path::new("/repo/prune-backend");
+                let mut registry = Registry::load(repo).unwrap();
+                for w in workstreams {
+                    registry.upsert(w);
+                }
+                registry.save().unwrap();
+                let mut out = Vec::new();
+                run(Command::Prune { json }, repo, &mut out).expect("prune must not fail here");
+                printed = String::from_utf8(out).unwrap();
+                after = Registry::load(repo).unwrap();
+            },
+        );
+        stand_in::remove(&bin);
+        let _ = std::fs::remove_dir_all(&state);
+        (printed, after)
+    }
+
+    #[test]
+    fn prune_json_removes_only_the_pane_the_poll_confirms_gone() {
+        let workstreams = vec![
+            workstream("fix-login", Some("%3"), Some("claude"), None),
+            workstream("old-spike", Some("%5"), Some("codex"), None),
+            workstream("planned", None, None, None),
+        ];
+        // Only %3 is in the listing: fix-login is alive, old-spike is gone.
+        let (printed, after) =
+            prune_with_tmux("prune-json", r#"printf '%%3 2000000000\n'"#, workstreams, true);
+        assert_eq!(printed, "{\"schema\":1,\"pruned\":[\"old-spike\"]}\n");
+        assert_eq!(after.get("old-spike"), None, "the dead one is forgotten");
+        assert!(after.get("fix-login").is_some(), "the live one stays");
+        assert!(after.get("planned").is_some(), "a workstream with no pane is untouched");
+    }
+
+    #[test]
+    fn prune_table_prints_one_line_per_pruned_branch_or_says_there_is_nothing() {
+        let dead = vec![workstream("old-spike", Some("%5"), Some("codex"), None)];
+        let (printed, after) = prune_with_tmux("prune-table-some", "printf ''", dead, false);
+        assert_eq!(printed, "pruned old-spike\n");
+        assert_eq!(after.get("old-spike"), None);
+
+        let alive = vec![workstream("fix-login", Some("%3"), Some("claude"), None)];
+        let (printed, after) = prune_with_tmux("prune-table-none", r#"printf '%%3 2000000000\n'"#, alive, false);
+        assert_eq!(printed, "nothing to prune\n");
+        assert!(after.get("fix-login").is_some());
+    }
+
+    /// The one case this whole feature exists to get right: no multiplexer reachable must
+    /// prune nothing, not everything, and must not error out either — see `poll_or_nothing`.
+    #[test]
+    fn prune_leaves_every_workstream_alone_when_no_backend_is_reachable() {
+        let _guard = crate::SPLIT_BACKEND_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("kanstack-cli-prune-no-backend-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let vars = [
+            ("KANSTACK_STATE_PATH", Some(dir.to_str().unwrap())),
+            ("KANSTACK_SPLIT_BACKEND", Some("tmux")),
+            ("TMUX_PANE", None),
+        ];
+        let old: Vec<_> = vars.iter().map(|(k, _)| (*k, std::env::var_os(k))).collect();
+        for (k, v) in vars {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+
+        let repo = Path::new("/repo/prune-no-backend");
+        let mut registry = Registry::load(repo).unwrap();
+        registry.upsert(workstream("fix-login", Some("%3"), Some("claude"), None));
+        registry.save().unwrap();
+
+        let mut out = Vec::new();
+        let result = run(Command::Prune { json: true }, repo, &mut out);
+        let after = result.as_ref().ok().map(|()| Registry::load(repo).unwrap());
+
+        for (k, v) in old {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        result.expect("prune must not error just because no multiplexer is reachable");
+        assert_eq!(String::from_utf8(out).unwrap(), "{\"schema\":1,\"pruned\":[]}\n");
+        assert!(after.unwrap().get("fix-login").is_some(), "unknown must never be treated as dead");
     }
 }
