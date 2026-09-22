@@ -1,6 +1,6 @@
 [package]
 name = "kanstack"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2021"
 rust-version = "1.82"
 description = "An unofficial kanban-style terminal UI for the GitButler CLI"
