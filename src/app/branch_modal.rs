@@ -296,7 +296,7 @@ impl App {
         // not need to stay alive past `board_from` below — its last use there is what
         // lets the borrow checker treat the `&mut self` calls after it as fine.
         let cwd = but.cwd().to_path_buf();
-        match but.branch_new(name, anchor) {
+        match but.branch_new(name, anchor.map(Placement::Above)) {
             Ok(status) => {
                 self.board = Self::board_from(but, &mut self.commit_stats, &status);
                 self.clamp();

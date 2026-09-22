@@ -16,7 +16,7 @@
 use anyhow::Result;
 
 use crate::board::{Board, Card, CardKind, ColumnKind, Unapplied};
-use crate::but::But;
+use crate::but::{But, Placement};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::mpsc;

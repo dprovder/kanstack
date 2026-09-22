@@ -6,7 +6,7 @@ use std::path::Path;
 use anyhow::Result;
 use serde::Serialize;
 
-use crate::but::But;
+use crate::but::{But, Placement};
 use crate::pane_status::PaneStatus;
 use crate::workstream::{AgentId, BranchId, PaneId, Registry, WorkItemRef, Workstream};
 
@@ -24,11 +24,16 @@ struct SpawnResult {
     workspace: Option<String>,
 }
 
+// One parameter per `spawn` flag, same shape as `Command::Spawn` itself — a struct would
+// only rename this same list, not shorten it.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn run(
     branch: String,
     agent: Option<String>,
     prompt: Option<String>,
     item: Option<String>,
+    above: Option<String>,
+    below: Option<String>,
     json: bool,
     cwd: &Path,
     out: &mut impl Write,
@@ -50,10 +55,31 @@ pub(super) fn run(
         // pane groups with, not just whether the branch itself needs creating.
         let status = but.status().map_err(|e| tag(ButFailed, e))?;
         let exists = status.stacks.iter().flat_map(|s| &s.branches).any(|b| b.name == branch);
+        // --above/--below only make sense for a branch spawn itself is about to create —
+        // stacking an *existing* branch onto another is `but move`'s job, not spawn's.
+        if exists && (above.is_some() || below.is_some()) {
+            let flag = if above.is_some() { "--above" } else { "--below" };
+            return Err(tag(
+                BranchAlreadyExists,
+                anyhow::anyhow!(
+                    "{branch} already exists — {flag} only places a newly created branch; \
+                     use `but move` to restack an existing one"
+                ),
+            ));
+        }
         let created = !exists;
         if created {
-            but.branch_new(&branch, None).map_err(|e| tag(ButFailed, e))?;
-            lines.push(format!("created {branch}"));
+            let placement = match (&above, &below) {
+                (Some(a), _) => Some(Placement::Above(a.as_str())),
+                (None, Some(b)) => Some(Placement::Below(b.as_str())),
+                (None, None) => None,
+            };
+            but.branch_new(&branch, placement).map_err(|e| tag(ButFailed, e))?;
+            lines.push(match (&above, &below) {
+                (Some(a), _) => format!("created {branch} above {a}"),
+                (None, Some(b)) => format!("created {branch} below {b}"),
+                (None, None) => format!("created {branch}"),
+            });
         }
 
         // One poll answers every question below: is the branch's old pane still alive,
@@ -195,6 +221,12 @@ mod tests {
         format!("cat '{}'", concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/status.json"))
     }
 
+    /// `but status`'s reply for tests that need `spawn` to take the "branch doesn't exist
+    /// yet" path — `--above`/`--below` only reach `but branch new` on that path.
+    fn but_status_no_feat_ui_cat() -> String {
+        format!("cat '{}'", concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/status_no_feat_ui.json"))
+    }
+
     #[test]
     fn spawn_json_reports_the_pane_the_agent_and_whether_it_created_the_branch() {
         with_but_and_tmux(
@@ -205,7 +237,7 @@ mod tests {
             |repo| {
                 let mut out = Vec::new();
                 crate::cli::run(
-                    Command::Spawn { branch: "feat-ui".into(), agent: Some("codex".into()), prompt: None, item: None, json: true },
+                    Command::Spawn { branch: "feat-ui".into(), agent: Some("codex".into()), prompt: None, item: None, above: None, below: None, json: true },
                     repo,
                     &mut out,
                 )
@@ -215,6 +247,87 @@ mod tests {
                     "{\"schema\":1,\"ok\":true,\"command\":\"spawn\",\"workstream\":\"feat-ui\",\"result\":\
                      {\"created\":false,\"pane\":\"%9\",\"agent\":\"codex\",\"workspace\":null}}\n"
                 );
+            },
+        );
+    }
+
+    /// `spawn --above`/`--below` reach `but branch new` as `--above`/`--below` (not the
+    /// deprecated `--anchor` this crate used before placement became two-directional) —
+    /// confirmed by inspecting the stand-in `but`'s own invocation log, since that's the
+    /// only way to see what args a `but` call actually got.
+    #[test]
+    fn spawn_above_and_below_reach_but_branch_new() {
+        use crate::mux::stand_in;
+        for (above, below, but_flag) in
+            [(Some("feat-auth".to_string()), None, "--above"), (None, Some("feat-auth".to_string()), "--below")]
+        {
+            let tag = format!("spawn-placement-{}", &but_flag[2..]);
+            let (but_bin, but_log) = stand_in::install(
+                &tag,
+                "but",
+                &format!("case \"$1\" in --version) echo 'but 0.22.3' ;; status) {} ;; esac", but_status_no_feat_ui_cat()),
+            );
+            let (tmux_bin, _tmux_log) =
+                stand_in::install(&tag, "tmux", r#"case "$1" in list-panes) printf '' ;; split-window) echo '%9' ;; esac"#);
+            let repo = std::env::temp_dir().join(format!("kanstack-cli-{tag}-repo-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&repo);
+            std::fs::create_dir_all(&repo).unwrap();
+            let state = std::env::temp_dir().join(format!("kanstack-cli-{tag}-state-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&state);
+            stand_in::with_env(
+                &[
+                    ("KANSTACK_STATE_PATH", Some(state.to_str().unwrap())),
+                    ("KANSTACK_SPLIT_BACKEND", Some("tmux")),
+                    ("KANSTACK_TMUX_BIN", Some(tmux_bin.to_str().unwrap())),
+                    ("KANSTACK_BUT_BIN", Some(but_bin.to_str().unwrap())),
+                    ("TMUX_PANE", Some("%0")),
+                ],
+                || {
+                    let command =
+                        Command::Spawn { branch: "feat-ui".into(), agent: None, prompt: None, item: None, above, below, json: false };
+                    crate::cli::run(command, &repo, &mut Vec::new()).expect("spawn with a placement flag succeeds");
+                },
+            );
+            let lines = stand_in::log_lines(&but_log);
+
+            stand_in::remove(&but_bin);
+            stand_in::remove(&tmux_bin);
+            let _ = std::fs::remove_dir_all(&repo);
+            let _ = std::fs::remove_dir_all(&state);
+
+            assert!(
+                lines.iter().any(|l| l == &format!("branch new feat-ui {but_flag} feat-auth --json")),
+                "{but_flag}: but was called with {lines:?}"
+            );
+        }
+    }
+
+    /// `spawn --above`/`--below` on a branch that already exists is `branch_already_exists`
+    /// — exit `4` — not silently ignored: stacking an *existing* branch is `but move`'s job.
+    #[test]
+    fn spawn_above_on_an_already_existing_branch_is_a_branch_already_exists_error() {
+        with_but_and_tmux(
+            "spawn-above-exists",
+            &but_status_cat(),
+            r#"case "$1" in list-panes) printf '' ;; esac"#,
+            vec![],
+            |repo| {
+                let mut out = Vec::new();
+                let mut err_out = Vec::new();
+                let command = Command::Spawn {
+                    branch: "feat-ui".into(),
+                    agent: None,
+                    prompt: None,
+                    item: None,
+                    above: Some("feat-auth".into()),
+                    below: None,
+                    json: true,
+                };
+                let code = dispatch(command, repo, &mut out, &mut err_out);
+                assert_eq!(code, 4);
+                assert!(err_out.is_empty());
+                let printed = String::from_utf8(out).unwrap();
+                assert!(printed.contains(r#""code":"branch_already_exists""#), "{printed}");
             },
         );
     }
@@ -231,7 +344,7 @@ mod tests {
             |repo| {
                 let mut out = Vec::new();
                 let mut err_out = Vec::new();
-                let command = Command::Spawn { branch: "feat-ui".into(), agent: None, prompt: None, item: None, json: true };
+                let command = Command::Spawn { branch: "feat-ui".into(), agent: None, prompt: None, item: None, above: None, below: None, json: true };
                 let code = dispatch(command, repo, &mut out, &mut err_out);
                 assert_eq!(code, 4);
                 assert!(err_out.is_empty());
@@ -278,7 +391,7 @@ mod tests {
         );
         with_but_and_tmux(tag, &but_body, &tmux_body, vec![], |repo| {
             let first = crate::cli::run(
-                Command::Spawn { branch: "feat-ui".into(), agent: None, prompt: None, item: None, json: false },
+                Command::Spawn { branch: "feat-ui".into(), agent: None, prompt: None, item: None, above: None, below: None, json: false },
                 repo,
                 &mut Vec::new(),
             );
@@ -289,7 +402,7 @@ mod tests {
             );
 
             let mut out = Vec::new();
-            crate::cli::run(Command::Spawn { branch: "feat-ui".into(), agent: None, prompt: None, item: None, json: true }, repo, &mut out)
+            crate::cli::run(Command::Spawn { branch: "feat-ui".into(), agent: None, prompt: None, item: None, above: None, below: None, json: true }, repo, &mut out)
                 .expect("retrying spawn on the same branch must now succeed");
             let printed = String::from_utf8(out).unwrap();
             assert!(

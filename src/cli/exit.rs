@@ -13,7 +13,7 @@
 //! | `1` | internal: a bug, a corrupt registry, an I/O failure below everything else here | `internal` |
 //! | `2` | invalid arguments — caught before anything ran | `invalid_arguments` |
 //! | `3` | nothing to act on: the target names no workstream, or it has no pane | `unknown_workstream`, `no_pane` |
-//! | `4` | conflict: `spawn` on a branch that already has a live pane | `workstream_exists` |
+//! | `4` | conflict: `spawn` on a branch that already has a live pane, or `--above`/`--below` on a branch that already exists | `workstream_exists`, `branch_already_exists` |
 //! | `5` | an external dependency is unavailable or refused: the split backend, `but`, the harness, or delivering a message to a pane | `multiplexer_unavailable`, `harness_unavailable`, `but_failed`, `delivery_failed` |
 //!
 //! A condition is tagged with [`tag`] at the point in [`super::run`] that already knows which
@@ -44,6 +44,9 @@ pub enum ErrorCode {
     UnknownWorkstream,
     /// `spawn` on a branch that already has a pane open.
     WorkstreamExists,
+    /// `spawn --above`/`--below` on a branch that already exists — stacking an existing
+    /// branch onto another is `but move`'s job, not spawn's.
+    BranchAlreadyExists,
     /// The workstream has no pane for this command to act on.
     NoPane,
     /// No split backend could be reached — none found, or a call to the one found failed.
@@ -67,6 +70,7 @@ impl ErrorCode {
             ErrorCode::InvalidArguments => "invalid_arguments",
             ErrorCode::UnknownWorkstream => "unknown_workstream",
             ErrorCode::WorkstreamExists => "workstream_exists",
+            ErrorCode::BranchAlreadyExists => "branch_already_exists",
             ErrorCode::NoPane => "no_pane",
             ErrorCode::MultiplexerUnavailable => "multiplexer_unavailable",
             ErrorCode::HarnessUnavailable => "harness_unavailable",
@@ -84,7 +88,7 @@ impl ErrorCode {
             ErrorCode::Internal => 1,
             ErrorCode::InvalidArguments => 2,
             ErrorCode::UnknownWorkstream | ErrorCode::NoPane => 3,
-            ErrorCode::WorkstreamExists => 4,
+            ErrorCode::WorkstreamExists | ErrorCode::BranchAlreadyExists => 4,
             ErrorCode::MultiplexerUnavailable
             | ErrorCode::HarnessUnavailable
             | ErrorCode::ButFailed
@@ -222,10 +226,11 @@ pub fn dispatch(command: Command, cwd: &Path, out: &mut impl Write, err_out: &mu
 mod tests {
     use super::*;
 
-    const ALL: [ErrorCode; 9] = [
+    const ALL: [ErrorCode; 10] = [
         ErrorCode::InvalidArguments,
         ErrorCode::UnknownWorkstream,
         ErrorCode::WorkstreamExists,
+        ErrorCode::BranchAlreadyExists,
         ErrorCode::NoPane,
         ErrorCode::MultiplexerUnavailable,
         ErrorCode::HarnessUnavailable,
@@ -261,6 +266,7 @@ mod tests {
         assert_eq!(ErrorCode::UnknownWorkstream.exit_code(), 3);
         assert_eq!(ErrorCode::NoPane.exit_code(), 3);
         assert_eq!(ErrorCode::WorkstreamExists.exit_code(), 4);
+        assert_eq!(ErrorCode::BranchAlreadyExists.exit_code(), 4);
         assert_eq!(ErrorCode::MultiplexerUnavailable.exit_code(), 5);
         assert_eq!(ErrorCode::HarnessUnavailable.exit_code(), 5);
         assert_eq!(ErrorCode::ButFailed.exit_code(), 5);

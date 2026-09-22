@@ -1,21 +1,33 @@
 use super::*;
 
+/// Where a new branch is placed relative to an existing applied branch, for
+/// [`But::branch_new`] — `but branch new --above`/`--below` (0.22). Spelled out as an enum,
+/// rather than the crate's older single `anchor: Option<&str>` (which only ever meant
+/// "above", via the now-deprecated `--anchor` alias), once a caller (`kanstack spawn
+/// --below`) needed to say which direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Placement<'a> {
+    Above(&'a str),
+    Below(&'a str),
+}
+
 impl But {
 
-    /// Creates a branch, optionally stacked on top of `anchor`.
+    /// Creates a branch, optionally stacked above or below `placement`'s branch.
     ///
-    /// With no anchor the branch becomes its own lane, applied in parallel. With one, it
-    /// is stacked on top of that branch and shares its lane — which is what makes the two
-    /// gestures on a board different operations rather than the same one.
+    /// With no placement the branch becomes its own lane, applied in parallel. With one,
+    /// it shares that branch's stack — which is what makes the two gestures on a board
+    /// different operations rather than the same one.
     ///
     /// `branch new` does not embed a status the way `rub`/`commit`/`move` do (verified
     /// against 0.21.2: the reply is just `{"branch":…,"anchor":…}`), so the board is
     /// queried separately.
-    pub fn branch_new(&self, name: &str, anchor: Option<&str>) -> Result<WorkspaceStatus> {
+    pub fn branch_new(&self, name: &str, placement: Option<Placement<'_>>) -> Result<WorkspaceStatus> {
         let mut args = vec!["branch", "new", name];
-        if let Some(a) = anchor {
-            args.push("--anchor");
-            args.push(a);
+        match placement {
+            Some(Placement::Above(a)) => args.extend(["--above", a]),
+            Some(Placement::Below(b)) => args.extend(["--below", b]),
+            None => {}
         }
         args.push("--json");
         self.run(&args)?;

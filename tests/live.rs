@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use kanstack::board::{Board, CardKind, ColumnKind};
-use kanstack::but::{But, MIN_VERSION};
+use kanstack::but::{But, Placement, MIN_VERSION};
 
 struct Sandbox {
     root: PathBuf,
@@ -640,7 +640,7 @@ fn a_branch_with_an_anchor_stacks_into_the_same_lane() {
     let before = Board::from_status(&but.status().unwrap());
     assert_eq!(before.columns.len(), 2, "backlog + one lane");
 
-    let after = Board::from_status(&but.branch_new("feat-ui", Some("feat-auth")).expect("branch"));
+    let after = Board::from_status(&but.branch_new("feat-ui", Some(Placement::Above("feat-auth"))).expect("branch"));
     assert_eq!(
         after.columns.len(),
         2,
@@ -1625,7 +1625,7 @@ fn shift_arrows_page_lanes_and_skip_groups_through_the_app() {
     // A second branch, anchored on the first, so the lane is a real two-branch stack --
     // exactly the shape Shift+↑/↓ is meant to skip across.
     let but = But::discover(&sb.repo()).unwrap();
-    but.branch_new("mid-work", Some("base-work")).unwrap();
+    but.branch_new("mid-work", Some(Placement::Above("base-work"))).unwrap();
     sb.write("b.txt", "mid\n");
     let status = but.status().unwrap();
     let id = status
@@ -1683,7 +1683,7 @@ fn landing_a_stacked_lane_lands_every_branch_base_first() {
     let sb = Sandbox::new("cascadeland");
     sb.branch_with_commit("base-work", "a.txt", "base work");
     let but = But::discover(&sb.repo()).unwrap();
-    but.branch_new("mid-work", Some("base-work")).unwrap();
+    but.branch_new("mid-work", Some(Placement::Above("base-work"))).unwrap();
     sb.write("b.txt", "mid\n");
     let status = but.status().unwrap();
     let id = status
@@ -1694,7 +1694,7 @@ fn landing_a_stacked_lane_lands_every_branch_base_first() {
         .cli_id
         .clone();
     but.commit(&[id], "mid work", "mid-work").unwrap();
-    but.branch_new("tip-work", Some("mid-work")).unwrap();
+    but.branch_new("tip-work", Some(Placement::Above("mid-work"))).unwrap();
     sb.write("c.txt", "tip\n");
     let status = but.status().unwrap();
     let id = status

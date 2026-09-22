@@ -33,6 +33,7 @@ mod setup;
 mod skill;
 mod undo;
 
+pub use branch::Placement;
 pub use pr::PrOptions;
 
 /// Oldest `but` whose JSON shape this was verified against.

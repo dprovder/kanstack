@@ -41,12 +41,17 @@ pub use status::STATUS_SCHEMA;
 pub const SUBCOMMANDS: &[&str] = &["spawn", "send", "status", "focus", "stop", "report", "prune", "events"];
 
 pub const HELP: &str = "\
-kanstack spawn <branch> [--agent <name>] [--prompt \"...\"] [--item <ref>] [--json]
+kanstack spawn <branch> [--agent <name>] [--prompt \"...\"] [--item <ref>]
+    [--above <base>|--below <base>] [--json]
     open a harness pane on <branch>, creating the branch first if it doesn't exist.
     --agent runs that harness (e.g. codex) instead of $KANSTACK_HARNESS; --prompt is
     the harness's first message; --item attaches an opaque work-item reference (e.g.
     github:#42) to the workstream, carried in `status`/`status --json` and never
-    interpreted or fetched by kanstack itself
+    interpreted or fetched by kanstack itself. --above/--below stack the new branch on
+    <base> instead of giving it its own lane (mutually exclusive; only meaningful when
+    <branch> doesn't exist yet — spawning on one that already does is `workstream_exists`
+    regardless, and stacking an *existing* branch onto another is `but move`'s job, not
+    spawn's)
 kanstack send <branch|session> \"...\" [--json]
     type a message into a pane and submit it
 kanstack status [--json]
@@ -89,7 +94,15 @@ the `error.code` a failed --json document carries are documented in the README.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    Spawn { branch: String, agent: Option<String>, prompt: Option<String>, item: Option<String>, json: bool },
+    Spawn {
+        branch: String,
+        agent: Option<String>,
+        prompt: Option<String>,
+        item: Option<String>,
+        above: Option<String>,
+        below: Option<String>,
+        json: bool,
+    },
     Send { target: String, text: String, json: bool },
     Status { json: bool },
     Focus { target: String, json: bool },
@@ -140,6 +153,8 @@ pub fn parse(name: &str, args: Vec<String>) -> Result<Option<Command>> {
     let mut agent = None;
     let mut prompt = None;
     let mut item = None;
+    let mut above = None;
+    let mut below = None;
     let mut json = false;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -167,6 +182,8 @@ pub fn parse(name: &str, args: Vec<String>) -> Result<Option<Command>> {
                 follow = true;
             }
             "--item" if name == "spawn" => item = Some(flag("--item", inline.as_deref(), &mut args)?),
+            "--above" if name == "spawn" => above = Some(flag("--above", inline.as_deref(), &mut args)?),
+            "--below" if name == "spawn" => below = Some(flag("--below", inline.as_deref(), &mut args)?),
             "--json" => {
                 if inline.is_some() {
                     bail!("--json takes no value\n\n{HELP}");
@@ -185,7 +202,12 @@ pub fn parse(name: &str, args: Vec<String>) -> Result<Option<Command>> {
             .ok_or_else(|| anyhow::anyhow!("`kanstack {name}` needs a {what}\n\n{HELP}"))
     };
     let command = match name {
-        "spawn" => Command::Spawn { branch: one("<branch>")?, agent, prompt, item, json },
+        "spawn" => {
+            if above.is_some() && below.is_some() {
+                bail!("`kanstack spawn` takes --above or --below, not both\n\n{HELP}");
+            }
+            Command::Spawn { branch: one("<branch>")?, agent, prompt, item, above, below, json }
+        }
         "send" => {
             let target = one("<branch|session>")?;
             let text = positional.collect::<Vec<_>>().join(" ");
@@ -289,7 +311,9 @@ struct PaneResult {
 
 pub fn run(command: Command, cwd: &Path, out: &mut impl Write) -> Result<()> {
     match command {
-        Command::Spawn { branch, agent, prompt, item, json } => spawn::run(branch, agent, prompt, item, json, cwd, out),
+        Command::Spawn { branch, agent, prompt, item, above, below, json } => {
+            spawn::run(branch, agent, prompt, item, above, below, json, cwd, out)
+        }
         Command::Send { target, text, json } => send::run(target, text, json, cwd, out),
         Command::Status { json } => status::run(json, cwd, out),
         Command::Focus { target, json } => focus::run(target, json, cwd, out),
@@ -375,7 +399,15 @@ mod tests {
     fn spawn_takes_a_branch_and_optional_agent_and_prompt() {
         assert_eq!(
             parse("spawn", args(&["fix-login"])).unwrap(),
-            Some(Command::Spawn { branch: "fix-login".into(), agent: None, prompt: None, item: None, json: false })
+            Some(Command::Spawn {
+                branch: "fix-login".into(),
+                agent: None,
+                prompt: None,
+                item: None,
+                above: None,
+                below: None,
+                json: false,
+            })
         );
         assert_eq!(
             parse("spawn", args(&["--agent", "codex", "fix-login", "--prompt", "fix the flaky test"])).unwrap(),
@@ -384,12 +416,22 @@ mod tests {
                 agent: Some("codex".into()),
                 prompt: Some("fix the flaky test".into()),
                 item: None,
+                above: None,
+                below: None,
                 json: false,
             })
         );
         assert_eq!(
             parse("spawn", args(&["b", "--agent=codex"])).unwrap(),
-            Some(Command::Spawn { branch: "b".into(), agent: Some("codex".into()), prompt: None, item: None, json: false })
+            Some(Command::Spawn {
+                branch: "b".into(),
+                agent: Some("codex".into()),
+                prompt: None,
+                item: None,
+                above: None,
+                below: None,
+                json: false,
+            })
         );
     }
 
@@ -402,6 +444,8 @@ mod tests {
                 agent: None,
                 prompt: None,
                 item: Some("github:#42".into()),
+                above: None,
+                below: None,
                 json: false,
             })
         );
@@ -412,11 +456,47 @@ mod tests {
                 agent: None,
                 prompt: None,
                 item: Some("linear:ENG-7".into()),
+                above: None,
+                below: None,
                 json: false,
             })
         );
         assert!(parse("spawn", args(&["b", "--item"])).is_err(), "--item requires a value");
         assert!(parse("send", args(&["b", "--item", "GH-1"])).is_err(), "--item is spawn-only");
+    }
+
+    #[test]
+    fn spawn_takes_above_or_below_but_not_both() {
+        assert_eq!(
+            parse("spawn", args(&["fix-parser", "--above", "main-feature"])).unwrap(),
+            Some(Command::Spawn {
+                branch: "fix-parser".into(),
+                agent: None,
+                prompt: None,
+                item: None,
+                above: Some("main-feature".into()),
+                below: None,
+                json: false,
+            })
+        );
+        assert_eq!(
+            parse("spawn", args(&["fix-parser", "--below=main-feature"])).unwrap(),
+            Some(Command::Spawn {
+                branch: "fix-parser".into(),
+                agent: None,
+                prompt: None,
+                item: None,
+                above: None,
+                below: Some("main-feature".into()),
+                json: false,
+            })
+        );
+        assert!(parse("spawn", args(&["b", "--above"])).is_err(), "--above requires a value");
+        assert!(
+            parse("spawn", args(&["b", "--above", "x", "--below", "y"])).is_err(),
+            "--above and --below are mutually exclusive"
+        );
+        assert!(parse("send", args(&["b", "--above", "x"])).is_err(), "--above is spawn-only");
     }
 
     #[test]
@@ -449,7 +529,7 @@ mod tests {
         assert!(parse("status", args(&["--json", "extra"])).is_err());
         assert_eq!(
             parse("spawn", args(&["b", "--json"])).unwrap(),
-            Some(Command::Spawn { branch: "b".into(), agent: None, prompt: None, item: None, json: true })
+            Some(Command::Spawn { branch: "b".into(), agent: None, prompt: None, item: None, above: None, below: None, json: true })
         );
         // `--json` is recognized as a flag wherever it falls among the arguments (flags are
         // split out before the remaining words are joined into the message), same as before
