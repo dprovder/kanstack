@@ -25,8 +25,11 @@
 
 use std::io::Write;
 use std::path::Path;
+use std::time::SystemTime;
 
 use serde::Serialize;
+
+use crate::events::EventLog;
 
 use super::{Command, run};
 
@@ -177,15 +180,40 @@ pub fn report_error(command: &str, e: anyhow::Error, json: bool, out: &mut impl 
     code.exit_code()
 }
 
+/// Which lifecycle event, if any, `command` should ring the events-log doorbell for
+/// (`crate::events`) once it succeeds — `spawn`/`stop`/`prune` only, the branch it named when
+/// it named one. `report` already rings it, from `Reports::write`, not from here; `send`,
+/// `focus`, `status` and `events` don't change what "lifecycle" means for a workstream, so
+/// none of them log anything here.
+fn lifecycle_event(command: &Command) -> Option<(&'static str, Option<String>)> {
+    match command {
+        Command::Spawn { branch, .. } => Some(("spawn", Some(branch.clone()))),
+        // Whatever `<branch|session>` was given — not necessarily resolved to a branch name;
+        // see the module doc on `crate::events`.
+        Command::Stop { target, .. } => Some(("stop", Some(target.clone()))),
+        // `prune` can remove several workstreams or none; one event marks that it ran rather
+        // than guessing which branches it touched.
+        Command::Prune { .. } => Some(("prune", None)),
+        Command::Send { .. } | Command::Status { .. } | Command::Focus { .. } | Command::Report { .. } | Command::Events { .. } => None,
+    }
+}
+
 /// Runs `command` against `cwd` and returns the process exit code — `0` for success, else
 /// [`ErrorCode::exit_code`]. Whatever `command` itself has to say on success — human text, or
 /// one `--json` document — goes to `out` from inside [`super::run`], unchanged by this
-/// wrapper; a failure is [`report_error`].
+/// wrapper; a failure is [`report_error`]. A spawn/stop/prune that succeeds also rings the
+/// events-log doorbell (best-effort, see [`lifecycle_event`] and `crate::events`).
 pub fn dispatch(command: Command, cwd: &Path, out: &mut impl Write, err_out: &mut impl Write) -> i32 {
     let json = command.wants_json();
     let name = command.name();
+    let lifecycle = lifecycle_event(&command);
     match run(command, cwd, out) {
-        Ok(()) => 0,
+        Ok(()) => {
+            if let Some((event, branch)) = lifecycle {
+                EventLog::for_repo(cwd).record_lifecycle(branch.as_deref(), event, SystemTime::now());
+            }
+            0
+        }
         Err(e) => report_error(name, e, json, out, err_out),
     }
 }
@@ -287,5 +315,83 @@ mod tests {
         assert_eq!(code, 3);
         assert!(out.is_empty(), "human mode writes nothing to stdout");
         assert_eq!(String::from_utf8(err_out).unwrap(), "Error: no workstream for \"x\"\n");
+    }
+
+    #[test]
+    fn lifecycle_event_covers_spawn_stop_and_prune_only() {
+        assert_eq!(
+            lifecycle_event(&Command::Spawn {
+                branch: "fix-login".into(),
+                agent: None,
+                prompt: None,
+                item: None,
+                above: None,
+                below: None,
+                json: false,
+            }),
+            Some(("spawn", Some("fix-login".to_string())))
+        );
+        assert_eq!(
+            lifecycle_event(&Command::Stop { target: "fix-login".into(), json: false }),
+            Some(("stop", Some("fix-login".to_string())))
+        );
+        assert_eq!(lifecycle_event(&Command::Prune { json: false }), Some(("prune", None)), "prune names no single branch");
+        assert_eq!(lifecycle_event(&Command::Status { json: false }), None);
+        assert_eq!(lifecycle_event(&Command::Focus { target: "fix-login".into(), json: false }), None);
+        assert_eq!(lifecycle_event(&Command::Send { target: "fix-login".into(), text: "hi".into(), json: false }), None);
+        assert_eq!(
+            lifecycle_event(&Command::Report { state: crate::report::Reported::Busy, branch: None, json: false }),
+            None,
+            "report rings the doorbell itself, from Reports::write"
+        );
+        assert_eq!(lifecycle_event(&Command::Events { since: 0, follow: false, json: false }), None);
+    }
+
+    /// `dispatch` is what `main` actually calls, and it's the one place that knows both a
+    /// command's outcome and (for spawn/stop/prune) which branch it was about — this pins down
+    /// that a successful one of those three actually rings the events-log doorbell.
+    #[test]
+    fn dispatch_rings_the_events_log_doorbell_for_a_successful_prune_and_stop() {
+        use crate::mux::stand_in;
+        let tag_ = "exit-events-doorbell";
+        let (bin, _log) = stand_in::install(tag_, "tmux", r#"case "$1" in list-panes) printf '%%3 2000000000\n' ;; esac"#);
+        let state = std::env::temp_dir().join(format!("kanstack-cli-{tag_}-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state);
+        stand_in::with_env(
+            &[
+                ("KANSTACK_STATE_PATH", Some(state.to_str().unwrap())),
+                ("KANSTACK_SPLIT_BACKEND", Some("tmux")),
+                ("KANSTACK_TMUX_BIN", Some(bin.to_str().unwrap())),
+                ("TMUX_PANE", Some("%0")),
+            ],
+            || {
+                use crate::workstream::{AgentId, BranchId, PaneId, Registry, Workstream};
+                let repo = Path::new("/repo/exit-events-doorbell");
+                let mut registry = Registry::load(repo).unwrap();
+                registry.upsert(Workstream {
+                    branch_id: BranchId("fix-login".into()),
+                    pane_id: Some(PaneId("%3".into())),
+                    agent: Some(AgentId("claude".into())),
+                    item: None,
+                });
+                registry.save().unwrap();
+
+                // A read-only command first: `status` must ring nothing.
+                let mut out = Vec::new();
+                let mut err_out = Vec::new();
+                assert_eq!(dispatch(Command::Status { json: true }, repo, &mut out, &mut err_out), 0);
+
+                assert_eq!(dispatch(Command::Stop { target: "fix-login".into(), json: true }, repo, &mut Vec::new(), &mut Vec::new()), 0);
+                assert_eq!(dispatch(Command::Prune { json: true }, repo, &mut Vec::new(), &mut Vec::new()), 0);
+
+                let raw = std::fs::read_to_string(crate::workstream::events_path(repo).unwrap()).unwrap();
+                let lines: Vec<&str> = raw.lines().collect();
+                assert_eq!(lines.len(), 2, "status must not have logged anything: {raw}");
+                assert!(lines[0].contains(r#""command":"stop""#) && lines[0].contains(r#""branch":"fix-login""#), "{}", lines[0]);
+                assert!(lines[1].contains(r#""command":"prune""#) && !lines[1].contains("\"branch\""), "{}", lines[1]);
+            },
+        );
+        stand_in::remove(&bin);
+        let _ = std::fs::remove_dir_all(&state);
     }
 }
