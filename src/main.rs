@@ -174,6 +174,17 @@ fn main() -> Result<()> {
                     // will once it gets far enough to recognize the flag.
                     Err(e) => {
                         let json = raw.iter().any(|a| a == "--json" || a.starts_with("--json="));
+                        // `parse`'s own messages end with the full multi-subcommand `HELP` text
+                        // (a `bail!("...\n\n{HELP}")` pattern) — the right thing on stderr, but
+                        // not something a JSON error's `message` field should repeat in full;
+                        // trim it there and keep the short reason. Human mode is untouched.
+                        let e = if json {
+                            let short = e.to_string();
+                            let short = short.strip_suffix(&format!("\n\n{}", cli::HELP)).unwrap_or(&short).to_string();
+                            anyhow::anyhow!(short)
+                        } else {
+                            e
+                        };
                         std::process::exit(cli::report_error(
                             name,
                             cli::invalid_arguments(e),
