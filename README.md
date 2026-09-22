@@ -499,9 +499,15 @@ a pane stopped on a prompt looks exactly like one at rest. The board shows it as
 For Claude Code, kanstack does this for you: it launches `claude` with `--settings` carrying
 hooks for the start and end of a turn, each tool call, permission prompts, and turns that die
 on an API error. They run alongside your own hooks rather than replacing them, and nothing on
-disk is edited. Other harnesses get no hooks, because kanstack doesn't yet know a safe way to
-hand them any at launch; they keep the multiplexer's reading, and can call `kanstack report`
-themselves. `KANSTACK_STATUS_HOOKS=off` launches every harness without them.
+disk is edited. Gemini CLI gets `busy`/`idle` the same way, via its own `BeforeAgent`/
+`AfterAgent` hooks (see `crate::harness::gemini::Gemini::status_hooks`) — but not `waiting`:
+Gemini has a permission-specific `Notification` hook that looks promising on paper, but nothing
+confirms it actually correlates with the CLI sitting blocked on an approval prompt, so it's
+left unwired rather than guessed at. Codex, Pi, OpenCode and Kiro get no hooks at all — each
+was checked against its own current docs and hits a real, harness-specific wall (see each
+harness's own file under `src/harness/` for why); they keep the multiplexer's reading, and can
+call `kanstack report` themselves. `KANSTACK_STATUS_HOOKS=off` launches every harness without
+them.
 
 The same `--settings` also carries a second, narrower `PreToolUse` hook — `kanstack claim`,
 matching only `Edit`/`Write`/`MultiEdit` — that can deny a file edit outright when another live

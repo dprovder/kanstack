@@ -40,6 +40,31 @@ use crate::harness::Harness;
 ///   `LaunchExtras`'s plain `args`/`env` can't do on its own — see
 ///   `crate::workstream::gemini_hooks_dir`'s doc comment for what this writes and the
 ///   cleanup gap it leaves.
+///
+/// The same settings file also carries `busy`/`idle` self-reporting (`kanstack report`, see
+/// `crate::report`), confirmed against the same hooks reference:
+/// - `busy` uses `BeforeAgent` — fires once per turn, "after a user submits a prompt, but
+///   before the agent begins planning." `BeforeModel` also exists and was considered, but it
+///   fires once per *model call*, which can happen several times within one turn (each tool
+///   round-trip) — a noisy, repeated `busy` write with no new information, not the clean
+///   once-per-turn signal `BeforeAgent` is.
+/// - `idle` uses `AfterAgent` — fires once per turn, "after the model generates its final
+///   response." Together these bracket a turn the same way Claude's `UserPromptSubmit`/`Stop`
+///   pair does.
+/// - Neither is tool-scoped, so neither entry takes a `matcher` — confirmed against the docs'
+///   own examples for these two events, unlike `BeforeTool` above.
+/// - **`waiting` is deliberately left unwired.** Gemini's `Notification` hook has a
+///   `notification_type: "ToolPermission"` case, documented as firing "when the CLI emits a
+///   system alert (for example, Tool Permissions)" — a real, *named* permission signal, more
+///   specific than Claude's `idle_prompt` notification type (which `Claude::status_hooks`'s own
+///   doc comment already found, empirically, to never fire). But there's no live Gemini
+///   instance available to confirm this one actually correlates with the CLI sitting blocked
+///   waiting on approval, the way Claude's was empirically disconfirmed rather than just
+///   doc-read — the docs also call the hook "observability only," which doesn't settle the
+///   timing question. Given the "only wire what's verified" bar the rest of this file holds
+///   to, this is left out rather than guessed at; a future pass with a live Gemini CLI to test
+///   against should revisit it before Claude does (Claude has no reliable `waiting` mechanism
+///   either, so Gemini getting one first would be new territory, not parity).
 pub struct Gemini;
 impl Harness for Gemini {
     fn id(&self) -> &'static str {
@@ -47,10 +72,9 @@ impl Harness for Gemini {
     }
 
     fn status_hooks(&self, report: &str, branch: &str, cwd: &Path) -> Option<LaunchExtras> {
-        let exe = report.strip_suffix(" report").unwrap_or(report);
         let dir = crate::workstream::gemini_hooks_dir(cwd)?;
         std::fs::create_dir_all(&dir).ok()?;
-        let settings = settings_json(exe, branch);
+        let settings = settings_json(report, branch);
         let path = dir.join(format!("{:016x}.json", crate::workstream::fnv1a(branch.as_bytes())));
         std::fs::write(&path, serde_json::to_vec(&settings).ok()?).ok()?;
         Some(LaunchExtras {
@@ -60,16 +84,21 @@ impl Harness for Gemini {
     }
 }
 
-/// The `settings.json` content written to `GEMINI_CLI_SYSTEM_SETTINGS_PATH` — a single
-/// `BeforeTool` hook, matching Gemini's own edit tools by name (`write_file`, `replace`; see
-/// `docs/tools/file-system.md`), running the same `kanstack claim <branch>` invocation Claude's
-/// `PreToolUse` claim-check hook runs. `timeout` is milliseconds here, confirmed against
-/// Gemini's own hooks reference example — unlike Claude's, which is seconds (see
-/// `Claude::status_hooks`) — so the two aren't interchangeable numbers even though both hooks
-/// exist to do the same job.
-fn settings_json(exe: &str, branch: &str) -> serde_json::Value {
+/// The `settings.json` content written to `GEMINI_CLI_SYSTEM_SETTINGS_PATH`: `BeforeAgent`/
+/// `AfterAgent` report `busy`/`idle` the same way Claude's `UserPromptSubmit`/`Stop` hooks do,
+/// and `BeforeTool` runs the same `kanstack claim <branch>` invocation Claude's `PreToolUse`
+/// claim-check hook runs, matching Gemini's own edit tools by name (`write_file`, `replace`;
+/// see `docs/tools/file-system.md`) since it alone is tool-scoped. `timeout` is milliseconds
+/// here, confirmed against Gemini's own hooks reference example — unlike Claude's, which is
+/// seconds (see `Claude::status_hooks`) — so the two aren't interchangeable numbers even though
+/// both hooks exist to do the same job.
+fn settings_json(report: &str, branch: &str) -> serde_json::Value {
+    let exe = report.strip_suffix(" report").unwrap_or(report);
+    let command = |cmd: String| serde_json::json!([{ "hooks": [{ "type": "command", "command": cmd, "timeout": 5000 }] }]);
     serde_json::json!({
         "hooks": {
+            "BeforeAgent": command(format!("{report} busy {}", shell_quote(branch))),
+            "AfterAgent": command(format!("{report} idle {}", shell_quote(branch))),
             "BeforeTool": [{
                 "matcher": "write_file|replace",
                 "hooks": [{
@@ -126,11 +155,31 @@ mod tests {
 
             let written = std::fs::read_to_string(path).unwrap();
             let settings: serde_json::Value = serde_json::from_str(&written).unwrap();
+            let hooks = settings["hooks"].as_object().unwrap();
+            assert_eq!(hooks.len(), 3, "no waiting hook — see the module doc's why not: {:?}", hooks.keys().collect::<Vec<_>>());
+
             let hook = &settings["hooks"]["BeforeTool"][0];
             assert_eq!(hook["matcher"], "write_file|replace", "Gemini's own edit tool names, not Claude's");
             assert_eq!(hook["hooks"][0]["type"], "command");
             assert_eq!(hook["hooks"][0]["command"], "'/opt/kanstack' claim 'feat-x'", "same invocation as Claude's own claim-check hook");
             assert_eq!(hook["hooks"][0]["timeout"], 5000, "milliseconds, not Claude's seconds");
+        });
+    }
+
+    #[test]
+    fn status_hooks_also_wires_busy_and_idle_reporting_for_gemini() {
+        with_scratch_state("busy-idle", |_state| {
+            let extras = crate::harness::for_command("gemini").status_hooks(REPORT, "feat-x", Path::new("/repo/a")).unwrap();
+            let written = std::fs::read_to_string(&extras.env[0].1).unwrap();
+            let settings: serde_json::Value = serde_json::from_str(&written).unwrap();
+
+            let before_agent = &settings["hooks"]["BeforeAgent"][0];
+            assert!(before_agent.get("matcher").is_none(), "not tool-scoped, unlike BeforeTool");
+            assert_eq!(before_agent["hooks"][0]["command"], "'/opt/kanstack' report busy 'feat-x'");
+
+            let after_agent = &settings["hooks"]["AfterAgent"][0];
+            assert!(after_agent.get("matcher").is_none());
+            assert_eq!(after_agent["hooks"][0]["command"], "'/opt/kanstack' report idle 'feat-x'");
         });
     }
 

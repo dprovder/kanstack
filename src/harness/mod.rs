@@ -51,7 +51,10 @@ pub trait Harness: Sync {
     ///
     /// `None`, the default, means kanstack knows no way to hand this harness hooks when it
     /// launches it. That costs nothing but accuracy: the multiplexer's own reading of the
-    /// pane is used instead, and anything can still call `kanstack report` itself.
+    /// pane is used instead, and anything can still call `kanstack report` itself. Today only
+    /// [`claude::Claude`] and [`gemini::Gemini`] return `Some` here — each one's own file
+    /// documents why `Codex`/`Pi`/`OpenCode`/`Kiro` were checked and left out, for both this
+    /// and the claim-check hook below.
     ///
     /// This is also where the `PreToolUse`-equivalent claim-check hook (`kanstack claim`, see
     /// `crate::claims` and `crate::cli::claim`) lives, for the harnesses that have it wired
