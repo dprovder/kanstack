@@ -18,6 +18,26 @@ use crate::harness::Harness;
 ///   `file_path` string — extracting the touched path(s) needs a patch-format parser, real
 ///   work `cli::claim::file_path_from_hook_payload` doesn't do today, not just another field
 ///   name to check for.
+///
+/// **`busy`/`idle` self-reporting checked too, same verdict, more precisely characterized.**
+/// `UserPromptSubmit` (busy) and `Stop` (idle) exist and would be the right pair — confirmed
+/// against the actual `openai/codex` source (`codex-rs/hooks`,
+/// `codex-rs/config/src/hook_config.rs`), not just the docs site, since the docs site's "hooks
+/// are experimental/disabled by default" framing turned out to not match the source at all.
+/// The real blocker isn't a feature flag: `discovery.rs` only runs a hook once it's
+/// `HookTrustStatus::Managed`/`Trusted`, and anything else — including a *new* hook config, or
+/// one that changed since it was last trusted — triggers an interactive TUI review prompt
+/// (`tui/src/startup_hooks_review.rs`). Since kanstack's hook command bakes the branch name in
+/// (same as every other harness), every new branch would produce a hook config Codex has never
+/// seen before, so this review would fire on *every single `kanstack spawn`* — worse than any
+/// other wired harness's UX. A blanket bypass flag (`bypass_hook_trust`) exists, but it skips
+/// trust review for anything else the user has configured too, not just kanstack's own hook —
+/// a real security-relevant side effect, not something to flip on by default just to silence a
+/// prompt. Combined with the same "no CLI-only injection path" blocker as the claim-check
+/// (`CODEX_HOME` exists but redirects Codex's *entire* home directory — auth, sessions,
+/// everything — the same problem Gemini's `GEMINI_CLI_HOME` was rejected for), this stays
+/// unwired. (`PermissionRequest`, for what it's worth, is a real confirmed `waiting` signal —
+/// moot while nothing else here is wireable, but worth knowing if this ever gets revisited.)
 pub struct Codex;
 impl Harness for Codex {
     fn id(&self) -> &'static str {
