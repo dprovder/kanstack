@@ -14,6 +14,17 @@ use crate::harness::Harness;
 /// plugin requirement — plus, per Pi's own docs, extensions "run with your full system
 /// permissions and can execute arbitrary code," a materially heavier footprint than every
 /// other harness's `status_hooks`.
+///
+/// **`busy`/`idle` self-reporting checked too — same wall, confirmed independently.**
+/// `turn_start`/`turn_end` exist and would be the right pair, but they register through the
+/// exact same `pi.on(...)` TypeScript extension API as `tool_call` — there is no separate,
+/// lighter subprocess/shell-command hook path for lifecycle events either (an explicit search
+/// of Pi's docs found no config-file `hooks:` section or CLI flag anywhere). Extensions can
+/// read `process.env` and shell out via `pi.exec(...)`, so a minimal, once-written `.ts` file
+/// that just calls `kanstack report` is technically buildable, but that doesn't change the
+/// actual objection: it still needs a file on disk before launch, still runs under the same
+/// full-system-permissions extension model the docs warn about — a smaller handler body, not a
+/// smaller risk. No `waiting`-equivalent event was found either.
 pub struct Pi;
 impl Harness for Pi {
     fn id(&self) -> &'static str {
