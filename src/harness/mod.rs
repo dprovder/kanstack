@@ -10,6 +10,7 @@
 //! and a backend just types it.
 
 pub mod gemini;
+pub mod kiro;
 pub mod launch;
 pub mod opencode;
 
@@ -163,19 +164,6 @@ impl Harness for Pi {
     }
 }
 
-/// `kiro-cli chat`'s full flag reference has nothing for system prompt, instructions or
-/// context (only pre-configured, not-dynamic-per-invocation agents via `--agent`), so the
-/// note is folded into the initial message.
-struct Kiro;
-impl Harness for Kiro {
-    fn id(&self) -> &'static str {
-        "kiro"
-    }
-    fn aliases(&self) -> &'static [&'static str] {
-        &["kiro-cli"]
-    }
-}
-
 /// Anything not in [`KNOWN`]: a wrapper script, a harness kanstack hasn't heard of. Gets
 /// the delivery that works everywhere.
 struct Generic;
@@ -187,7 +175,7 @@ impl Harness for Generic {
 
 /// Every harness kanstack recognizes by name, in the order `--setup` prefers them when
 /// several are installed.
-pub const KNOWN: &[&dyn Harness] = &[&Claude, &Codex, &Pi, &opencode::OpenCode, &Kiro, &gemini::Gemini];
+pub const KNOWN: &[&dyn Harness] = &[&Claude, &Codex, &Pi, &opencode::OpenCode, &kiro::Kiro, &gemini::Gemini];
 
 static GENERIC: Generic = Generic;
 
@@ -452,15 +440,13 @@ mod tests {
         });
     }
 
-    /// Harnesses with no confirmed mechanism (including OpenCode, and anything unknown)
-    /// fall back to folding the note into the message rather than guessing at a flag
-    /// that might not exist for them.
+    /// A genuinely unrecognized command — no [`Harness`] impl at all, so [`Generic`]
+    /// answers — falls back to folding the note into the message rather than guessing at a
+    /// flag that might not exist for it. Each known harness with no confirmed mechanism of
+    /// its own asserts the same fallback in its own file.
     #[test]
-    fn resolve_note_delivery_falls_back_to_folding_for_unconfirmed_harnesses() {
+    fn resolve_note_delivery_falls_back_to_folding_for_an_unrecognized_command() {
         with_system_flag_env(None, || {
-            assert_eq!(resolve_note_delivery("kiro"), NoteDelivery::FoldIntoMessage);
-            assert_eq!(resolve_note_delivery("kiro-cli"), NoteDelivery::FoldIntoMessage);
-            // Genuinely unrecognized commands get the same safe fallback.
             assert_eq!(resolve_note_delivery("./my-custom-harness.sh"), NoteDelivery::FoldIntoMessage);
         });
     }
