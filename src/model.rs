@@ -422,11 +422,6 @@ pub struct ConflictingFile {
 /// which a plain ours/theirs picker needs.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ResolveConflicts {
-    /// Needed for [`crate::but::But::resolve_ai`], which — unlike `resolve apply` — refuses
-    /// a branch name and insists on the commit id (verified live: 0.22.3 replies `'<branch>'
-    /// does not refer to a commit`). Stale after every successful apply, so callers always
-    /// re-fetch this rather than caching it across a mutation.
-    pub commit_id: String,
     pub branch: String,
     #[serde(default)]
     pub files: Vec<ConflictFile>,

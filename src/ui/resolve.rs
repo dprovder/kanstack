@@ -72,7 +72,7 @@ pub(super) fn draw_resolve_confirm(f: &mut Frame, app: &App, area: Rect, hits: &
         body.push(Line::styled(format!("    {}", manual.reason), theme::faint()));
     }
 
-    let hint = "  ↑/↓ file · o ours · t theirs · A resolve w/ AI · esc cancel";
+    let hint = "  ↑/↓ file · o ours · t theirs · A ask the agent · esc cancel";
     body.push(Line::raw(""));
     body.push(Line::styled(hint, theme::faint()));
 

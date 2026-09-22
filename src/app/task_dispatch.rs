@@ -30,8 +30,16 @@ impl App {
             self.notify("pick a lane with a branch — the backlog has no pane", Notice::Info);
             return;
         };
+        self.start_task(branch, String::new());
+    }
+
+    /// Starts typing a task for `branch`'s pane, pre-filled with `prefill` rather than
+    /// empty — used by the conflict picker's "hand off to the agent" action, which knows
+    /// what to ask for before the user has typed anything. Still an ordinary `Mode::Task`
+    /// from here on: editable, and `esc` cancels it exactly like a `t`-started one.
+    pub(super) fn start_task(&mut self, branch: String, prefill: String) {
         self.task_target = Some(branch);
-        self.task_input.clear();
+        self.task_input.set(prefill);
         self.mode = Mode::Task;
     }
 
@@ -64,7 +72,7 @@ impl App {
                 Ok(pane) => {
                     crate::workstream::record_spawn(&cwd, &branch, &pane, None, splitter.workspace().as_deref());
                     self.notify(
-                        format!("opened a pane for {branch} — press t again once it's ready for the task"),
+                        format!("opened a pane for {branch} — send the task again once it's ready"),
                         Notice::Info,
                     );
                 }

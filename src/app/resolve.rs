@@ -89,19 +89,36 @@ impl App {
         }
     }
 
-    /// Resolves every remaining conflict in the commit with AI, in one shot — not just the
-    /// selected row, since `but resolve <commit-id> --ai` works commit-wide with no
-    /// per-file targeting of its own.
-    fn apply_ai(&mut self) {
+    /// Hands the whole branch's remaining conflicts to the coding agent already sitting in
+    /// this lane's split pane, as an ordinary task — the same `t`/`send_task` path, just
+    /// pre-filled and targeting `view.branch` by name rather than whatever `self.col`
+    /// happens to be on.
+    ///
+    /// Deliberately not `but resolve <commit> --ai`: that calls GitButler's own, separate
+    /// AI provider config (`but config ai`), which has nothing to do with the coding agent
+    /// this lane is actually running and — unlike it — has no context on the change beyond
+    /// the diff itself. The agent already has both, and kanstack already has a way to talk
+    /// to it.
+    fn dispatch_to_agent(&mut self) {
         let Some(view) = &self.resolve_view else { return };
-        let commit_id = view.data.commit_id.clone();
-        let title = view.title.clone();
-        let Some(but) = self.but.clone() else { return };
-        self.notify(format!("resolving {title} with AI…"), Notice::Info);
-        match but.resolve_ai(&commit_id) {
-            Ok(()) => self.refresh_resolve(),
-            Err(e) => self.notify(format!("{e}"), Notice::Error),
+        if self.splitter.is_none() {
+            self.notify(
+                "no harness-split backend found (cmux, tmux, orca or ghostty)",
+                Notice::Info,
+            );
+            return;
         }
+        let Some(pane_branch) = self.pane_branch(self.col) else {
+            self.notify("pick a lane with a branch — the backlog has no pane", Notice::Info);
+            return;
+        };
+        let branch = view.branch.clone();
+        let prefill = format!(
+            "resolve the merge conflicts on `{branch}` — `but resolve conflicts {branch}` \
+             shows what's left, `but resolve apply` fixes it"
+        );
+        self.resolve_view = None;
+        self.start_task(pane_branch, prefill);
     }
 }
 
@@ -123,7 +140,7 @@ impl App {
             }
             K::Char('o') => self.apply_side(true),
             K::Char('t') => self.apply_side(false),
-            K::Char('A') => self.apply_ai(),
+            K::Char('A') => self.dispatch_to_agent(),
             K::Esc | K::Char('q') => {
                 self.resolve_view = None;
                 self.mode = Mode::Normal;
