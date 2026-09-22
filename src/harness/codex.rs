@@ -5,6 +5,19 @@ use crate::harness::Harness;
 /// closed unimplemented); `-c developer_instructions=<toml>` is the closest equivalent, a
 /// differently-*shaped* mechanism (TOML-quoted, and a "developer" message rather than
 /// literally the system prompt), not just a different flag name.
+///
+/// **No `status_hooks` — checked and deliberately left out**, for two independent reasons,
+/// confirmed against Codex's own hooks docs (`developers.openai.com/codex/hooks`):
+/// - Hooks configure only through `~/.codex/hooks.json`/`config.toml` (or their project-local
+///   equivalents) — no CLI flag exists to inject one at launch the way Claude's `--settings`
+///   does. `-c` does accept arbitrary dotted-TOML overrides in principle, so `-c
+///   hooks.PreToolUse=...` *might* parse, but this exact usage is undocumented with no example
+///   anywhere — not something to build a blocking security check on.
+/// - Even with a hook wired up, `apply_patch` (Codex's edit tool) hands `tool_input.command`
+///   the raw patch text in Codex's own diff format (`*** Update File: path`, etc.), not a
+///   `file_path` string — extracting the touched path(s) needs a patch-format parser, real
+///   work `cli::claim::file_path_from_hook_payload` doesn't do today, not just another field
+///   name to check for.
 pub struct Codex;
 impl Harness for Codex {
     fn id(&self) -> &'static str {
