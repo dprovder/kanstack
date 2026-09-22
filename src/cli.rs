@@ -427,7 +427,9 @@ fn report(
 /// --json` reported before this distinction existed. One `but status` call, so it is only
 /// made when there is a workstream to report on.
 enum GitState {
-    Ok(WorkspaceStatus),
+    // Boxed: `WorkspaceStatus` is the biggest thing in this enum by far, and this is
+    // constructed once per `status --json` call, nowhere near a hot path.
+    Ok(Box<WorkspaceStatus>),
     Blocked(String),
     Unreachable,
 }
@@ -456,7 +458,7 @@ fn git_state(registry: &Registry, cwd: &Path) -> GitState {
         return GitState::Unreachable;
     };
     match but.status_with_upstream() {
-        Ok(status) => GitState::Ok(status),
+        Ok(status) => GitState::Ok(Box::new(status)),
         Err(e) if crate::but::is_workspace_block(&e.to_string()) => GitState::Blocked(e.to_string()),
         Err(_) => GitState::Unreachable,
     }
@@ -1246,6 +1248,332 @@ mod tests {
     fn status_json_keeps_a_fresh_agent_report_when_the_poll_fails() {
         let failing = r#"echo "no server running" >&2; exit 1"#;
         assert_eq!(status_json_with_tmux("json-report", failing, Some(Reported::Busy)), fix_login("busy"));
+    }
+
+    // `--json` on `send`/`focus`/`stop`/`report`, and the generic error envelope/exit codes
+    // `dispatch` gives every subcommand — see `cli::exit`.
+
+    /// Runs `body` against a repo pre-loaded with `workstreams` and a stand-in `tmux`
+    /// answering `list-panes` with `list_panes`. Mirrors `status_json_with_tmux`, but hands
+    /// the repo path to the caller instead of running one fixed command, for tests that
+    /// exercise `send`/`focus`/`stop` (and their error paths) against it.
+    fn with_tmux_registry(tag: &str, list_panes: &str, workstreams: Vec<Workstream>, body: impl FnOnce(&Path)) {
+        use crate::mux::stand_in;
+        let (bin, _log) = stand_in::install(tag, "tmux", &format!(r#"case "$1" in list-panes) {list_panes} ;; esac"#));
+        let state = std::env::temp_dir().join(format!("kanstack-cli-{tag}-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state);
+        stand_in::with_env(
+            &[
+                ("KANSTACK_STATE_PATH", Some(state.to_str().unwrap())),
+                ("KANSTACK_SPLIT_BACKEND", Some("tmux")),
+                ("KANSTACK_TMUX_BIN", Some(bin.to_str().unwrap())),
+                ("TMUX_PANE", Some("%0")),
+            ],
+            || {
+                let repo = Path::new("/repo/cli-json-with-tmux");
+                let mut registry = Registry::load(repo).unwrap();
+                for w in workstreams {
+                    registry.upsert(w);
+                }
+                registry.save().unwrap();
+                body(repo);
+            },
+        );
+        stand_in::remove(&bin);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn send_json_reports_the_pane_it_typed_into() {
+        with_tmux_registry(
+            "send-json",
+            r#"printf '%%3 2000000000\n'"#,
+            vec![workstream("fix-login", Some("%3"), Some("claude"), None)],
+            |repo| {
+                let mut out = Vec::new();
+                run(Command::Send { target: "fix-login".into(), text: "run tests".into(), json: true }, repo, &mut out).unwrap();
+                assert_eq!(
+                    String::from_utf8(out).unwrap(),
+                    "{\"schema\":1,\"ok\":true,\"command\":\"send\",\"workstream\":\"fix-login\",\"result\":{\"pane\":\"%3\"}}\n"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn focus_json_reports_the_pane_it_focused() {
+        with_tmux_registry(
+            "focus-json",
+            r#"printf '%%3 2000000000\n'"#,
+            vec![workstream("fix-login", Some("%3"), Some("claude"), None)],
+            |repo| {
+                let mut out = Vec::new();
+                run(Command::Focus { target: "fix-login".into(), json: true }, repo, &mut out).unwrap();
+                assert_eq!(
+                    String::from_utf8(out).unwrap(),
+                    "{\"schema\":1,\"ok\":true,\"command\":\"focus\",\"workstream\":\"fix-login\",\"result\":{\"pane\":\"%3\"}}\n"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn stop_json_reports_the_pane_it_closed_and_null_when_there_was_none() {
+        with_tmux_registry(
+            "stop-json",
+            r#"printf '%%3 2000000000\n'"#,
+            vec![workstream("fix-login", Some("%3"), Some("claude"), None), workstream("planned", None, None, None)],
+            |repo| {
+                let mut out = Vec::new();
+                run(Command::Stop { target: "fix-login".into(), json: true }, repo, &mut out).unwrap();
+                assert_eq!(
+                    String::from_utf8(out).unwrap(),
+                    "{\"schema\":1,\"ok\":true,\"command\":\"stop\",\"workstream\":\"fix-login\",\"result\":{\"pane\":\"%3\"}}\n"
+                );
+
+                let mut out = Vec::new();
+                run(Command::Stop { target: "planned".into(), json: true }, repo, &mut out).unwrap();
+                assert_eq!(
+                    String::from_utf8(out).unwrap(),
+                    "{\"schema\":1,\"ok\":true,\"command\":\"stop\",\"workstream\":\"planned\",\"result\":{\"pane\":null}}\n"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn report_json_prints_the_envelope_and_plain_report_prints_nothing() {
+        with_state("report-json", &[("KANSTACK_BRANCH", None)], || {
+            let repo = Path::new("/repo/report-json");
+            let mut out = Vec::new();
+            run(Command::Report { state: Reported::Waiting, branch: Some("fix-login".into()), json: true }, repo, &mut out).unwrap();
+            assert_eq!(
+                String::from_utf8(out).unwrap(),
+                "{\"schema\":1,\"ok\":true,\"command\":\"report\",\"workstream\":\"fix-login\",\"result\":{\"state\":\"waiting\"}}\n"
+            );
+
+            let mut out = Vec::new();
+            run(Command::Report { state: Reported::Waiting, branch: Some("fix-login".into()), json: false }, repo, &mut out).unwrap();
+            assert!(out.is_empty(), "without --json, report still prints nothing");
+        });
+    }
+
+    /// `dispatch` is what `main` actually calls: it turns a failure into `--json`'s error
+    /// envelope (or, without `--json`, `anyhow`'s own text on `err_out`) and a matching exit
+    /// code — see `cli::exit`. `unknown_workstream` is shared by every command that resolves
+    /// a `<branch|session>` target.
+    #[test]
+    fn an_unknown_target_is_an_unknown_workstream_error_everywhere_that_resolves_one() {
+        with_tmux_registry("unknown-json", "printf ''", vec![], |repo| {
+            for command in [
+                Command::Send { target: "ghost".into(), text: "hi".into(), json: true },
+                Command::Focus { target: "ghost".into(), json: true },
+                Command::Stop { target: "ghost".into(), json: true },
+            ] {
+                let name = command.name();
+                let mut out = Vec::new();
+                let mut err_out = Vec::new();
+                let code = dispatch(command, repo, &mut out, &mut err_out);
+                assert_eq!(code, 3, "{name}");
+                assert!(err_out.is_empty(), "{name}: json mode writes nothing to the error stream");
+                let printed = String::from_utf8(out).unwrap();
+                assert_eq!(
+                    printed,
+                    format!(
+                        "{{\"schema\":1,\"ok\":false,\"command\":\"{name}\",\"error\":{{\"code\":\"unknown_workstream\",\
+                         \"message\":\"no workstream for \\\"ghost\\\" — `kanstack status` lists them\"}}}}\n"
+                    ),
+                    "{name}: {printed}"
+                );
+            }
+        });
+    }
+
+    /// Without `--json`, `dispatch` reports the same failure the old flat-exit-1 `main` did —
+    /// text on `err_out`, nothing on `out` — but with the more specific exit code.
+    #[test]
+    fn a_human_mode_failure_still_goes_to_err_out_with_the_sharper_exit_code() {
+        with_tmux_registry("unknown-human", "printf ''", vec![], |repo| {
+            let mut out = Vec::new();
+            let mut err_out = Vec::new();
+            let code = dispatch(Command::Focus { target: "ghost".into(), json: false }, repo, &mut out, &mut err_out);
+            assert_eq!(code, 3);
+            assert!(out.is_empty());
+            assert_eq!(
+                String::from_utf8(err_out).unwrap(),
+                "Error: no workstream for \"ghost\" — `kanstack status` lists them\n"
+            );
+        });
+    }
+
+    // `spawn --json` — the one command that also talks to `but`, so its stand-in needs both
+    // `but` (for `status`/`branch_new`) and `tmux` (for the pane itself).
+
+    /// Runs `body` against a real, empty temp directory (needed because `But::run` sets
+    /// `current_dir` to it, which fails outright against the fake `/repo/...` paths every
+    /// other test here uses — nothing under it ever needs to look like a real git repo, since
+    /// both `but` and `tmux` are stand-ins) with `KANSTACK_BUT_BIN` answering `--version` and
+    /// `status` from `but_status_body`, and `KANSTACK_TMUX_BIN` answering `list-panes` and
+    /// `split-window` from `tmux_body`.
+    fn with_but_and_tmux(tag: &str, but_status_body: &str, tmux_body: &str, workstreams: Vec<Workstream>, body: impl FnOnce(&Path)) {
+        use crate::mux::stand_in;
+        let (but_bin, _but_log) =
+            stand_in::install(tag, "but", &format!("case \"$1\" in --version) echo 'but 0.22.3' ;; status) {but_status_body} ;; esac"));
+        let (tmux_bin, _tmux_log) = stand_in::install(tag, "tmux", tmux_body);
+        let repo = std::env::temp_dir().join(format!("kanstack-cli-{tag}-repo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(&repo).unwrap();
+        let state = std::env::temp_dir().join(format!("kanstack-cli-{tag}-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state);
+        stand_in::with_env(
+            &[
+                ("KANSTACK_STATE_PATH", Some(state.to_str().unwrap())),
+                ("KANSTACK_SPLIT_BACKEND", Some("tmux")),
+                ("KANSTACK_TMUX_BIN", Some(tmux_bin.to_str().unwrap())),
+                ("KANSTACK_BUT_BIN", Some(but_bin.to_str().unwrap())),
+                ("TMUX_PANE", Some("%0")),
+            ],
+            || {
+                let mut registry = Registry::load(&repo).unwrap();
+                for w in workstreams {
+                    registry.upsert(w);
+                }
+                registry.save().unwrap();
+                body(&repo);
+            },
+        );
+        stand_in::remove(&but_bin);
+        stand_in::remove(&tmux_bin);
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// `but status`'s reply for these tests: a real capture with a `feat-ui` branch already in
+    /// the workspace, so `spawn feat-ui` takes the "branch already exists" path rather than
+    /// also needing a stand-in `branch_new` reply.
+    fn but_status_cat() -> String {
+        format!("cat '{}'", concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/status.json"))
+    }
+
+    #[test]
+    fn spawn_json_reports_the_pane_the_agent_and_whether_it_created_the_branch() {
+        with_but_and_tmux(
+            "spawn-json",
+            &but_status_cat(),
+            r#"case "$1" in list-panes) printf '' ;; split-window) echo '%9' ;; esac"#,
+            vec![],
+            |repo| {
+                let mut out = Vec::new();
+                run(
+                    Command::Spawn { branch: "feat-ui".into(), agent: Some("codex".into()), prompt: None, item: None, json: true },
+                    repo,
+                    &mut out,
+                )
+                .unwrap();
+                assert_eq!(
+                    String::from_utf8(out).unwrap(),
+                    "{\"schema\":1,\"ok\":true,\"command\":\"spawn\",\"workstream\":\"feat-ui\",\"result\":\
+                     {\"created\":false,\"pane\":\"%9\",\"agent\":\"codex\",\"workspace\":null}}\n"
+                );
+            },
+        );
+    }
+
+    /// `spawn` on a branch that already has a live pane is `workstream_exists` — exit `4`,
+    /// distinct from every other condition here.
+    #[test]
+    fn spawn_on_an_already_running_workstream_is_a_workstream_exists_error() {
+        with_but_and_tmux(
+            "spawn-exists-json",
+            &but_status_cat(),
+            r#"case "$1" in list-panes) printf '%%3 2000000000\n' ;; esac"#,
+            vec![workstream("feat-ui", Some("%3"), Some("claude"), None)],
+            |repo| {
+                let mut out = Vec::new();
+                let mut err_out = Vec::new();
+                let command = Command::Spawn { branch: "feat-ui".into(), agent: None, prompt: None, item: None, json: true };
+                let code = dispatch(command, repo, &mut out, &mut err_out);
+                assert_eq!(code, 4);
+                assert!(err_out.is_empty());
+                let printed = String::from_utf8(out).unwrap();
+                assert!(printed.starts_with("{\"schema\":1,\"ok\":false,\"command\":\"spawn\",\"error\":{\"code\":\"workstream_exists\","), "{printed}");
+            },
+        );
+    }
+
+    // `status --json`'s `workspace_blocked` — see `StatusReport::workspace_blocked` and
+    // `GitState`. `docs/ARCHITECTURE.md` ("A commit on the workspace head locks everything")
+    // has the background on why this is worth telling apart from ordinary unreachability.
+
+    #[test]
+    fn report_json_carries_the_workspace_blocked_reason_when_given_one() {
+        let json = serde_json::to_string(&report(&Registry::default(), |_| None, None, Some("run `but teardown`"))).unwrap();
+        assert_eq!(
+            json,
+            r#"{"schema":1,"workstreams":[],"workspace":null,"workspace_blocked":"run `but teardown`"}"#
+        );
+    }
+
+    /// `git_state` itself, against a stand-in `but` whose `status` fails the way a locked
+    /// workspace really does (prose on stderr, matched by `but::is_workspace_block`) —
+    /// distinct from a `but` that is merely unreachable, which the next test covers.
+    #[test]
+    fn git_state_reports_blocked_when_but_refuses_over_a_stray_workspace_commit() {
+        use crate::mux::stand_in;
+        let (bin, _log) = stand_in::install(
+            "git-state-blocked",
+            "but",
+            "case \"$1\" in --version) echo 'but 0.22.3' ;; \
+             status) echo 'Error: GitButler mode exit required: please run but teardown to preserve your work.' >&2; exit 1 ;; esac",
+        );
+        // A real, existing directory: `But::run` (unlike `But::discover`'s own `--version`
+        // check) sets `current_dir` to it, which fails outright against the fake `/repo/...`
+        // paths every other test here uses.
+        let cwd = std::env::temp_dir().join(format!("kanstack-cli-git-state-blocked-{}", std::process::id()));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let mut registry = Registry::default();
+        registry.upsert(workstream("feat-ui", None, None, None));
+        stand_in::with_env(&[("KANSTACK_BUT_BIN", Some(bin.to_str().unwrap()))], || {
+            let state = git_state(&registry, &cwd);
+            assert!(state.status().is_none());
+            let message = state.blocked_message().expect("a workspace block must be recognized");
+            assert!(message.contains("GitButler mode exit required"), "{message}");
+        });
+        stand_in::remove(&bin);
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// `but` genuinely reachable and happy: `Ok`, and neither `status` nor `blocked_message`
+    /// collapse it into "unreachable".
+    #[test]
+    fn git_state_reads_a_reachable_but() {
+        use crate::mux::stand_in;
+        let (bin, _log) =
+            stand_in::install("git-state-ok", "but", &format!("case \"$1\" in --version) echo 'but 0.22.3' ;; status) {} ;; esac", but_status_cat()));
+        let cwd = std::env::temp_dir().join(format!("kanstack-cli-git-state-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let mut registry = Registry::default();
+        registry.upsert(workstream("feat-ui", None, None, None));
+        stand_in::with_env(&[("KANSTACK_BUT_BIN", Some(bin.to_str().unwrap()))], || {
+            let state = git_state(&registry, &cwd);
+            assert!(state.status().is_some());
+            assert!(state.blocked_message().is_none());
+        });
+        stand_in::remove(&bin);
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// `but` not installed at all (an empty `KANSTACK_BUT_BIN` pointing nowhere) is
+    /// "unreachable", not "blocked" — the two must not be conflated.
+    #[test]
+    fn git_state_reads_unreachable_when_but_cannot_even_be_run() {
+        let mut registry = Registry::default();
+        registry.upsert(workstream("feat-ui", None, None, None));
+        crate::mux::stand_in::with_env(&[("KANSTACK_BUT_BIN", Some("/nonexistent/but-does-not-exist"))], || {
+            let state = git_state(&registry, Path::new("/repo/git-state-unreachable"));
+            assert!(state.status().is_none());
+            assert!(state.blocked_message().is_none());
+        });
     }
 
     #[test]
