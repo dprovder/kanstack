@@ -53,13 +53,23 @@ pub trait Harness: Sync {
     /// launches it. That costs nothing but accuracy: the multiplexer's own reading of the
     /// pane is used instead, and anything can still call `kanstack report` itself.
     ///
-    /// This is also where [`claude::Claude`]'s `PreToolUse` claim-check hook (`kanstack
-    /// claim`, see `crate::claims` and `crate::cli::claim`) lives, for the one harness that
-    /// has it wired up so far. Every harness kanstack knows about can block a tool call by
-    /// some equivalent mechanism (confirmed in the design discussion that led to that
-    /// module) — each harness's own file is where its version of this hook would go; none
-    /// of the others are wired up yet, a deliberate v1 limitation, not an oversight.
-    fn status_hooks(&self, _report: &str, _branch: &str) -> Option<LaunchExtras> {
+    /// This is also where the `PreToolUse`-equivalent claim-check hook (`kanstack claim`, see
+    /// `crate::claims` and `crate::cli::claim`) lives, for the harnesses that have it wired
+    /// up: [`claude::Claude`] (`PreToolUse`, Claude Code's own decision shape) and
+    /// [`gemini::Gemini`] (`BeforeTool`, its own flat `{"decision":"deny",...}` shape — see
+    /// `cli::claim::DecisionShape`, which tells the two apart from the payload's own
+    /// `hook_event_name` rather than a flag). `Codex`, `Pi`, `OpenCode` and `Kiro` each have a
+    /// blocking hook of some kind too, per the design discussion that led to this module, but
+    /// none is wireable the same lightweight way — see each one's own file for why (a file
+    /// that must exist on disk before launch, arbitrary-code-execution risk, an
+    /// incompatible payload shape, or more than one of those at once) — a deliberate,
+    /// documented v1 limitation, not an oversight.
+    ///
+    /// `cwd` is the repository the pane is about to launch into — not this process's own
+    /// working directory, which may differ (`kanstack -C <path> ...`). [`gemini::Gemini`]
+    /// needs it to place its per-branch settings file (see
+    /// `crate::workstream::gemini_hooks_dir`); every other implementor ignores it.
+    fn status_hooks(&self, _report: &str, _branch: &str, _cwd: &Path) -> Option<LaunchExtras> {
         None
     }
 }
@@ -182,7 +192,7 @@ impl HarnessConfig {
         let extras = self
             .report_command
             .as_deref()
-            .and_then(|report| for_command(command).status_hooks(report, name))
+            .and_then(|report| for_command(command).status_hooks(report, name, cwd))
             .map(|mut extras| {
                 extras.env.push(("KANSTACK_BRANCH".to_string(), name.to_string()));
                 extras
@@ -370,11 +380,11 @@ mod tests {
     // Status hooks.
 
     /// Only harnesses with a launch-time route are handed hooks; kanstack does not guess at
-    /// the others'.
+    /// the others'. Gemini is deliberately not in this list — see its own file's tests.
     #[test]
     fn harnesses_without_a_known_launch_time_route_get_no_hooks() {
-        for name in ["codex", "pi", "opencode", "kiro", "gemini", "./my-wrapper.sh"] {
-            assert_eq!(for_command(name).status_hooks(REPORT, "feat-x"), None, "{name}");
+        for name in ["codex", "pi", "opencode", "kiro", "./my-wrapper.sh"] {
+            assert_eq!(for_command(name).status_hooks(REPORT, "feat-x", Path::new("/repo")), None, "{name}");
         }
     }
 

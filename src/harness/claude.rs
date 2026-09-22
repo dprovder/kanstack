@@ -51,7 +51,7 @@ impl Harness for Claude {
     fn note_delivery(&self) -> NoteDelivery {
         NoteDelivery::Flag("--append-system-prompt".to_string())
     }
-    fn status_hooks(&self, report: &str, branch: &str) -> Option<LaunchExtras> {
+    fn status_hooks(&self, report: &str, branch: &str, _cwd: &std::path::Path) -> Option<LaunchExtras> {
         let entry = |matcher: &str, command: String| {
             serde_json::json!({ "matcher": matcher, "hooks": [{ "type": "command", "command": command, "timeout": 5 }] })
         };
@@ -110,7 +110,9 @@ mod tests {
     // Status hooks.
 
     fn claude_settings() -> serde_json::Value {
-        let extras = for_command("claude").status_hooks(REPORT, "feat-x").expect("claude takes hooks at launch");
+        let extras = for_command("claude")
+            .status_hooks(REPORT, "feat-x", std::path::Path::new("/repo"))
+            .expect("claude takes hooks at launch");
         assert_eq!(extras.args[0], "--settings");
         serde_json::from_str(&extras.args[1]).expect("--settings takes JSON")
     }
