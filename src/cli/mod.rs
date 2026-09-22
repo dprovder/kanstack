@@ -26,6 +26,7 @@ mod exit;
 pub use exit::{dispatch, error_code, invalid_arguments, report_error, ErrorCode};
 use exit::{tag, ErrorCode::*, RESULT_SCHEMA};
 
+mod events;
 mod focus;
 mod prune;
 mod report_cmd;
@@ -37,7 +38,7 @@ mod stop;
 pub use prune::PRUNE_SCHEMA;
 pub use status::STATUS_SCHEMA;
 
-pub const SUBCOMMANDS: &[&str] = &["spawn", "send", "status", "focus", "stop", "report", "prune"];
+pub const SUBCOMMANDS: &[&str] = &["spawn", "send", "status", "focus", "stop", "report", "prune", "events"];
 
 pub const HELP: &str = "\
 kanstack spawn <branch> [--agent <name>] [--prompt \"...\"] [--item <ref>] [--json]
@@ -67,6 +68,16 @@ kanstack prune [--json]
     forget workstreams whose pane is confirmed gone (closed outside kanstack, the process
     died). Only removes ones the poll came back and said were dead — never ones it
     couldn't ask, which stay registered. --json prints one JSON document instead of lines
+kanstack events [--since <offset>] [--follow] [--json]
+    print the append-only events log (schema in the README): a report state change and a
+    spawn/stop/prune lifecycle change, one JSON line each, so a caller doesn't have to poll
+    `status` in a loop to notice one — a doorbell, not the payload; go read `status --json`
+    for what actually happened. --since <offset> starts from that byte offset instead of the
+    beginning (print the offset a prior run left off at, e.g. with `wc -c`, to resume where it
+    left off); --follow keeps printing new lines as they're appended (like `tail -f`) until
+    killed, instead of exiting once caught up. Needs no multiplexer and never touches the
+    workstream registry. Always prints raw JSON lines on success; --json only changes how a
+    failure is reported, same as every other subcommand
 
 <session> is a pane id as `kanstack status` prints it. These need to run inside the
 multiplexer the panes live in (see README).
@@ -85,6 +96,7 @@ pub enum Command {
     Stop { target: String, json: bool },
     Report { state: Reported, branch: Option<String>, json: bool },
     Prune { json: bool },
+    Events { since: u64, follow: bool, json: bool },
 }
 
 impl Command {
@@ -98,6 +110,7 @@ impl Command {
             Command::Stop { .. } => "stop",
             Command::Report { .. } => "report",
             Command::Prune { .. } => "prune",
+            Command::Events { .. } => "events",
         }
     }
 
@@ -109,7 +122,8 @@ impl Command {
             | Command::Focus { json, .. }
             | Command::Stop { json, .. }
             | Command::Report { json, .. }
-            | Command::Prune { json } => *json,
+            | Command::Prune { json }
+            | Command::Events { json, .. } => *json,
         }
     }
 }
@@ -121,6 +135,8 @@ pub fn parse(name: &str, args: Vec<String>) -> Result<Option<Command>> {
         return Ok(None);
     }
     let mut positional = Vec::new();
+    let mut since = None;
+    let mut follow = false;
     let mut agent = None;
     let mut prompt = None;
     let mut item = None;
@@ -140,6 +156,16 @@ pub fn parse(name: &str, args: Vec<String>) -> Result<Option<Command>> {
         match key.as_str() {
             "--agent" if name == "spawn" => agent = Some(flag("--agent", inline.as_deref(), &mut args)?),
             "--prompt" if name == "spawn" => prompt = Some(flag("--prompt", inline.as_deref(), &mut args)?),
+            "--since" if name == "events" => {
+                let raw = flag("--since", inline.as_deref(), &mut args)?;
+                since = Some(raw.parse::<u64>().map_err(|_| anyhow::anyhow!("--since must be a byte offset, e.g. 4096\n\n{HELP}"))?);
+            }
+            "--follow" if name == "events" => {
+                if inline.is_some() {
+                    bail!("--follow takes no value\n\n{HELP}");
+                }
+                follow = true;
+            }
             "--item" if name == "spawn" => item = Some(flag("--item", inline.as_deref(), &mut args)?),
             "--json" => {
                 if inline.is_some() {
@@ -179,6 +205,7 @@ pub fn parse(name: &str, args: Vec<String>) -> Result<Option<Command>> {
             Command::Report { state, branch: positional.next(), json }
         }
         "prune" => Command::Prune { json },
+        "events" => Command::Events { since: since.unwrap_or(0), follow, json },
         other => bail!("unknown subcommand {other:?}"),
     };
     if positional.next().is_some() {
@@ -272,6 +299,7 @@ pub fn run(command: Command, cwd: &Path, out: &mut impl Write) -> Result<()> {
         // not make it noisy or slow, and report_cmd::run never reads the registry at all.
         Command::Report { state, branch, json } => report_cmd::run(state, branch, json, cwd, out),
         Command::Prune { json } => prune::run(json, cwd, out),
+        Command::Events { since, follow, json: _ } => events::run(since, follow, cwd, out),
     }
 }
 
@@ -496,6 +524,23 @@ mod tests {
         assert_eq!(parse("prune", args(&[])).unwrap(), Some(Command::Prune { json: false }));
         assert_eq!(parse("prune", args(&["--json"])).unwrap(), Some(Command::Prune { json: true }));
         assert!(parse("prune", args(&["extra"])).is_err(), "prune takes no positional arguments");
+    }
+
+    #[test]
+    fn parse_accepts_events_with_since_follow_and_json() {
+        assert_eq!(parse("events", args(&[])).unwrap(), Some(Command::Events { since: 0, follow: false, json: false }));
+        assert_eq!(
+            parse("events", args(&["--since", "4096"])).unwrap(),
+            Some(Command::Events { since: 4096, follow: false, json: false })
+        );
+        assert_eq!(
+            parse("events", args(&["--since=4096", "--follow", "--json"])).unwrap(),
+            Some(Command::Events { since: 4096, follow: true, json: true })
+        );
+        assert!(parse("events", args(&["--since", "not-a-number"])).is_err());
+        assert!(parse("events", args(&["extra"])).is_err(), "events takes no positional arguments");
+        assert!(parse("status", args(&["--since", "1"])).is_err(), "--since is events-only");
+        assert!(parse("status", args(&["--follow"])).is_err(), "--follow is events-only");
     }
 
     // Cross-cutting behavior of the shared `resolve_branch`/`target_with_pane` helpers above,
