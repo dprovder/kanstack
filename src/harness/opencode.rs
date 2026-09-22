@@ -13,6 +13,17 @@ use crate::harness::Harness;
 /// persistent plugin file into the target repository or the user's global config directory,
 /// not a self-contained launch-time argument — a heavier, more invasive footprint than
 /// `status_hooks`'s `LaunchExtras` (plain CLI args/env) is built for.
+///
+/// **`busy`/`idle` self-reporting checked too, with fresh eyes since reporting doesn't need to
+/// block anything — same wall anyway.** `session.idle` (idle) and `session.created`/
+/// `tool.execute.before` (busy) all exist, alongside a full event catalog including
+/// `permission.asked`/`permission.replied` (a real `waiting` candidate, confirmed to exist,
+/// moot for the same reason as everything else here). Every one of them registers exactly the
+/// same way as `tool.execute.before` — a `.ts`/`.js` plugin file, or an npm package name in
+/// `opencode.json` — with no distinct "observation-only" registration tier and no config key
+/// that takes an inline shell command for any event (the closest thing,
+/// `attention.notifications`/`attention.sound`, is a boolean toggle for OpenCode's own built-in
+/// desktop notifications, not a hook). Non-blocking doesn't buy a lighter mechanism here.
 pub struct OpenCode;
 impl Harness for OpenCode {
     fn id(&self) -> &'static str {
