@@ -1,6 +1,6 @@
 //! What can be learned about a pane from the process table alone, for a multiplexer that
 //! can't say for itself whether a pane's harness is busy, idle or still there — see
-//! [`crate::mux::Multiplexer::tracks_pids`]. `crate::tmux` reads the same table for the same
+//! [`crate::mux::Multiplexer::tracks_pids`]. `crate::mux::tmux` reads the same table for the same
 //! CPU sum, so the helpers live here rather than in either.
 //!
 //! One `ps -A -o pid=,ppid=,pcpu=` call yields every process's parent and CPU%, and from

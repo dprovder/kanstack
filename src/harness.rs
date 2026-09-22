@@ -5,7 +5,7 @@
 //! context note reaches it (see [`NoteDelivery`]), and it is where anything else that varies
 //! per harness belongs — one implementor per harness, one entry in [`KNOWN`].
 //!
-//! The split backends (`crate::cmux`, `crate::tmux`, `crate::orca`) know nothing about any
+//! The split backends (`crate::mux::cmux`, `crate::mux::tmux`, `crate::mux::orca`) know nothing about any
 //! of this: [`HarnessConfig::launch_line`] turns a harness choice into the finished line,
 //! and a backend just types it.
 

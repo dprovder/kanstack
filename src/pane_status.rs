@@ -1,9 +1,9 @@
-//! [`PaneStatus`], shared by every harness-split backend (`crate::cmux`, `crate::tmux`,
-//! `crate::orca`) — see `crate::splitter` for how a caller picks between them.
+//! [`PaneStatus`], shared by every harness-split backend (`crate::mux::cmux`, `crate::mux::tmux`,
+//! `crate::mux::orca`) — see `crate::splitter` for how a caller picks between them.
 
 /// Last known liveness/activity of a lane's split pane, however the backend derives it:
-/// `crate::cmux::Cmux` from `cmux top`'s CPU reading, `crate::tmux::Tmux` from a `ps` walk of
-/// the pane's process tree, `crate::orca::Orca` from Orca's own idle detection (no CPU
+/// `crate::mux::cmux::Cmux` from `cmux top`'s CPU reading, `crate::mux::tmux::Tmux` from a `ps` walk of
+/// the pane's process tree, `crate::mux::orca::Orca` from Orca's own idle detection (no CPU
 /// threshold involved) — each in its `Multiplexer::probe`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneStatus {
