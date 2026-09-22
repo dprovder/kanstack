@@ -11,6 +11,7 @@
 
 pub mod gemini;
 pub mod launch;
+pub mod opencode;
 
 use std::path::Path;
 
@@ -162,15 +163,6 @@ impl Harness for Pi {
     }
 }
 
-/// No such flag (a feature request for exactly this, anomalyco/opencode#16089, was closed
-/// as not planned), so the note is folded into the initial message.
-struct OpenCode;
-impl Harness for OpenCode {
-    fn id(&self) -> &'static str {
-        "opencode"
-    }
-}
-
 /// `kiro-cli chat`'s full flag reference has nothing for system prompt, instructions or
 /// context (only pre-configured, not-dynamic-per-invocation agents via `--agent`), so the
 /// note is folded into the initial message.
@@ -195,7 +187,7 @@ impl Harness for Generic {
 
 /// Every harness kanstack recognizes by name, in the order `--setup` prefers them when
 /// several are installed.
-pub const KNOWN: &[&dyn Harness] = &[&Claude, &Codex, &Pi, &OpenCode, &Kiro, &gemini::Gemini];
+pub const KNOWN: &[&dyn Harness] = &[&Claude, &Codex, &Pi, &opencode::OpenCode, &Kiro, &gemini::Gemini];
 
 static GENERIC: Generic = Generic;
 
@@ -466,7 +458,6 @@ mod tests {
     #[test]
     fn resolve_note_delivery_falls_back_to_folding_for_unconfirmed_harnesses() {
         with_system_flag_env(None, || {
-            assert_eq!(resolve_note_delivery("opencode"), NoteDelivery::FoldIntoMessage);
             assert_eq!(resolve_note_delivery("kiro"), NoteDelivery::FoldIntoMessage);
             assert_eq!(resolve_note_delivery("kiro-cli"), NoteDelivery::FoldIntoMessage);
             // Genuinely unrecognized commands get the same safe fallback.
