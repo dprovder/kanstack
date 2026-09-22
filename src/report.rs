@@ -20,6 +20,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::events::EventLog;
 use crate::pane_status::PaneStatus;
 use crate::workstream::{fnv1a, reports_dir};
 
@@ -99,16 +100,19 @@ pub enum Said {
 #[derive(Debug, Clone, Default)]
 pub struct Reports {
     dir: Option<PathBuf>,
+    /// Where a report [`Self::write`]s also rings the events-log doorbell — see
+    /// `crate::events`. Best-effort, like the report itself.
+    events: EventLog,
 }
 
 impl Reports {
     pub fn for_repo(repo: &Path) -> Self {
-        Reports { dir: reports_dir(repo) }
+        Reports { dir: reports_dir(repo), events: EventLog::for_repo(repo) }
     }
 
     #[cfg(test)]
     pub(crate) fn in_dir(dir: PathBuf) -> Self {
-        Reports { dir: Some(dir) }
+        Reports { dir: Some(dir), events: EventLog::default() }
     }
 
     /// One file per branch, named by a hash of it so any branch name — slashes and all — is a
@@ -131,6 +135,7 @@ impl Reports {
         let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
         std::fs::write(&tmp, serde_json::to_string(&stored)? + "\n")?;
         std::fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))?;
+        self.events.record_report(branch, state, now);
         Ok(())
     }
 
@@ -331,5 +336,30 @@ mod tests {
         assert!(!reports.retract_busy("idle", 1000, at(1030)));
         assert!(!reports.retract_busy("never-reported", 1000, at(1030)));
         assert_eq!(reports.status("waiting", at(1031)), Some(PaneStatus::Waiting));
+    }
+
+    /// `write` is the one place every `kanstack report <state>` call goes through, so it's
+    /// where the events-log doorbell rings too — see `crate::events`. `Reports::in_dir` (what
+    /// `scratch` above uses) has nowhere to keep an events log, so this goes through
+    /// `Reports::for_repo` instead, the same constructor `kanstack report` actually uses.
+    #[test]
+    fn writing_a_report_also_appends_it_to_the_events_log() {
+        let _guard = crate::SPLIT_BACKEND_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("kanstack-reports-events-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("KANSTACK_STATE_PATH", &dir);
+        let repo = Path::new("/repo/reports-events");
+
+        Reports::for_repo(repo).write("fix-login", Reported::Busy, at(1000)).unwrap();
+
+        let events_path = crate::workstream::events_path(repo).unwrap();
+        let raw = std::fs::read_to_string(&events_path).unwrap();
+        assert_eq!(raw.lines().count(), 1);
+        assert!(raw.contains(r#""branch":"fix-login""#), "{raw}");
+        assert!(raw.contains(r#""kind":"report""#), "{raw}");
+        assert!(raw.contains(r#""state":"busy""#), "{raw}");
+
+        std::env::remove_var("KANSTACK_STATE_PATH");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
