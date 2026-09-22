@@ -12,7 +12,6 @@ pub mod claims;
 pub mod config;
 pub mod diff;
 pub mod harness;
-pub mod harness_launch;
 pub mod hit;
 pub mod mux;
 pub mod model;

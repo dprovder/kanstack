@@ -111,7 +111,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
-use crate::harness_launch::shell_quote;
+use crate::harness::launch::shell_quote;
 use crate::mux::{command_exists, Multiplexer, OpenRequest};
 use crate::mux::pane_status::PaneStatus;
 
@@ -687,7 +687,7 @@ probe) printf 'OWN\nOTHER\nNEW-after-OWN\n' ;;"#;
                 out.display()
             );
             splitter.set_anchor("OWN");
-            let real = crate::harness_launch::shell_quote(&launch);
+            let real = crate::harness::launch::shell_quote(&launch);
             assert_ne!(real, launch);
             let ghostty = fake.ghostty();
             ghostty

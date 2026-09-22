@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{bail, Context, Result};
 
-use crate::harness_launch::shell_quote;
+use crate::harness::launch::shell_quote;
 use crate::mux::pane_status::{PaneStatus, CPU_BUSY_THRESHOLD_PERCENT};
 use crate::workstream::{fnv1a, pids_dir};
 

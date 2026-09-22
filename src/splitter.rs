@@ -1531,7 +1531,7 @@ mod tests {
         let (mut splitter, mux, _) = splitter_tracking("quoting", true, None);
         splitter.set_pids(Pids::in_dir(dir.clone()));
         splitter.spawn_harness(cwd(), "feat-a", None).unwrap();
-        let quoted = crate::harness_launch::shell_quote(&dir.join("x").to_string_lossy());
+        let quoted = crate::harness::launch::shell_quote(&dir.join("x").to_string_lossy());
         let quoted_dir = quoted.trim_end_matches("x'");
         let line = launched(&mux);
         assert!(line.contains("'\\''s"), "the apostrophe is closed out and escaped: {line}");

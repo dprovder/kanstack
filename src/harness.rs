@@ -9,11 +9,13 @@
 //! of this: [`HarnessConfig::launch_line`] turns a harness choice into the finished line,
 //! and a backend just types it.
 
+pub mod launch;
+
 use std::path::Path;
 
 use anyhow::Result;
 
-use crate::harness_launch::{launch_line_with, shell_quote, LaunchExtras, NoteDelivery};
+use crate::harness::launch::{launch_line_with, shell_quote, LaunchExtras, NoteDelivery};
 
 /// One coding-agent harness. Unit structs, looked up by [`for_command`].
 pub trait Harness: Sync {
@@ -26,7 +28,7 @@ pub trait Harness: Sync {
         &[]
     }
 
-    /// How the branch-context note (see `harness_launch::branch_context_note`) reaches this
+    /// How the branch-context note (see `launch::branch_context_note`) reaches this
     /// harness when nothing overrides it. Defaults to the one delivery every harness
     /// supports: folding the note into the initial message.
     fn note_delivery(&self) -> NoteDelivery {
@@ -290,7 +292,7 @@ impl HarnessConfig {
     /// configured command for just this pane (`kanstack spawn --agent`), including which
     /// delivery the note uses — that depends on the harness, not on what was configured.
     ///
-    /// No trailing newline; the backend submits it. See `harness_launch::launch_line` for
+    /// No trailing newline; the backend submits it. See `launch::launch_line` for
     /// the spill-to-files handling of a prompt too long to type.
     pub fn launch_line(
         &self,
