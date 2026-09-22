@@ -1482,6 +1482,32 @@ mod tests {
         });
     }
 
+    /// A registered workstream with no pane (e.g. `spawn --item` reserved it, or a previous
+    /// `stop` already closed its pane while leaving the branch registered some other way) is a
+    /// different condition from an unknown target entirely — `send`/`focus` tell them apart as
+    /// `no_pane` vs `unknown_workstream`, both exit `3` but distinct `error.code`s, so a caller
+    /// that wants to react differently (e.g. `spawn` a pane for it vs treat the branch as
+    /// nonexistent) can. `send`/`focus` are not made idempotent by this task — a retry really
+    /// does mean "do it again" — but the signal that decides *how* to react is unambiguous
+    /// either way (see the module doc on `send`/`focus` above).
+    #[test]
+    fn a_workstream_with_no_pane_is_no_pane_not_unknown_workstream() {
+        with_tmux_registry("no-pane-json", "printf ''", vec![workstream("planned", None, None, None)], |repo| {
+            for command in
+                [Command::Send { target: "planned".into(), text: "hi".into(), json: true }, Command::Focus { target: "planned".into(), json: true }]
+            {
+                let name = command.name();
+                let mut out = Vec::new();
+                let mut err_out = Vec::new();
+                let code = dispatch(command, repo, &mut out, &mut err_out);
+                assert_eq!(code, 3, "{name}: no_pane shares unknown_workstream's exit code");
+                assert!(err_out.is_empty(), "{name}");
+                let printed = String::from_utf8(out).unwrap();
+                assert!(printed.contains(r#""code":"no_pane""#), "{name}: {printed}");
+            }
+        });
+    }
+
     // `spawn --json` — the one command that also talks to `but`, so its stand-in needs both
     // `but` (for `status`/`branch_new`) and `tmux` (for the pane itself).
 
@@ -2041,6 +2067,48 @@ mod tests {
         assert_eq!(after.get("old-spike"), None, "the dead one is forgotten");
         assert!(after.get("fix-login").is_some(), "the live one stays");
         assert!(after.get("planned").is_some(), "a workstream with no pane is untouched");
+    }
+
+    /// `prune` is idempotent by construction (see the module doc): a repeat run just finds
+    /// nothing left to prune. Runs `prune` twice against the same on-disk registry, in the
+    /// same process, to pin that down directly rather than relying on it falling out of the
+    /// single-run tests above. No code change needed — `stale_branches` already only acts on a
+    /// poll that came back `Dead`, so once a branch is gone from the registry there is nothing
+    /// left for a second run to find.
+    #[test]
+    fn running_prune_twice_prunes_nothing_the_second_time() {
+        use crate::mux::stand_in;
+        let tag = "prune-twice";
+        let (bin, _log) = stand_in::install(tag, "tmux", r#"case "$1" in list-panes) printf '%%3 2000000000\n' ;; esac"#);
+        let state = std::env::temp_dir().join(format!("kanstack-cli-{tag}-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state);
+        stand_in::with_env(
+            &[
+                ("KANSTACK_STATE_PATH", Some(state.to_str().unwrap())),
+                ("KANSTACK_SPLIT_BACKEND", Some("tmux")),
+                ("KANSTACK_TMUX_BIN", Some(bin.to_str().unwrap())),
+                ("TMUX_PANE", Some("%0")),
+            ],
+            || {
+                let repo = Path::new("/repo/prune-twice");
+                let mut registry = Registry::load(repo).unwrap();
+                registry.upsert(workstream("fix-login", Some("%3"), Some("claude"), None));
+                registry.upsert(workstream("old-spike", Some("%5"), Some("codex"), None));
+                registry.save().unwrap();
+
+                let mut first = Vec::new();
+                run(Command::Prune { json: true }, repo, &mut first).unwrap();
+                assert_eq!(String::from_utf8(first).unwrap(), "{\"schema\":1,\"pruned\":[\"old-spike\"]}\n");
+                assert!(Registry::load(repo).unwrap().get("old-spike").is_none());
+
+                let mut second = Vec::new();
+                run(Command::Prune { json: true }, repo, &mut second).unwrap();
+                assert_eq!(String::from_utf8(second).unwrap(), "{\"schema\":1,\"pruned\":[]}\n", "nothing left to prune the second time");
+                assert!(Registry::load(repo).unwrap().get("fix-login").is_some(), "the live one is untouched by either run");
+            },
+        );
+        stand_in::remove(&bin);
+        let _ = std::fs::remove_dir_all(&state);
     }
 
     #[test]
