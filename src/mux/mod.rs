@@ -11,6 +11,8 @@
 //! Panes are addressed by an opaque id string the backend defines: tmux's `%3`, cmux's
 //! `surface:12`, Orca's terminal handle.
 
+pub mod tmux;
+
 use std::collections::HashMap;
 use std::path::Path;
 

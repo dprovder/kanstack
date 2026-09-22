@@ -27,13 +27,12 @@ pub mod snapshot;
 pub mod splitter;
 pub mod text_input;
 pub mod theme;
-pub mod tmux;
 pub mod tutorial;
 pub mod ui;
 pub mod watch;
 pub mod workstream;
 
-/// Serializes tests, across `cmux.rs`/`tmux.rs`/`orca.rs`/`ghostty.rs`/`splitter.rs`, that mutate
+/// Serializes tests, across `cmux.rs`/`mux/tmux.rs`/`orca.rs`/`ghostty.rs`/`splitter.rs`, that mutate
 /// process-wide env vars each backend's `discover` reads (`PATH`, `KANSTACK_CMUX_BIN`,
 /// `KANSTACK_TMUX_BIN`, `KANSTACK_ORCA_BIN`, `KANSTACK_OSASCRIPT_BIN`, `TMUX_PANE`,
 /// `ORCA_TERMINAL_HANDLE`, `TERM_PROGRAM`, `CMUX_SURFACE_ID`,
