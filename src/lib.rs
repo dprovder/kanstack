@@ -16,7 +16,6 @@ pub mod harness_launch;
 pub mod hit;
 pub mod mux;
 pub mod model;
-pub mod orca;
 pub mod pane_status;
 pub mod procs;
 pub mod report;
@@ -31,7 +30,7 @@ pub mod ui;
 pub mod watch;
 pub mod workstream;
 
-/// Serializes tests, across `mux/cmux.rs`/`mux/tmux.rs`/`orca.rs`/`ghostty.rs`/`splitter.rs`, that mutate
+/// Serializes tests, across `mux/cmux.rs`/`mux/tmux.rs`/`mux/orca.rs`/`ghostty.rs`/`splitter.rs`, that mutate
 /// process-wide env vars each backend's `discover` reads (`PATH`, `KANSTACK_CMUX_BIN`,
 /// `KANSTACK_TMUX_BIN`, `KANSTACK_ORCA_BIN`, `KANSTACK_OSASCRIPT_BIN`, `TMUX_PANE`,
 /// `ORCA_TERMINAL_HANDLE`, `TERM_PROGRAM`, `CMUX_SURFACE_ID`,

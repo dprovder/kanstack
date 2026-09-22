@@ -1,6 +1,6 @@
 //! Optional bridge to the `orca` CLI (<https://github.com/stablyai/orca>, CLI reference at
 //! <https://www.onorca.dev/docs/cli/reference>), the third harness-split backend beside
-//! `crate::cmux` and `crate::tmux`.
+//! `crate::mux::cmux` and `crate::mux::tmux`.
 //!
 //! **What is verified, and against what.** The command names and flags come from the
 //! published CLI reference. The JSON shapes, the `path:` selector rules, the split orientation
@@ -737,14 +737,14 @@ mod tests {
 
     // Real replies, captured from Orca's headless runtime (`orcad`, built from stablyai/orca
     // at 9fbdfc5) with paths, username and hostname scrubbed. The desktop app was not run.
-    const CREATE_LIVE: &str = include_str!("../tests/fixtures/orca_create.json");
-    const SPLIT_LIVE: &str = include_str!("../tests/fixtures/orca_split.json");
-    const LIST_LIVE: &str = include_str!("../tests/fixtures/orca_list.json");
-    const WAIT_TIMEOUT_LIVE: &str = include_str!("../tests/fixtures/orca_wait_timeout.json");
-    const SEND_PLAIN_LIVE: &str = include_str!("../tests/fixtures/orca_send_plain.json");
-    const CLOSE_LIVE: &str = include_str!("../tests/fixtures/orca_close.json");
-    const SPLIT_STALE_LIVE: &str = include_str!("../tests/fixtures/orca_split_stale.json");
-    const BAD_SELECTOR_LIVE: &str = include_str!("../tests/fixtures/orca_create_bad_selector.json");
+    const CREATE_LIVE: &str = include_str!("../../tests/fixtures/orca_create.json");
+    const SPLIT_LIVE: &str = include_str!("../../tests/fixtures/orca_split.json");
+    const LIST_LIVE: &str = include_str!("../../tests/fixtures/orca_list.json");
+    const WAIT_TIMEOUT_LIVE: &str = include_str!("../../tests/fixtures/orca_wait_timeout.json");
+    const SEND_PLAIN_LIVE: &str = include_str!("../../tests/fixtures/orca_send_plain.json");
+    const CLOSE_LIVE: &str = include_str!("../../tests/fixtures/orca_close.json");
+    const SPLIT_STALE_LIVE: &str = include_str!("../../tests/fixtures/orca_split_stale.json");
+    const BAD_SELECTOR_LIVE: &str = include_str!("../../tests/fixtures/orca_create_bad_selector.json");
 
     #[test]
     fn live_create_and_split_replies_yield_the_new_handle() {
