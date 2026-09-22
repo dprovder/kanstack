@@ -9,6 +9,7 @@
 //! of this: [`HarnessConfig::launch_line`] turns a harness choice into the finished line,
 //! and a backend just types it.
 
+pub mod codex;
 pub mod gemini;
 pub mod kiro;
 pub mod launch;
@@ -140,20 +141,6 @@ impl Harness for Claude {
     }
 }
 
-/// No `--append-system-prompt` exists (a request for exactly that, openai/codex#11117, is
-/// closed unimplemented); `-c developer_instructions=<toml>` is the closest equivalent, a
-/// differently-*shaped* mechanism (TOML-quoted, and a "developer" message rather than
-/// literally the system prompt), not just a different flag name.
-struct Codex;
-impl Harness for Codex {
-    fn id(&self) -> &'static str {
-        "codex"
-    }
-    fn note_delivery(&self) -> NoteDelivery {
-        NoteDelivery::CodexConfig
-    }
-}
-
 /// Anything not in [`KNOWN`]: a wrapper script, a harness kanstack hasn't heard of. Gets
 /// the delivery that works everywhere.
 struct Generic;
@@ -165,7 +152,7 @@ impl Harness for Generic {
 
 /// Every harness kanstack recognizes by name, in the order `--setup` prefers them when
 /// several are installed.
-pub const KNOWN: &[&dyn Harness] = &[&Claude, &Codex, &pi::Pi, &opencode::OpenCode, &kiro::Kiro, &gemini::Gemini];
+pub const KNOWN: &[&dyn Harness] = &[&Claude, &codex::Codex, &pi::Pi, &opencode::OpenCode, &kiro::Kiro, &gemini::Gemini];
 
 static GENERIC: Generic = Generic;
 
@@ -404,13 +391,6 @@ mod tests {
                 resolve_note_delivery("claude"),
                 NoteDelivery::Flag("--append-system-prompt".to_string())
             );
-        });
-    }
-
-    #[test]
-    fn resolve_note_delivery_uses_codex_config_for_codex() {
-        with_system_flag_env(None, || {
-            assert_eq!(resolve_note_delivery("codex"), NoteDelivery::CodexConfig);
         });
     }
 
