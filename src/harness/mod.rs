@@ -51,10 +51,11 @@ pub trait Harness: Sync {
     ///
     /// `None`, the default, means kanstack knows no way to hand this harness hooks when it
     /// launches it. That costs nothing but accuracy: the multiplexer's own reading of the
-    /// pane is used instead, and anything can still call `kanstack report` itself. Today only
-    /// [`claude::Claude`] and [`gemini::Gemini`] return `Some` here — each one's own file
-    /// documents why `Codex`/`Pi`/`OpenCode`/`Kiro` were checked and left out, for both this
-    /// and the claim-check hook below.
+    /// pane is used instead, and anything can still call `kanstack report` itself. Today
+    /// [`claude::Claude`], [`gemini::Gemini`] and [`codex::Codex`] return `Some` here —
+    /// `codex::Codex`'s own file documents why it took a differently-shaped fix (a
+    /// branch-agnostic command, not a branch baked into the launch environment) than the
+    /// other two, and why `Pi`/`OpenCode`/`Kiro` were checked and still left out for this.
     ///
     /// This is also where the `PreToolUse`-equivalent claim-check hook (`kanstack claim`, see
     /// `crate::claims` and `crate::cli::claim`) lives, for the harnesses that have it wired
@@ -66,12 +67,17 @@ pub trait Harness: Sync {
     /// none is wireable the same lightweight way — see each one's own file for why (a file
     /// that must exist on disk before launch, arbitrary-code-execution risk, an
     /// incompatible payload shape, or more than one of those at once) — a deliberate,
-    /// documented v1 limitation, not an oversight.
+    /// documented v1 limitation, not an oversight. [`codex::Codex`] is a special case: its
+    /// original blocker (per-hook trust review re-triggering every spawn) is solved along with
+    /// the reporting hooks above, but a second, independent one (`apply_patch`'s payload
+    /// shape) is not, so it stays unwired for this specifically — see its own file.
     ///
     /// `cwd` is the repository the pane is about to launch into — not this process's own
     /// working directory, which may differ (`kanstack -C <path> ...`). [`gemini::Gemini`]
     /// needs it to place its per-branch settings file (see
-    /// `crate::workstream::gemini_hooks_dir`); every other implementor ignores it.
+    /// `crate::workstream::gemini_hooks_dir`); [`codex::Codex`] needs it to find the
+    /// repository root its own project-local hook file lives under. Every other implementor
+    /// ignores it.
     fn status_hooks(&self, _report: &str, _branch: &str, _cwd: &Path) -> Option<LaunchExtras> {
         None
     }
@@ -253,14 +259,17 @@ pub(crate) mod test_support {
 
     pub(crate) const REPORT: &str = "'/opt/kanstack' report";
 
-    /// A directory holding stand-ins named `claude` and `codex` that print the environment
-    /// variable hooks rely on, then each argument they were started with.
+    /// A directory holding stand-ins named `claude`, `codex` and `pi` that print the
+    /// environment variable hooks rely on, then each argument they were started with. `pi` is
+    /// here specifically as a harness with no launch-time hook route at all (unlike `codex`,
+    /// which now has one — see `crate::harness::codex`), for tests that need to contrast the
+    /// two.
     pub(crate) fn stand_in_harnesses(tag: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("kanstack-harness-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        for name in ["claude", "codex"] {
+        for name in ["claude", "codex", "pi"] {
             let path = dir.join(name);
             std::fs::write(&path, "#!/bin/sh\nprintf '%s\\n' \"$KANSTACK_BRANCH\"\nfor a in \"$@\"; do printf '%s\\0' \"$a\"; done\n").unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -383,10 +392,11 @@ mod tests {
     // Status hooks.
 
     /// Only harnesses with a launch-time route are handed hooks; kanstack does not guess at
-    /// the others'. Gemini is deliberately not in this list — see its own file's tests.
+    /// the others'. Gemini and Codex are deliberately not in this list — see their own
+    /// files' tests.
     #[test]
     fn harnesses_without_a_known_launch_time_route_get_no_hooks() {
-        for name in ["codex", "pi", "opencode", "kiro", "./my-wrapper.sh"] {
+        for name in ["pi", "opencode", "kiro", "./my-wrapper.sh"] {
             assert_eq!(for_command(name).status_hooks(REPORT, "feat-x", Path::new("/repo")), None, "{name}");
         }
     }
@@ -403,21 +413,22 @@ mod tests {
         });
     }
 
-    /// `--agent codex` from a claude-configured board must not be handed claude's flags, and
-    /// the other way round.
+    /// `--agent pi` from a claude-configured board must not be handed claude's flags, and
+    /// the other way round. `pi` stands in for "no launch-time hook route at all" — `codex`
+    /// no longer fits that role, see `crate::harness::codex`.
     #[test]
     fn hooks_follow_the_harness_actually_launched_not_the_configured_one() {
         with_system_flag_env(None, || {
             let dir = stand_in_harnesses("override");
             let claude = dir.join("claude").to_string_lossy().into_owned();
-            let codex = dir.join("codex").to_string_lossy().into_owned();
+            let pi = dir.join("pi").to_string_lossy().into_owned();
 
             let config = HarnessConfig::new(claude.clone()).with_reporter(REPORT);
-            let (branch, args) = launched(&config, Some(&codex), Some("fix it"));
-            assert_eq!(branch, "", "codex takes no hooks, so no lane variable either");
+            let (branch, args) = launched(&config, Some(&pi), Some("fix it"));
+            assert_eq!(branch, "", "pi takes no hooks, so no lane variable either");
             assert!(!args.iter().any(|a| a == "--settings"), "{args:?}");
 
-            let config = HarnessConfig::new(codex).with_reporter(REPORT);
+            let config = HarnessConfig::new(pi).with_reporter(REPORT);
             let (branch, args) = launched(&config, Some(&claude), Some("fix it"));
             assert_eq!(branch, "feat-x");
             assert!(args.iter().any(|a| a == "--settings"), "{args:?}");
