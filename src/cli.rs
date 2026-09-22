@@ -1341,6 +1341,82 @@ mod tests {
         );
     }
 
+    // Idempotency: what a retried `stop`/`spawn`/`prune` actually does. `send`/`focus` are
+    // deliberately not made idempotent (see the module doc and README) — only their signal on
+    // failure is checked, alongside the others', in the tests below.
+
+    /// A pane already gone — closed outside kanstack, or by a `stop` that raced this one and
+    /// won the registry lock — is what every backend's own `close` already treats as success
+    /// (see `tmux`/`cmux`/`ghostty`/`orca`'s `close`, and `Splitter::stop`'s "already gone
+    /// counts as stopped"), so `stop` must not surface the multiplexer's "no such pane" as a
+    /// failure: the workstream ends up forgotten either way, which is what the caller asked
+    /// for. No code change needed here — this pins down behavior that was already correct.
+    #[test]
+    fn stop_on_a_pane_already_closed_outside_kanstack_succeeds_quietly() {
+        use crate::mux::stand_in;
+        let (bin, _log) = stand_in::install(
+            "stop-already-dead",
+            "tmux",
+            r#"case "$1" in list-panes) printf '' ;; kill-pane) echo "can't find pane %3" >&2; exit 1 ;; esac"#,
+        );
+        let state = std::env::temp_dir().join(format!("kanstack-cli-stop-already-dead-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state);
+        stand_in::with_env(
+            &[
+                ("KANSTACK_STATE_PATH", Some(state.to_str().unwrap())),
+                ("KANSTACK_SPLIT_BACKEND", Some("tmux")),
+                ("KANSTACK_TMUX_BIN", Some(bin.to_str().unwrap())),
+                ("TMUX_PANE", Some("%0")),
+            ],
+            || {
+                let repo = Path::new("/repo/stop-already-dead");
+                let mut registry = Registry::load(repo).unwrap();
+                registry.upsert(workstream("fix-login", Some("%3"), Some("claude"), None));
+                registry.save().unwrap();
+
+                let mut out = Vec::new();
+                run(Command::Stop { target: "fix-login".into(), json: true }, repo, &mut out)
+                    .expect("a pane already gone must not fail the stop");
+                assert_eq!(
+                    String::from_utf8(out).unwrap(),
+                    "{\"schema\":1,\"ok\":true,\"command\":\"stop\",\"workstream\":\"fix-login\",\"result\":{\"pane\":\"%3\"}}\n"
+                );
+                assert!(Registry::load(repo).unwrap().get("fix-login").is_none(), "the workstream is forgotten either way");
+            },
+        );
+        stand_in::remove(&bin);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// A second `stop` on a workstream the first one already forgot is indistinguishable, by
+    /// construction, from a target that never existed — `stop` removes the registry entry, so
+    /// there is nothing left recording that it was ever there. It reports the same
+    /// `unknown_workstream` a typo'd branch name would (exit `3`): a specific,
+    /// machine-readable condition, not a silent success and not `internal` — an orchestrator
+    /// retrying a `stop` it's unsure landed can treat this exact code as "already done".
+    #[test]
+    fn stopping_an_already_stopped_workstream_is_unknown_workstream_not_a_silent_success() {
+        with_tmux_registry(
+            "stop-retry",
+            r#"printf '%%3 2000000000\n'"#,
+            vec![workstream("fix-login", Some("%3"), Some("claude"), None)],
+            |repo| {
+                run(Command::Stop { target: "fix-login".into(), json: true }, repo, &mut Vec::new()).unwrap();
+                assert!(Registry::load(repo).unwrap().get("fix-login").is_none());
+
+                let mut out = Vec::new();
+                let mut err_out = Vec::new();
+                let code = dispatch(Command::Stop { target: "fix-login".into(), json: true }, repo, &mut out, &mut err_out);
+                assert_eq!(code, 3, "unknown_workstream's exit code");
+                let printed = String::from_utf8(out).unwrap();
+                assert!(
+                    printed.contains(r#""code":"unknown_workstream""#),
+                    "a retried stop must report a specific, non-ambiguous condition: {printed}"
+                );
+            },
+        );
+    }
+
     #[test]
     fn report_json_prints_the_envelope_and_plain_report_prints_nothing() {
         with_state("report-json", &[("KANSTACK_BRANCH", None)], || {
