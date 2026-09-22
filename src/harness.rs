@@ -530,7 +530,16 @@ mod tests {
         // `sh` and `cat` are found through `PATH`, which the backends' discovery tests swap.
         let _guard = crate::SPLIT_BACKEND_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let line = config.launch_line(Path::new("/tmp"), "feat-x", message, harness).unwrap();
-        let out = std::process::Command::new("sh").arg("-c").arg(&line).output().unwrap();
+        // Cleared, not just left alone: this process may itself be running inside a pane
+        // kanstack launched (dogfooding kanstack from kanstack), which would otherwise leak
+        // its own `$KANSTACK_BRANCH` into the child and mask exactly the "no lane variable
+        // leaks to the harness" behavior this helper exists to check.
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&line)
+            .env_remove("KANSTACK_BRANCH")
+            .output()
+            .unwrap();
         assert!(out.status.success(), "{line:?} failed: {}", String::from_utf8_lossy(&out.stderr));
         let stdout = String::from_utf8(out.stdout).unwrap();
         let (branch, args) = stdout.split_once('\n').unwrap();
