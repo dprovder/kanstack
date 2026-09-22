@@ -22,6 +22,7 @@ pub mod pane_status;
 pub mod procs;
 pub mod report;
 pub mod setup;
+pub mod events;
 pub mod snapshot;
 pub mod splitter;
 pub mod text_input;

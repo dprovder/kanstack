@@ -103,6 +103,14 @@ pub fn pids_dir(repo: &Path) -> Option<PathBuf> {
     Some(dir.join(format!("pids-{key:016x}")))
 }
 
+/// Where the append-only events log for `repo` lives — one JSONL file, see `crate::events`. A
+/// sibling of `reports_dir`/`pids_dir`, not inside either: it's one file, not one per branch,
+/// so it doesn't need its own directory.
+pub fn events_path(repo: &Path) -> Option<PathBuf> {
+    let (dir, key) = repo_state(repo)?;
+    Some(dir.join(format!("events-{key:016x}.jsonl")))
+}
+
 /// The state directory, and the key identifying `repo` within it.
 fn repo_state(repo: &Path) -> Option<(PathBuf, u64)> {
     let dir = std::env::var_os("KANSTACK_STATE_PATH")
@@ -381,6 +389,22 @@ mod tests {
             "the same key: {reports:?} {pids:?}"
         );
         assert_ne!(pids, pids_dir(Path::new("/repo/b")).unwrap());
+        std::env::remove_var("KANSTACK_STATE_PATH");
+    }
+
+    /// The events log is also keyed by the repository, a sibling of `reports`/`pids` — same
+    /// key, same directory, but one file rather than a directory of its own.
+    #[test]
+    fn the_events_log_is_a_sibling_file_keyed_by_the_repository() {
+        let _guard = crate::SPLIT_BACKEND_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("KANSTACK_STATE_PATH", "/state");
+        let (reports, events) = (reports_dir(Path::new("/repo/a")).unwrap(), events_path(Path::new("/repo/a")).unwrap());
+        assert_eq!(events.parent(), Some(Path::new("/state")));
+        assert_eq!(
+            reports.file_name().unwrap().to_string_lossy().strip_prefix("reports-"),
+            events.file_name().unwrap().to_string_lossy().strip_suffix(".jsonl").and_then(|s| s.strip_prefix("events-")),
+        );
+        assert_ne!(events, events_path(Path::new("/repo/b")).unwrap());
         std::env::remove_var("KANSTACK_STATE_PATH");
     }
 
