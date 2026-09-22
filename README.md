@@ -289,6 +289,7 @@ kanstack focus <branch|session> [--json]
 kanstack stop <branch|session> [--json]                     # closes the pane, ends its harness
 kanstack report <busy|idle> [<branch>] [--json]              # what an agent says about itself
 kanstack prune [--json]                                     # forgets workstreams whose pane is confirmed gone
+kanstack events [--since <offset>] [--follow] [--json]      # tails the append-only events log
 ```
 
 Every one of these takes `--json`, for a script or another agent to drive kanstack without
@@ -395,6 +396,48 @@ no risk of it wiping the registry just because it wasn't run from inside a pane 
 
 The table form prints one `pruned <branch>` line per branch removed, or `nothing to prune`.
 `schema` versions independently of `status --json`'s.
+
+### Tailing kanstack without polling: `kanstack events`
+
+kanstack has no daemon, no server and no push channel — but it does keep one append-only
+JSONL file per repository (in the same state directory as the workstream registry) that an
+orchestrator can `tail -f` directly, or read through `kanstack events`:
+
+```sh
+kanstack events                       # print everything logged so far
+kanstack events --since 4096          # print only what was appended after byte 4096
+kanstack events --follow              # keep printing new lines as they arrive, like tail -f
+```
+
+Two commands write to it. `kanstack report <busy|idle|waiting>` appends one line every time
+it's called:
+
+```json
+{"schema":1,"ts":"2026-09-22T13:04:05Z","branch":"fix-login","kind":"report","state":"busy"}
+```
+
+And a successful `spawn`, `stop` or `prune` appends a lifecycle line — `command` is the
+subcommand, `branch` is the branch it named (`spawn`'s branch, or whatever `<branch|session>`
+`stop` was given, which is not necessarily resolved to a branch name); `prune` can touch
+several workstreams or none, so it logs one event with no `branch` rather than guessing which:
+
+```json
+{"schema":1,"ts":"2026-09-22T13:05:10Z","kind":"lifecycle","command":"prune"}
+```
+
+`schema` versions this shape independently of every other `--json` schema in kanstack. Both
+kinds are deliberately thin — a doorbell, not the payload: seeing a line is a cue to go read
+`kanstack status --json` for what actually happened, not something to parse for the state
+itself. Appending is best-effort, like every other write in this file — a full disk or a
+missing state directory never fails the command it's attached to, it just means that one event
+doesn't get logged.
+
+`kanstack events` itself always prints raw JSON lines on success, whether or not `--json` is
+given; `--json` only changes how a *failure* (e.g. an unreadable log) is reported, the same
+generic error envelope documented below. It needs no multiplexer and never touches the
+workstream registry, so — like `report` — it's safe to run from anywhere. There is no log
+rotation or size limit yet; if a repository's log ever grows enough to matter, that's worth
+revisiting, but nothing does that today.
 
 ### Exit codes, and `--json` for every subcommand
 
