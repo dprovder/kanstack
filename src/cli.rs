@@ -1577,6 +1577,67 @@ mod tests {
         );
     }
 
+    /// `spawn` failing after `but branch new` succeeds but before the pane actually opens
+    /// (e.g. the multiplexer refuses the split) must not leave a workstream registered with no
+    /// pane for a retry to trip over: `registry.upsert` only runs after the pane spawn
+    /// succeeds, and `Registry::with_lock` only saves once its closure returns `Ok`, so the
+    /// failed attempt's in-memory mutations (there aren't any, here) never reach disk. A retry
+    /// then sees the branch `but` already created — skipping `branch new` again, which a real
+    /// `but` would refuse the second time — and succeeds. No code change needed: this pins
+    /// down behavior the locking added for stage 1 (`registry-locking`) already gave for free.
+    #[test]
+    fn spawn_retried_after_the_pane_fails_to_open_does_not_leave_a_bogus_workstream() {
+        let tag = "spawn-retry";
+        let status_counter = std::env::temp_dir().join(format!("kanstack-cli-{tag}-status-count-{}", std::process::id()));
+        let split_marker = std::env::temp_dir().join(format!("kanstack-cli-{tag}-split-marker-{}", std::process::id()));
+        let _ = std::fs::remove_file(&status_counter);
+        let _ = std::fs::remove_file(&split_marker);
+        let before = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/status_no_feat_ui.json");
+        let after = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/status.json");
+
+        // `status` is asked at least once per spawn attempt. The very first call overall —
+        // before `but branch new` has run — must say `feat-ui` does not exist yet; every call
+        // after must say it does, exactly what a real `but` would report once the branch is
+        // real, whether or not the attempt asking is the one that created it.
+        let but_body = format!(
+            "case \"$1\" in --version) echo 'but 0.22.3' ;; status) \
+             n=$(( $(cat '{counter}' 2>/dev/null || echo 0) + 1 )); echo \"$n\" > '{counter}'; \
+             if [ \"$n\" -le 1 ]; then cat '{before}'; else cat '{after}'; fi ;; esac",
+            counter = status_counter.display(),
+        );
+        // The pane fails to open the first time `split-window` is asked; it succeeds the
+        // second time, simulating a transient multiplexer failure a retry gets past.
+        let tmux_body = format!(
+            "case \"$1\" in list-panes) printf '' ;; split-window) \
+             if [ -f '{marker}' ]; then echo '%9'; else touch '{marker}'; echo boom >&2; exit 1; fi ;; esac",
+            marker = split_marker.display(),
+        );
+        with_but_and_tmux(tag, &but_body, &tmux_body, vec![], |repo| {
+            let first = run(
+                Command::Spawn { branch: "feat-ui".into(), agent: None, prompt: None, item: None, json: false },
+                repo,
+                &mut Vec::new(),
+            );
+            assert!(first.is_err(), "the pane never opened, so the attempt must fail");
+            assert!(
+                Registry::load(repo).unwrap().workstreams.is_empty(),
+                "a failed spawn must not register a workstream with no pane"
+            );
+
+            let mut out = Vec::new();
+            run(Command::Spawn { branch: "feat-ui".into(), agent: None, prompt: None, item: None, json: true }, repo, &mut out)
+                .expect("retrying spawn on the same branch must now succeed");
+            let printed = String::from_utf8(out).unwrap();
+            assert!(
+                printed.contains(r#""created":false"#),
+                "the branch `but` already created on the failed attempt must not be created again: {printed}"
+            );
+            assert_eq!(Registry::load(repo).unwrap().get("feat-ui").map(|w| w.pane_id.is_some()), Some(true));
+        });
+        let _ = std::fs::remove_file(&status_counter);
+        let _ = std::fs::remove_file(&split_marker);
+    }
+
     // `status --json`'s `workspace_blocked` — see `StatusReport::workspace_blocked` and
     // `GitState`. `docs/ARCHITECTURE.md` ("A commit on the workspace head locks everything")
     // has the background on why this is worth telling apart from ordinary unreachability.

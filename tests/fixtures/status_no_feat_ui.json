@@ -1,0 +1,125 @@
+{
+  "uncommittedChanges": [
+    {
+      "cliId": "mv",
+      "filePath": "wip1.txt",
+      "changeType": "added"
+    },
+    {
+      "cliId": "nr",
+      "filePath": "wip2.txt",
+      "changeType": "added"
+    }
+  ],
+  "stacks": [
+    {
+      "cliId": "m0",
+      "assignedChanges": [],
+      "branches": [
+        {
+          "cliId": "fi",
+          "name": "fix-flaky-tests",
+          "commits": [
+            {
+              "cliId": "cf",
+              "commitId": "cfbd894e8633d30dff5ccabbd49aefe9dcf3063c",
+              "createdAt": "2026-07-25T02:29:58+00:00",
+              "message": "Deflake worktree integration suite",
+              "authorName": "Dani",
+              "authorEmail": "d@e.com",
+              "conflicted": false,
+              "reviewId": null,
+              "changes": [
+                {
+                  "cliId": "cf:qs",
+                  "filePath": "d.txt",
+                  "changeType": "added"
+                }
+              ]
+            }
+          ],
+          "upstreamCommits": [],
+          "branchStatus": "completelyUnpushed",
+          "reviewId": null,
+          "ci": null
+        }
+      ]
+    },
+    {
+      "cliId": "k0",
+      "assignedChanges": [],
+      "branches": [
+        {
+          "cliId": "au",
+          "name": "feat-auth",
+          "commits": [
+            {
+              "cliId": "d5",
+              "commitId": "d593db0766d563ee2756d8971e3fd96cc63438fa",
+              "createdAt": "2026-07-25T02:29:57+00:00",
+              "message": "Wire session refresh into gateway",
+              "authorName": "Dani",
+              "authorEmail": "d@e.com",
+              "conflicted": false,
+              "reviewId": null,
+              "changes": [
+                {
+                  "cliId": "d5:nn",
+                  "filePath": "a2.txt",
+                  "changeType": "added"
+                }
+              ]
+            },
+            {
+              "cliId": "e1",
+              "commitId": "e17b60c84da4faf84301db4986d962a57ec807da",
+              "createdAt": "2026-07-25T02:29:57+00:00",
+              "message": "Add auth middleware",
+              "authorName": "Dani",
+              "authorEmail": "d@e.com",
+              "conflicted": false,
+              "reviewId": null,
+              "changes": [
+                {
+                  "cliId": "e1:nk",
+                  "filePath": "a.txt",
+                  "changeType": "added"
+                }
+              ]
+            }
+          ],
+          "upstreamCommits": [],
+          "branchStatus": "completelyUnpushed",
+          "reviewId": null,
+          "ci": null
+        }
+      ]
+    }
+  ],
+  "mergeBase": {
+    "cliId": "",
+    "commitId": "3189356f76bab7ac37e94d48345ecfe559437997",
+    "createdAt": "2026-07-25T02:29:57+00:00",
+    "message": "base\n",
+    "authorName": "Dani",
+    "authorEmail": "d@e.com",
+    "conflicted": null,
+    "reviewId": null,
+    "changes": null
+  },
+  "upstreamState": {
+    "behind": 0,
+    "latestCommit": {
+      "cliId": "",
+      "commitId": "3189356f76bab7ac37e94d48345ecfe559437997",
+      "createdAt": "2026-07-25T02:29:57+00:00",
+      "message": "base\n",
+      "authorName": "Dani",
+      "authorEmail": "d@e.com",
+      "conflicted": null,
+      "reviewId": null,
+      "changes": null
+    },
+    "lastFetched": "2026-07-25T02:29:06.137+00:00"
+  }
+}
