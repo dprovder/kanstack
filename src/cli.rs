@@ -21,32 +21,36 @@ use crate::report::{Reported, Reports};
 use crate::splitter::Splitter;
 use crate::workstream::{AgentId, BranchId, PaneId, Registry, WorkItemRef, Workstream};
 
+mod exit;
+pub use exit::{dispatch, error_code, invalid_arguments, report_error, ErrorCode};
+use exit::{tag, ErrorCode::*, RESULT_SCHEMA};
+
 pub const SUBCOMMANDS: &[&str] = &["spawn", "send", "status", "focus", "stop", "report", "prune"];
 
 pub const HELP: &str = "\
-kanstack spawn <branch> [--agent <name>] [--prompt \"...\"] [--item <ref>]
+kanstack spawn <branch> [--agent <name>] [--prompt \"...\"] [--item <ref>] [--json]
     open a harness pane on <branch>, creating the branch first if it doesn't exist.
     --agent runs that harness (e.g. codex) instead of $KANSTACK_HARNESS; --prompt is
     the harness's first message; --item attaches an opaque work-item reference (e.g.
     github:#42) to the workstream, carried in `status`/`status --json` and never
     interpreted or fetched by kanstack itself
-kanstack send <branch|session> \"...\"
+kanstack send <branch|session> \"...\" [--json]
     type a message into a pane and submit it
 kanstack status [--json]
     list every workstream and whether its pane is busy, idle, waiting on you, or dead. --json prints one
     JSON document instead (schema in the README) and, unlike the table, still lists every
     workstream when no multiplexer is reachable, with their panes' status \"unknown\"
-kanstack focus <branch|session>
+kanstack focus <branch|session> [--json]
     bring a pane to the front
-kanstack stop <branch|session>
+kanstack stop <branch|session> [--json]
     close a pane, ending its harness, and forget the workstream
-kanstack report <busy|idle|waiting> [<branch>]
+kanstack report <busy|idle|waiting> [<branch>] [--json]
     say what the agent on <branch> is doing, for `status` and the board to show; waiting
     means stopped on a permission prompt. This is
     what the hooks kanstack gives a harness run (claude's, today); anything else can call it
     too. <branch> defaults to $KANSTACK_BRANCH, which kanstack sets in a pane it launches.
-    Prints nothing, and needs no multiplexer. KANSTACK_STATUS_HOOKS=off stops kanstack
-    handing harnesses those hooks
+    Prints nothing unless --json is given (never anything else — see README), and needs no
+    multiplexer. KANSTACK_STATUS_HOOKS=off stops kanstack handing harnesses those hooks
 kanstack prune [--json]
     forget workstreams whose pane is confirmed gone (closed outside kanstack, the process
     died). Only removes ones the poll came back and said were dead — never ones it
@@ -54,17 +58,48 @@ kanstack prune [--json]
 
 <session> is a pane id as `kanstack status` prints it. These need to run inside the
 multiplexer the panes live in (see README).
+
+Every subcommand's --json prints one JSON document to stdout and nothing else, whether it
+succeeds or fails; without --json, a failure is reported on stderr as always. Exit codes and
+the `error.code` a failed --json document carries are documented in the README.
 ";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    Spawn { branch: String, agent: Option<String>, prompt: Option<String>, item: Option<String> },
-    Send { target: String, text: String },
+    Spawn { branch: String, agent: Option<String>, prompt: Option<String>, item: Option<String>, json: bool },
+    Send { target: String, text: String, json: bool },
     Status { json: bool },
-    Focus { target: String },
-    Stop { target: String },
-    Report { state: Reported, branch: Option<String> },
+    Focus { target: String, json: bool },
+    Stop { target: String, json: bool },
+    Report { state: Reported, branch: Option<String>, json: bool },
     Prune { json: bool },
+}
+
+impl Command {
+    /// The subcommand name, for a `--json` envelope's `"command"` field.
+    fn name(&self) -> &'static str {
+        match self {
+            Command::Spawn { .. } => "spawn",
+            Command::Send { .. } => "send",
+            Command::Status { .. } => "status",
+            Command::Focus { .. } => "focus",
+            Command::Stop { .. } => "stop",
+            Command::Report { .. } => "report",
+            Command::Prune { .. } => "prune",
+        }
+    }
+
+    fn wants_json(&self) -> bool {
+        match self {
+            Command::Spawn { json, .. }
+            | Command::Send { json, .. }
+            | Command::Status { json }
+            | Command::Focus { json, .. }
+            | Command::Stop { json, .. }
+            | Command::Report { json, .. }
+            | Command::Prune { json } => *json,
+        }
+    }
 }
 
 /// Parses the arguments after subcommand `name`. `Ok(None)` means help was asked for and
@@ -94,7 +129,7 @@ pub fn parse(name: &str, args: Vec<String>) -> Result<Option<Command>> {
             "--agent" if name == "spawn" => agent = Some(flag("--agent", inline.as_deref(), &mut args)?),
             "--prompt" if name == "spawn" => prompt = Some(flag("--prompt", inline.as_deref(), &mut args)?),
             "--item" if name == "spawn" => item = Some(flag("--item", inline.as_deref(), &mut args)?),
-            "--json" if name == "status" || name == "prune" => {
+            "--json" => {
                 if inline.is_some() {
                     bail!("--json takes no value\n\n{HELP}");
                 }
@@ -112,24 +147,24 @@ pub fn parse(name: &str, args: Vec<String>) -> Result<Option<Command>> {
             .ok_or_else(|| anyhow::anyhow!("`kanstack {name}` needs a {what}\n\n{HELP}"))
     };
     let command = match name {
-        "spawn" => Command::Spawn { branch: one("<branch>")?, agent, prompt, item },
+        "spawn" => Command::Spawn { branch: one("<branch>")?, agent, prompt, item, json },
         "send" => {
             let target = one("<branch|session>")?;
             let text = positional.collect::<Vec<_>>().join(" ");
             if text.trim().is_empty() {
                 bail!("`kanstack send` needs a message\n\n{HELP}");
             }
-            return Ok(Some(Command::Send { target, text }));
+            return Ok(Some(Command::Send { target, text, json }));
         }
         "status" => Command::Status { json },
-        "focus" => Command::Focus { target: one("<branch|session>")? },
-        "stop" => Command::Stop { target: one("<branch|session>")? },
+        "focus" => Command::Focus { target: one("<branch|session>")?, json },
+        "stop" => Command::Stop { target: one("<branch|session>")?, json },
         "report" => {
             let word = one("<busy|idle|waiting>")?;
             let state = Reported::parse(&word).ok_or_else(|| {
                 anyhow::anyhow!("`kanstack report` takes busy, idle or waiting, not {word:?}\n\n{HELP}")
             })?;
-            Command::Report { state, branch: positional.next() }
+            Command::Report { state, branch: positional.next(), json }
         }
         "prune" => Command::Prune { json },
         other => bail!("unknown subcommand {other:?}"),
@@ -154,10 +189,13 @@ fn spawn_direction(raw: Option<&str>) -> Result<String> {
 /// A splitter seeded with every pane in `registry`, or an explanation of why there isn't one.
 fn seeded_splitter(registry: &Registry) -> Result<Splitter> {
     let mut splitter = Splitter::discover().ok_or_else(|| {
-        anyhow::anyhow!(
-            "no harness-split backend found — run this from inside a {} pane \
-             (see KANSTACK_SPLIT_BACKEND)",
-            crate::splitter::describe_backends()
+        tag(
+            MultiplexerUnavailable,
+            anyhow::anyhow!(
+                "no harness-split backend found — run this from inside a {} pane \
+                 (see KANSTACK_SPLIT_BACKEND)",
+                crate::splitter::describe_backends()
+            ),
         )
     })?;
     registry.adopt_into(&mut splitter);
@@ -167,15 +205,23 @@ fn seeded_splitter(registry: &Registry) -> Result<Splitter> {
     Ok(splitter)
 }
 
+/// The branch `target` (a branch name or a pane id) names in `registry`.
+fn resolve_branch(registry: &Registry, target: &str) -> Result<String> {
+    registry
+        .resolve(target)
+        .map(|w| w.branch_id.0.clone())
+        .ok_or_else(|| tag(UnknownWorkstream, anyhow::anyhow!("no workstream for {target:?} — `kanstack status` lists them")))
+}
+
 /// The workstream `target` names, that has a pane to act on.
 fn target_with_pane<'a>(registry: &'a Registry, target: &str) -> Result<(&'a Workstream, &'a PaneId)> {
     let w = registry
         .resolve(target)
-        .ok_or_else(|| anyhow::anyhow!("no workstream for {target:?} — `kanstack status` lists them"))?;
+        .ok_or_else(|| tag(UnknownWorkstream, anyhow::anyhow!("no workstream for {target:?} — `kanstack status` lists them")))?;
     let pane = w
         .pane_id
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("{} has no pane open", w.branch_id))?;
+        .ok_or_else(|| tag(NoPane, anyhow::anyhow!("{} has no pane open", w.branch_id)))?;
     Ok((w, pane))
 }
 
@@ -200,8 +246,16 @@ pub const STATUS_SCHEMA: u32 = 1;
 struct StatusReport {
     schema: u32,
     workstreams: Vec<WorkstreamReport>,
-    /// The workspace as a whole. `null` when `but` could not be reached.
+    /// The workspace as a whole. `null` when `but` could not be reached, including while
+    /// `workspace_blocked` is set — a blocked workspace refuses `but status` too.
     workspace: Option<WorkspaceReport>,
+    /// Set, with `but`'s own explanation, when the workspace is locked by a stray commit on
+    /// `gitbutler/workspace` (see `docs/ARCHITECTURE.md`, "A commit on the workspace head
+    /// locks everything") — `but` refuses every subcommand until it's fixed, which is worth
+    /// telling apart from ordinary unreachability (`but` not installed, not a repo, a
+    /// transient failure): it names one specific, fixable cause instead of "try again",
+    /// `null` otherwise.
+    workspace_blocked: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -342,6 +396,7 @@ fn report(
     registry: &Registry,
     status_of: impl Fn(&str) -> Option<PaneStatus>,
     git: Option<&WorkspaceStatus>,
+    workspace_blocked: Option<&str>,
 ) -> StatusReport {
     let workstreams = registry
         .workstreams
@@ -358,17 +413,53 @@ fn report(
             lane: git.and_then(|status| lane_report(status, &w.branch_id.0)),
         })
         .collect();
-    StatusReport { schema: STATUS_SCHEMA, workstreams, workspace: git.map(workspace_report) }
+    StatusReport {
+        schema: STATUS_SCHEMA,
+        workstreams,
+        workspace: git.map(workspace_report),
+        workspace_blocked: workspace_blocked.map(str::to_string),
+    }
 }
 
-/// The workspace's git state, or nothing if `but` isn't reachable — `status --json` reports
-/// what it can either way. One `but status` call, so it is only made when there is a
-/// workstream to report on.
-fn git_state(registry: &Registry, cwd: &Path) -> Option<WorkspaceStatus> {
-    if registry.workstreams.is_empty() {
-        return None;
+/// The workspace's git state: `but` reachable, refusing because of a workspace-commit lock
+/// (see `StatusReport::workspace_blocked`), or neither — `but` not installed, not a repo, or
+/// some other, transient failure, all of which collapse into the same "unreachable" `status
+/// --json` reported before this distinction existed. One `but status` call, so it is only
+/// made when there is a workstream to report on.
+enum GitState {
+    Ok(WorkspaceStatus),
+    Blocked(String),
+    Unreachable,
+}
+
+impl GitState {
+    fn status(&self) -> Option<&WorkspaceStatus> {
+        match self {
+            GitState::Ok(status) => Some(status),
+            GitState::Blocked(_) | GitState::Unreachable => None,
+        }
     }
-    But::discover(cwd).ok()?.status_with_upstream().ok()
+
+    fn blocked_message(&self) -> Option<&str> {
+        match self {
+            GitState::Blocked(message) => Some(message),
+            GitState::Ok(_) | GitState::Unreachable => None,
+        }
+    }
+}
+
+fn git_state(registry: &Registry, cwd: &Path) -> GitState {
+    if registry.workstreams.is_empty() {
+        return GitState::Unreachable;
+    }
+    let Ok(but) = But::discover(cwd) else {
+        return GitState::Unreachable;
+    };
+    match but.status_with_upstream() {
+        Ok(status) => GitState::Ok(status),
+        Err(e) if crate::but::is_workspace_block(&e.to_string()) => GitState::Blocked(e.to_string()),
+        Err(_) => GitState::Unreachable,
+    }
 }
 
 /// Pane statuses by branch, or nothing at all if there's no multiplexer to ask or the poll
@@ -404,32 +495,78 @@ fn stale_branches(registry: &Registry, statuses: &HashMap<String, PaneStatus>) -
         .collect()
 }
 
+/// The generic `--json` success envelope for `spawn`/`send`/`focus`/`stop`/`report` — see
+/// [`RESULT_SCHEMA`]. `status` and `prune` print their own, independently versioned shapes
+/// instead of this, unchanged by this addition.
+#[derive(Debug, Serialize)]
+struct ResultEnvelope<T: Serialize> {
+    schema: u32,
+    ok: bool,
+    command: &'static str,
+    workstream: String,
+    result: T,
+}
+
+fn json_result<T: Serialize>(command: &'static str, workstream: String, result: T) -> Result<String> {
+    Ok(serde_json::to_string(&ResultEnvelope { schema: RESULT_SCHEMA, ok: true, command, workstream, result })?)
+}
+
+#[derive(Debug, Serialize)]
+struct SpawnResult {
+    /// Whether `branch` was newly created by this call, or already existed.
+    created: bool,
+    pane: String,
+    agent: String,
+    /// The multiplexer's workspace the pane opened in, when the backend has one (cmux does;
+    /// tmux, Orca and Ghostty don't).
+    workspace: Option<String>,
+}
+
+/// The result `send`, `focus` and `stop` share: which pane the command acted on, `null` for
+/// `stop` on a workstream that had none to close.
+#[derive(Debug, Serialize)]
+struct PaneResult {
+    pane: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReportResult {
+    state: Reported,
+}
+
 pub fn run(command: Command, cwd: &Path, out: &mut impl Write) -> Result<()> {
     // Before the registry is even read: this runs from a harness's hooks, on every turn, and
-    // a registry problem must not make it noisy or slow. And it writes nothing to `out` —
-    // Claude adds a `UserPromptSubmit` hook's stdout to what the model sees.
-    if let Command::Report { state, branch } = &command {
+    // a registry problem must not make it noisy or slow. And without --json it writes nothing
+    // to `out` — Claude adds a `UserPromptSubmit` hook's stdout to what the model sees.
+    if let Command::Report { state, branch, json } = &command {
         let branch = branch
             .clone()
             .or_else(|| std::env::var("KANSTACK_BRANCH").ok())
             .filter(|b| !b.is_empty())
             .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "`kanstack report` needs a branch: name one, or run it where $KANSTACK_BRANCH is set \
-                     (in a pane kanstack launched)"
+                tag(
+                    InvalidArguments,
+                    anyhow::anyhow!(
+                        "`kanstack report` needs a branch: name one, or run it where $KANSTACK_BRANCH is set \
+                         (in a pane kanstack launched)"
+                    ),
                 )
             })?;
-        return Reports::for_repo(cwd).write(&branch, *state, SystemTime::now());
+        Reports::for_repo(cwd).write(&branch, *state, SystemTime::now())?;
+        if *json {
+            writeln!(out, "{}", json_result("report", branch, ReportResult { state: *state })?)?;
+        }
+        return Ok(());
     }
 
     match command {
-        Command::Spawn { branch, agent, prompt, item } => {
+        Command::Spawn { branch, agent, prompt, item, json } => {
             // Locked for the whole load-mutate-save, including the pane spawn itself: two
             // `kanstack spawn`s racing here must serialize rather than each load the same
             // registry and have the loser's `upsert` vanish under the winner's save.
-            let lines = Registry::with_lock(cwd, |registry| {
+            let (lines, spawn_result) = Registry::with_lock(cwd, |registry| {
                 let mut lines = Vec::new();
-                let but = But::discover(cwd)?;
+                let but = But::discover(cwd).map_err(|e| tag(ButFailed, e))?;
                 let mut splitter = seeded_splitter(registry)?;
                 // Its own setting, not the board's `KANSTACK_*_DIRECTION`: the board's `above`
                 // assumes kanstack is the pane at the bottom, but here the caller is usually an
@@ -440,10 +577,11 @@ pub fn run(command: Command, cwd: &Path, out: &mut impl Write) -> Result<()> {
                 // Fetched before the poll below decides anything: whether `branch` is stacked on
                 // top of a sibling that already has a pane open determines which anchor the new
                 // pane groups with, not just whether the branch itself needs creating.
-                let status = but.status()?;
+                let status = but.status().map_err(|e| tag(ButFailed, e))?;
                 let exists = status.stacks.iter().flat_map(|s| &s.branches).any(|b| b.name == branch);
-                if !exists {
-                    but.branch_new(&branch, None)?;
+                let created = !exists;
+                if created {
+                    but.branch_new(&branch, None).map_err(|e| tag(ButFailed, e))?;
                     lines.push(format!("created {branch}"));
                 }
 
@@ -456,7 +594,10 @@ pub fn run(command: Command, cwd: &Path, out: &mut impl Write) -> Result<()> {
 
                 if let Some(w) = registry.get(&branch) {
                     if w.pane_id.is_some() && !dead(&w.branch_id) {
-                        bail!("{branch} already has a pane open — use `kanstack send`, `focus` or `stop`");
+                        return Err(tag(
+                            WorkstreamExists,
+                            anyhow::anyhow!("{branch} already has a pane open — use `kanstack send`, `focus` or `stop`"),
+                        ));
                     }
                 }
 
@@ -490,8 +631,11 @@ pub fn run(command: Command, cwd: &Path, out: &mut impl Write) -> Result<()> {
 
                 let pane = match &group_with {
                     Some(anchor) => splitter
-                        .spawn_stacked_harness_with(but.cwd(), &branch, prompt.as_deref(), agent.as_deref(), &anchor.0)?,
-                    None => splitter.spawn_harness_with(but.cwd(), &branch, prompt.as_deref(), agent.as_deref())?,
+                        .spawn_stacked_harness_with(but.cwd(), &branch, prompt.as_deref(), agent.as_deref(), &anchor.0)
+                        .map_err(|e| tag(MultiplexerUnavailable, e))?,
+                    None => splitter
+                        .spawn_harness_with(but.cwd(), &branch, prompt.as_deref(), agent.as_deref())
+                        .map_err(|e| tag(MultiplexerUnavailable, e))?,
                 };
                 let agent = agent
                     .or_else(|| std::env::var("KANSTACK_HARNESS").ok())
@@ -512,24 +656,35 @@ pub fn run(command: Command, cwd: &Path, out: &mut impl Write) -> Result<()> {
                     Some(workspace) => format!("spawned {agent} on {branch} in {pane} ({workspace})"),
                     None => format!("spawned {agent} on {branch} in {pane}"),
                 });
-                Ok(lines)
+                let result = SpawnResult { created, pane, agent, workspace: registry.workspace.clone() };
+                Ok((lines, result))
             })?;
-            for line in lines {
-                writeln!(out, "{line}")?;
+            if json {
+                writeln!(out, "{}", json_result("spawn", branch, spawn_result)?)?;
+            } else {
+                for line in lines {
+                    writeln!(out, "{line}")?;
+                }
             }
         }
-        Command::Send { target, text } => {
+        Command::Send { target, text, json } => {
             let registry = Registry::load(cwd)?;
             let splitter = seeded_splitter(&registry)?;
-            let (w, _) = target_with_pane(&registry, &target)?;
-            splitter.send_task(&w.branch_id.0, &text)?;
-            writeln!(out, "sent to {}", w.branch_id)?;
+            let (w, pane) = target_with_pane(&registry, &target)?;
+            let branch = w.branch_id.0.clone();
+            let pane = pane.0.clone();
+            splitter.send_task(&branch, &text).map_err(|e| tag(DeliveryFailed, e))?;
+            if json {
+                writeln!(out, "{}", json_result("send", branch, PaneResult { pane: Some(pane) })?)?;
+            } else {
+                writeln!(out, "sent to {branch}")?;
+            }
         }
         Command::Status { json: true } => {
             let registry = Registry::load(cwd)?;
             let statuses = poll_or_nothing(&registry);
             let git = git_state(&registry, cwd);
-            let report = report(&registry, |branch| statuses.get(branch).copied(), git.as_ref());
+            let report = report(&registry, |branch| statuses.get(branch).copied(), git.status(), git.blocked_message());
             writeln!(out, "{}", serde_json::to_string(&report)?)?;
         }
         Command::Status { json: false } => {
@@ -539,7 +694,7 @@ pub fn run(command: Command, cwd: &Path, out: &mut impl Write) -> Result<()> {
                 return Ok(());
             }
             let mut splitter = seeded_splitter(&registry)?;
-            let statuses = splitter.poll_statuses()?;
+            let statuses = splitter.poll_statuses().map_err(|e| tag(MultiplexerUnavailable, e))?;
             splitter.apply_statuses(statuses);
             let width = registry.workstreams.iter().map(|w| w.branch_id.0.len()).max().unwrap_or(0);
             for w in &registry.workstreams {
@@ -558,32 +713,40 @@ pub fn run(command: Command, cwd: &Path, out: &mut impl Write) -> Result<()> {
                 )?;
             }
         }
-        Command::Focus { target } => {
+        Command::Focus { target, json } => {
             let registry = Registry::load(cwd)?;
             let splitter = seeded_splitter(&registry)?;
-            let (w, _) = target_with_pane(&registry, &target)?;
-            splitter.focus(&w.branch_id.0)?;
-            writeln!(out, "focused {}", w.branch_id)?;
+            let (w, pane) = target_with_pane(&registry, &target)?;
+            let branch = w.branch_id.0.clone();
+            let pane = pane.0.clone();
+            splitter.focus(&branch).map_err(|e| tag(MultiplexerUnavailable, e))?;
+            if json {
+                writeln!(out, "{}", json_result("focus", branch, PaneResult { pane: Some(pane) })?)?;
+            } else {
+                writeln!(out, "focused {branch}")?;
+            }
         }
         Command::Report { .. } => unreachable!("handled before the registry is loaded"),
-        Command::Stop { target } => {
+        Command::Stop { target, json } => {
             // Locked for the same reason as `Spawn`: resolving the target, stopping the pane
             // and forgetting the workstream must land as one save, not two processes' saves
             // interleaved.
-            let branch = Registry::with_lock(cwd, |registry| {
-                let branch = registry
-                    .resolve(&target)
-                    .map(|w| w.branch_id.0.clone())
-                    .ok_or_else(|| anyhow::anyhow!("no workstream for {target:?} — `kanstack status` lists them"))?;
+            let (branch, pane) = Registry::with_lock(cwd, |registry| {
+                let branch = resolve_branch(registry, &target)?;
+                let pane = registry.get(&branch).and_then(|w| w.pane_id.clone());
                 // A workstream with no pane has nothing to close; forgetting it is the stop.
-                if registry.get(&branch).is_some_and(|w| w.pane_id.is_some()) {
+                if pane.is_some() {
                     let mut splitter = seeded_splitter(registry)?;
-                    splitter.stop(&branch)?;
+                    splitter.stop(&branch).map_err(|e| tag(MultiplexerUnavailable, e))?;
                 }
                 registry.remove(&branch);
-                Ok(branch)
+                Ok((branch, pane))
             })?;
-            writeln!(out, "stopped {branch}")?;
+            if json {
+                writeln!(out, "{}", json_result("stop", branch, PaneResult { pane: pane.map(|p| p.0) })?)?;
+            } else {
+                writeln!(out, "stopped {branch}")?;
+            }
         }
         Command::Prune { json } => {
             // Best-effort, like `poll_or_nothing` itself: no multiplexer reachable, or a poll
@@ -629,7 +792,7 @@ mod tests {
     fn spawn_takes_a_branch_and_optional_agent_and_prompt() {
         assert_eq!(
             parse("spawn", args(&["fix-login"])).unwrap(),
-            Some(Command::Spawn { branch: "fix-login".into(), agent: None, prompt: None, item: None })
+            Some(Command::Spawn { branch: "fix-login".into(), agent: None, prompt: None, item: None, json: false })
         );
         assert_eq!(
             parse("spawn", args(&["--agent", "codex", "fix-login", "--prompt", "fix the flaky test"])).unwrap(),
@@ -638,11 +801,12 @@ mod tests {
                 agent: Some("codex".into()),
                 prompt: Some("fix the flaky test".into()),
                 item: None,
+                json: false,
             })
         );
         assert_eq!(
             parse("spawn", args(&["b", "--agent=codex"])).unwrap(),
-            Some(Command::Spawn { branch: "b".into(), agent: Some("codex".into()), prompt: None, item: None })
+            Some(Command::Spawn { branch: "b".into(), agent: Some("codex".into()), prompt: None, item: None, json: false })
         );
     }
 
@@ -655,6 +819,7 @@ mod tests {
                 agent: None,
                 prompt: None,
                 item: Some("github:#42".into()),
+                json: false,
             })
         );
         assert_eq!(
@@ -664,6 +829,7 @@ mod tests {
                 agent: None,
                 prompt: None,
                 item: Some("linear:ENG-7".into()),
+                json: false,
             })
         );
         assert!(parse("spawn", args(&["b", "--item"])).is_err(), "--item requires a value");
@@ -674,7 +840,7 @@ mod tests {
     fn send_joins_the_rest_into_one_message() {
         assert_eq!(
             parse("send", args(&["fix-login", "run", "the", "tests"])).unwrap(),
-            Some(Command::Send { target: "fix-login".into(), text: "run the tests".into() })
+            Some(Command::Send { target: "fix-login".into(), text: "run the tests".into(), json: false })
         );
         assert!(parse("send", args(&["fix-login"])).is_err());
         assert!(parse("send", args(&[])).is_err());
@@ -682,8 +848,11 @@ mod tests {
 
     #[test]
     fn the_single_target_commands_take_exactly_one_argument() {
-        assert_eq!(parse("focus", args(&["%3"])).unwrap(), Some(Command::Focus { target: "%3".into() }));
-        assert_eq!(parse("stop", args(&["a"])).unwrap(), Some(Command::Stop { target: "a".into() }));
+        assert_eq!(
+            parse("focus", args(&["%3"])).unwrap(),
+            Some(Command::Focus { target: "%3".into(), json: false })
+        );
+        assert_eq!(parse("stop", args(&["a"])).unwrap(), Some(Command::Stop { target: "a".into(), json: false }));
         assert!(parse("stop", args(&[])).is_err());
         assert!(parse("stop", args(&["a", "b"])).is_err());
         assert_eq!(parse("status", args(&[])).unwrap(), Some(Command::Status { json: false }));
@@ -691,14 +860,34 @@ mod tests {
     }
 
     #[test]
-    fn status_takes_a_json_flag_and_no_other_command_does() {
+    fn every_subcommand_takes_a_json_flag() {
         assert_eq!(parse("status", args(&["--json"])).unwrap(), Some(Command::Status { json: true }));
         assert!(parse("status", args(&["--json=true"])).is_err(), "it is a switch, not an option with a value");
         assert!(parse("status", args(&["--json", "extra"])).is_err());
-        assert!(parse("spawn", args(&["b", "--json"])).is_err());
-        assert!(parse("send", args(&["b", "hi", "--json"])).is_err());
-        assert!(parse("focus", args(&["b", "--json"])).is_err());
-        assert!(parse("stop", args(&["b", "--json"])).is_err());
+        assert_eq!(
+            parse("spawn", args(&["b", "--json"])).unwrap(),
+            Some(Command::Spawn { branch: "b".into(), agent: None, prompt: None, item: None, json: true })
+        );
+        // `--json` is recognized as a flag wherever it falls among the arguments (flags are
+        // split out before the remaining words are joined into the message), same as before
+        // this test for any other unrecognized `--word` — which used to make it an error for
+        // every command but `status`/`prune` (see `options_are_rejected_where_they_do_not_apply`).
+        assert_eq!(
+            parse("send", args(&["b", "hi", "--json"])).unwrap(),
+            Some(Command::Send { target: "b".into(), text: "hi".into(), json: true })
+        );
+        assert_eq!(
+            parse("focus", args(&["b", "--json"])).unwrap(),
+            Some(Command::Focus { target: "b".into(), json: true })
+        );
+        assert_eq!(
+            parse("stop", args(&["b", "--json"])).unwrap(),
+            Some(Command::Stop { target: "b".into(), json: true })
+        );
+        assert_eq!(
+            parse("report", args(&["busy", "--json"])).unwrap(),
+            Some(Command::Report { state: Reported::Busy, branch: None, json: true })
+        );
     }
 
     fn registry_of(workstreams: Vec<Workstream>) -> Registry {
@@ -736,7 +925,7 @@ mod tests {
             // No entry for "planned": it has no pane, so nobody is asked.
             ("stray".to_string(), PaneStatus::Busy),
         ]);
-        let json = serde_json::to_string(&report(&five_workstreams(), |b| statuses.get(b).copied(), None)).unwrap();
+        let json = serde_json::to_string(&report(&five_workstreams(), |b| statuses.get(b).copied(), None, None)).unwrap();
         assert_eq!(
             json,
             concat!(
@@ -746,14 +935,14 @@ mod tests {
                 r#"{"branch":"old-spike","pane":"%5","agent":null,"item":null,"status":"dead","lane":null},"#,
                 r#"{"branch":"mystery","pane":"%6","agent":"claude","item":null,"status":"unknown","lane":null},"#,
                 r#"{"branch":"planned","pane":null,"agent":null,"item":"GH-9","status":"no-pane","lane":null}"#,
-                r#"],"workspace":null}"#
+                r#"],"workspace":null,"workspace_blocked":null}"#
             )
         );
     }
 
     #[test]
     fn a_pane_the_poll_did_not_mention_is_unknown_and_a_paneless_workstream_stays_no_pane() {
-        let nothing = report(&five_workstreams(), |_| None, None);
+        let nothing = report(&five_workstreams(), |_| None, None, None);
         let statuses: Vec<_> = nothing.workstreams.iter().map(|w| w.status).collect();
         assert_eq!(
             statuses,
@@ -769,8 +958,8 @@ mod tests {
 
     #[test]
     fn an_empty_registry_is_an_empty_list_not_prose() {
-        let json = serde_json::to_string(&report(&Registry::default(), |_| None, None)).unwrap();
-        assert_eq!(json, r#"{"schema":1,"workstreams":[],"workspace":null}"#);
+        let json = serde_json::to_string(&report(&Registry::default(), |_| None, None, None)).unwrap();
+        assert_eq!(json, r#"{"schema":1,"workstreams":[],"workspace":null,"workspace_blocked":null}"#);
     }
 
     /// With no multiplexer to ask, `status --json` still lists everything and exits 0. Forcing
@@ -819,7 +1008,7 @@ mod tests {
                 r#"{"schema":1,"workstreams":["#,
                 r#"{"branch":"fix-login","pane":"%3","agent":"claude","item":null,"status":"unknown","lane":null},"#,
                 r#"{"branch":"planned","pane":null,"agent":null,"item":null,"status":"no-pane","lane":null}"#,
-                "],\"workspace\":null}\n"
+                "],\"workspace\":null,\"workspace_blocked\":null}\n"
             )
         );
         assert!(human.is_err(), "the table still needs a backend");
@@ -929,16 +1118,15 @@ mod tests {
     fn report_takes_busy_or_idle_and_an_optional_branch() {
         assert_eq!(
             parse("report", args(&["busy"])).unwrap(),
-            Some(Command::Report { state: Reported::Busy, branch: None })
+            Some(Command::Report { state: Reported::Busy, branch: None, json: false })
         );
         assert_eq!(
             parse("report", args(&["idle", "fix-login"])).unwrap(),
-            Some(Command::Report { state: Reported::Idle, branch: Some("fix-login".into()) })
+            Some(Command::Report { state: Reported::Idle, branch: Some("fix-login".into()), json: false })
         );
         assert!(parse("report", args(&[])).is_err());
         assert!(parse("report", args(&["dead"])).is_err(), "only busy and idle can be reported");
         assert!(parse("report", args(&["busy", "a", "b"])).is_err());
-        assert!(parse("report", args(&["busy", "--json"])).is_err());
     }
 
     /// Claude adds a `UserPromptSubmit` hook's stdout to what the model sees, so a
@@ -948,11 +1136,11 @@ mod tests {
         with_state("report", &[("KANSTACK_BRANCH", None)], || {
             let repo = Path::new("/repo/report");
             let mut out = Vec::new();
-            run(Command::Report { state: Reported::Busy, branch: Some("fix-login".into()) }, repo, &mut out).unwrap();
+            run(Command::Report { state: Reported::Busy, branch: Some("fix-login".into()), json: false }, repo, &mut out).unwrap();
             assert!(out.is_empty(), "stdout must stay empty: {:?}", String::from_utf8_lossy(&out));
             assert_eq!(Reports::for_repo(repo).status("fix-login", SystemTime::now()), Some(PaneStatus::Busy));
 
-            run(Command::Report { state: Reported::Idle, branch: Some("fix-login".into()) }, repo, &mut out).unwrap();
+            run(Command::Report { state: Reported::Idle, branch: Some("fix-login".into()), json: false }, repo, &mut out).unwrap();
             assert_eq!(Reports::for_repo(repo).status("fix-login", SystemTime::now()), Some(PaneStatus::Idle));
         });
     }
@@ -963,8 +1151,8 @@ mod tests {
     fn report_names_its_lane_from_the_environment_unless_told_otherwise() {
         with_state("report-env", &[("KANSTACK_BRANCH", Some("from-env"))], || {
             let repo = Path::new("/repo/report-env");
-            run(Command::Report { state: Reported::Busy, branch: None }, repo, &mut Vec::new()).unwrap();
-            run(Command::Report { state: Reported::Idle, branch: Some("named".into()) }, repo, &mut Vec::new()).unwrap();
+            run(Command::Report { state: Reported::Busy, branch: None, json: false }, repo, &mut Vec::new()).unwrap();
+            run(Command::Report { state: Reported::Idle, branch: Some("named".into()), json: false }, repo, &mut Vec::new()).unwrap();
             let now = SystemTime::now();
             assert_eq!(Reports::for_repo(repo).status("from-env", now), Some(PaneStatus::Busy));
             assert_eq!(Reports::for_repo(repo).status("named", now), Some(PaneStatus::Idle));
@@ -975,7 +1163,7 @@ mod tests {
     fn report_without_a_branch_anywhere_says_what_it_needs() {
         for unset in [None, Some("")] {
             with_state("report-nobranch", &[("KANSTACK_BRANCH", unset)], || {
-                let err = run(Command::Report { state: Reported::Busy, branch: None }, Path::new("/repo/x"), &mut Vec::new())
+                let err = run(Command::Report { state: Reported::Busy, branch: None, json: false }, Path::new("/repo/x"), &mut Vec::new())
                     .unwrap_err()
                     .to_string();
                 assert!(err.contains("KANSTACK_BRANCH"), "{err}");
@@ -993,7 +1181,7 @@ mod tests {
             std::fs::create_dir_all(registry.parent().unwrap()).unwrap();
             std::fs::write(&registry, "{ not a registry").unwrap();
             assert!(Registry::load(repo).is_err(), "the fixture must really be broken");
-            run(Command::Report { state: Reported::Busy, branch: Some("a".into()) }, repo, &mut Vec::new()).unwrap();
+            run(Command::Report { state: Reported::Busy, branch: Some("a".into()), json: false }, repo, &mut Vec::new()).unwrap();
         });
     }
 
@@ -1035,7 +1223,7 @@ mod tests {
     }
 
     fn fix_login(status: &str) -> String {
-        format!(r#"{{"schema":1,"workstreams":[{{"branch":"fix-login","pane":"%3","agent":"claude","item":null,"status":"{status}","lane":null}}],"workspace":null}}{}"#, "\n")
+        format!(r#"{{"schema":1,"workstreams":[{{"branch":"fix-login","pane":"%3","agent":"claude","item":null,"status":"{status}","lane":null}}],"workspace":null,"workspace_blocked":null}}{}"#, "\n")
     }
 
     #[test]
@@ -1064,7 +1252,7 @@ mod tests {
     fn report_accepts_waiting_and_names_all_three_words_when_given_another() {
         assert_eq!(
             parse("report", args(&["waiting", "fix-login"])).unwrap(),
-            Some(Command::Report { state: Reported::Waiting, branch: Some("fix-login".into()) })
+            Some(Command::Report { state: Reported::Waiting, branch: Some("fix-login".into()), json: false })
         );
         let err = parse("report", args(&["asleep"])).unwrap_err().to_string();
         assert!(err.contains("busy, idle or waiting"), "{err}");
@@ -1075,7 +1263,7 @@ mod tests {
     #[test]
     fn a_waiting_pane_is_waiting_in_both_the_table_and_the_json() {
         assert_eq!(label(Some(PaneStatus::Waiting)), "waiting");
-        let json = serde_json::to_string(&report(&five_workstreams(), |b| (b == "fix-login").then_some(PaneStatus::Waiting), None)).unwrap();
+        let json = serde_json::to_string(&report(&five_workstreams(), |b| (b == "fix-login").then_some(PaneStatus::Waiting), None, None)).unwrap();
         assert!(json.contains(r#""branch":"fix-login","pane":"%3","agent":"claude","item":"GH-4","status":"waiting""#), "{json}");
     }
 
@@ -1276,7 +1464,7 @@ mod tests {
         registry.upsert(workstream("gone", Some("%4"), None, None));
         let status = capture(CONFLICT_EXPECTED);
         let fetched = workspace_report(&status).fetched.unwrap();
-        let json = serde_json::to_string(&report(&registry, |_| Some(PaneStatus::Idle), Some(&status))).unwrap();
+        let json = serde_json::to_string(&report(&registry, |_| Some(PaneStatus::Idle), Some(&status), None)).unwrap();
         assert_eq!(
             json,
             format!(
@@ -1285,7 +1473,7 @@ mod tests {
                     r#"{{"branch":"lane-conflict","pane":"%3","agent":"claude","item":null,"status":"idle","lane":"#,
                     r#"{{"commits":1,"conflicted":false,"behind":0,"rebase":"conflicts","landed":false,"push":"local-only","uncommitted":0}}}},"#,
                     r#"{{"branch":"gone","pane":"%4","agent":null,"item":null,"status":"idle","lane":null}}"#,
-                    r#"],"workspace":{{"behind":3,"uncommitted":0,"fetched":"{}"}}}}"#
+                    r#"],"workspace":{{"behind":3,"uncommitted":0,"fetched":"{}"}},"workspace_blocked":null}}"#
                 ),
                 fetched
             )
@@ -1297,12 +1485,15 @@ mod tests {
     fn without_but_the_lane_and_workspace_are_null_and_the_rest_is_unchanged() {
         let mut registry = Registry::default();
         registry.upsert(workstream("feat-ui", Some("%3"), Some("claude"), None));
-        assert!(git_state(&Registry::default(), Path::new("/nonexistent")).is_none(), "no workstreams: no reason to ask but");
-        assert!(git_state(&registry, Path::new("/nonexistent/not-a-repo")).is_none());
-        let json = serde_json::to_string(&report(&registry, |_| Some(PaneStatus::Busy), None)).unwrap();
+        assert!(
+            git_state(&Registry::default(), Path::new("/nonexistent")).status().is_none(),
+            "no workstreams: no reason to ask but"
+        );
+        assert!(git_state(&registry, Path::new("/nonexistent/not-a-repo")).status().is_none());
+        let json = serde_json::to_string(&report(&registry, |_| Some(PaneStatus::Busy), None, None)).unwrap();
         assert_eq!(
             json,
-            r#"{"schema":1,"workstreams":[{"branch":"feat-ui","pane":"%3","agent":"claude","item":null,"status":"busy","lane":null}],"workspace":null}"#
+            r#"{"schema":1,"workstreams":[{"branch":"feat-ui","pane":"%3","agent":"claude","item":null,"status":"busy","lane":null}],"workspace":null,"workspace_blocked":null}"#
         );
     }
 

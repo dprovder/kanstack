@@ -162,11 +162,25 @@ fn main() -> Result<()> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             name if cli::SUBCOMMANDS.contains(&name) => {
-                match cli::parse(name, args.by_ref().collect())? {
-                    Some(command) => subcommand = Some(command),
-                    None => {
+                let raw: Vec<String> = args.by_ref().collect();
+                match cli::parse(name, raw.clone()) {
+                    Ok(Some(command)) => subcommand = Some(command),
+                    Ok(None) => {
                         print!("{}", cli::HELP);
                         return Ok(());
+                    }
+                    // No `Command` exists yet to carry `--json` (parsing is what failed), so
+                    // this reads the raw argument list for it directly, same as `parse` itself
+                    // will once it gets far enough to recognize the flag.
+                    Err(e) => {
+                        let json = raw.iter().any(|a| a == "--json" || a.starts_with("--json="));
+                        std::process::exit(cli::report_error(
+                            name,
+                            cli::invalid_arguments(e),
+                            json,
+                            &mut std::io::stdout(),
+                            &mut std::io::stderr(),
+                        ));
                     }
                 }
             }
@@ -206,13 +220,15 @@ fn main() -> Result<()> {
     }
 
     // Headless: no board, no first-run wizard, no terminal needed — so this comes before
-    // every check below that assumes one.
+    // every check below that assumes one. Exits directly, rather than returning through
+    // `Result<()>`, so a failure can carry a more specific code than the flat `1` every error
+    // here used to get — see `cli::dispatch` and the exit-code table in the README.
     if let Some(command) = subcommand {
         let cwd = match cwd {
             Some(p) => p,
             None => std::env::current_dir()?,
         };
-        return cli::run(command, &cwd, &mut std::io::stdout());
+        std::process::exit(cli::dispatch(command, &cwd, &mut std::io::stdout(), &mut std::io::stderr()));
     }
 
     if let Some(path) = snapshot {
