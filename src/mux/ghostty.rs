@@ -113,7 +113,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::harness_launch::shell_quote;
 use crate::mux::{command_exists, Multiplexer, OpenRequest};
-use crate::pane_status::PaneStatus;
+use crate::mux::pane_status::PaneStatus;
 
 /// How long the first lane waits for its marker title to show up in Ghostty's terminal list.
 /// The title is applied by Ghostty asynchronously, so the first look can be too early.

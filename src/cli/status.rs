@@ -10,7 +10,7 @@ use serde::Serialize;
 
 use crate::but::But;
 use crate::model::{BranchStatus, MergeStatus, WorkspaceStatus};
-use crate::pane_status::PaneStatus;
+use crate::mux::pane_status::PaneStatus;
 use crate::workstream::Registry;
 
 use super::exit::{tag, ErrorCode::*};

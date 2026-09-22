@@ -47,7 +47,7 @@ mod tests {
     use std::time::SystemTime;
 
     use crate::cli::Command;
-    use crate::pane_status::PaneStatus;
+    use crate::mux::pane_status::PaneStatus;
     use crate::report::{Reported, Reports};
     use crate::workstream::Registry;
 

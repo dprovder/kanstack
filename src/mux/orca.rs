@@ -91,7 +91,7 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
 use crate::mux::{command_exists, Multiplexer, OpenRequest};
-use crate::pane_status::PaneStatus;
+use crate::mux::pane_status::PaneStatus;
 
 /// How long each `terminal wait --for tui-idle` probe may block before its timeout is read
 /// as "busy". Probes for every tracked terminal run in parallel, so this is roughly what one

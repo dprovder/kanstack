@@ -176,7 +176,7 @@ pub struct Section {
     /// [`WorkspaceStatus`], it's set afterwards by the app, the same way
     /// `group_unassigned_by_folder` is reapplied post-build rather than threaded through
     /// `build` itself.
-    pub pane_status: Option<crate::pane_status::PaneStatus>,
+    pub pane_status: Option<crate::mux::pane_status::PaneStatus>,
 }
 
 #[derive(Debug, Clone)]
@@ -201,7 +201,7 @@ pub struct Column {
     pub branch_name: Option<String>,
     /// Mirrors the tip section's `pane_status`, so the column header can show it without
     /// the renderer reaching into `sections[0]` itself.
-    pub pane_status: Option<crate::pane_status::PaneStatus>,
+    pub pane_status: Option<crate::mux::pane_status::PaneStatus>,
 }
 
 #[derive(Debug, Clone)]

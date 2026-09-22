@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::{bail, Context, Result};
 
 use crate::harness_launch::shell_quote;
-use crate::pane_status::{PaneStatus, CPU_BUSY_THRESHOLD_PERCENT};
+use crate::mux::pane_status::{PaneStatus, CPU_BUSY_THRESHOLD_PERCENT};
 use crate::workstream::{fnv1a, pids_dir};
 
 /// One row of `ps -A -o pid=,ppid=,pcpu=` output: a process, its parent, and its CPU%.

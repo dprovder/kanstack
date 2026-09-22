@@ -322,7 +322,7 @@ impl App {
                         let label = splitter.label();
                         // A dead pane isn't "already has one" — nothing to group with.
                         let group_anchor = anchor
-                            .filter(|a| splitter.pane_status(a) != Some(crate::pane_status::PaneStatus::Dead))
+                            .filter(|a| splitter.pane_status(a) != Some(crate::mux::pane_status::PaneStatus::Dead))
                             .and_then(|a| splitter.pane_id(a));
                         let spawned = match &group_anchor {
                             Some(pane_id) => splitter.spawn_stacked_harness_with(&cwd, name, initial_message, None, pane_id),

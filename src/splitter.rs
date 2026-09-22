@@ -20,7 +20,7 @@ use crate::mux::ghostty::Ghostty;
 use crate::mux::orca::Orca;
 use crate::mux::tmux::Tmux;
 use crate::mux::{configured_directions, normalize_direction, Multiplexer, OpenRequest};
-use crate::pane_status::PaneStatus;
+use crate::mux::pane_status::PaneStatus;
 use crate::procs::{
     reading_from_pid, real_age, real_killer, real_ps, record_pid_prefix, started_before, subtree, tracking_applies, AgeReader,
     Killer, Pids, PsReader, PsRow,
@@ -1647,7 +1647,7 @@ mod tests {
     // reads like, from the pid its shell recorded, against a table the test scripts.
 
     use crate::procs::PsRow;
-    use crate::pane_status::CPU_BUSY_THRESHOLD_PERCENT;
+    use crate::mux::pane_status::CPU_BUSY_THRESHOLD_PERCENT;
     use std::sync::Mutex;
 
     /// A process table the test controls, that counts how often it was read.

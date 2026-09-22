@@ -14,6 +14,7 @@
 pub mod cmux;
 pub mod ghostty;
 pub mod orca;
+pub mod pane_status;
 pub mod tmux;
 
 use std::collections::HashMap;
@@ -21,7 +22,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::pane_status::PaneStatus;
+use crate::mux::pane_status::PaneStatus;
 
 /// Everything [`Multiplexer::open_pane`] needs to place and start one pane.
 pub struct OpenRequest<'a> {

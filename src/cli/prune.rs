@@ -11,7 +11,7 @@ use std::path::Path;
 use anyhow::Result;
 use serde::Serialize;
 
-use crate::pane_status::PaneStatus;
+use crate::mux::pane_status::PaneStatus;
 use crate::workstream::Registry;
 
 use super::status::poll_or_nothing;
@@ -76,7 +76,7 @@ mod tests {
 
     use crate::cli::test_support::*;
     use crate::cli::Command;
-    use crate::pane_status::PaneStatus;
+    use crate::mux::pane_status::PaneStatus;
     use crate::workstream::{Registry, Workstream};
 
     use super::stale_branches;

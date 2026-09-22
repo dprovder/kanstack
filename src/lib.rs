@@ -16,7 +16,6 @@ pub mod harness_launch;
 pub mod hit;
 pub mod mux;
 pub mod model;
-pub mod pane_status;
 pub mod procs;
 pub mod report;
 pub mod setup;

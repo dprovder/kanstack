@@ -340,7 +340,7 @@ struct PendingRefresh {
 /// A split-pane-liveness poll in flight on a background thread; see
 /// `App::maybe_begin_split_poll`.
 struct PendingSplitPoll {
-    rx: mpsc::Receiver<Result<HashMap<String, crate::pane_status::PaneStatus>>>,
+    rx: mpsc::Receiver<Result<HashMap<String, crate::mux::pane_status::PaneStatus>>>,
 }
 
 /// What a move actually does now that `but rub` is gone and every combination is its own

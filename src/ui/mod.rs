@@ -17,7 +17,7 @@ use ratatui::Frame;
 use crate::app::{columns_that_fit, App, BranchPreview, BranchUi, Mode, Notice, COL_GAP};
 use crate::board::{Card, ColumnKind, Tone};
 use crate::hit::{HitMap, HitTarget};
-use crate::pane_status::PaneStatus;
+use crate::mux::pane_status::PaneStatus;
 use crate::theme;
 
 mod board;

@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::claims::Claims;
 use crate::events::EventLog;
-use crate::pane_status::PaneStatus;
+use crate::mux::pane_status::PaneStatus;
 use crate::workstream::{fnv1a, reports_dir};
 
 /// How long a `busy` or `idle` report is believed. Long enough to span a turn that is busy

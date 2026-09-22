@@ -7,7 +7,7 @@ use anyhow::Result;
 use serde::Serialize;
 
 use crate::but::{But, Placement};
-use crate::pane_status::PaneStatus;
+use crate::mux::pane_status::PaneStatus;
 use crate::workstream::{AgentId, BranchId, PaneId, Registry, WorkItemRef, Workstream};
 
 use super::exit::{tag, ErrorCode::*};

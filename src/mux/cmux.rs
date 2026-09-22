@@ -35,9 +35,9 @@ use std::sync::Mutex;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
-pub use crate::pane_status::PaneStatus;
+pub use crate::mux::pane_status::PaneStatus;
 use crate::mux::{command_exists, Multiplexer, OpenRequest};
-use crate::pane_status::CPU_BUSY_THRESHOLD_PERCENT;
+use crate::mux::pane_status::CPU_BUSY_THRESHOLD_PERCENT;
 
 /// Pixels of slack allowed when treating two pane edges as touching. Frames come back as
 /// floats (e.g. `461.5`); this absorbs rounding without false-matching panes that are

@@ -27,7 +27,7 @@ use std::process::{Command, Output};
 use anyhow::{bail, Context, Result};
 
 use crate::mux::{command_exists, Multiplexer, OpenRequest};
-use crate::pane_status::{PaneStatus, CPU_BUSY_THRESHOLD_PERCENT};
+use crate::mux::pane_status::{PaneStatus, CPU_BUSY_THRESHOLD_PERCENT};
 use crate::procs::{read_ps_table, subtree_cpu, PsRow};
 
 /// tmux, through its own CLI. Stateless: which pane belongs to which branch is
