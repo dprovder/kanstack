@@ -172,6 +172,18 @@ pub struct App {
     pending_commit_move: Option<PendingCommitMove>,
     /// Branch name being typed, valid while `mode == Branch`.
     pub branch_input: TextInput,
+    /// Harness override being typed/cycled for the branch's pane, valid while `mode ==
+    /// Branch` (see `BranchModalRow::Harness`) and carried into `Mode::HarnessMessage` via
+    /// `PendingBranch` once `advance_to_harness_message` hands off. Both a text field and a
+    /// picker: `Left`/`Right` cycles through `harness_choices`, and typing overrides it with
+    /// anything else — same hybrid `crate::setup`'s own harness field uses. Blank means "no
+    /// `--agent` given", same as `kanstack spawn` with the flag omitted.
+    pub harness_input: TextInput,
+    /// Every harness actually found on `PATH` (`crate::setup::detect_harnesses`) as of the
+    /// last `begin_branch` — what `harness_input`'s `Left`/`Right` cycles through. Recomputed
+    /// each time branch naming starts rather than once at startup, so installing a harness
+    /// mid-session is picked up the next time `b` is pressed.
+    pub harness_choices: Vec<&'static str>,
     /// Model name being typed for the branch's harness pane, valid while `mode == Branch`
     /// (see `BranchModalRow::Model`) and carried into `Mode::HarnessMessage` via
     /// `PendingBranch` once `advance_to_harness_message` hands off. An open string, not a
@@ -451,6 +463,8 @@ impl App {
             commit_input: TextInput::default(),
             pending_commit_move: None,
             branch_input: TextInput::default(),
+            harness_input: TextInput::default(),
+            harness_choices: Vec::new(),
             model_input: TextInput::default(),
             effort: None,
             task_input: TextInput::default(),
@@ -516,6 +530,8 @@ impl App {
             commit_input: TextInput::default(),
             pending_commit_move: None,
             branch_input: TextInput::default(),
+            harness_input: TextInput::default(),
+            harness_choices: Vec::new(),
             model_input: TextInput::default(),
             effort: None,
             task_input: TextInput::default(),
@@ -1072,6 +1088,7 @@ impl App {
                 self.branch_name_missing = false;
             }
             Mode::Branch if self.branch_modal_row == BranchModalRow::Model => self.model_input.paste(text, false),
+            Mode::Branch if self.branch_modal_row == BranchModalRow::Harness => self.harness_input.paste(text, false),
             Mode::PrModal => match self.pr_modal_row {
                 PrModalRow::Title => self.pr_title_input.paste(text, false),
                 PrModalRow::Message => self.pr_message_input.paste(text, true),
@@ -2131,11 +2148,11 @@ mod tests {
         assert_eq!(app.effort, None);
     }
 
-    /// With a splitter available, `Down` walks every row — Name, Action, Split, Model,
-    /// Effort — before finally dropping into the optional message step, in exactly that
-    /// top-to-bottom order.
+    /// With a splitter available, `Down` walks every row — Name, Action, Split, Harness,
+    /// Model, Effort — before finally dropping into the optional message step, in exactly
+    /// that top-to-bottom order.
     #[test]
-    fn down_walks_through_the_model_and_effort_rows_when_a_splitter_is_available() {
+    fn down_walks_through_the_harness_model_and_effort_rows_when_a_splitter_is_available() {
         let mut app = App::from_board(board());
         with_fake_splitter(&mut app);
         app.begin_branch(); // col 0: a parallel lane, open_harness defaults on
@@ -2148,6 +2165,8 @@ mod tests {
         app.handle_key(key(ratatui::crossterm::event::KeyCode::Down));
         assert_eq!(app.branch_modal_row, BranchModalRow::Split);
         app.handle_key(key(ratatui::crossterm::event::KeyCode::Down));
+        assert_eq!(app.branch_modal_row, BranchModalRow::Harness);
+        app.handle_key(key(ratatui::crossterm::event::KeyCode::Down));
         assert_eq!(app.branch_modal_row, BranchModalRow::Model);
         app.handle_key(key(ratatui::crossterm::event::KeyCode::Down));
         assert_eq!(app.branch_modal_row, BranchModalRow::Effort);
@@ -2156,17 +2175,21 @@ mod tests {
         assert_eq!(app.mode, Mode::HarnessMessage, "past Effort, Down reaches the message step");
     }
 
-    /// `Up` from the message step lands back on `Effort` (not `Split`, now that Model/Effort
-    /// sit between Split and the message step), and restores the model/effort that were
-    /// typed/picked before `Down` moved on — same "moving between fields must not throw
-    /// anything away" guarantee `branch_input`/`stack_onto` already get.
+    /// `Up` from the message step lands back on `Effort` (not `Split`, now that
+    /// Harness/Model/Effort sit between Split and the message step), and restores the
+    /// harness/model/effort that were typed/picked before `Down` moved on — same "moving
+    /// between fields must not throw anything away" guarantee `branch_input`/`stack_onto`
+    /// already get.
     #[test]
-    fn up_from_the_harness_message_step_restores_model_and_effort_too() {
+    fn up_from_the_harness_message_step_restores_harness_model_and_effort_too() {
         let mut app = App::from_board(board());
         with_fake_splitter(&mut app);
         app.begin_branch();
         for c in "feature".chars() {
             app.branch_input.insert(c);
+        }
+        for c in "codex".chars() {
+            app.harness_input.insert(c);
         }
         for c in "opus".chars() {
             app.model_input.insert(c);
@@ -2178,9 +2201,92 @@ mod tests {
         app.back_to_branch_name();
 
         assert_eq!(app.mode, Mode::Branch);
+        assert_eq!(app.harness_input.as_str(), "codex");
         assert_eq!(app.model_input.as_str(), "opus");
         assert_eq!(app.effort, Some(crate::harness::Effort::Medium));
         assert_eq!(app.branch_modal_row, BranchModalRow::Effort, "the last row before the message step");
+    }
+
+    /// Once the row cursor is on `Harness`, ordinary character keys edit `harness_input` —
+    /// same as `Model` — while `Left`/`Right` are reserved for cycling (see the next test),
+    /// not text-cursor movement the way they are on `Name`/`Model`.
+    #[test]
+    fn typing_on_the_harness_row_edits_the_harness_field_only() {
+        let mut app = App::from_board(board());
+        with_fake_splitter(&mut app);
+        app.begin_branch();
+        for c in "feature".chars() {
+            app.branch_input.insert(c);
+        }
+        app.branch_modal_row = BranchModalRow::Harness;
+
+        for c in "my-wrapper".chars() {
+            app.handle_key(key(ratatui::crossterm::event::KeyCode::Char(c)));
+        }
+
+        assert_eq!(app.harness_input.as_str(), "my-wrapper");
+        assert_eq!(app.branch_input.as_str(), "feature", "the name field must be untouched");
+    }
+
+    /// `Left`/`Right` on the `Harness` row cycles through whatever `harness_choices` found on
+    /// `PATH`, wrapping at either end, and typing something not in that list overrides the
+    /// pick until the next cycle jumps back in from whichever end matches the direction
+    /// pressed — mirrors `crate::setup::Wizard::cycle_harness` exactly.
+    #[test]
+    fn left_right_on_the_harness_row_cycles_detected_choices_and_typing_overrides_them() {
+        let mut app = App::from_board(board());
+        with_fake_splitter(&mut app);
+        app.begin_branch();
+        app.harness_choices = vec!["claude", "codex", "gemini"];
+        app.branch_modal_row = BranchModalRow::Harness;
+
+        app.handle_key(key(ratatui::crossterm::event::KeyCode::Right));
+        assert_eq!(app.harness_input.as_str(), "claude", "empty starts the cycle at the first choice going right");
+        app.handle_key(key(ratatui::crossterm::event::KeyCode::Right));
+        assert_eq!(app.harness_input.as_str(), "codex");
+        app.handle_key(key(ratatui::crossterm::event::KeyCode::Left));
+        assert_eq!(app.harness_input.as_str(), "claude");
+        app.handle_key(key(ratatui::crossterm::event::KeyCode::Left));
+        assert_eq!(app.harness_input.as_str(), "gemini", "wraps backward past the first choice");
+
+        app.harness_input.clear();
+        for c in "opencode".chars() {
+            app.handle_key(key(ratatui::crossterm::event::KeyCode::Char(c)));
+        }
+        assert_eq!(app.harness_input.as_str(), "opencode", "typing overrides the cycled pick");
+        app.handle_key(key(ratatui::crossterm::event::KeyCode::Right));
+        assert_eq!(app.harness_input.as_str(), "claude", "cycling from an unmatched value jumps back in at the start");
+    }
+
+    /// Cycling with nothing detected on `PATH` is a quiet no-op, not a panic — the same
+    /// "cycling with no choices does nothing" rule `crate::setup::Wizard::cycle_harness`
+    /// follows for its own field.
+    #[test]
+    fn left_right_on_the_harness_row_is_a_no_op_with_nothing_detected() {
+        let mut app = App::from_board(board());
+        with_fake_splitter(&mut app);
+        app.begin_branch();
+        app.harness_choices = Vec::new();
+        app.branch_modal_row = BranchModalRow::Harness;
+
+        app.handle_key(key(ratatui::crossterm::event::KeyCode::Right));
+
+        assert!(app.harness_input.is_empty());
+    }
+
+    /// `begin_branch` clears whatever harness was typed/picked on a previous visit and
+    /// refreshes `harness_choices` from what's actually on `PATH` right now — same reset
+    /// `model_input`/`effort` already get.
+    #[test]
+    fn begin_branch_resets_the_harness_field_too() {
+        let mut app = App::from_board(board());
+        for c in "codex".chars() {
+            app.harness_input.insert(c);
+        }
+
+        app.begin_branch();
+
+        assert!(app.harness_input.is_empty());
     }
 
     /// Once the row cursor is on `Model`, ordinary character keys edit `model_input`, the
@@ -2229,23 +2335,24 @@ mod tests {
         assert_eq!(app.effort, Some(Effort::High), "and the other way around from none");
     }
 
-    /// `confirm_branch` with the model field left blank and the effort picker never touched
-    /// — the modal's own defaults — must not behave any differently from before this feature
-    /// existed: `App::from_board` leaves `but` unset, so this still takes the same
+    /// `confirm_branch` with the harness/model fields left blank and the effort picker never
+    /// touched — the modal's own defaults — must not behave any differently from before this
+    /// feature existed: `App::from_board` leaves `but` unset, so this still takes the same
     /// "snapshot is read-only" path every other confirm does here (see
     /// `clicking_the_branch_modals_buttons_takes_the_same_paths_as_its_keys`), never panicking
-    /// or otherwise tripping over the two new, empty fields on the way there. What actually
+    /// or otherwise tripping over the three new, empty fields on the way there. What actually
     /// reaches a spawned harness once `but` and a splitter are both real is
     /// `Splitter::spawn_harness_with`'s own job, covered in `crate::splitter`'s tests
     /// (`a_harness_override_changes_only_that_lanes_launch_line` and its neighbors).
     #[test]
-    fn confirm_branch_with_a_blank_model_and_no_effort_is_unchanged_from_before_this_feature() {
+    fn confirm_branch_with_a_blank_harness_model_and_no_effort_is_unchanged_from_before_this_feature() {
         let mut app = App::from_board(board());
         with_fake_splitter(&mut app);
         app.begin_branch();
         for c in "feature".chars() {
             app.branch_input.insert(c);
         }
+        assert!(app.harness_input.is_empty());
         assert!(app.model_input.is_empty());
         assert_eq!(app.effort, None);
 
@@ -2376,6 +2483,7 @@ mod tests {
         app.pending_branch = Some(PendingBranch {
             name: "feature".to_string(),
             anchor: Some("main".to_string()),
+            harness: None,
             model: None,
             effort: None,
         });

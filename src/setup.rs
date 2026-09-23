@@ -89,11 +89,13 @@ fn harness_on_path(name: &str) -> bool {
 }
 
 /// Every harness in `crate::harness::KNOWN` that's on `PATH`, in that list's priority order —
-/// what builds both the detection line and the default `KANSTACK_HARNESS` value below. Only
-/// each harness's own name is checked, not its aliases: `kiro-cli` is the same binary as
-/// `kiro` under an alternate name, and listing it separately would just double-count one
-/// install as two.
-fn detect_harnesses() -> Vec<&'static str> {
+/// what builds both the detection line and the default `KANSTACK_HARNESS` value below, and
+/// also what `crate::app::branch_modal`'s own harness row cycles through — the interactive
+/// board's flow and the `--setup` wizard both want "what's actually installed here," so they
+/// share the one PATH scan rather than each keeping their own. Only each harness's own name is
+/// checked, not its aliases: `kiro-cli` is the same binary as `kiro` under an alternate name,
+/// and listing it separately would just double-count one install as two.
+pub(crate) fn detect_harnesses() -> Vec<&'static str> {
     crate::harness::KNOWN.iter().map(|h| h.id()).filter(|name| harness_on_path(name)).collect()
 }
 

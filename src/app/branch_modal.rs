@@ -4,11 +4,13 @@ use ratatui::crossterm::event::KeyCode as K;
 
 /// A branch named in `Mode::Branch` but not yet created, waiting on
 /// `Mode::HarnessMessage`'s prompt — see `App::advance_to_harness_message`. Carries the
-/// model/effort choice too, gathered on the name step same as the branch name and stack
-/// target, so `App::confirm_harness_message` has them once the branch is actually created.
+/// harness/model/effort choice too, gathered on the name step same as the branch name and
+/// stack target, so `App::confirm_harness_message` has them once the branch is actually
+/// created.
 pub(super) struct PendingBranch {
     pub(super) name: String,
     pub(super) anchor: Option<String>,
+    pub(super) harness: Option<String>,
     pub(super) model: Option<String>,
     pub(super) effort: Option<Effort>,
 }
@@ -23,6 +25,13 @@ pub enum BranchModalRow {
     Name,
     Action,
     Split,
+    /// A hybrid of the two other row shapes, same as `crate::setup`'s own harness field:
+    /// `Left`/`Right` cycles through whatever's actually on `PATH` (see
+    /// `App::cycle_harness_choice`, `crate::setup::detect_harnesses`), and typing overrides
+    /// it with anything else — a harness kanstack doesn't know about, or one not on `PATH`
+    /// in this shell. Blank means "no `--agent` override", same as `kanstack spawn` without
+    /// the flag.
+    Harness,
     /// A free-text field, same shape as `Name` — the model name is an open string, not a
     /// fixed set of choices, so it gets a text field rather than a picker.
     Model,
@@ -54,6 +63,13 @@ impl BranchUi {
     }
 }
 
+/// A text field's value, trimmed, or `None` if that leaves nothing — the modal's own "blank
+/// means no override given" rule, shared by every optional free-text field it collects
+/// (`model_input`, `harness_input`) so they can't drift on what counts as blank.
+fn trimmed_or_none(input: &crate::text_input::TextInput) -> Option<String> {
+    Some(input.trimmed()).filter(|s| !s.is_empty())
+}
+
 impl App {
 
     /// Starts naming a new branch.
@@ -69,6 +85,8 @@ impl App {
     pub(super) fn begin_branch(&mut self) {
         self.branch_input.clear();
         self.harness_message_input.clear();
+        self.harness_input.clear();
+        self.harness_choices = crate::setup::detect_harnesses();
         self.model_input.clear();
         self.effort = None;
         self.stack_onto = self
@@ -128,11 +146,11 @@ impl App {
         self.splitter_available()
     }
 
-    /// `Down` in the name step: moves the row cursor along Name → Action → Split → Model →
-    /// Effort (skipping Split/Model/Effort together when `branch_modal_split_row_visible`
-    /// says they aren't shown — there's no split backend to hand any of the three to) → on
-    /// to the optional message step, the same top-to-bottom order the modal itself renders
-    /// in.
+    /// `Down` in the name step: moves the row cursor along Name → Action → Split → Harness →
+    /// Model → Effort (skipping Split/Harness/Model/Effort together when
+    /// `branch_modal_split_row_visible` says they aren't shown — there's no split backend to
+    /// hand any of the four to) → on to the optional message step, the same top-to-bottom
+    /// order the modal itself renders in.
     pub(super) fn branch_modal_row_down(&mut self) {
         self.branch_modal_row = match self.branch_modal_row {
             BranchModalRow::Name => BranchModalRow::Action,
@@ -141,7 +159,8 @@ impl App {
                 self.advance_to_harness_message();
                 return;
             }
-            BranchModalRow::Split => BranchModalRow::Model,
+            BranchModalRow::Split => BranchModalRow::Harness,
+            BranchModalRow::Harness => BranchModalRow::Model,
             BranchModalRow::Model => BranchModalRow::Effort,
             BranchModalRow::Effort => {
                 self.advance_to_harness_message();
@@ -155,7 +174,8 @@ impl App {
     pub(super) fn branch_modal_row_up(&mut self) {
         self.branch_modal_row = match self.branch_modal_row {
             BranchModalRow::Effort => BranchModalRow::Model,
-            BranchModalRow::Model => BranchModalRow::Split,
+            BranchModalRow::Model => BranchModalRow::Harness,
+            BranchModalRow::Harness => BranchModalRow::Split,
             BranchModalRow::Split => BranchModalRow::Action,
             BranchModalRow::Action | BranchModalRow::Name => BranchModalRow::Name,
         };
@@ -164,18 +184,43 @@ impl App {
     /// `Left`/`Right` on whichever row is focused: moves the name/model field's text cursor,
     /// toggles the action/split row exactly as `Tab`/`Shift-Tab` already do (direction
     /// doesn't matter for a two-state toggle, so both keys reach the same handler), or steps
-    /// the effort picker one way or the other (see `cycle_effort`, where direction does
-    /// matter).
+    /// the harness/effort picker one way or the other (see `cycle_harness_choice`/
+    /// `cycle_effort`, where direction does matter). Unlike `Model`, `Harness` never moves a
+    /// text cursor on `Left`/`Right` — same as `crate::setup`'s own harness field, those two
+    /// keys are reserved for cycling, and typing still edits the field by other keys.
     pub(super) fn branch_modal_row_left_right(&mut self, left: bool) {
         match self.branch_modal_row {
             BranchModalRow::Name if left => self.branch_input.move_left(),
             BranchModalRow::Name => self.branch_input.move_right(),
             BranchModalRow::Action => self.toggle_stack_onto(),
             BranchModalRow::Split => self.toggle_open_harness(),
+            BranchModalRow::Harness => self.cycle_harness_choice(left),
             BranchModalRow::Model if left => self.model_input.move_left(),
             BranchModalRow::Model => self.model_input.move_right(),
             BranchModalRow::Effort => self.cycle_effort(left),
         }
+    }
+
+    /// `Left`/`Right` on the harness row: steps `harness_input` to the next (or previous)
+    /// harness actually found on `PATH` (`self.harness_choices`, refreshed each time
+    /// `begin_branch` starts). A no-op with nothing detected. When the current value isn't
+    /// one of the detected choices at all (typed in by hand, or nothing found), `Right` lands
+    /// on the first choice and `Left` on the last — the exact same rule
+    /// `crate::setup::Wizard::cycle_harness` uses for its own harness field, which this
+    /// mirrors rather than reinventing.
+    pub(super) fn cycle_harness_choice(&mut self, left: bool) {
+        let len = self.harness_choices.len();
+        if len == 0 {
+            return;
+        }
+        let current = self.harness_choices.iter().position(|h| *h == self.harness_input.as_str());
+        let next = match (current, left) {
+            (Some(i), false) => (i + 1) % len,
+            (Some(i), true) => (i + len - 1) % len,
+            (None, false) => 0,
+            (None, true) => len - 1,
+        };
+        self.harness_input.set(self.harness_choices[next]);
     }
 
     /// `Left`/`Right` on the effort row: cycles through no hint at all, then `low` →
@@ -233,13 +278,6 @@ impl App {
         }
     }
 
-    /// `model_input`, trimmed, or `None` if that leaves nothing — the modal's own "blank
-    /// means no `--model` given" rule, shared by `confirm_branch` and
-    /// `advance_to_harness_message` so the two can't drift on what counts as blank.
-    fn model_field(&self) -> Option<String> {
-        Some(self.model_input.trimmed()).filter(|m| !m.is_empty())
-    }
-
     /// Enter's one job on the name field: create the branch right now. `Down`
     /// (`advance_to_harness_message`) is the way to write an initial harness message —
     /// keeping Enter here from ever meaning "navigate" instead of "create" is the reason
@@ -259,13 +297,15 @@ impl App {
         let message = (open_harness && self.branch_ui == BranchUi::Modal)
             .then(|| self.harness_message_input.trimmed())
             .filter(|m| !m.is_empty());
-        let model = self.model_field();
+        let harness = trimmed_or_none(&self.harness_input);
+        let model = trimmed_or_none(&self.model_input);
         let effort = self.effort;
         self.branch_input.clear();
         self.harness_message_input.clear();
+        self.harness_input.clear();
         self.model_input.clear();
         self.mode = Mode::Normal;
-        self.create_branch(&name, anchor.as_deref(), message.as_deref(), open_harness, model.as_deref(), effort);
+        self.create_branch(&name, anchor.as_deref(), message.as_deref(), open_harness, harness.as_deref(), model.as_deref(), effort);
     }
 
     /// The last step of `branch_modal_row_down`'s descent through the name step's rows:
@@ -287,11 +327,13 @@ impl App {
             return;
         }
         let anchor = self.stack_onto.clone();
-        let model = self.model_field();
+        let harness = trimmed_or_none(&self.harness_input);
+        let model = trimmed_or_none(&self.model_input);
         let effort = self.effort;
         self.branch_input.clear();
+        self.harness_input.clear();
         self.model_input.clear();
-        self.pending_branch = Some(PendingBranch { name, anchor, model, effort });
+        self.pending_branch = Some(PendingBranch { name, anchor, harness, model, effort });
         self.mode = Mode::HarnessMessage;
     }
 
@@ -306,6 +348,7 @@ impl App {
         let Some(pending) = self.pending_branch.take() else { return };
         self.branch_input.set(pending.name);
         self.stack_onto = pending.anchor;
+        self.harness_input.set(pending.harness.unwrap_or_default());
         self.model_input.set(pending.model.unwrap_or_default());
         self.effort = pending.effort;
         self.mode = Mode::Branch;
@@ -328,7 +371,15 @@ impl App {
             return;
         };
         let message = if text.is_empty() { None } else { Some(text.as_str()) };
-        self.create_branch(&pending.name, pending.anchor.as_deref(), message, true, pending.model.as_deref(), pending.effort);
+        self.create_branch(
+            &pending.name,
+            pending.anchor.as_deref(),
+            message,
+            true,
+            pending.harness.as_deref(),
+            pending.model.as_deref(),
+            pending.effort,
+        );
     }
 
     /// Creates `name` via `but branch new`, rebuilds the board, and — when `open_harness`
@@ -344,9 +395,12 @@ impl App {
     /// to group with, so it opens a plain pane instead, same as `anchor` being `None` (a
     /// parallel lane, or a stacked branch whose base never opened one) always has.
     ///
+    /// `harness` overrides the configured harness for just this pane, same as `kanstack spawn
+    /// --agent` — `None` (the modal's default, and every call site before the harness row
+    /// existed) leaves it to `$KANSTACK_HARNESS`/the configured default, exactly as before.
     /// `model`/`effort` are the modal's own Model/Effort rows, gathered the same way as
     /// `initial_message` and forwarded exactly as `kanstack spawn --model`/`--effort` would —
-    /// see `crate::harness::Harness::model_effort_args`. `None` for either (the modal's
+    /// see `crate::harness::Harness::model_effort_args`. `None` for all three (the modal's
     /// default, and every call site before this feature existed) reproduces the launch line
     /// byte for byte.
     #[allow(clippy::too_many_arguments)]
@@ -356,6 +410,7 @@ impl App {
         anchor: Option<&str>,
         initial_message: Option<&str>,
         open_harness: bool,
+        harness: Option<&str>,
         model: Option<&str>,
         effort: Option<Effort>,
     ) {
@@ -396,12 +451,14 @@ impl App {
                             .filter(|a| splitter.pane_status(a) != Some(crate::mux::pane_status::PaneStatus::Dead))
                             .and_then(|a| splitter.pane_id(a));
                         let spawned = match &group_anchor {
-                            Some(pane_id) => splitter.spawn_stacked_harness_with(&cwd, name, initial_message, None, model, effort, pane_id),
-                            None => splitter.spawn_harness_with(&cwd, name, initial_message, None, model, effort),
+                            Some(pane_id) => {
+                                splitter.spawn_stacked_harness_with(&cwd, name, initial_message, harness, model, effort, pane_id)
+                            }
+                            None => splitter.spawn_harness_with(&cwd, name, initial_message, harness, model, effort),
                         };
                         match spawned {
                             Ok(pane) => {
-                                crate::workstream::record_spawn(&cwd, name, &pane, None, splitter.workspace().as_deref());
+                                crate::workstream::record_spawn(&cwd, name, &pane, harness, splitter.workspace().as_deref());
                                 self.notify(format!("created {name} — harness open"), Notice::Success);
                             }
                             Err(e) => self.notify(format!("{label}: {e}"), Notice::Error),
@@ -424,6 +481,7 @@ impl App {
         // existed.
         let modal = self.branch_ui == BranchUi::Modal;
         let on_name_row = !modal || self.branch_modal_row == BranchModalRow::Name;
+        let on_harness_row = modal && self.branch_modal_row == BranchModalRow::Harness;
         let on_model_row = modal && self.branch_modal_row == BranchModalRow::Model;
         match key.code {
             K::Esc => {
@@ -445,6 +503,9 @@ impl App {
                 if self.branch_input.handle_key(key) {
                     self.branch_name_missing = false;
                 }
+            }
+            _ if on_harness_row => {
+                self.harness_input.handle_key(key);
             }
             _ if on_model_row => {
                 self.model_input.handle_key(key);

@@ -155,7 +155,7 @@ repo is thrown away when you're done. `esc` or `q` leaves any time.
 | `f` | resolve conflicts on this lane — `o`/`t` take ours/theirs per file, `A` hands the branch's conflicts to the lane's coding agent as a task |
 | `tab` | on the unassigned lane: group its cards by folder, or back to a flat list |
 | `⏎` | open the diff beside the board — `←` goes back, `m` commits or amends one hunk |
-| `b` | new branch — stacks on the selected lane, `tab` for a parallel lane; `shift-tab` opens a harness split (`cmux`, `tmux` as a fallback, `orca`, or `ghostty`) — on by default for a parallel lane, off by default while stacking, groups with the base's pane if it already has one; also offers an optional model and reasoning-effort hint for the harness pane, the same two fields `kanstack spawn --model`/`--effort` take; asks for an optional initial message before creating anything, so `esc` cancels the whole branch |
+| `b` | new branch — stacks on the selected lane, `tab` for a parallel lane; `shift-tab` opens a harness split (`cmux`, `tmux` as a fallback, `orca`, or `ghostty`) — on by default for a parallel lane, off by default while stacking, groups with the base's pane if it already has one; also offers an optional harness override (cycle with `←`/`→` through what's on `PATH`, or type any other), model name and reasoning-effort hint for the harness pane, the same fields `kanstack spawn --agent`/`--model`/`--effort` take; asks for an optional initial message before creating anything, so `esc` cancels the whole branch |
 | `t` | send a task to this lane's split pane — spawns one first if it isn't open yet |
 | `s` | stack this whole lane onto another — rewrites history |
 | `p` | push this lane — shows what it will do first |
@@ -304,8 +304,10 @@ reasoning-effort control at all, so it drops both rather than risk handing `kiro
 argument it doesn't understand; every other harness falls back to a generic `--model <value>`
 for `model` (a literal argument, not guaranteed to be one that harness actually recognizes)
 and drops `effort` silently, since not every harness has a concept of it. The interactive
-board's own branch-creation modal (`b`) offers the same two fields, right below the split
-checkbox.
+board's own branch-creation modal (`b`) offers a harness picker too, right below the split
+checkbox: `←`/`→` cycles through whatever's actually on `PATH` (the same detection `--setup`
+uses), and typing overrides it with anything else, same as `--agent` — plus the same model and
+effort fields as `kanstack spawn --model`/`--effort`.
 
 **Handing off to a stacked branch.** `spawn <branch>` works on a branch already stacked on
 another, and when that other branch already has a pane open — an agent finishing its own

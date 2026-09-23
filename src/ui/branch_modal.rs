@@ -116,9 +116,39 @@ pub(super) fn draw_branch_modal(f: &mut Frame, app: &App, area: Rect, hits: &mut
         None
     };
 
-    // Model/effort ride along with the split row's own visibility — both are meaningless
-    // without a split backend to hand a harness pane's launch line to in the first place.
+    // Harness/model/effort ride along with the split row's own visibility — all three are
+    // meaningless without a split backend to hand a harness pane's launch line to in the
+    // first place.
     if app.branch_modal_split_row_visible() {
+        let harness_prefix = format!("{}harness  ", row_marker(BranchModalRow::Harness));
+        if app.branch_modal_row == BranchModalRow::Harness {
+            let (before, after) = app.harness_input.split_at_cursor();
+            let budget = footer_input_budget(content_width as u16, harness_prefix.chars().count(), 0);
+            let (before, after) = scroll_input(before, after, budget);
+            body.push(Line::from(vec![
+                Span::styled(harness_prefix, theme::faint()),
+                Span::styled(before, theme::title(true)),
+                Span::styled("█", cursor),
+                Span::styled(after, theme::title(true)),
+            ]));
+        } else if app.harness_input.is_empty() {
+            body.push(hint_row(
+                &harness_prefix,
+                "optional — defaults to $KANSTACK_HARNESS",
+                theme::faint(),
+                "←/→ cycle",
+                content_width,
+            ));
+        } else {
+            body.push(hint_row(
+                &harness_prefix,
+                app.harness_input.as_str(),
+                theme::tone(crate::board::Tone::Accent),
+                "←/→ cycle",
+                content_width,
+            ));
+        }
+
         let model_prefix = format!("{}model    ", row_marker(BranchModalRow::Model));
         if app.branch_modal_row == BranchModalRow::Model {
             let (before, after) = app.model_input.split_at_cursor();
