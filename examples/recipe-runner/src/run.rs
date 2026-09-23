@@ -20,6 +20,15 @@
 //! single failed poll is logged and retried next tick. Only [`MAX_CONSECUTIVE_STATUS_FAILURES`]
 //! in a row — a `kanstack` that is actually unreachable, not a blip — fails every step still
 //! running.
+//!
+//! **`idle` on the very first status read after a spawn/send is never trusted.** kanstack's own
+//! `PaneStatus::Idle` doc comment (`src/mux/pane_status.rs` in the parent crate) says a single
+//! poll can't tell "the harness returned to rest" apart from "the harness never got a chance to
+//! start" — the pane can look idle for a moment before the harness has actually begun the turn
+//! we just sent it. A step only finishes on its *second* (or later) status read since launch;
+//! the first idle reading is discounted and polling continues. This can't hang forever the way
+//! waiting for a "busy" sighting first could (a step whose whole turn finishes between two
+//! polls would never be seen busy at all) — it costs at most one extra `poll_interval` per step.
 
 use std::collections::{HashMap, HashSet};
 use std::process::Command;
@@ -59,6 +68,9 @@ pub fn run_recipe(recipe: &Recipe, client: &KanstackClient, opts: &RunOptions) -
         .collect();
     // step id -> the workstream branch it's waiting to go idle on.
     let mut waiting_on_branch: HashMap<String, String> = HashMap::new();
+    // step id -> how many status reads have been taken since it started running. A step needs
+    // at least 2 before an `idle` reading is trusted — see the module doc.
+    let mut status_reads_since_launch: HashMap<String, u32> = HashMap::new();
     let mut consecutive_status_failures: u32 = 0;
 
     loop {
@@ -111,6 +123,7 @@ pub fn run_recipe(recipe: &Recipe, client: &KanstackClient, opts: &RunOptions) -
                 Ok(()) => {
                     states.insert(step_id.clone(), StepState::Running);
                     waiting_on_branch.insert(step_id.clone(), branch.clone());
+                    status_reads_since_launch.insert(step_id.clone(), 0);
                     busy_branches.insert(branch);
                 }
                 Err(e) => {
@@ -147,13 +160,23 @@ pub fn run_recipe(recipe: &Recipe, client: &KanstackClient, opts: &RunOptions) -
 
                 for step_id in &running {
                     let branch = &waiting_on_branch[step_id];
+                    let reads = status_reads_since_launch.entry(step_id.clone()).or_insert(0);
+                    *reads += 1;
                     match status_by_branch.get(branch.as_str()).copied() {
-                        Some("idle") => finish_step(recipe, step_id, &mut states),
+                        Some("idle") if *reads >= 2 => {
+                            finish_step(recipe, step_id, &mut states);
+                            status_reads_since_launch.remove(step_id);
+                        }
+                        Some("idle") => {
+                            // First read since launch — too early to trust: the harness may
+                            // not have started the turn we just sent it yet. Keep polling.
+                        }
                         Some("dead") => {
                             eprintln!(
                                 "✗ {step_id:<15} failed    workstream \"{branch}\" died before finishing"
                             );
                             states.insert(step_id.clone(), StepState::Failed);
+                            status_reads_since_launch.remove(step_id);
                         }
                         _ => {} // busy, waiting, unknown, no-pane, or not yet reported — keep polling
                     }
@@ -167,6 +190,7 @@ pub fn run_recipe(recipe: &Recipe, client: &KanstackClient, opts: &RunOptions) -
                     );
                     for step_id in &running {
                         states.insert(step_id.clone(), StepState::Failed);
+                        status_reads_since_launch.remove(step_id);
                     }
                 } else {
                     eprintln!(

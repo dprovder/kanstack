@@ -234,6 +234,37 @@ fn check_smoke_test_on_acceptance_recipe_via_binary() {
     assert!(stdout.contains("recipe valid"));
 }
 
+/// A step's workstream reading `idle` on the very first status poll after its spawn/send must
+/// not be trusted as done — kanstack's own `PaneStatus::Idle` doc comment
+/// (`src/mux/pane_status.rs` in the parent crate) says a single poll can't tell "returned to
+/// rest" apart from "never got a chance to start." The fake kanstack here reports every
+/// spawned branch idle from its very first status call (same as the other tests), so this
+/// asserts on `calls.log` directly: the step must not complete after only one status read
+/// since launch — exactly two are required.
+#[test]
+fn idle_is_not_trusted_on_the_first_status_read_after_launch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = write_fake_kanstack(tmp.path(), None, 0);
+    let recipe = recipe::parse(
+        "---\nversion: 1\nsteps:\n  a:\n    agent: codex\n    prompt: Do A\n---\nctx\n",
+    )
+    .unwrap();
+
+    let client = KanstackClient::new(bin);
+    let outcome = run_recipe(&recipe, &client, &fast_opts());
+
+    assert!(!outcome.failed);
+    assert_eq!(outcome.states["a"], StepState::Complete);
+
+    let calls = calls_log(tmp.path());
+    let status_reads = calls.lines().filter(|l| *l == "status").count();
+    assert_eq!(
+        status_reads, 2,
+        "a should complete on its second status read, not its first, since a single idle \
+         reading can't tell \"finished\" apart from \"never started\":\n{calls}"
+    );
+}
+
 /// Two independent siblings (`b`, `c`) both placed `on: implement` become runnable in the same
 /// tick once `implement` completes. Before the fix, both were `send` in that same tick and
 /// then both marked complete off a single `status --json` observation of `implement` idle —
