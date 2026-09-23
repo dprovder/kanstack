@@ -1,4 +1,4 @@
-use crate::harness::Harness;
+use crate::harness::{Effort, Harness};
 
 /// `kiro-cli chat`'s full flag reference has nothing for system prompt, instructions or
 /// context (only pre-configured, not-dynamic-per-invocation agents via `--agent`), so the
@@ -34,9 +34,16 @@ use crate::harness::Harness;
 /// through static `.kiro/hooks/*.json` files with no CLI-flag or env-var injection path at
 /// launch, exit-code semantics aside. No `waiting`-equivalent event was found either.
 ///
-/// No `model_effort_args` override either: `kiro-cli chat --agent` picks a pre-configured
-/// agent, not a per-invocation model or reasoning-effort setting, so there is nothing
-/// confirmed to map either hint onto — left on the trait's default rather than guessed at.
+/// **`model_effort_args` overridden to drop both, rather than left on the trait's default.**
+/// `kiro-cli chat`'s full flag reference (checked again for this purpose) has no per-invocation
+/// model selector at all — `--agent` picks a *pre-configured* agent, not a model — and no
+/// reasoning-effort control either. The trait's default would still forward `model` as a bare
+/// `--model <value>`, which `kiro-cli` does not recognize: unlike `effort` (silently dropped by
+/// every harness with no mapping, the default's documented, intentional behavior for *that*
+/// hint), an unrecognized `--model` is a real CLI argument that reaches `kiro-cli` and likely
+/// errors it out, while `kanstack spawn --json` would still report `ok:true` with the model
+/// echoed back as though it had taken effect. So Kiro drops both explicitly instead of relying
+/// on the default to (incorrectly, for `model`) do the safe thing on its own.
 pub struct Kiro;
 impl Harness for Kiro {
     fn id(&self) -> &'static str {
@@ -45,6 +52,10 @@ impl Harness for Kiro {
     fn aliases(&self) -> &'static [&'static str] {
         &["kiro-cli"]
     }
+
+    fn model_effort_args(&self, _model: Option<&str>, _effort: Option<Effort>) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 #[cfg(test)]
@@ -52,6 +63,7 @@ mod tests {
     use crate::harness::launch::NoteDelivery;
     use crate::harness::test_support::with_system_flag_env;
     use crate::harness::resolve_note_delivery;
+    use crate::harness::Harness;
 
     /// No confirmed mechanism, so the note is folded into the initial message — for both
     /// the name and its `kiro-cli` alias.
@@ -61,5 +73,15 @@ mod tests {
             assert_eq!(resolve_note_delivery("kiro"), NoteDelivery::FoldIntoMessage);
             assert_eq!(resolve_note_delivery("kiro-cli"), NoteDelivery::FoldIntoMessage);
         });
+    }
+
+    /// Unlike the trait's default, Kiro must drop a given `model` too, not just `effort` —
+    /// `kiro-cli` has no `--model` flag to hand it to, so forwarding one the generic way would
+    /// hand it an argument it doesn't understand.
+    #[test]
+    fn model_effort_args_drops_both_model_and_effort() {
+        use crate::harness::Effort;
+        assert!(super::Kiro.model_effort_args(Some("o3"), Some(Effort::High)).is_empty());
+        assert!(super::Kiro.model_effort_args(None, None).is_empty());
     }
 }

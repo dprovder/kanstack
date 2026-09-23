@@ -233,6 +233,13 @@ impl App {
         }
     }
 
+    /// `model_input`, trimmed, or `None` if that leaves nothing — the modal's own "blank
+    /// means no `--model` given" rule, shared by `confirm_branch` and
+    /// `advance_to_harness_message` so the two can't drift on what counts as blank.
+    fn model_field(&self) -> Option<String> {
+        Some(self.model_input.trimmed()).filter(|m| !m.is_empty())
+    }
+
     /// Enter's one job on the name field: create the branch right now. `Down`
     /// (`advance_to_harness_message`) is the way to write an initial harness message —
     /// keeping Enter here from ever meaning "navigate" instead of "create" is the reason
@@ -252,7 +259,7 @@ impl App {
         let message = (open_harness && self.branch_ui == BranchUi::Modal)
             .then(|| self.harness_message_input.trimmed())
             .filter(|m| !m.is_empty());
-        let model = Some(self.model_input.trimmed()).filter(|m| !m.is_empty());
+        let model = self.model_field();
         let effort = self.effort;
         self.branch_input.clear();
         self.harness_message_input.clear();
@@ -280,7 +287,7 @@ impl App {
             return;
         }
         let anchor = self.stack_onto.clone();
-        let model = Some(self.model_input.trimmed()).filter(|m| !m.is_empty());
+        let model = self.model_field();
         let effort = self.effort;
         self.branch_input.clear();
         self.model_input.clear();

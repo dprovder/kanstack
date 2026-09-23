@@ -54,9 +54,12 @@ kanstack spawn <branch> [--agent <name>] [--prompt \"...\"] [--item <ref>]
     <branch> doesn't exist yet — spawning on one that already does is `workstream_exists`
     regardless, and stacking an *existing* branch onto another is `but move`'s job, not
     spawn's). --model names a model for the harness to use and --effort gives it a coarse
-    reasoning-effort hint; both are optional and forwarded however the launched harness
-    knows how to take them (a harness with no mapping for one or the other just ignores
-    it — see the README)
+    reasoning-effort hint; both are optional. --effort is silently dropped by a harness with
+    no reasoning-effort mapping of its own; --model reaches every harness that has no
+    mapping of its own either as a literal --model <name> argument, which is not guaranteed
+    to be one that harness understands — see the README for which harnesses map each to
+    something real and which get the generic (or, for a harness with no model concept at
+    all, no) treatment
 kanstack send <branch|session> \"...\" [--json]
     type a message into a pane and submit it
 kanstack status [--json]

@@ -298,12 +298,14 @@ the shared envelope and error contract. `<session>` is a pane id as `kanstack st
 from, to its right; `KANSTACK_SPAWN_DIRECTION` (`left`, `right`, `above` or `below`, and
 saveable in the config file) changes that without touching where the board puts its lanes. `--agent` runs that harness instead
 of `$KANSTACK_HARNESS` for this one pane. `--model` and `--effort` (`low`, `medium` or `high`,
-a coarse reasoning-effort hint) are both optional and forwarded however the launched harness
-knows how to take them — Codex maps both to its own `-c model=...`/`-c
-model_reasoning_effort=...` config overrides, and every other harness falls back to a generic
-`--model <value>` (dropping `effort` silently — not every harness has a concept of it). The
-interactive board's own branch-creation modal (`b`) offers the same two fields, right below
-the split checkbox.
+a coarse reasoning-effort hint) are both optional. Codex maps both to its own `-c model=...`/`-c
+model_reasoning_effort=...` config overrides; Kiro has no per-invocation model or
+reasoning-effort control at all, so it drops both rather than risk handing `kiro-cli` an
+argument it doesn't understand; every other harness falls back to a generic `--model <value>`
+for `model` (a literal argument, not guaranteed to be one that harness actually recognizes)
+and drops `effort` silently, since not every harness has a concept of it. The interactive
+board's own branch-creation modal (`b`) offers the same two fields, right below the split
+checkbox.
 
 **Handing off to a stacked branch.** `spawn <branch>` works on a branch already stacked on
 another, and when that other branch already has a pane open — an agent finishing its own
