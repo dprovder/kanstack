@@ -76,6 +76,7 @@ pub enum RecipeError {
     SelfReference { step: String, field: &'static str },
     NeedsCycle(Vec<String>),
     OnCycle(Vec<String>),
+    OnNotInNeeds { step: String, target: String },
 }
 
 impl fmt::Display for RecipeError {
@@ -111,6 +112,11 @@ impl fmt::Display for RecipeError {
             RecipeError::OnCycle(chain) => {
                 write!(f, "cycle in `on` placement: {}", chain.join(" -> "))
             }
+            RecipeError::OnNotInNeeds { step, target } => write!(
+                f,
+                "step \"{step}\" is placed `on` \"{target}\", which is not in its `needs` \
+                 (directly or transitively) — `on` selects placement, not causal order"
+            ),
         }
     }
 }
@@ -250,6 +256,7 @@ fn validate(raw: RawFrontMatter, body: &str) -> Result<Recipe, RecipeError> {
 
     detect_needs_cycle(&steps)?;
     detect_on_cycle(&steps)?;
+    detect_on_without_needs(&steps)?;
 
     Ok(Recipe {
         steps,
@@ -294,6 +301,47 @@ fn detect_needs_cycle(steps: &BTreeMap<String, Step>) -> Result<(), RecipeError>
     let mut stack = Vec::new();
     for id in steps.keys() {
         visit(id, steps, &mut marks, &mut stack)?;
+    }
+    Ok(())
+}
+
+/// `on` is workspace placement, `needs` is causal order — but placing a step on a workstream it
+/// never causally waits for was never valid: it could be sent to a branch that isn't even
+/// spawned yet, or isn't done with whatever it was doing. Requires the `on` target to be
+/// present in the step's `needs`, directly or transitively (e.g. `docs` doesn't need
+/// `implement` directly, but does via `needs: [review]` where `review` needs `implement` —
+/// that transitive reach is what makes `docs: { on: implement }` valid).
+fn detect_on_without_needs(steps: &BTreeMap<String, Step>) -> Result<(), RecipeError> {
+    fn needs_closure(
+        id: &str,
+        steps: &BTreeMap<String, Step>,
+        memo: &mut HashMap<String, HashSet<String>>,
+    ) -> HashSet<String> {
+        if let Some(cached) = memo.get(id) {
+            return cached.clone();
+        }
+        let mut closure = HashSet::new();
+        for need in &steps[id].needs {
+            closure.insert(need.clone());
+            for transitive in needs_closure(need, steps, memo) {
+                closure.insert(transitive);
+            }
+        }
+        memo.insert(id.to_string(), closure.clone());
+        closure
+    }
+
+    let mut memo = HashMap::new();
+    for step in steps.values() {
+        if let Some(on) = &step.on {
+            let closure = needs_closure(&step.id, steps, &mut memo);
+            if !closure.contains(on) {
+                return Err(RecipeError::OnNotInNeeds {
+                    step: step.id.clone(),
+                    target: on.clone(),
+                });
+            }
+        }
     }
     Ok(())
 }
@@ -415,6 +463,35 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, RecipeError::UnknownOn { .. }));
+    }
+
+    #[test]
+    fn rejects_on_target_not_in_needs() {
+        // review is placed `on: implement` but never `needs` it, directly or transitively --
+        // `on` is placement, not a substitute for causal ordering.
+        let err = parse(
+            "---\nversion: 1\nsteps:\n  implement:\n    agent: codex\n    prompt: Implement\n  review:\n    agent: claude\n    on: implement\n    prompt: Review\n---\nbody\n",
+        )
+        .unwrap_err();
+        match err {
+            RecipeError::OnNotInNeeds { step, target } => {
+                assert_eq!(step, "review");
+                assert_eq!(target, "implement");
+            }
+            other => panic!("expected OnNotInNeeds, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_on_target_reached_transitively_through_needs() {
+        // docs needs review, review needs implement -- docs is `on: implement`, which is not a
+        // *direct* need of docs but is reachable transitively, matching the acceptance recipe's
+        // shape (implement -> review -> docs, all placed on implement).
+        let recipe = parse(
+            "---\nversion: 1\nsteps:\n  implement:\n    agent: codex\n    prompt: Implement\n  review:\n    agent: claude\n    needs: [implement]\n    on: implement\n    prompt: Review\n  docs:\n    agent: codex\n    needs: [review]\n    on: implement\n    prompt: Docs\n---\nbody\n",
+        )
+        .unwrap();
+        assert_eq!(recipe.steps["docs"].on.as_deref(), Some("implement"));
     }
 
     #[test]

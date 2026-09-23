@@ -111,7 +111,7 @@ That combined text is what reaches the harness, via `kanstack spawn --prompt` or
 | `effort` | no | one of `low`/`medium`/`high`, validated at parse time, forwarded as `--effort <value>`. |
 | `prompt` | yes | this step's own instruction; combined with the recipe's shared context as above. |
 | `needs` | no | list of step ids — **causal** dependency. A step is runnable once every step it `needs` has *completed* (see below). Determines *when* a step runs. |
-| `on` | no | a step id — **placement**. Send this step's prompt to the *same* workstream an earlier step created (`kanstack send`) instead of opening a new one (`kanstack spawn`). Determines *where* a step runs, independent of `needs`. Must reference an already-declared step; chains are followed to the step that actually owns the workstream. |
+| `on` | no | a step id — **placement**. Send this step's prompt to the *same* workstream an earlier step created (`kanstack send`) instead of opening a new one (`kanstack spawn`). Determines *where* a step runs. Must reference an already-declared step; chains are followed to the step that actually owns the workstream. Must also be reachable through the step's own `needs` — directly, or transitively through a chain of `needs` (e.g. `docs: { needs: [review] }` may be `on: implement` if `review` itself `needs: [implement]`) — since placing work on a workstream you never causally wait for was never meaningful: `on` selects placement, `needs` still decides *when*, and the two are validated together, not independently. |
 | `owns` | no | glob list, advisory only — for prompt context and collision-awareness. Not enforced by this runner or by kanstack; no new locking mechanism is built around it. |
 | `verify` | no | list of shell commands, run from the directory the runner itself was invoked in once the step's workstream goes idle. **All** must exit `0` for the step to count as complete; any nonzero exit fails the step (and the whole recipe). Run once each, no retries. |
 
@@ -177,8 +177,9 @@ recipe error: step "review" depends on unknown step "implementt"
 
 Rejected: missing/unsupported `version`, missing/empty `steps`, an empty step id, a step missing
 `agent` or `prompt`, an invalid `effort` value, a `needs` or `on` entry naming an unknown step, a
-step that `needs` or is `on` itself, a cycle in `needs`, a placement cycle through `on`, and
-malformed YAML front matter.
+step that `needs` or is `on` itself, a cycle in `needs`, a placement cycle through `on`, an `on`
+target not reachable (directly or transitively) through the step's own `needs`, and malformed
+YAML front matter.
 
 ## What this crate does not do
 
