@@ -140,6 +140,24 @@ straightforward loop instead of two coordinated ones (a blocking `events --follo
 a separate scheduling loop). `events --json` remains a reasonable choice for a longer-lived
 orchestrator; this one just doesn't need it.
 
+**At most one in-flight `spawn`/`send` per workstream branch.** Two steps that resolve to the
+same branch — an `on` chain, or two independent siblings that both happen to be `on` the same
+target and become runnable in the same tick — are never launched onto it in the same tick. A
+step whose target branch is already claimed by another currently-running step is deferred to a
+later tick instead. This matters because kanstack's `status --json` reports one `idle`/`busy`
+reading per workstream, not "did *this specific message's* turn finish" — sending two messages
+to one pane back-to-back and then observing the pane go idle once cannot tell you which message
+(or whether both) finished. Serializing per branch is what makes "the workstream went idle"
+mean "the step I sent is actually done."
+
+**A single transient `status --json` failure is retried, not treated as a step failure.**
+Reading status is itself a `kanstack` subprocess call and can hiccup independently of any step's
+own work (a `but` timeout, a momentary I/O error). One failed poll is logged and retried on the
+next tick; only several in a row (`MAX_CONSECUTIVE_STATUS_FAILURES` in `src/run.rs`, `3` today)
+fail every step that's currently running — enough to tell a real, persistent problem (`kanstack`
+actually unreachable) apart from a blip, without adding a general retry/timeout policy to the
+recipe format itself (still out of scope, per the non-goals above).
+
 **Independent siblings on failure: let them finish, don't stop them.** When a step fails (spawn
 error or a `verify` command exiting nonzero), any *other*, independent step that's already
 running is left alone rather than torn down with `kanstack stop`. Stopping them would discard

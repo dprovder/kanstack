@@ -6,8 +6,22 @@
 //! 0, is marked `failed` and none of its dependents ever become runnable (their `needs` can
 //! never all be `complete`). Independent sibling steps that are already running are left to
 //! finish on their own — see the README for why.
+//!
+//! **At most one in-flight operation per workstream branch.** Two steps that resolve to the
+//! same branch (an `on` chain, or two siblings both `on` the same target) are never both
+//! `spawn`/`send` in the same tick, and a step whose target branch is already claimed by
+//! another currently-`running` step is deferred to a later tick instead. Without this, two
+//! sends to one pane in the same tick race: kanstack's `status --json` reports one workstream
+//! `idle`/`busy` state, not "did *this* message's turn finish," so a single idle observation
+//! could otherwise be read as both steps' completion.
+//!
+//! **A transient `status --json` failure never fails a running step outright.** Reading status
+//! shells out to `kanstack` itself and can hiccup independently of any step's own work; a
+//! single failed poll is logged and retried next tick. Only [`MAX_CONSECUTIVE_STATUS_FAILURES`]
+//! in a row — a `kanstack` that is actually unreachable, not a blip — fails every step still
+//! running.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
@@ -15,6 +29,10 @@ use std::time::Duration;
 use crate::graph::{resolve_workstream, runnable_steps, StepState};
 use crate::kanstack::KanstackClient;
 use crate::recipe::Recipe;
+
+/// How many consecutive `status --json` failures in a row are tolerated as transient before
+/// every currently-running step is failed. See the module doc.
+const MAX_CONSECUTIVE_STATUS_FAILURES: u32 = 3;
 
 pub struct RunOptions {
     pub poll_interval: Duration,
@@ -41,14 +59,31 @@ pub fn run_recipe(recipe: &Recipe, client: &KanstackClient, opts: &RunOptions) -
         .collect();
     // step id -> the workstream branch it's waiting to go idle on.
     let mut waiting_on_branch: HashMap<String, String> = HashMap::new();
+    let mut consecutive_status_failures: u32 = 0;
 
     loop {
         let runnable = runnable_steps(recipe, &states);
-        let launched_any = !runnable.is_empty();
+
+        // Branches already claimed by a currently-running step — never spawn/send onto one of
+        // these again until it frees up. Updated in-line below too, so two runnable steps that
+        // resolve to the same branch in this same tick don't both launch onto it.
+        let mut busy_branches: HashSet<String> = waiting_on_branch
+            .iter()
+            .filter(|(id, _)| states.get(id.as_str()) == Some(&StepState::Running))
+            .map(|(_, branch)| branch.clone())
+            .collect();
+
+        let mut launched_this_tick = false;
 
         for step_id in &runnable {
             let step = &recipe.steps[step_id];
             let branch = resolve_workstream(recipe, step_id);
+            if busy_branches.contains(&branch) {
+                // Another step already owns this workstream right now; try again next tick
+                // once it frees up, rather than racing a second spawn/send onto it.
+                continue;
+            }
+
             let effective_prompt = recipe.effective_prompt(step_id);
             let placed_on_existing = step.on.is_some();
 
@@ -71,10 +106,12 @@ pub fn run_recipe(recipe: &Recipe, client: &KanstackClient, opts: &RunOptions) -
                 client.spawn(&branch, step, &effective_prompt).map(|_| ())
             };
 
+            launched_this_tick = true;
             match launch_result {
                 Ok(()) => {
                     states.insert(step_id.clone(), StepState::Running);
-                    waiting_on_branch.insert(step_id.clone(), branch);
+                    waiting_on_branch.insert(step_id.clone(), branch.clone());
+                    busy_branches.insert(branch);
                 }
                 Err(e) => {
                     eprintln!("✗ {step_id:<15} failed    {e}");
@@ -90,18 +127,19 @@ pub fn run_recipe(recipe: &Recipe, client: &KanstackClient, opts: &RunOptions) -
             .collect();
 
         if running.is_empty() {
-            if !launched_any {
-                // Nothing running and nothing newly launchable: either everything is done, or
-                // every remaining pending step has a failed dependency and can never run.
+            if !launched_this_tick {
+                // Nothing running and nothing launched: either everything is done, or every
+                // remaining pending step has a failed dependency and can never run.
                 break;
             }
-            // Every step launched this tick already failed at spawn/send time; loop again so
+            // Everything launched this tick already failed at spawn/send time; loop again so
             // any still-independent pending steps get a chance.
             continue;
         }
 
         match client.status() {
             Ok(statuses) => {
+                consecutive_status_failures = 0;
                 let status_by_branch: HashMap<&str, &str> = statuses
                     .iter()
                     .map(|w| (w.branch.as_str(), w.status.as_str()))
@@ -122,9 +160,18 @@ pub fn run_recipe(recipe: &Recipe, client: &KanstackClient, opts: &RunOptions) -
                 }
             }
             Err(e) => {
-                eprintln!("✗ could not read kanstack status: {e}");
-                for step_id in &running {
-                    states.insert(step_id.clone(), StepState::Failed);
+                consecutive_status_failures += 1;
+                if consecutive_status_failures >= MAX_CONSECUTIVE_STATUS_FAILURES {
+                    eprintln!(
+                        "✗ kanstack status failed {consecutive_status_failures} times in a row, giving up: {e}"
+                    );
+                    for step_id in &running {
+                        states.insert(step_id.clone(), StepState::Failed);
+                    }
+                } else {
+                    eprintln!(
+                        "! kanstack status failed (attempt {consecutive_status_failures}/{MAX_CONSECUTIVE_STATUS_FAILURES}), retrying: {e}"
+                    );
                 }
             }
         }

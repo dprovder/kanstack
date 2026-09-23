@@ -2,7 +2,7 @@
 //! states per step, tracked by the caller (`run.rs`): `pending`, `running`, `complete`,
 //! `failed`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::recipe::Recipe;
 
@@ -33,11 +33,24 @@ pub fn runnable_steps(recipe: &Recipe, states: &HashMap<String, StepState>) -> V
 
 /// Follows a step's `on` chain to the step that actually owns the workstream (the one with no
 /// `on` of its own) — the branch name a step's work should land on.
+///
+/// [`crate::recipe::parse`] already rejects an `on` cycle at validation time, so a *parsed*
+/// recipe can never reach one here. But `Recipe`/`Step` are public, plain data — a caller using
+/// this crate as a library can build one by hand and skip `parse()` entirely — so this still
+/// guards against looping forever on a hand-built cyclic `on` chain: it stops and returns the
+/// first repeated step id once it revisits one, rather than hanging.
 pub fn resolve_workstream(recipe: &Recipe, step_id: &str) -> String {
+    let mut seen = HashSet::new();
     let mut current = step_id.to_string();
+    seen.insert(current.clone());
     loop {
         match recipe.steps.get(&current).and_then(|s| s.on.clone()) {
-            Some(next) => current = next,
+            Some(next) => {
+                if !seen.insert(next.clone()) {
+                    return current;
+                }
+                current = next;
+            }
             None => return current,
         }
     }
@@ -154,6 +167,52 @@ mod tests {
         .unwrap();
         let st = states(&[("a", StepState::Failed), ("b", StepState::Pending)]);
         assert!(runnable_steps(&recipe, &st).is_empty());
+    }
+
+    #[test]
+    fn resolve_workstream_does_not_hang_on_a_hand_built_cyclic_on_chain() {
+        // parse() rejects this shape, so build it by hand — a library caller who skips
+        // parse() is exactly who the guard in resolve_workstream protects.
+        use crate::recipe::Step;
+        use std::collections::BTreeMap;
+
+        let mut steps = BTreeMap::new();
+        steps.insert(
+            "a".to_string(),
+            Step {
+                id: "a".to_string(),
+                agent: "codex".to_string(),
+                model: None,
+                effort: None,
+                prompt: "A".to_string(),
+                needs: vec![],
+                on: Some("b".to_string()),
+                owns: vec![],
+                verify: vec![],
+            },
+        );
+        steps.insert(
+            "b".to_string(),
+            Step {
+                id: "b".to_string(),
+                agent: "codex".to_string(),
+                model: None,
+                effort: None,
+                prompt: "B".to_string(),
+                needs: vec![],
+                on: Some("a".to_string()),
+                owns: vec![],
+                verify: vec![],
+            },
+        );
+        let recipe = Recipe {
+            steps,
+            context: String::new(),
+        };
+
+        // Must return promptly rather than looping forever.
+        let resolved = resolve_workstream(&recipe, "a");
+        assert!(resolved == "a" || resolved == "b");
     }
 
     #[test]
