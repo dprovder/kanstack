@@ -333,6 +333,8 @@ mod tests {
                 item: None,
                 above: None,
                 below: None,
+                model: None,
+                effort: None,
                 json: false,
             }),
             Some(("spawn", Some("fix-login".to_string())))

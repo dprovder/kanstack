@@ -24,6 +24,9 @@ use crate::harness::Harness;
 /// that takes an inline shell command for any event (the closest thing,
 /// `attention.notifications`/`attention.sound`, is a boolean toggle for OpenCode's own built-in
 /// desktop notifications, not a hook). Non-blocking doesn't buy a lighter mechanism here.
+///
+/// No `model_effort_args` override: no confirmed reasoning-effort control was found for this
+/// one either, so it stays on the trait's default rather than a guessed-at flag.
 pub struct OpenCode;
 impl Harness for OpenCode {
     fn id(&self) -> &'static str {

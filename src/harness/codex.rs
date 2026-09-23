@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
-use crate::harness::launch::{LaunchExtras, NoteDelivery};
-use crate::harness::Harness;
+use crate::harness::launch::{toml_quote, LaunchExtras, NoteDelivery};
+use crate::harness::{Effort, Harness};
 
 /// No `--append-system-prompt` exists (a request for exactly that, openai/codex#11117, is
 /// closed unimplemented); `-c developer_instructions=<toml>` is the closest equivalent, a
@@ -92,6 +92,27 @@ impl Harness for Codex {
         std::fs::write(&path, merged).ok()?;
         Some(LaunchExtras::default())
     }
+
+    /// Codex has real `-c key=value` config overrides for both of these — `model`, its own
+    /// top-level model selector, and `model_reasoning_effort`, its actual reasoning-effort
+    /// config key (confirmed against `codex-rs/config`, not guessed from the docs site) —
+    /// so unlike the trait's default (which forwards `model` as a generic `--model` flag and
+    /// drops `effort`), Codex maps *both* hints through the same mechanism its note delivery
+    /// already uses (see `NoteDelivery::CodexConfig` and [`toml_quote`]): one `-c` argument
+    /// per override, each a TOML-quoted string value, `low`/`medium`/`high` passed straight
+    /// through unchanged since those are exactly the words Codex's own config expects.
+    fn model_effort_args(&self, model: Option<&str>, effort: Option<Effort>) -> Vec<String> {
+        let mut args = Vec::new();
+        if let Some(model) = model {
+            args.push("-c".to_string());
+            args.push(format!("model={}", toml_quote(model)));
+        }
+        if let Some(effort) = effort {
+            args.push("-c".to_string());
+            args.push(format!("model_reasoning_effort={}", toml_quote(&effort.to_string())));
+        }
+        args
+    }
 }
 
 /// `<project-root>/.codex/hooks.json` — `project_root` found the same way Codex's own
@@ -170,6 +191,7 @@ mod tests {
     use crate::harness::launch::NoteDelivery;
     use crate::harness::test_support::{with_system_flag_env, REPORT};
     use crate::harness::resolve_note_delivery;
+    use crate::harness::Harness;
 
     #[test]
     fn resolve_note_delivery_uses_codex_config_for_codex() {
@@ -306,8 +328,48 @@ mod tests {
             std::fs::create_dir_all(repo.join(".git")).unwrap();
 
             let config = HarnessConfig::new("codex").with_reporter(REPORT);
-            let line = config.launch_line(&repo, "feat-x", Some("fix it"), None).unwrap();
+            let line = config.launch_line(&repo, "feat-x", Some("fix it"), None, None, None).unwrap();
             assert!(line.contains("KANSTACK_BRANCH='feat-x'"), "{line:?}");
+
+            let _ = std::fs::remove_dir_all(&repo);
+        });
+    }
+
+    // `model_effort_args`.
+
+    #[test]
+    fn model_effort_args_maps_model_and_effort_to_their_real_codex_config_keys() {
+        let args = super::Codex.model_effort_args(Some("o3"), Some(crate::harness::Effort::High));
+        assert_eq!(args, ["-c", r#"model="o3""#, "-c", r#"model_reasoning_effort="high""#]);
+    }
+
+    #[test]
+    fn model_effort_args_omits_whichever_of_the_two_was_not_given() {
+        assert_eq!(super::Codex.model_effort_args(Some("o3"), None), ["-c", r#"model="o3""#]);
+        assert_eq!(
+            super::Codex.model_effort_args(None, Some(crate::harness::Effort::Low)),
+            ["-c", r#"model_reasoning_effort="low""#]
+        );
+        assert!(super::Codex.model_effort_args(None, None).is_empty());
+    }
+
+    /// The full launch line: each `-c` override reaches Codex as its own shell word, TOML
+    /// quoting intact, alongside the note's own `-c developer_instructions=...`.
+    #[test]
+    fn a_launch_line_carries_model_and_effort_as_their_own_c_arguments() {
+        use crate::harness::HarnessConfig;
+
+        with_system_flag_env(None, || {
+            let repo = std::env::temp_dir().join(format!("kanstack-codex-model-effort-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&repo);
+            std::fs::create_dir_all(repo.join(".git")).unwrap();
+
+            let config = HarnessConfig::new("codex");
+            let line = config
+                .launch_line(&repo, "feat-x", Some("fix it"), None, Some("o3"), Some(crate::harness::Effort::Medium))
+                .unwrap();
+            assert!(line.contains(r#"'-c' 'model="o3"'"#), "{line:?}");
+            assert!(line.contains(r#"'-c' 'model_reasoning_effort="medium"'"#), "{line:?}");
 
             let _ = std::fs::remove_dir_all(&repo);
         });

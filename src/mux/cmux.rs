@@ -765,7 +765,7 @@ esac"#
 esac"#;
         let vars = [("KANSTACK_STACK_PANES", None)];
         with_fake_cmux("tabs", body, &vars, |mut splitter, log| {
-            let pane = splitter.spawn_stacked_harness_with(Path::new("/repo"), "feat-top", Some("go"), None, "surface:9").unwrap();
+            let pane = splitter.spawn_stacked_harness_with(Path::new("/repo"), "feat-top", Some("go"), None, None, None, "surface:9").unwrap();
             assert_eq!(pane, "surface:99");
             let lines = stand_in::log_lines(log);
             assert_eq!(lines[0], "rpc pane.list");
@@ -783,7 +783,7 @@ esac"#;
         let vars = [("KANSTACK_STACK_PANES", None)];
         with_fake_cmux("no-pane", body, &vars, |mut splitter, log| {
             let err =
-                splitter.spawn_stacked_harness_with(Path::new("/repo"), "feat-top", None, None, "surface:9").unwrap_err().to_string();
+                splitter.spawn_stacked_harness_with(Path::new("/repo"), "feat-top", None, None, None, None, "surface:9").unwrap_err().to_string();
             assert!(err.contains("no cmux pane found holding surface:9"), "{err}");
             assert!(!splitter.has_pane("feat-top"));
             assert_eq!(stand_in::log_lines(log).len(), 1, "nothing may be typed once the pane can't be found");

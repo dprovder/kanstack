@@ -18,6 +18,7 @@ use std::path::Path;
 use anyhow::{bail, Result};
 use serde::Serialize;
 
+use crate::harness::Effort;
 use crate::report::Reported;
 use crate::splitter::Splitter;
 use crate::workstream::{PaneId, Registry, Workstream};
@@ -43,7 +44,7 @@ pub const SUBCOMMANDS: &[&str] = &["spawn", "send", "status", "focus", "stop", "
 
 pub const HELP: &str = "\
 kanstack spawn <branch> [--agent <name>] [--prompt \"...\"] [--item <ref>]
-    [--above <base>|--below <base>] [--json]
+    [--above <base>|--below <base>] [--model <name>] [--effort <low|medium|high>] [--json]
     open a harness pane on <branch>, creating the branch first if it doesn't exist.
     --agent runs that harness (e.g. codex) instead of $KANSTACK_HARNESS; --prompt is
     the harness's first message; --item attaches an opaque work-item reference (e.g.
@@ -52,7 +53,10 @@ kanstack spawn <branch> [--agent <name>] [--prompt \"...\"] [--item <ref>]
     <base> instead of giving it its own lane (mutually exclusive; only meaningful when
     <branch> doesn't exist yet — spawning on one that already does is `workstream_exists`
     regardless, and stacking an *existing* branch onto another is `but move`'s job, not
-    spawn's)
+    spawn's). --model names a model for the harness to use and --effort gives it a coarse
+    reasoning-effort hint; both are optional and forwarded however the launched harness
+    knows how to take them (a harness with no mapping for one or the other just ignores
+    it — see the README)
 kanstack send <branch|session> \"...\" [--json]
     type a message into a pane and submit it
 kanstack status [--json]
@@ -115,6 +119,8 @@ pub enum Command {
         item: Option<String>,
         above: Option<String>,
         below: Option<String>,
+        model: Option<String>,
+        effort: Option<Effort>,
         json: bool,
     },
     Send { target: String, text: String, json: bool },
@@ -173,6 +179,8 @@ pub fn parse(name: &str, args: Vec<String>) -> Result<Option<Command>> {
     let mut item = None;
     let mut above = None;
     let mut below = None;
+    let mut model = None;
+    let mut effort = None;
     let mut json = false;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -208,6 +216,14 @@ pub fn parse(name: &str, args: Vec<String>) -> Result<Option<Command>> {
             "--item" if name == "spawn" => item = Some(flag("--item", inline.as_deref(), &mut args)?),
             "--above" if name == "spawn" => above = Some(flag("--above", inline.as_deref(), &mut args)?),
             "--below" if name == "spawn" => below = Some(flag("--below", inline.as_deref(), &mut args)?),
+            "--model" if name == "spawn" => model = Some(flag("--model", inline.as_deref(), &mut args)?),
+            "--effort" if name == "spawn" => {
+                let raw = flag("--effort", inline.as_deref(), &mut args)?;
+                effort = Some(
+                    Effort::parse(&raw)
+                        .ok_or_else(|| anyhow::anyhow!("--effort must be low, medium or high, not {raw:?}\n\n{HELP}"))?,
+                );
+            }
             "--json" => {
                 if inline.is_some() {
                     bail!("--json takes no value\n\n{HELP}");
@@ -230,7 +246,7 @@ pub fn parse(name: &str, args: Vec<String>) -> Result<Option<Command>> {
             if above.is_some() && below.is_some() {
                 bail!("`kanstack spawn` takes --above or --below, not both\n\n{HELP}");
             }
-            Command::Spawn { branch: one("<branch>")?, agent, prompt, item, above, below, json }
+            Command::Spawn { branch: one("<branch>")?, agent, prompt, item, above, below, model, effort, json }
         }
         "send" => {
             let target = one("<branch|session>")?;
@@ -341,8 +357,8 @@ struct PaneResult {
 
 pub fn run(command: Command, cwd: &Path, out: &mut impl Write) -> Result<()> {
     match command {
-        Command::Spawn { branch, agent, prompt, item, above, below, json } => {
-            spawn::run(branch, agent, prompt, item, above, below, json, cwd, out)
+        Command::Spawn { branch, agent, prompt, item, above, below, model, effort, json } => {
+            spawn::run(branch, agent, prompt, item, above, below, model, effort, json, cwd, out)
         }
         Command::Send { target, text, json } => send::run(target, text, json, cwd, out),
         Command::Status { json } => status::run(json, cwd, out),
@@ -440,6 +456,8 @@ mod tests {
                 item: None,
                 above: None,
                 below: None,
+                model: None,
+                effort: None,
                 json: false,
             })
         );
@@ -452,6 +470,8 @@ mod tests {
                 item: None,
                 above: None,
                 below: None,
+                model: None,
+                effort: None,
                 json: false,
             })
         );
@@ -464,6 +484,8 @@ mod tests {
                 item: None,
                 above: None,
                 below: None,
+                model: None,
+                effort: None,
                 json: false,
             })
         );
@@ -480,6 +502,8 @@ mod tests {
                 item: Some("github:#42".into()),
                 above: None,
                 below: None,
+                model: None,
+                effort: None,
                 json: false,
             })
         );
@@ -492,6 +516,8 @@ mod tests {
                 item: Some("linear:ENG-7".into()),
                 above: None,
                 below: None,
+                model: None,
+                effort: None,
                 json: false,
             })
         );
@@ -510,6 +536,8 @@ mod tests {
                 item: None,
                 above: Some("main-feature".into()),
                 below: None,
+                model: None,
+                effort: None,
                 json: false,
             })
         );
@@ -522,6 +550,8 @@ mod tests {
                 item: None,
                 above: None,
                 below: Some("main-feature".into()),
+                model: None,
+                effort: None,
                 json: false,
             })
         );
@@ -531,6 +561,50 @@ mod tests {
             "--above and --below are mutually exclusive"
         );
         assert!(parse("send", args(&["b", "--above", "x"])).is_err(), "--above is spawn-only");
+    }
+
+    #[test]
+    fn spawn_takes_an_optional_model_and_effort() {
+        assert_eq!(
+            parse("spawn", args(&["fix-parser", "--model", "o3", "--effort", "high"])).unwrap(),
+            Some(Command::Spawn {
+                branch: "fix-parser".into(),
+                agent: None,
+                prompt: None,
+                item: None,
+                above: None,
+                below: None,
+                model: Some("o3".into()),
+                effort: Some(crate::harness::Effort::High),
+                json: false,
+            })
+        );
+        assert_eq!(
+            parse("spawn", args(&["b", "--model=opus", "--effort=low"])).unwrap(),
+            Some(Command::Spawn {
+                branch: "b".into(),
+                agent: None,
+                prompt: None,
+                item: None,
+                above: None,
+                below: None,
+                model: Some("opus".into()),
+                effort: Some(crate::harness::Effort::Low),
+                json: false,
+            })
+        );
+        assert!(parse("spawn", args(&["b", "--model"])).is_err(), "--model requires a value");
+        assert!(parse("send", args(&["b", "--model", "opus"])).is_err(), "--model is spawn-only");
+        assert!(parse("send", args(&["b", "--effort", "low"])).is_err(), "--effort is spawn-only");
+    }
+
+    /// An `--effort` word other than `low`/`medium`/`high` is `invalid_arguments` (exit `2`),
+    /// same as any other malformed argument caught before a command ever runs — see
+    /// `cli::invalid_arguments`, applied in `main` to every `parse` failure.
+    #[test]
+    fn spawn_rejects_an_effort_word_that_is_not_low_medium_or_high() {
+        let err = parse("spawn", args(&["b", "--effort", "extreme"])).unwrap_err().to_string();
+        assert!(err.contains("low, medium or high"), "{err}");
     }
 
     #[test]
@@ -563,7 +637,7 @@ mod tests {
         assert!(parse("status", args(&["--json", "extra"])).is_err());
         assert_eq!(
             parse("spawn", args(&["b", "--json"])).unwrap(),
-            Some(Command::Spawn { branch: "b".into(), agent: None, prompt: None, item: None, above: None, below: None, json: true })
+            Some(Command::Spawn { branch: "b".into(), agent: None, prompt: None, item: None, above: None, below: None, model: None, effort: None, json: true })
         );
         // `--json` is recognized as a flag wherever it falls among the arguments (flags are
         // split out before the remaining words are joined into the message), same as before

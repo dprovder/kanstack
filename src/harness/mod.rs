@@ -23,6 +23,41 @@ use anyhow::Result;
 
 use crate::harness::launch::{launch_line_with, shell_quote, LaunchExtras, NoteDelivery};
 
+/// A coarse reasoning-effort hint for a spawned agent — `kanstack spawn --effort` and the
+/// board's own branch-creation modal (`crate::app::branch_modal`) both collect one of these,
+/// portably across harnesses, even though not every harness has a concept of "effort" at all
+/// (see [`Harness::model_effort_args`]). Wire words mirror `crate::report::Reported`'s own
+/// convention: lowercase, matched by [`Effort::parse`] and printed back the same way by
+/// `Display` — so a round trip through a CLI flag, a JSON field, or a harness's own
+/// `-c key=value` override all agree on the same three words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+}
+
+impl Effort {
+    pub fn parse(word: &str) -> Option<Effort> {
+        match word {
+            "low" => Some(Effort::Low),
+            "medium" => Some(Effort::Medium),
+            "high" => Some(Effort::High),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Effort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Effort::Low => "low",
+            Effort::Medium => "medium",
+            Effort::High => "high",
+        })
+    }
+}
+
 /// One coding-agent harness. Unit structs, looked up by [`for_command`].
 pub trait Harness: Sync {
     /// The program's own name, as it would be typed at a shell: `claude`. What
@@ -80,6 +115,25 @@ pub trait Harness: Sync {
     /// ignores it.
     fn status_hooks(&self, _report: &str, _branch: &str, _cwd: &Path) -> Option<LaunchExtras> {
         None
+    }
+
+    /// Extra launch arguments encoding `model`/`effort`, appended like any other
+    /// [`LaunchExtras::args`] (see [`HarnessConfig::launch_line`]). The default forwards
+    /// `model` as a generic `--model <value>` argument — most CLIs, including several
+    /// harnesses here, accept that spelling — and drops `effort` silently: not every harness
+    /// has a way to express a reasoning-effort hint at all, and per this feature's own design
+    /// the mapping is meant to be shallow rather than guessing at a flag that might not exist,
+    /// so a harness with no mapping of its own just ignores it. That is a deliberate,
+    /// documented choice, not a bug — a harness that overrides this to do something different
+    /// (or to do nothing at all, like the default's silent drop of `effort`) says so in its own
+    /// doc comment, the same way [`status_hooks`](Harness::status_hooks) documents which
+    /// harnesses it does and doesn't cover.
+    fn model_effort_args(&self, model: Option<&str>, effort: Option<Effort>) -> Vec<String> {
+        let _ = effort;
+        match model {
+            Some(model) => vec!["--model".to_string(), model.to_string()],
+            None => Vec::new(),
+        }
     }
 }
 
@@ -181,6 +235,9 @@ impl HarnessConfig {
     /// on lane `name`, with `initial_message` as its first message. `harness` overrides the
     /// configured command for just this pane (`kanstack spawn --agent`), including which
     /// delivery the note uses — that depends on the harness, not on what was configured.
+    /// `model`/`effort` reach the launched harness via [`Harness::model_effort_args`] on
+    /// whichever harness actually launches (the override, if any, same as `harness` itself) —
+    /// see that method for what each harness does with them.
     ///
     /// No trailing newline; the backend submits it. See `launch::launch_line` for
     /// the spill-to-files handling of a prompt too long to type.
@@ -190,6 +247,8 @@ impl HarnessConfig {
         name: &str,
         initial_message: Option<&str>,
         harness: Option<&str>,
+        model: Option<&str>,
+        effort: Option<Effort>,
     ) -> Result<String> {
         let (command, delivery) = match harness {
             Some(h) if h != self.command => (h, resolve_note_delivery_for_override(h)),
@@ -198,7 +257,7 @@ impl HarnessConfig {
         // The hook commands themselves name `name` directly (see `Harness::status_hooks`);
         // `KANSTACK_BRANCH` is set here too, but only for a human running `kanstack report`
         // by hand from this same pane, since the harness's own hooks can't be trusted to see it.
-        let extras = self
+        let mut extras = self
             .report_command
             .as_deref()
             .and_then(|report| for_command(command).status_hooks(report, name, cwd))
@@ -207,6 +266,11 @@ impl HarnessConfig {
                 extras
             })
             .unwrap_or_default();
+        // Appended after the status hooks' own args rather than in front of them — the two
+        // never interact (status hooks are file-based or environment-based extras, never
+        // positional flags a model/effort argument could shift), so the order is a free
+        // choice; this just keeps everything about hooks together, model/effort after.
+        extras.args.extend(for_command(command).model_effort_args(model, effort));
         let line = launch_line_with(cwd, command, &delivery, name, initial_message, &extras)?;
         Ok(line.trim_end_matches('\n').to_string())
     }
@@ -284,7 +348,7 @@ pub(crate) mod test_support {
     pub(crate) fn launched(config: &HarnessConfig, harness: Option<&str>, message: Option<&str>) -> (String, Vec<String>) {
         // `sh` and `cat` are found through `PATH`, which the backends' discovery tests swap.
         let _guard = crate::SPLIT_BACKEND_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let line = config.launch_line(Path::new("/tmp"), "feat-x", message, harness).unwrap();
+        let line = config.launch_line(Path::new("/tmp"), "feat-x", message, harness, None, None).unwrap();
         // Cleared, not just left alone: this process may itself be running inside a pane
         // kanstack launched (dogfooding kanstack from kanstack), which would otherwise leak
         // its own `$KANSTACK_BRANCH` into the child and mask exactly the "no lane variable
@@ -376,14 +440,14 @@ mod tests {
             let config = HarnessConfig::new("claude");
             let cwd = Path::new("/repo");
 
-            let configured = config.launch_line(cwd, "feat-x", Some("fix it"), None).unwrap();
+            let configured = config.launch_line(cwd, "feat-x", Some("fix it"), None, None, None).unwrap();
             assert!(configured.starts_with("cd '/repo' && claude --append-system-prompt "), "{configured:?}");
             assert!(!configured.ends_with('\n'), "the backend submits the line, so it carries no newline");
 
             // Naming the configured harness is not an override.
-            assert_eq!(config.launch_line(cwd, "feat-x", Some("fix it"), Some("claude")).unwrap(), configured);
+            assert_eq!(config.launch_line(cwd, "feat-x", Some("fix it"), Some("claude"), None, None).unwrap(), configured);
 
-            let other = config.launch_line(cwd, "feat-x", Some("fix it"), Some("codex")).unwrap();
+            let other = config.launch_line(cwd, "feat-x", Some("fix it"), Some("codex"), None, None).unwrap();
             assert!(other.starts_with("cd '/repo' && codex -c "), "{other:?}");
             assert!(!other.contains("--append-system-prompt"), "{other:?}");
         });
@@ -445,5 +509,48 @@ mod tests {
             assert_eq!(reporter_command(Some(exe), Some(off)), None, "{off:?}");
         }
         assert_eq!(reporter_command(None, None), None, "nothing to point the hooks at");
+    }
+
+    // `model`/`effort`.
+
+    /// A harness with no override (every one but `Codex` — see its own file) forwards
+    /// `model` as a generic `--model <value>` and silently drops `effort`, per the trait's
+    /// documented default.
+    #[test]
+    fn the_default_model_effort_args_forwards_model_and_drops_effort() {
+        assert_eq!(GENERIC.model_effort_args(Some("gpt-5"), Some(Effort::High)), ["--model", "gpt-5"]);
+        assert_eq!(GENERIC.model_effort_args(None, Some(Effort::High)), Vec::<String>::new());
+        assert!(GENERIC.model_effort_args(None, None).is_empty());
+    }
+
+    /// Omitting `--model`/`--effort` reproduces today's exact launch line — this is the one
+    /// guarantee the whole feature rests on: a caller that never asks for either must see
+    /// byte-for-byte the same command kanstack has always produced, computed independently
+    /// here via `launch::build_launch_command` rather than a hand-copied literal.
+    #[test]
+    fn launch_line_with_no_model_or_effort_is_unchanged_from_before_this_feature() {
+        with_system_flag_env(None, || {
+            let config = HarnessConfig::new("claude");
+            let cwd = Path::new("/repo");
+            let delivery = crate::harness::launch::NoteDelivery::Flag("--append-system-prompt".to_string());
+            let expected = crate::harness::launch::build_launch_command(cwd, "claude", &delivery, "feat-x", Some("fix it"));
+            let actual = config.launch_line(cwd, "feat-x", Some("fix it"), None, None, None).unwrap();
+            assert_eq!(actual, expected.trim_end_matches('\n'));
+        });
+    }
+
+    /// `model`/`effort` land on the launch line as ordinary extra arguments, after any
+    /// status-hook extras — for a harness with no override (`claude`, here) that means a
+    /// generic `--model`, and `effort` contributes nothing at all.
+    #[test]
+    fn launch_line_appends_the_default_model_flag_and_drops_effort() {
+        with_system_flag_env(None, || {
+            let config = HarnessConfig::new("claude");
+            let line = config
+                .launch_line(Path::new("/repo"), "feat-x", Some("fix it"), None, Some("opus"), Some(Effort::Low))
+                .unwrap();
+            assert!(line.contains("'--model' 'opus'"), "{line:?}");
+            assert!(!line.contains("low"), "claude has no effort mapping, so the hint must not surface: {line:?}");
+        });
     }
 }

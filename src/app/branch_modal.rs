@@ -1,22 +1,35 @@
 use super::*;
+use crate::harness::Effort;
 use ratatui::crossterm::event::KeyCode as K;
 
 /// A branch named in `Mode::Branch` but not yet created, waiting on
-/// `Mode::HarnessMessage`'s prompt — see `App::advance_to_harness_message`.
+/// `Mode::HarnessMessage`'s prompt — see `App::advance_to_harness_message`. Carries the
+/// model/effort choice too, gathered on the name step same as the branch name and stack
+/// target, so `App::confirm_harness_message` has them once the branch is actually created.
 pub(super) struct PendingBranch {
     pub(super) name: String,
     pub(super) anchor: Option<String>,
+    pub(super) model: Option<String>,
+    pub(super) effort: Option<Effort>,
 }
 
 /// Which row of the branch-creation modal `Left`/`Right`/`Up`/`Down` currently act on —
 /// see `App::branch_modal_row_down`/`_up`. Top-to-bottom order matches the modal's own
-/// layout, `Split` included only when `App::branch_modal_split_row_visible` says it's
-/// shown.
+/// layout, `Split`/`Model`/`Effort` included only when `App::branch_modal_split_row_visible`
+/// says they're shown — all three are meaningless without a split backend to hand a model or
+/// an effort hint to in the first place, the same reasoning `Split` already followed alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BranchModalRow {
     Name,
     Action,
     Split,
+    /// A free-text field, same shape as `Name` — the model name is an open string, not a
+    /// fixed set of choices, so it gets a text field rather than a picker.
+    Model,
+    /// A small fixed-choice picker, cycled with `Left`/`Right` through no hint at all, then
+    /// `low` → `medium` → `high` — the same two-key cycling `Action`/`Split` already use,
+    /// just with four states instead of two.
+    Effort,
 }
 
 /// How the branch-naming/harness-message flow is presented: a dedicated modal (the
@@ -56,6 +69,8 @@ impl App {
     pub(super) fn begin_branch(&mut self) {
         self.branch_input.clear();
         self.harness_message_input.clear();
+        self.model_input.clear();
+        self.effort = None;
         self.stack_onto = self
             .board
             .columns
@@ -113,14 +128,22 @@ impl App {
         self.splitter_available()
     }
 
-    /// `Down` in the name step: moves the row cursor along Name → Action → Split (skipping
-    /// Split when `branch_modal_split_row_visible` says it isn't shown) → on to the
-    /// optional message step, the same top-to-bottom order the modal itself renders in.
+    /// `Down` in the name step: moves the row cursor along Name → Action → Split → Model →
+    /// Effort (skipping Split/Model/Effort together when `branch_modal_split_row_visible`
+    /// says they aren't shown — there's no split backend to hand any of the three to) → on
+    /// to the optional message step, the same top-to-bottom order the modal itself renders
+    /// in.
     pub(super) fn branch_modal_row_down(&mut self) {
         self.branch_modal_row = match self.branch_modal_row {
             BranchModalRow::Name => BranchModalRow::Action,
             BranchModalRow::Action if self.branch_modal_split_row_visible() => BranchModalRow::Split,
-            BranchModalRow::Action | BranchModalRow::Split => {
+            BranchModalRow::Action => {
+                self.advance_to_harness_message();
+                return;
+            }
+            BranchModalRow::Split => BranchModalRow::Model,
+            BranchModalRow::Model => BranchModalRow::Effort,
+            BranchModalRow::Effort => {
                 self.advance_to_harness_message();
                 return;
             }
@@ -131,21 +154,39 @@ impl App {
     /// a no-op already at the top row.
     pub(super) fn branch_modal_row_up(&mut self) {
         self.branch_modal_row = match self.branch_modal_row {
+            BranchModalRow::Effort => BranchModalRow::Model,
+            BranchModalRow::Model => BranchModalRow::Split,
             BranchModalRow::Split => BranchModalRow::Action,
             BranchModalRow::Action | BranchModalRow::Name => BranchModalRow::Name,
         };
     }
 
-    /// `Left`/`Right` on whichever row is focused: moves the name field's text cursor, or
-    /// toggles the action/split row exactly as `Tab`/`Shift-Tab` already do — direction
-    /// doesn't matter for a two-state toggle, so both keys reach the same handler.
+    /// `Left`/`Right` on whichever row is focused: moves the name/model field's text cursor,
+    /// toggles the action/split row exactly as `Tab`/`Shift-Tab` already do (direction
+    /// doesn't matter for a two-state toggle, so both keys reach the same handler), or steps
+    /// the effort picker one way or the other (see `cycle_effort`, where direction does
+    /// matter).
     pub(super) fn branch_modal_row_left_right(&mut self, left: bool) {
         match self.branch_modal_row {
             BranchModalRow::Name if left => self.branch_input.move_left(),
             BranchModalRow::Name => self.branch_input.move_right(),
             BranchModalRow::Action => self.toggle_stack_onto(),
             BranchModalRow::Split => self.toggle_open_harness(),
+            BranchModalRow::Model if left => self.model_input.move_left(),
+            BranchModalRow::Model => self.model_input.move_right(),
+            BranchModalRow::Effort => self.cycle_effort(left),
         }
+    }
+
+    /// `Left`/`Right` on the effort row: cycles through no hint at all, then `low` →
+    /// `medium` → `high`, wrapping at either end — the same four values `kanstack spawn
+    /// --effort` accepts (absent, or one of the three words `crate::harness::Effort::parse`
+    /// takes), in the order low-to-high reads.
+    pub(super) fn cycle_effort(&mut self, left: bool) {
+        const STATES: [Option<Effort>; 4] = [None, Some(Effort::Low), Some(Effort::Medium), Some(Effort::High)];
+        let at = STATES.iter().position(|e| *e == self.effort).unwrap_or(0);
+        let len = STATES.len();
+        self.effort = STATES[if left { (at + len - 1) % len } else { (at + 1) % len }];
     }
 
     /// What `b` will do, in the same spirit as the move footer: say it before doing it.
@@ -211,10 +252,13 @@ impl App {
         let message = (open_harness && self.branch_ui == BranchUi::Modal)
             .then(|| self.harness_message_input.trimmed())
             .filter(|m| !m.is_empty());
+        let model = Some(self.model_input.trimmed()).filter(|m| !m.is_empty());
+        let effort = self.effort;
         self.branch_input.clear();
         self.harness_message_input.clear();
+        self.model_input.clear();
         self.mode = Mode::Normal;
-        self.create_branch(&name, anchor.as_deref(), message.as_deref(), open_harness);
+        self.create_branch(&name, anchor.as_deref(), message.as_deref(), open_harness, model.as_deref(), effort);
     }
 
     /// The last step of `branch_modal_row_down`'s descent through the name step's rows:
@@ -236,8 +280,11 @@ impl App {
             return;
         }
         let anchor = self.stack_onto.clone();
+        let model = Some(self.model_input.trimmed()).filter(|m| !m.is_empty());
+        let effort = self.effort;
         self.branch_input.clear();
-        self.pending_branch = Some(PendingBranch { name, anchor });
+        self.model_input.clear();
+        self.pending_branch = Some(PendingBranch { name, anchor, model, effort });
         self.mode = Mode::HarnessMessage;
     }
 
@@ -252,9 +299,11 @@ impl App {
         let Some(pending) = self.pending_branch.take() else { return };
         self.branch_input.set(pending.name);
         self.stack_onto = pending.anchor;
+        self.model_input.set(pending.model.unwrap_or_default());
+        self.effort = pending.effort;
         self.mode = Mode::Branch;
         self.branch_modal_row = if self.branch_modal_split_row_visible() {
-            BranchModalRow::Split
+            BranchModalRow::Effort
         } else {
             BranchModalRow::Action
         };
@@ -272,7 +321,7 @@ impl App {
             return;
         };
         let message = if text.is_empty() { None } else { Some(text.as_str()) };
-        self.create_branch(&pending.name, pending.anchor.as_deref(), message, true);
+        self.create_branch(&pending.name, pending.anchor.as_deref(), message, true, pending.model.as_deref(), pending.effort);
     }
 
     /// Creates `name` via `but branch new`, rebuilds the board, and — when `open_harness`
@@ -287,7 +336,22 @@ impl App {
     /// than sharing it outright. A dead pane doesn't count as "already has one" — nothing
     /// to group with, so it opens a plain pane instead, same as `anchor` being `None` (a
     /// parallel lane, or a stacked branch whose base never opened one) always has.
-    pub(super) fn create_branch(&mut self, name: &str, anchor: Option<&str>, initial_message: Option<&str>, open_harness: bool) {
+    ///
+    /// `model`/`effort` are the modal's own Model/Effort rows, gathered the same way as
+    /// `initial_message` and forwarded exactly as `kanstack spawn --model`/`--effort` would —
+    /// see `crate::harness::Harness::model_effort_args`. `None` for either (the modal's
+    /// default, and every call site before this feature existed) reproduces the launch line
+    /// byte for byte.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn create_branch(
+        &mut self,
+        name: &str,
+        anchor: Option<&str>,
+        initial_message: Option<&str>,
+        open_harness: bool,
+        model: Option<&str>,
+        effort: Option<Effort>,
+    ) {
         let Some(but) = &self.but else {
             self.notify("snapshot is read-only", Notice::Info);
             return;
@@ -325,8 +389,8 @@ impl App {
                             .filter(|a| splitter.pane_status(a) != Some(crate::mux::pane_status::PaneStatus::Dead))
                             .and_then(|a| splitter.pane_id(a));
                         let spawned = match &group_anchor {
-                            Some(pane_id) => splitter.spawn_stacked_harness_with(&cwd, name, initial_message, None, pane_id),
-                            None => splitter.spawn_harness(&cwd, name, initial_message),
+                            Some(pane_id) => splitter.spawn_stacked_harness_with(&cwd, name, initial_message, None, model, effort, pane_id),
+                            None => splitter.spawn_harness_with(&cwd, name, initial_message, None, model, effort),
                         };
                         match spawned {
                             Ok(pane) => {
@@ -353,6 +417,7 @@ impl App {
         // existed.
         let modal = self.branch_ui == BranchUi::Modal;
         let on_name_row = !modal || self.branch_modal_row == BranchModalRow::Name;
+        let on_model_row = modal && self.branch_modal_row == BranchModalRow::Model;
         match key.code {
             K::Esc => {
                 self.mode = Mode::Normal;
@@ -373,6 +438,9 @@ impl App {
                 if self.branch_input.handle_key(key) {
                     self.branch_name_missing = false;
                 }
+            }
+            _ if on_model_row => {
+                self.model_input.handle_key(key);
             }
             _ => {}
         }

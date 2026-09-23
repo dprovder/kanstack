@@ -43,6 +43,10 @@ use crate::harness::Harness;
 /// non-zero exit, so `claim` never uses exit code 2). It runs alongside the existing
 /// matcher-`""` entry, which still reports `busy` for every tool call regardless of which one
 /// this narrower matcher catches.
+///
+/// No `model_effort_args` override: Claude Code's own `--model <value>` is exactly the
+/// trait's default spelling, and it has no reasoning-effort flag of its own to map `effort`
+/// onto, so the default's silent drop of it is already the right answer here too.
 pub struct Claude;
 impl Harness for Claude {
     fn id(&self) -> &'static str {

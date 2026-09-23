@@ -25,6 +25,9 @@ use crate::harness::Harness;
 /// actual objection: it still needs a file on disk before launch, still runs under the same
 /// full-system-permissions extension model the docs warn about — a smaller handler body, not a
 /// smaller risk. No `waiting`-equivalent event was found either.
+///
+/// No `model_effort_args` override: no confirmed reasoning-effort control was found for Pi
+/// either, so it stays on the trait's default rather than a guessed-at flag.
 pub struct Pi;
 impl Harness for Pi {
     fn id(&self) -> &'static str {

@@ -65,6 +65,10 @@ use crate::harness::Harness;
 ///   to, this is left out rather than guessed at; a future pass with a live Gemini CLI to test
 ///   against should revisit it before Claude does (Claude has no reliable `waiting` mechanism
 ///   either, so Gemini getting one first would be new territory, not parity).
+///
+/// No `model_effort_args` override: this crate has no confirmed reasoning-effort control for
+/// Gemini CLI to map `effort` onto, so it stays on the trait's default (a generic `--model`
+/// for `model`, `effort` silently dropped) rather than guessing at a flag.
 pub struct Gemini;
 impl Harness for Gemini {
     fn id(&self) -> &'static str {

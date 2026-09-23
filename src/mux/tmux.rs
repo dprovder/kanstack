@@ -482,7 +482,7 @@ mod tests {
     fn a_stacked_spawn_opens_a_tab_after_the_siblings_window_and_is_typed_into_and_titled() {
         let vars = [("KANSTACK_STACK_PANES", None)];
         with_fake_tmux("tabs", TABS, &vars, |mut splitter, log| {
-            let pane = splitter.spawn_stacked_harness_with(Path::new("/repo"), "feat-top", Some("go"), None, "%3").unwrap();
+            let pane = splitter.spawn_stacked_harness_with(Path::new("/repo"), "feat-top", Some("go"), None, None, None, "%3").unwrap();
             assert_eq!(pane, "%9_tab_after_@0");
             let lines = stand_in::log_lines(log);
             assert_eq!(lines[0], "display-message -p -t %3 #{window_id}");
@@ -498,7 +498,7 @@ mod tests {
     fn a_tab_whose_anchor_window_cannot_be_resolved_is_an_error() {
         let vars = [("KANSTACK_STACK_PANES", None)];
         with_fake_tmux("no-window", r#"case "$1" in display-message) ;; esac"#, &vars, |mut splitter, log| {
-            let err = splitter.spawn_stacked_harness_with(Path::new("/repo"), "feat-top", None, None, "%3").unwrap_err().to_string();
+            let err = splitter.spawn_stacked_harness_with(Path::new("/repo"), "feat-top", None, None, None, None, "%3").unwrap_err().to_string();
             assert!(err.contains("did not report"), "{err}");
             assert!(!splitter.has_pane("feat-top"));
             assert_eq!(stand_in::log_lines(log).len(), 1, "nothing may be typed once the window can't be found");

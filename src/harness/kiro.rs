@@ -33,6 +33,10 @@ use crate::harness::Harness;
 /// resembling Gemini's `GEMINI_CLI_SYSTEM_SETTINGS_PATH` escape hatch — hooks configure only
 /// through static `.kiro/hooks/*.json` files with no CLI-flag or env-var injection path at
 /// launch, exit-code semantics aside. No `waiting`-equivalent event was found either.
+///
+/// No `model_effort_args` override either: `kiro-cli chat --agent` picks a pre-configured
+/// agent, not a per-invocation model or reasoning-effort setting, so there is nothing
+/// confirmed to map either hint onto — left on the trait's default rather than guessed at.
 pub struct Kiro;
 impl Harness for Kiro {
     fn id(&self) -> &'static str {

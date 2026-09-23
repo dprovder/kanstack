@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, bail, Result};
 
-use crate::harness::HarnessConfig;
+use crate::harness::{Effort, HarnessConfig};
 use crate::mux::cmux::Cmux;
 use crate::mux::ghostty::Ghostty;
 use crate::mux::orca::Orca;
@@ -296,13 +296,16 @@ impl Splitter {
     }
 
     pub fn spawn_harness(&mut self, cwd: &Path, name: &str, initial_message: Option<&str>) -> Result<String> {
-        self.spawn_harness_with(cwd, name, initial_message, None)
+        self.spawn_harness_with(cwd, name, initial_message, None, None, None)
     }
 
     /// Opens a pane running the harness on lane `name`, with `cwd` as its working directory,
     /// and starts tracking it. `harness` runs in place of the configured one, for just this
-    /// pane. Returns the new pane's backend-specific id, for a caller that needs to find it
-    /// again from another process.
+    /// pane. `model`/`effort` are forwarded to whichever harness actually launches — see
+    /// `crate::harness::Harness::model_effort_args` for what each one does with them; `None`
+    /// for either reproduces exactly the launch line this crate produced before they existed.
+    /// Returns the new pane's backend-specific id, for a caller that needs to find it again
+    /// from another process.
     ///
     /// `initial_message` and the note that `name` is a GitButler virtual branch go out on
     /// the launch line itself rather than as a second message afterwards: the harness needs
@@ -315,8 +318,10 @@ impl Splitter {
         name: &str,
         initial_message: Option<&str>,
         harness: Option<&str>,
+        model: Option<&str>,
+        effort: Option<Effort>,
     ) -> Result<String> {
-        let launch = self.prepare_launch(cwd, name, initial_message, harness)?;
+        let launch = self.prepare_launch(cwd, name, initial_message, harness, model, effort)?;
         let id = self.mux.open_pane(&OpenRequest {
             cwd,
             title: name,
@@ -347,9 +352,11 @@ impl Splitter {
         name: &str,
         initial_message: Option<&str>,
         harness: Option<&str>,
+        model: Option<&str>,
+        effort: Option<Effort>,
         group_anchor: &str,
     ) -> Result<String> {
-        let launch = self.prepare_launch(cwd, name, initial_message, harness)?;
+        let launch = self.prepare_launch(cwd, name, initial_message, harness, model, effort)?;
         let stack_direction = crate::mux::orthogonal_direction(&self.chain_direction);
         let req = OpenRequest {
             cwd,
@@ -371,8 +378,16 @@ impl Splitter {
     /// stale state for `name` forgotten first — a fast harness could report before we got
     /// back, and the last word of a previous pane on this branch must not outlive it — and,
     /// where process tracking applies, the pid-recording prefix folded in.
-    fn prepare_launch(&mut self, cwd: &Path, name: &str, initial_message: Option<&str>, harness: Option<&str>) -> Result<String> {
-        let mut launch = self.harness.launch_line(cwd, name, initial_message, harness)?;
+    fn prepare_launch(
+        &mut self,
+        cwd: &Path,
+        name: &str,
+        initial_message: Option<&str>,
+        harness: Option<&str>,
+        model: Option<&str>,
+        effort: Option<Effort>,
+    ) -> Result<String> {
+        let mut launch = self.harness.launch_line(cwd, name, initial_message, harness, model, effort)?;
         self.reports.forget(name);
         self.pids.forget(name);
         if self.tracks_pids() {
@@ -1087,11 +1102,51 @@ mod tests {
     #[test]
     fn a_harness_override_changes_only_that_lanes_launch_line() {
         let (mut splitter, mux) = fake_splitter();
-        splitter.spawn_harness_with(cwd(), "feat-a", Some("go"), Some("codex")).unwrap();
+        splitter.spawn_harness_with(cwd(), "feat-a", Some("go"), Some("codex"), None, None).unwrap();
         splitter.spawn_harness(cwd(), "feat-b", Some("go")).unwrap();
         let lines = mux.lines();
         assert!(lines[0].contains("&& codex "), "{lines:#?}");
         assert!(lines[1].contains("&& claude "), "{lines:#?}");
+    }
+
+    /// `model`/`effort` reach the launched harness's line via `Harness::model_effort_args` —
+    /// `codex` maps both to their own `-c` config overrides (see `crate::harness::codex`),
+    /// so both `spawn_harness_with` and `spawn_stacked_harness_with` must carry them through
+    /// `prepare_launch` all the way to the typed line, not just to the harness with no
+    /// override.
+    #[test]
+    fn spawn_harness_with_forwards_model_and_effort_to_the_launch_line() {
+        let (mut splitter, mux) = fake_splitter();
+        splitter
+            .spawn_harness_with(cwd(), "feat-a", Some("go"), Some("codex"), Some("o3"), Some(crate::harness::Effort::High))
+            .unwrap();
+        let line = &mux.lines()[0];
+        assert!(line.contains(r#"'-c' 'model="o3"'"#), "{line:?}");
+        assert!(line.contains(r#"'-c' 'model_reasoning_effort="high"'"#), "{line:?}");
+    }
+
+    #[test]
+    fn spawn_stacked_harness_with_forwards_model_and_effort_to_the_launch_line() {
+        let (mut splitter, mux) = fake_splitter();
+        splitter.spawn_harness(cwd(), "feat-base", None).unwrap();
+        splitter
+            .spawn_stacked_harness_with(cwd(), "feat-top", None, Some("codex"), Some("o3"), Some(crate::harness::Effort::Low), "p1")
+            .unwrap();
+        let line = &mux.lines()[1];
+        assert!(line.contains(r#"'-c' 'model="o3"'"#), "{line:?}");
+        assert!(line.contains(r#"'-c' 'model_reasoning_effort="low"'"#), "{line:?}");
+    }
+
+    /// Omitting both — every call site before this feature existed, and every call site
+    /// today that still passes `None, None` — must reproduce exactly the same launch line
+    /// as before: no `-c`/`--model` argument anywhere on it.
+    #[test]
+    fn spawn_harness_with_no_model_or_effort_adds_nothing_to_the_launch_line() {
+        let (mut splitter, mux) = fake_splitter();
+        splitter.spawn_harness_with(cwd(), "feat-a", Some("go"), None, None, None).unwrap();
+        let line = &mux.lines()[0];
+        assert!(!line.contains("--model"), "{line:?}");
+        assert!(!line.contains("-c"), "{line:?}");
     }
 
     /// The default (`KANSTACK_STACK_PANES` unset): a real tab alongside the sibling, in the
@@ -1103,7 +1158,7 @@ mod tests {
         with_env(&[("KANSTACK_STACK_PANES", None)], || {
             let (mut splitter, mux) = fake_splitter();
             splitter.spawn_harness(cwd(), "feat-base", None).unwrap();
-            let tab = splitter.spawn_stacked_harness_with(cwd(), "feat-top", None, None, "p1").unwrap();
+            let tab = splitter.spawn_stacked_harness_with(cwd(), "feat-top", None, None, None, None, "p1").unwrap();
             assert_eq!(tab, "p2");
             assert!(mux.lines()[1].starts_with("tab p2 alongside p1 in /repo as feat-top:"), "{:#?}", mux.lines());
 
@@ -1122,7 +1177,7 @@ mod tests {
         with_env(&[("KANSTACK_STACK_PANES", Some("split"))], || {
             let (mut splitter, mux) = fake_splitter();
             splitter.spawn_harness(cwd(), "feat-base", None).unwrap();
-            splitter.spawn_stacked_harness_with(cwd(), "feat-top", None, None, "p1").unwrap();
+            splitter.spawn_stacked_harness_with(cwd(), "feat-top", None, None, None, None, "p1").unwrap();
             // Default chain direction is `right` (horizontal) — orthogonal is `down`.
             assert!(mux.lines()[1].starts_with("open p2 down of p1"), "{:#?}", mux.lines());
         });
@@ -1135,7 +1190,7 @@ mod tests {
         with_env(&[("KANSTACK_STACK_PANES", Some("split")), ("KANSTACK_FAKE_CHAIN_DIRECTION", Some("up"))], || {
             let (mut splitter, mux) = fake_splitter();
             splitter.spawn_harness(cwd(), "feat-base", None).unwrap();
-            splitter.spawn_stacked_harness_with(cwd(), "feat-top", None, None, "p1").unwrap();
+            splitter.spawn_stacked_harness_with(cwd(), "feat-top", None, None, None, None, "p1").unwrap();
             assert!(mux.lines()[1].starts_with("open p2 right of p1"), "{:#?}", mux.lines());
         });
     }

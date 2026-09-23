@@ -1,5 +1,5 @@
 use super::*;
-
+use crate::harness::Effort;
 
 /// A label/value row with a key hint right-aligned to `content_width`, e.g.
 /// `"  action   new parallel lane                                   tab"`.
@@ -115,6 +115,48 @@ pub(super) fn draw_branch_modal(f: &mut Frame, app: &App, area: Rect, hits: &mut
     } else {
         None
     };
+
+    // Model/effort ride along with the split row's own visibility — both are meaningless
+    // without a split backend to hand a harness pane's launch line to in the first place.
+    if app.branch_modal_split_row_visible() {
+        let model_prefix = format!("{}model    ", row_marker(BranchModalRow::Model));
+        if app.branch_modal_row == BranchModalRow::Model {
+            let (before, after) = app.model_input.split_at_cursor();
+            let budget = footer_input_budget(content_width as u16, model_prefix.chars().count(), 0);
+            let (before, after) = scroll_input(before, after, budget);
+            body.push(Line::from(vec![
+                Span::styled(model_prefix, theme::faint()),
+                Span::styled(before, theme::title(true)),
+                Span::styled("█", cursor),
+                Span::styled(after, theme::title(true)),
+            ]));
+        } else if app.model_input.is_empty() {
+            body.push(Line::from(vec![
+                Span::styled(model_prefix, theme::faint()),
+                Span::styled("optional — $KANSTACK_HARNESS's own default", theme::faint()),
+            ]));
+        } else {
+            let value = truncate(app.model_input.as_str(), content_width.saturating_sub(model_prefix.chars().count()));
+            body.push(Line::from(vec![
+                Span::styled(model_prefix, theme::faint()),
+                Span::styled(value, theme::title(true)),
+            ]));
+        }
+
+        let effort_label = match app.effort {
+            None => "off",
+            Some(Effort::Low) => "low",
+            Some(Effort::Medium) => "medium",
+            Some(Effort::High) => "high",
+        };
+        body.push(hint_row(
+            &format!("{}effort   ", row_marker(BranchModalRow::Effort)),
+            effort_label,
+            theme::tone(crate::board::Tone::Accent),
+            "←/→",
+            content_width,
+        ));
+    }
 
     if will_prompt {
         body.push(Line::raw(""));
