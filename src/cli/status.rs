@@ -10,7 +10,9 @@ use serde::Serialize;
 
 use crate::but::But;
 use crate::model::{BranchStatus, MergeStatus, WorkspaceStatus};
+use crate::events::rfc3339;
 use crate::mux::pane_status::PaneStatus;
+use crate::orchestration::Orchestration;
 use crate::workstream::Registry;
 
 use super::exit::{tag, ErrorCode::*};
@@ -49,6 +51,22 @@ struct WorkstreamReport {
     /// The lane's git state. `null` when `but` could not be reached, or the branch is not in
     /// the workspace (deleted, or unapplied).
     lane: Option<LaneReport>,
+    /// Spawned with `--advisory`: not expected to produce commits. Always `true` or `false`,
+    /// never `null` — a registry written before this existed reads as `false`.
+    advisory: bool,
+    /// What `kanstack intent` last set for this lane — why it looks the way it does right now.
+    /// `null` when nothing is set, including after a stop or respawn dropped it.
+    intent: Option<String>,
+    /// The question `kanstack ask` left pending for this lane, until `kanstack answer` clears
+    /// it. `null` when nothing is pending. Kept apart from `intent`: this one wants a human.
+    pending_ask: Option<PendingAskReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct PendingAskReport {
+    question: String,
+    /// RFC3339, UTC — the same format as an events-log line's `ts`.
+    asked_at: String,
 }
 
 /// The state of the workspace itself, for an agent deciding whether to pull.
@@ -172,12 +190,14 @@ impl From<Option<PaneStatus>> for ReportStatus {
 /// Every workstream in `registry`, with `status_of` answering for the ones that have a pane
 /// (by branch, as `Splitter::poll_statuses` keys them). Taking a lookup rather than a
 /// splitter keeps this free of a real multiplexer; a lookup that knows nothing yields
-/// `unknown` for every pane.
+/// `unknown` for every pane. `orchestration` answers each lane's `intent`/`pending_ask`; a
+/// default one knows nothing, leaving both `null`.
 fn report(
     registry: &Registry,
     status_of: impl Fn(&str) -> Option<PaneStatus>,
     git: Option<&WorkspaceStatus>,
     workspace_blocked: Option<&str>,
+    orchestration: &Orchestration,
 ) -> StatusReport {
     let workstreams = registry
         .workstreams
@@ -192,6 +212,11 @@ fn report(
                 None => ReportStatus::NoPane,
             },
             lane: git.and_then(|status| lane_report(status, &w.branch_id.0)),
+            advisory: w.advisory,
+            intent: orchestration.intent(&w.branch_id.0),
+            pending_ask: orchestration
+                .pending_ask(&w.branch_id.0)
+                .map(|a| PendingAskReport { question: a.question, asked_at: rfc3339(a.asked_at) }),
         })
         .collect();
     StatusReport {
@@ -270,7 +295,13 @@ pub(super) fn run(json: bool, cwd: &Path, out: &mut impl Write) -> Result<()> {
         let registry = Registry::load(cwd)?;
         let statuses = poll_or_nothing(&registry);
         let git = git_state(&registry, cwd);
-        let report = report(&registry, |branch| statuses.get(branch).copied(), git.status(), git.blocked_message());
+        let report = report(
+            &registry,
+            |branch| statuses.get(branch).copied(),
+            git.status(),
+            git.blocked_message(),
+            &Orchestration::for_repo(cwd),
+        );
         writeln!(out, "{}", serde_json::to_string(&report)?)?;
         return Ok(());
     }
@@ -324,24 +355,69 @@ mod tests {
             // No entry for "planned": it has no pane, so nobody is asked.
             ("stray".to_string(), PaneStatus::Busy),
         ]);
-        let json = serde_json::to_string(&report(&five_workstreams(), |b| statuses.get(b).copied(), None, None)).unwrap();
+        let json = serde_json::to_string(&report(&five_workstreams(), |b| statuses.get(b).copied(), None, None, &Orchestration::default())).unwrap();
         assert_eq!(
             json,
             concat!(
                 r#"{"schema":1,"workstreams":["#,
-                r#"{"branch":"fix-login","pane":"%3","agent":"claude","item":"GH-4","status":"busy","lane":null},"#,
-                r#"{"branch":"add-search","pane":"%4","agent":"codex","item":null,"status":"idle","lane":null},"#,
-                r#"{"branch":"old-spike","pane":"%5","agent":null,"item":null,"status":"dead","lane":null},"#,
-                r#"{"branch":"mystery","pane":"%6","agent":"claude","item":null,"status":"unknown","lane":null},"#,
-                r#"{"branch":"planned","pane":null,"agent":null,"item":"GH-9","status":"no-pane","lane":null}"#,
+                r#"{"branch":"fix-login","pane":"%3","agent":"claude","item":"GH-4","status":"busy","lane":null,"advisory":false,"intent":null,"pending_ask":null},"#,
+                r#"{"branch":"add-search","pane":"%4","agent":"codex","item":null,"status":"idle","lane":null,"advisory":false,"intent":null,"pending_ask":null},"#,
+                r#"{"branch":"old-spike","pane":"%5","agent":null,"item":null,"status":"dead","lane":null,"advisory":false,"intent":null,"pending_ask":null},"#,
+                r#"{"branch":"mystery","pane":"%6","agent":"claude","item":null,"status":"unknown","lane":null,"advisory":false,"intent":null,"pending_ask":null},"#,
+                r#"{"branch":"planned","pane":null,"agent":null,"item":"GH-9","status":"no-pane","lane":null,"advisory":false,"intent":null,"pending_ask":null}"#,
                 r#"],"workspace":null,"workspace_blocked":null}"#
             )
         );
     }
 
+    /// `advisory`, `intent` and `pending_ask` filled in: a plain boolean, a plain string, and
+    /// an object with the question and an RFC3339 `asked_at` — each on its own lane, so the
+    /// others show exactly what "nothing set" looks like beside them (`false`/`null`/`null`,
+    /// pinned for every lane in `the_status_json_shape_is_pinned` above).
+    #[test]
+    fn advisory_intent_and_pending_ask_are_reported_per_workstream() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let dir = std::env::temp_dir().join(format!("kanstack-cli-status-orchestration-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let orchestration = Orchestration::in_dir(dir.clone());
+        orchestration.set_intent("fix-login", "waiting for cargo test", UNIX_EPOCH + Duration::from_secs(1000)).unwrap();
+        orchestration.ask("add-search", "ship it?", UNIX_EPOCH + Duration::from_secs(90_061)).unwrap();
+        let mut registry = registry_of(vec![
+            workstream("fix-login", Some("%3"), Some("claude"), None),
+            workstream("add-search", Some("%4"), Some("codex"), None),
+            workstream("review", Some("%5"), Some("claude"), None),
+        ]);
+        registry.workstreams[2].advisory = true;
+
+        let json = serde_json::to_string(&report(&registry, |_| Some(PaneStatus::Idle), None, None, &orchestration)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            json,
+            concat!(
+                r#"{"schema":1,"workstreams":["#,
+                r#"{"branch":"fix-login","pane":"%3","agent":"claude","item":null,"status":"idle","lane":null,"#,
+                r#""advisory":false,"intent":"waiting for cargo test","pending_ask":null},"#,
+                r#"{"branch":"add-search","pane":"%4","agent":"codex","item":null,"status":"idle","lane":null,"#,
+                r#""advisory":false,"intent":null,"pending_ask":{"question":"ship it?","asked_at":"1970-01-02T01:01:01Z"}},"#,
+                r#"{"branch":"review","pane":"%5","agent":"claude","item":null,"status":"idle","lane":null,"#,
+                r#""advisory":true,"intent":null,"pending_ask":null}"#,
+                r#"],"workspace":null,"workspace_blocked":null}"#
+            )
+        );
+    }
+
+    /// A registry written before `advisory` existed has no such key at all; it must still load,
+    /// every workstream `false`, rather than fail the whole `status`.
+    #[test]
+    fn a_registry_from_before_advisory_existed_still_loads_as_not_advisory() {
+        let w: crate::workstream::Workstream =
+            serde_json::from_str(r#"{"branch_id":"fix-login","pane_id":"%3","agent":"claude","item":null}"#).unwrap();
+        assert!(!w.advisory);
+    }
+
     #[test]
     fn a_pane_the_poll_did_not_mention_is_unknown_and_a_paneless_workstream_stays_no_pane() {
-        let nothing = report(&five_workstreams(), |_| None, None, None);
+        let nothing = report(&five_workstreams(), |_| None, None, None, &Orchestration::default());
         let statuses: Vec<_> = nothing.workstreams.iter().map(|w| w.status).collect();
         assert_eq!(
             statuses,
@@ -357,7 +433,7 @@ mod tests {
 
     #[test]
     fn an_empty_registry_is_an_empty_list_not_prose() {
-        let json = serde_json::to_string(&report(&Registry::default(), |_| None, None, None)).unwrap();
+        let json = serde_json::to_string(&report(&Registry::default(), |_| None, None, None, &Orchestration::default())).unwrap();
         assert_eq!(json, r#"{"schema":1,"workstreams":[],"workspace":null,"workspace_blocked":null}"#);
     }
 
@@ -405,8 +481,8 @@ mod tests {
             String::from_utf8(out).unwrap(),
             concat!(
                 r#"{"schema":1,"workstreams":["#,
-                r#"{"branch":"fix-login","pane":"%3","agent":"claude","item":null,"status":"unknown","lane":null},"#,
-                r#"{"branch":"planned","pane":null,"agent":null,"item":null,"status":"no-pane","lane":null}"#,
+                r#"{"branch":"fix-login","pane":"%3","agent":"claude","item":null,"status":"unknown","lane":null,"advisory":false,"intent":null,"pending_ask":null},"#,
+                r#"{"branch":"planned","pane":null,"agent":null,"item":null,"status":"no-pane","lane":null,"advisory":false,"intent":null,"pending_ask":null}"#,
                 "],\"workspace\":null,\"workspace_blocked\":null}\n"
             )
         );
@@ -502,7 +578,7 @@ mod tests {
     }
 
     fn fix_login(status: &str) -> String {
-        format!(r#"{{"schema":1,"workstreams":[{{"branch":"fix-login","pane":"%3","agent":"claude","item":null,"status":"{status}","lane":null}}],"workspace":null,"workspace_blocked":null}}{}"#, "\n")
+        format!(r#"{{"schema":1,"workstreams":[{{"branch":"fix-login","pane":"%3","agent":"claude","item":null,"status":"{status}","lane":null,"advisory":false,"intent":null,"pending_ask":null}}],"workspace":null,"workspace_blocked":null}}{}"#, "\n")
     }
 
     #[test]
@@ -533,7 +609,7 @@ mod tests {
 
     #[test]
     fn report_json_carries_the_workspace_blocked_reason_when_given_one() {
-        let json = serde_json::to_string(&report(&Registry::default(), |_| None, None, Some("run `but teardown`"))).unwrap();
+        let json = serde_json::to_string(&report(&Registry::default(), |_| None, None, Some("run `but teardown`"), &Orchestration::default())).unwrap();
         assert_eq!(
             json,
             r#"{"schema":1,"workstreams":[],"workspace":null,"workspace_blocked":"run `but teardown`"}"#
@@ -607,7 +683,7 @@ mod tests {
     #[test]
     fn a_waiting_pane_is_waiting_in_both_the_table_and_the_json() {
         assert_eq!(label(Some(PaneStatus::Waiting)), "waiting");
-        let json = serde_json::to_string(&report(&five_workstreams(), |b| (b == "fix-login").then_some(PaneStatus::Waiting), None, None)).unwrap();
+        let json = serde_json::to_string(&report(&five_workstreams(), |b| (b == "fix-login").then_some(PaneStatus::Waiting), None, None, &Orchestration::default())).unwrap();
         assert!(json.contains(r#""branch":"fix-login","pane":"%3","agent":"claude","item":"GH-4","status":"waiting""#), "{json}");
     }
 
@@ -808,15 +884,15 @@ mod tests {
         registry.upsert(workstream("gone", Some("%4"), None, None));
         let status = capture(CONFLICT_EXPECTED);
         let fetched = workspace_report(&status).fetched.unwrap();
-        let json = serde_json::to_string(&report(&registry, |_| Some(PaneStatus::Idle), Some(&status), None)).unwrap();
+        let json = serde_json::to_string(&report(&registry, |_| Some(PaneStatus::Idle), Some(&status), None, &Orchestration::default())).unwrap();
         assert_eq!(
             json,
             format!(
                 concat!(
                     r#"{{"schema":1,"workstreams":["#,
                     r#"{{"branch":"lane-conflict","pane":"%3","agent":"claude","item":null,"status":"idle","lane":"#,
-                    r#"{{"commits":1,"conflicted":false,"behind":0,"rebase":"conflicts","landed":false,"push":"local-only","uncommitted":0}}}},"#,
-                    r#"{{"branch":"gone","pane":"%4","agent":null,"item":null,"status":"idle","lane":null}}"#,
+                    r#"{{"commits":1,"conflicted":false,"behind":0,"rebase":"conflicts","landed":false,"push":"local-only","uncommitted":0}},"advisory":false,"intent":null,"pending_ask":null}},"#,
+                    r#"{{"branch":"gone","pane":"%4","agent":null,"item":null,"status":"idle","lane":null,"advisory":false,"intent":null,"pending_ask":null}}"#,
                     r#"],"workspace":{{"behind":3,"uncommitted":0,"fetched":"{}"}},"workspace_blocked":null}}"#
                 ),
                 fetched
@@ -834,10 +910,10 @@ mod tests {
             "no workstreams: no reason to ask but"
         );
         assert!(git_state(&registry, Path::new("/nonexistent/not-a-repo")).status().is_none());
-        let json = serde_json::to_string(&report(&registry, |_| Some(PaneStatus::Busy), None, None)).unwrap();
+        let json = serde_json::to_string(&report(&registry, |_| Some(PaneStatus::Busy), None, None, &Orchestration::default())).unwrap();
         assert_eq!(
             json,
-            r#"{"schema":1,"workstreams":[{"branch":"feat-ui","pane":"%3","agent":"claude","item":null,"status":"busy","lane":null}],"workspace":null,"workspace_blocked":null}"#
+            r#"{"schema":1,"workstreams":[{"branch":"feat-ui","pane":"%3","agent":"claude","item":null,"status":"busy","lane":null,"advisory":false,"intent":null,"pending_ask":null}],"workspace":null,"workspace_blocked":null}"#
         );
     }
 

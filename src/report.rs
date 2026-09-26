@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::claims::Claims;
 use crate::events::EventLog;
 use crate::mux::pane_status::PaneStatus;
+use crate::orchestration::Orchestration;
 use crate::workstream::{fnv1a, gemini_hooks_dir, reports_dir};
 
 /// How long a `busy` or `idle` report is believed. Long enough to span a turn that is busy
@@ -112,6 +113,11 @@ pub struct Reports {
     /// Unlike `claims`, not touched by [`Self::write`] — see `crate::workstream::gemini_hooks_dir`'s
     /// doc comment for why only `forget` releases it.
     gemini_hooks_dir: Option<PathBuf>,
+    /// What an orchestrator said about the lane — its intent and pending ask (see
+    /// `crate::orchestration`) — which [`Self::forget`] drops alongside the report, for the same
+    /// reason. Not touched by [`Self::write`]: a turn ending says nothing about whether the
+    /// orchestrator's question has been answered.
+    orchestration: Orchestration,
 }
 
 impl Reports {
@@ -121,12 +127,19 @@ impl Reports {
             events: EventLog::for_repo(repo),
             claims: Claims::for_repo(repo),
             gemini_hooks_dir: gemini_hooks_dir(repo),
+            orchestration: Orchestration::for_repo(repo),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn in_dir(dir: PathBuf) -> Self {
-        Reports { dir: Some(dir), events: EventLog::default(), claims: Claims::default(), gemini_hooks_dir: None }
+        Reports {
+            dir: Some(dir),
+            events: EventLog::default(),
+            claims: Claims::default(),
+            gemini_hooks_dir: None,
+            orchestration: Orchestration::default(),
+        }
     }
 
     /// One file per branch, named by a hash of it so any branch name — slashes and all — is a
@@ -205,9 +218,11 @@ impl Reports {
     /// or about to be replaced, can't still be mid-edit of anything. And, if `branch` is a
     /// Gemini lane, deletes its `GEMINI_CLI_SYSTEM_SETTINGS_PATH` file (see
     /// `crate::harness::gemini::Gemini::status_hooks`) — a stopped or respawning pane has no
-    /// further use for settings written for the process that just ended. Best-effort, like the
-    /// claim release beside it: a file that's already gone, or can't be removed, is not an
-    /// error here.
+    /// further use for settings written for the process that just ended. And drops the lane's
+    /// intent and pending ask (see `crate::orchestration`): a stale "waiting for cargo test",
+    /// or an unanswered question from a finished task, must not haunt the next agent spawned
+    /// on the same branch name. Best-effort, like the claim release beside it: a file that's
+    /// already gone, or can't be removed, is not an error here.
     pub fn forget(&self, branch: &str) {
         if let Some(path) = self.file(branch) {
             let _ = std::fs::remove_file(path);
@@ -216,6 +231,7 @@ impl Reports {
         if let Some(dir) = &self.gemini_hooks_dir {
             let _ = std::fs::remove_file(dir.join(format!("{:016x}.json", fnv1a(branch.as_bytes()))));
         }
+        self.orchestration.forget(branch);
     }
 }
 
@@ -452,6 +468,28 @@ mod tests {
 
             assert_eq!(claims.holder("/repo/src/lib.rs", at(1001)), None);
             assert_eq!(claims.holder("/repo/src/other.rs", at(1001)), Some("add-search".to_string()));
+        });
+    }
+
+    /// `forget` also drops the lane's intent and pending ask — the one choke point `stop` and a
+    /// respawn onto the same branch both already go through — but leaves another branch's.
+    #[test]
+    fn forgetting_a_branch_also_drops_its_intent_and_pending_ask() {
+        with_claims_state("forget-orchestration", |repo, _claims| {
+            let orchestration = Orchestration::for_repo(repo);
+            orchestration.set_intent("fix-login", "waiting for cargo test", at(1000)).unwrap();
+            orchestration.ask("fix-login", "ship it?", at(1000)).unwrap();
+            orchestration.set_intent("add-search", "reading the spec", at(1000)).unwrap();
+
+            let reports = Reports::for_repo(repo);
+            reports.write("fix-login", Reported::Idle, at(1001)).unwrap();
+            assert!(orchestration.pending_ask("fix-login").is_some(), "a turn ending doesn't clear an ask");
+
+            reports.forget("fix-login");
+
+            assert_eq!(orchestration.intent("fix-login"), None);
+            assert_eq!(orchestration.pending_ask("fix-login"), None);
+            assert_eq!(orchestration.intent("add-search").as_deref(), Some("reading the spec"));
         });
     }
 }

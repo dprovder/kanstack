@@ -27,6 +27,10 @@ struct SpawnResult {
     model: Option<String>,
     /// `--effort`'s wire word (`"low"`/`"medium"`/`"high"`), or `null` when it wasn't given.
     effort: Option<String>,
+    /// `--advisory`, echoed back: whether the workstream was recorded as one not expected to
+    /// produce commits. Always present — a plain flag with a real default, unlike the
+    /// nullable fields above.
+    advisory: bool,
 }
 
 // One parameter per `spawn` flag, same shape as `Command::Spawn` itself — a struct would
@@ -41,6 +45,7 @@ pub(super) fn run(
     below: Option<String>,
     model: Option<String>,
     effort: Option<Effort>,
+    advisory: bool,
     json: bool,
     cwd: &Path,
     out: &mut impl Write,
@@ -155,6 +160,10 @@ pub(super) fn run(
             pane_id: Some(PaneId(pane.clone())),
             agent: Some(AgentId(agent.clone())),
             item,
+            // Whatever this spawn said, not carried over from an earlier one the way `item` is:
+            // a flag can't tell "not given" from "not advisory", and a respawn is a new agent
+            // that may well be doing a different kind of work on the same branch.
+            advisory,
         });
         lines.push(match &registry.workspace {
             Some(workspace) => format!("spawned {agent} on {branch} in {pane} ({workspace})"),
@@ -167,6 +176,7 @@ pub(super) fn run(
             workspace: registry.workspace.clone(),
             model: model.clone(),
             effort: effort.map(|e| e.to_string()),
+            advisory,
         };
         Ok((lines, result))
     })?;
@@ -251,7 +261,7 @@ mod tests {
             |repo| {
                 let mut out = Vec::new();
                 crate::cli::run(
-                    Command::Spawn { branch: "feat-ui".into(), agent: Some("codex".into()), prompt: None, item: None, above: None, below: None, model: None, effort: None, json: true },
+                    Command::Spawn { branch: "feat-ui".into(), agent: Some("codex".into()), prompt: None, item: None, above: None, below: None, model: None, effort: None, advisory: false, json: true },
                     repo,
                     &mut out,
                 )
@@ -260,7 +270,7 @@ mod tests {
                     String::from_utf8(out).unwrap(),
                     "{\"schema\":1,\"ok\":true,\"command\":\"spawn\",\"workstream\":\"feat-ui\",\"result\":\
                      {\"created\":false,\"pane\":\"%9\",\"agent\":\"codex\",\"workspace\":null,\
-                     \"model\":null,\"effort\":null}}\n"
+                     \"model\":null,\"effort\":null,\"advisory\":false}}\n"
                 );
             },
         );
@@ -287,6 +297,7 @@ mod tests {
                         below: None,
                         model: Some("o3".into()),
                         effort: Some(crate::harness::Effort::High),
+                        advisory: false,
                         json: true,
                     },
                     repo,
@@ -297,8 +308,82 @@ mod tests {
                     String::from_utf8(out).unwrap(),
                     "{\"schema\":1,\"ok\":true,\"command\":\"spawn\",\"workstream\":\"feat-ui\",\"result\":\
                      {\"created\":false,\"pane\":\"%9\",\"agent\":\"codex\",\"workspace\":null,\
-                     \"model\":\"o3\",\"effort\":\"high\"}}\n"
+                     \"model\":\"o3\",\"effort\":\"high\",\"advisory\":false}}\n"
                 );
+            },
+        );
+    }
+
+    /// `--advisory` round-trips through `spawn --json` and lands on the registered workstream,
+    /// where `status --json` (and, later, the board) reads it — and changes nothing else
+    /// about the spawn: same pane, same agent, same `created`.
+    #[test]
+    fn spawn_json_echoes_back_advisory_and_records_it_on_the_workstream() {
+        with_but_and_tmux(
+            "spawn-advisory-json",
+            &but_status_cat(),
+            r#"case "$1" in list-panes) printf '' ;; split-window) echo '%9' ;; esac"#,
+            vec![],
+            |repo| {
+                let mut out = Vec::new();
+                crate::cli::run(
+                    Command::Spawn {
+                        branch: "feat-ui".into(),
+                        agent: Some("claude".into()),
+                        prompt: Some("review the diff".into()),
+                        item: None,
+                        above: None,
+                        below: None,
+                        model: None,
+                        effort: None,
+                        advisory: true,
+                        json: true,
+                    },
+                    repo,
+                    &mut out,
+                )
+                .unwrap();
+                assert_eq!(
+                    String::from_utf8(out).unwrap(),
+                    "{\"schema\":1,\"ok\":true,\"command\":\"spawn\",\"workstream\":\"feat-ui\",\"result\":\
+                     {\"created\":false,\"pane\":\"%9\",\"agent\":\"claude\",\"workspace\":null,\
+                     \"model\":null,\"effort\":null,\"advisory\":true}}\n"
+                );
+                let registry = Registry::load(repo).unwrap();
+                let w = registry.get("feat-ui").unwrap();
+                assert!(w.advisory);
+                assert_eq!(w.pane_id.as_ref().map(|p| p.0.as_str()), Some("%9"));
+            },
+        );
+    }
+
+    /// A respawn onto a branch whose old pane died must not inherit that pane's intent or
+    /// pending ask — a finished task's "waiting for cargo test", or its unanswered question,
+    /// would otherwise haunt the new agent. `Splitter::prepare_launch`'s `Reports::forget` is
+    /// what drops them, before the new pane even opens.
+    #[test]
+    fn respawning_on_the_same_branch_forgets_the_old_intent_and_pending_ask() {
+        with_but_and_tmux(
+            "spawn-respawn-forgets-orchestration",
+            &but_status_cat(),
+            // `%3` isn't listed, so the old pane reads as dead and the respawn is allowed.
+            r#"case "$1" in list-panes) printf '' ;; split-window) echo '%9' ;; esac"#,
+            vec![workstream("feat-ui", Some("%3"), Some("claude"), None)],
+            |repo| {
+                let orchestration = crate::orchestration::Orchestration::for_repo(repo);
+                let now = std::time::SystemTime::now();
+                orchestration.set_intent("feat-ui", "waiting for cargo test", now).unwrap();
+                orchestration.ask("feat-ui", "ship it?", now).unwrap();
+
+                crate::cli::run(
+                    Command::Spawn { branch: "feat-ui".into(), agent: None, prompt: None, item: None, above: None, below: None, model: None, effort: None, advisory: false, json: false },
+                    repo,
+                    &mut Vec::new(),
+                )
+                .expect("respawning over a dead pane succeeds");
+
+                assert_eq!(orchestration.intent("feat-ui"), None);
+                assert_eq!(orchestration.pending_ask("feat-ui"), None);
             },
         );
     }
@@ -336,7 +421,7 @@ mod tests {
                 ],
                 || {
                     let command =
-                        Command::Spawn { branch: "feat-ui".into(), agent: None, prompt: None, item: None, above, below, model: None, effort: None, json: false };
+                        Command::Spawn { branch: "feat-ui".into(), agent: None, prompt: None, item: None, above, below, model: None, effort: None, advisory: false, json: false };
                     crate::cli::run(command, &repo, &mut Vec::new()).expect("spawn with a placement flag succeeds");
                 },
             );
@@ -375,6 +460,7 @@ mod tests {
                     below: None,
                     model: None,
                     effort: None,
+                    advisory: false,
                     json: true,
                 };
                 let code = dispatch(command, repo, &mut out, &mut err_out);
@@ -398,7 +484,7 @@ mod tests {
             |repo| {
                 let mut out = Vec::new();
                 let mut err_out = Vec::new();
-                let command = Command::Spawn { branch: "feat-ui".into(), agent: None, prompt: None, item: None, above: None, below: None, model: None, effort: None, json: true };
+                let command = Command::Spawn { branch: "feat-ui".into(), agent: None, prompt: None, item: None, above: None, below: None, model: None, effort: None, advisory: false, json: true };
                 let code = dispatch(command, repo, &mut out, &mut err_out);
                 assert_eq!(code, 4);
                 assert!(err_out.is_empty());
@@ -445,7 +531,7 @@ mod tests {
         );
         with_but_and_tmux(tag, &but_body, &tmux_body, vec![], |repo| {
             let first = crate::cli::run(
-                Command::Spawn { branch: "feat-ui".into(), agent: None, prompt: None, item: None, above: None, below: None, model: None, effort: None, json: false },
+                Command::Spawn { branch: "feat-ui".into(), agent: None, prompt: None, item: None, above: None, below: None, model: None, effort: None, advisory: false, json: false },
                 repo,
                 &mut Vec::new(),
             );
@@ -456,7 +542,7 @@ mod tests {
             );
 
             let mut out = Vec::new();
-            crate::cli::run(Command::Spawn { branch: "feat-ui".into(), agent: None, prompt: None, item: None, above: None, below: None, model: None, effort: None, json: true }, repo, &mut out)
+            crate::cli::run(Command::Spawn { branch: "feat-ui".into(), agent: None, prompt: None, item: None, above: None, below: None, model: None, effort: None, advisory: false, json: true }, repo, &mut out)
                 .expect("retrying spawn on the same branch must now succeed");
             let printed = String::from_utf8(out).unwrap();
             assert!(
