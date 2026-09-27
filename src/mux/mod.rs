@@ -45,6 +45,24 @@ pub struct OpenRequest<'a> {
     pub chain_direction: &'a str,
 }
 
+/// Everything [`Multiplexer::regroup`] needs to move one already-open pane next to another.
+pub struct RegroupRequest<'a> {
+    /// The pane to move. It keeps its id: the caller goes on tracking it under the same one.
+    pub pane: &'a str,
+    /// The pane it should end up grouped with — a stack sibling's, which stays where it is.
+    pub anchor: &'a str,
+    /// What `pane` is called (its branch name), for a backend whose move leaves the pane in a
+    /// fresh container that would otherwise go untitled (tmux's `break-pane` window).
+    pub title: &'a str,
+    /// Whether to end up as a tab alongside `anchor` or a split off it — the same
+    /// `KANSTACK_STACK_PANES` choice a stacked spawn makes (see
+    /// `crate::splitter::Splitter::spawn_stacked_harness_with`).
+    pub placement: StackPlacement,
+    /// Which side of `anchor` a [`StackPlacement::Split`] puts `pane` on: the
+    /// [`orthogonal_direction`] of the chain direction, exactly as a stacked spawn's split.
+    pub split_direction: &'a str,
+}
+
 /// One terminal multiplexer's view of panes. See the module doc for what is deliberately not
 /// in here.
 pub trait Multiplexer: Send + Sync {
@@ -83,6 +101,24 @@ pub trait Multiplexer: Send + Sync {
     fn open_tab(&self, req: &OpenRequest<'_>) -> Result<String> {
         self.open_pane(req)
     }
+
+    /// Moves `req.pane`, which is already open and running its harness, so it sits with
+    /// `req.anchor` the way [`Self::open_tab`] (for [`StackPlacement::Tabbed`]) or
+    /// [`Self::open_pane`] split off the anchor (for [`StackPlacement::Split`]) would have put
+    /// it had it been opened there in the first place. Nothing is relaunched or retyped: the
+    /// harness inside carries on, and the pane keeps its id.
+    ///
+    /// Distinct from `open_tab`/`open_pane`, which only ever create. The only caller is
+    /// `crate::splitter::Splitter::restack_moved_branches`: a branch whose GitButler stack
+    /// membership changed after its pane was already open (an agent ran `but move` itself,
+    /// say), which a stacked spawn never got the chance to place.
+    ///
+    /// No default, unlike `open_tab`: there is no creating-only fallback that would do
+    /// anything useful here, so each backend states for itself whether it can move a live pane
+    /// at all. One that can't (Orca, Ghostty) returns `Ok(())` and says why in its own docs —
+    /// the pane staying where it is is cosmetic, and must not fail whatever caller is
+    /// refreshing the board around it.
+    fn regroup(&self, req: &RegroupRequest<'_>) -> Result<()>;
 
     /// Types `text` into `pane` as literal input, then submits it. The submit is a separate
     /// key press rather than a trailing newline in the same burst, which a TUI reads as part
@@ -258,6 +294,8 @@ pub(crate) mod fake {
         pub fail_close: Mutex<bool>,
         /// Makes every `probe` fail while set.
         pub fail_probe: Mutex<bool>,
+        /// Makes every `regroup` fail (after recording it) while set.
+        pub fail_regroup: Mutex<bool>,
         /// Answers for the next probes, one per call, before falling back to `statuses`.
         pub probe_queue: Mutex<std::collections::VecDeque<HashMap<String, PaneStatus>>>,
         /// How many times `probe` has been called.
@@ -320,6 +358,21 @@ pub(crate) mod fake {
             let anchor = req.after.expect("open_tab is only ever called with an anchor");
             self.record(format!("tab {id} alongside {anchor} in {} as {}: {}", req.cwd.display(), req.title, req.launch));
             Ok(id)
+        }
+
+        /// Recorded in the same words as `open_tab`/`open_pane`'s own lines, so a test reads
+        /// which placement a regroup asked for the same way it reads a stacked spawn's.
+        fn regroup(&self, req: &RegroupRequest<'_>) -> Result<()> {
+            self.record(match req.placement {
+                StackPlacement::Tabbed => format!("regroup {} alongside {} as {}", req.pane, req.anchor, req.title),
+                StackPlacement::Split => {
+                    format!("regroup {} {} of {} as {}", req.pane, req.split_direction, req.anchor, req.title)
+                }
+            });
+            if *self.fail_regroup.lock().unwrap() {
+                anyhow::bail!("fake regroup failed");
+            }
+            Ok(())
         }
 
         fn type_line(&self, pane: &str, text: &str) -> Result<()> {

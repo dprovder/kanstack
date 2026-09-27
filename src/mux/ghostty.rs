@@ -112,7 +112,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 
 use crate::harness::launch::shell_quote;
-use crate::mux::{command_exists, Multiplexer, OpenRequest};
+use crate::mux::{command_exists, Multiplexer, OpenRequest, RegroupRequest};
 use crate::mux::pane_status::PaneStatus;
 
 /// How long the first lane waits for its marker title to show up in Ghostty's terminal list.
@@ -308,6 +308,19 @@ impl Multiplexer for Ghostty {
             bail!("Ghostty's `split` did not report a terminal id");
         }
         Ok(id.to_string())
+    }
+
+    /// A deliberate no-op: Ghostty has no way to move a terminal that already exists. Its
+    /// AppleScript dictionary (`macos/Ghostty.sdef`) can `split` a terminal, open a `new tab`
+    /// or `new window`, and `focus`, `close`, `input text` and `send key` — all of which make a
+    /// new terminal or act on one where it stands — and `perform action` reaches only its
+    /// keybinding actions, whose moves (`move_tab`, `move_tab_to_new_window`) reorder or detach
+    /// a whole tab, never carry one split into another tab or beside another terminal. So a
+    /// branch that joins a stack after its pane opened keeps its pane where it is. `Ok(())`
+    /// rather than an error, because an out-of-place pane is cosmetic and must not fail the
+    /// board refresh that noticed it.
+    fn regroup(&self, _req: &RegroupRequest<'_>) -> Result<()> {
+        Ok(())
     }
 
     /// A paste, then Enter as its own key: a paste alone is not submitted.
@@ -979,6 +992,19 @@ probe) printf 'OWN\nOTHER\nNEW-after-OWN\n' ;;"#;
             let line = detection();
             assert!(line.starts_with('✗') && line.to_lowercase().contains("ghostty"), "{line}");
             assert!(line.contains("macOS only") || line.contains("TERM_PROGRAM"), "{line}");
+        });
+    }
+
+    /// Ghostty can't move a live terminal (see `regroup`), so a branch joining a stack after
+    /// its pane opened leaves it where it is: no script runs, and nothing fails.
+    #[test]
+    fn a_regroup_is_a_documented_no_op_that_never_runs_a_script() {
+        with_fake("regroup", ARMS, &[], |mut splitter, fake| {
+            splitter.adopt("feat-top", "TOP");
+            splitter.adopt("feat-base", "BASE");
+            splitter.restack_moved_branches(&crate::splitter::status_with_stacks(&[&["feat-base"], &["feat-top"]])).unwrap();
+            splitter.restack_moved_branches(&crate::splitter::status_with_stacks(&[&["feat-top", "feat-base"]])).unwrap();
+            assert!(fake.calls().is_empty(), "{:#?}", fake.ops());
         });
     }
 }

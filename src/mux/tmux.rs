@@ -26,7 +26,7 @@ use std::process::{Command, Output};
 
 use anyhow::{bail, Context, Result};
 
-use crate::mux::{command_exists, Multiplexer, OpenRequest};
+use crate::mux::{command_exists, Multiplexer, OpenRequest, RegroupRequest, StackPlacement};
 use crate::mux::pane_status::{PaneStatus, CPU_BUSY_THRESHOLD_PERCENT};
 use crate::procs::{read_ps_table, subtree_cpu, PsRow};
 
@@ -169,6 +169,37 @@ impl Multiplexer for Tmux {
         self.type_and_submit(&pane_id, req.launch)?;
         let _ = self.run(&["rename-window", "-t", &pane_id, req.title]);
         Ok(pane_id)
+    }
+
+    /// `tabbed`: `break-pane -a` makes `req.pane` its own window right after the anchor's —
+    /// where [`Self::open_tab`]'s `new-window -a` would have put it — named `req.title`, since
+    /// the window name is what shows as the tab. `split`: `join-pane` moves it into the
+    /// anchor's window as a split off the anchor, with the same direction flags
+    /// [`Self::open_pane`]'s `split-window` uses; `join-pane` is `split-window` for a pane
+    /// that already exists (tmux's own words).
+    ///
+    /// Both `-d`, so the pane that has focus keeps it. Measured against tmux 3.6b on a private
+    /// server (`-L`): both keep the pane's `%N` id, so the caller's tracked id stays good; the
+    /// window a joined pane leaves is closed if it's now empty; `break-pane` also works on a
+    /// pane that is already alone in its window (it moves that window, rather than refusing);
+    /// and repeating either is harmless. The anchor's window is resolved first, as for
+    /// `open_tab`, because `break-pane -t` wants a window.
+    fn regroup(&self, req: &RegroupRequest<'_>) -> Result<()> {
+        match req.placement {
+            StackPlacement::Tabbed => {
+                let window = self.run(&["display-message", "-p", "-t", req.anchor, "#{window_id}"])?.trim().to_string();
+                if window.is_empty() {
+                    bail!("`tmux display-message` did not report {}'s window", req.anchor);
+                }
+                self.run(&["break-pane", "-d", "-a", "-n", req.title, "-s", req.pane, "-t", &window])?;
+            }
+            StackPlacement::Split => {
+                let mut args = vec!["join-pane", "-d", "-s", req.pane, "-t", req.anchor];
+                args.extend(split_flags(req.split_direction));
+                self.run(&args)?;
+            }
+        }
+        Ok(())
     }
 
     fn type_line(&self, pane: &str, text: &str) -> Result<()> {
@@ -502,6 +533,54 @@ mod tests {
             assert!(err.contains("did not report"), "{err}");
             assert!(!splitter.has_pane("feat-top"));
             assert_eq!(stand_in::log_lines(log).len(), 1, "nothing may be typed once the window can't be found");
+        });
+    }
+
+    /// `feat-top`, open in `%5`, joins `feat-base`'s stack (`%3`, in window `@0`) after the
+    /// fact: by default `break-pane` makes it its own window right after `@0`, named for its
+    /// branch — where `open_tab`'s `new-window -a` would have put it — without taking focus.
+    #[test]
+    fn a_regroup_breaks_the_pane_out_into_a_window_after_the_siblings() {
+        with_fake_tmux("regroup-tab", TABS, &[("KANSTACK_STACK_PANES", None)], |mut splitter, log| {
+            splitter.adopt("feat-top", "%5");
+            splitter.adopt("feat-base", "%3");
+            splitter.restack_moved_branches(&crate::splitter::status_with_stacks(&[&["feat-base"], &["feat-top"]])).unwrap();
+            splitter.restack_moved_branches(&crate::splitter::status_with_stacks(&[&["feat-top", "feat-base"]])).unwrap();
+            assert_eq!(
+                stand_in::log_lines(log),
+                ["display-message -p -t %3 #{window_id}", "break-pane -d -a -n feat-top -s %5 -t @0"]
+            );
+            assert_eq!(splitter.pane_id("feat-top").as_deref(), Some("%5"), "tmux keeps a moved pane's id");
+        });
+    }
+
+    /// `KANSTACK_STACK_PANES=split`: `join-pane` into the sibling's window instead, with the
+    /// same flags `split-window` gets for the orthogonal direction (`down`, off tmux's default
+    /// `right` chain: `-v`).
+    #[test]
+    fn a_split_regroup_joins_the_pane_to_the_sibling_in_the_orthogonal_direction() {
+        with_fake_tmux("regroup-split", "", &[("KANSTACK_STACK_PANES", Some("split"))], |mut splitter, log| {
+            splitter.adopt("feat-top", "%5");
+            splitter.adopt("feat-base", "%3");
+            splitter.restack_moved_branches(&crate::splitter::status_with_stacks(&[&["feat-base"], &["feat-top"]])).unwrap();
+            splitter.restack_moved_branches(&crate::splitter::status_with_stacks(&[&["feat-top", "feat-base"]])).unwrap();
+            assert_eq!(stand_in::log_lines(log), ["join-pane -d -s %5 -t %3 -v"]);
+        });
+    }
+
+    #[test]
+    fn a_regroup_whose_anchor_window_cannot_be_resolved_is_an_error_and_moves_nothing() {
+        let vars = [("KANSTACK_STACK_PANES", None)];
+        with_fake_tmux("regroup-no-window", r#"case "$1" in display-message) ;; esac"#, &vars, |mut splitter, log| {
+            splitter.adopt("feat-top", "%5");
+            splitter.adopt("feat-base", "%3");
+            splitter.restack_moved_branches(&crate::splitter::status_with_stacks(&[&["feat-base"], &["feat-top"]])).unwrap();
+            let err = splitter
+                .restack_moved_branches(&crate::splitter::status_with_stacks(&[&["feat-top", "feat-base"]]))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("feat-top: `tmux display-message` did not report %3's window"), "{err}");
+            assert_eq!(stand_in::log_lines(log).len(), 1, "{:#?}", stand_in::log_lines(log));
         });
     }
 

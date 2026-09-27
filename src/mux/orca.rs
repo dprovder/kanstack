@@ -90,7 +90,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
-use crate::mux::{command_exists, Multiplexer, OpenRequest};
+use crate::mux::{command_exists, Multiplexer, OpenRequest, RegroupRequest};
 use crate::mux::pane_status::PaneStatus;
 
 /// How long each `terminal wait --for tui-idle` probe may block before its timeout is read
@@ -252,6 +252,19 @@ impl Multiplexer for Orca {
             Some(reason) => bail!("orca refused the message: {reason}"),
             None => bail!("orca did not accept the message"),
         }
+    }
+
+    /// A deliberate no-op: Orca's CLI has no way to move a terminal that already exists. The
+    /// `terminal` verbs in the published CLI reference are `create`, `split`, `rename`, `send`,
+    /// `switch`, `show`, `read`, `wait`, `list` and `close` — every one either makes a new
+    /// terminal or acts on one where it stands — and the drag-to-split and tab-group moves
+    /// Orca's app offers are UI-only, with no CLI verb behind them. So a branch that joins a
+    /// stack after its terminal opened keeps its terminal where it is; only a stacked spawn
+    /// places one next to its sibling (as a split off it, through `open_tab`'s default).
+    /// `Ok(())` rather than an error, because an out-of-place pane is cosmetic and must not
+    /// fail the board refresh that noticed it.
+    fn regroup(&self, _req: &RegroupRequest<'_>) -> Result<()> {
+        Ok(())
     }
 
     /// Brings the terminal to the front and gives it focus (`terminal switch`).
@@ -1100,6 +1113,20 @@ esac"#;
             orca.adopt("feat-a", "term_a");
             let err = orca.stop("feat-a").unwrap_err().to_string();
             assert!(err.contains("terminal_stop_live"), "{err}");
+        });
+    }
+
+    /// Orca's CLI can't move a live terminal (see `regroup`), so a branch joining a stack after
+    /// its terminal opened leaves it where it is: nothing reaches `orca`, and nothing fails.
+    #[test]
+    fn a_regroup_is_a_documented_no_op_that_never_calls_orca() {
+        with_fake_orca("regroup", SPLITS_AND_ACKS, |mut orca, log| {
+            orca.adopt("feat-top", "term_top");
+            orca.adopt("feat-base", "term_base");
+            orca.restack_moved_branches(&crate::splitter::status_with_stacks(&[&["feat-base"], &["feat-top"]])).unwrap();
+            orca.restack_moved_branches(&crate::splitter::status_with_stacks(&[&["feat-top", "feat-base"]])).unwrap();
+            assert!(log_lines(log).is_empty(), "{:#?}", log_lines(log));
+            assert_eq!(orca.pane_id("feat-top").as_deref(), Some("term_top"));
         });
     }
 }
