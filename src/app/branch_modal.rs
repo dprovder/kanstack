@@ -33,7 +33,11 @@ pub enum BranchModalRow {
     /// the flag.
     Harness,
     /// A free-text field, same shape as `Name` — the model name is an open string, not a
-    /// fixed set of choices, so it gets a text field rather than a picker.
+    /// fixed set of choices in general, so typing is always how you can set one. When the
+    /// picked harness happens to have real suggestions to offer (today: Codex, via its own
+    /// locally cached `models_cache.json` — see `App::model_choices`), `Left`/`Right` cycles
+    /// through those instead of moving the text cursor, the same hybrid `Harness` already
+    /// uses; with nothing to suggest, `Left`/`Right` falls back to ordinary cursor movement.
     Model,
     /// A small fixed-choice picker, cycled with `Left`/`Right` through no hint at all, then
     /// `low` → `medium` → `high` — the same two-key cycling `Action`/`Split` already use,
@@ -182,12 +186,14 @@ impl App {
     }
 
     /// `Left`/`Right` on whichever row is focused: moves the name/model field's text cursor,
-    /// toggles the action/split row exactly as `Tab`/`Shift-Tab` already do (direction
-    /// doesn't matter for a two-state toggle, so both keys reach the same handler), or steps
-    /// the harness/effort picker one way or the other (see `cycle_harness_choice`/
-    /// `cycle_effort`, where direction does matter). Unlike `Model`, `Harness` never moves a
-    /// text cursor on `Left`/`Right` — same as `crate::setup`'s own harness field, those two
-    /// keys are reserved for cycling, and typing still edits the field by other keys.
+    /// toggles the action/split/advisory row exactly as `Tab`/`Shift-Tab`/`space` already do
+    /// (direction doesn't matter for a two-state toggle, so both keys reach the same
+    /// handler), or steps the harness/effort picker one way or the other (see
+    /// `cycle_harness_choice`/`cycle_effort`, where direction does matter). `Harness` never
+    /// moves a text cursor on `Left`/`Right` — same as `crate::setup`'s own harness field,
+    /// those two keys are reserved for cycling there, and typing still edits the field by
+    /// other keys. `Model` follows suit only when it actually has something to cycle through
+    /// (`model_choices`) — with nothing to suggest, it's cursor movement like `Name`.
     pub(super) fn branch_modal_row_left_right(&mut self, left: bool) {
         match self.branch_modal_row {
             BranchModalRow::Name if left => self.branch_input.move_left(),
@@ -195,10 +201,79 @@ impl App {
             BranchModalRow::Action => self.toggle_stack_onto(),
             BranchModalRow::Split => self.toggle_open_harness(),
             BranchModalRow::Harness => self.cycle_harness_choice(left),
+            BranchModalRow::Model if !self.model_choices().is_empty() => self.cycle_model_choice(left),
             BranchModalRow::Model if left => self.model_input.move_left(),
             BranchModalRow::Model => self.model_input.move_right(),
             BranchModalRow::Effort => self.cycle_effort(left),
         }
+    }
+
+    /// The harness whose model catalog the picker should consult: `harness_input`, trimmed,
+    /// or the configured default when it's blank — the same fallback `kanstack spawn` itself
+    /// uses when `--agent`/`harness` is `None` (`$KANSTACK_HARNESS`, else `claude`). Shared by
+    /// `model_choices` and the effort row's own hint, so the two can't disagree about which
+    /// harness is actually in play.
+    fn resolved_harness(&self) -> String {
+        let typed = self.harness_input.trimmed();
+        if typed.is_empty() {
+            std::env::var("KANSTACK_HARNESS").unwrap_or_else(|_| "claude".to_string())
+        } else {
+            typed
+        }
+    }
+
+    /// Model-name suggestions for whichever harness is currently picked (see
+    /// `resolved_harness`) — today, only Codex has anything to offer: its own locally cached
+    /// `models_cache.json` (`crate::harness::codex::cached_models`), read fresh each call
+    /// rather than cached on `App` since it depends on `harness_input`, which can change on
+    /// every keystroke of the Harness row — a small local file read is cheaper than keeping
+    /// the two in sync by hand. Empty for every other harness, and empty for Codex too when
+    /// nothing is cached (never run, or never run online, on this machine) — the model field
+    /// stays a plain text field in either case, exactly as it always has.
+    pub fn model_choices(&self) -> Vec<String> {
+        if crate::harness::for_command(&self.resolved_harness()).id() != "codex" {
+            return Vec::new();
+        }
+        crate::harness::codex::cached_models().into_iter().map(|m| m.slug).collect()
+    }
+
+    /// `Left`/`Right` on the model row, reachable only once `model_choices` has something to
+    /// offer (see `branch_modal_row_left_right`) — steps through those suggestions exactly
+    /// the way `cycle_harness_choice` steps through detected harnesses.
+    pub(super) fn cycle_model_choice(&mut self, left: bool) {
+        let choices = self.model_choices();
+        let len = choices.len();
+        if len == 0 {
+            return;
+        }
+        let current = choices.iter().position(|m| m == self.model_input.as_str());
+        let next = match (current, left) {
+            (Some(i), false) => (i + 1) % len,
+            (Some(i), true) => (i + len - 1) % len,
+            (None, false) => 0,
+            (None, true) => len - 1,
+        };
+        self.model_input.set(choices[next].clone());
+    }
+
+    /// Whether Codex's own locally cached catalog positively says the currently typed model
+    /// does *not* support the currently picked effort — `false` (never flags anything)
+    /// whenever there is nothing to check against: no effort picked, no model typed, the
+    /// picked harness isn't Codex, or the cache has nothing for this exact slug (a model too
+    /// new for a stale cache, or no cache at all). A hint for the effort row to show, never
+    /// something that blocks picking it — kanstack has no way to be sure an unlisted slug
+    /// really doesn't support a given effort, only that a *listed* one doesn't.
+    pub fn effort_unsupported_by_typed_model(&self) -> bool {
+        let Some(effort) = self.effort else { return false };
+        let model = self.model_input.trimmed();
+        if model.is_empty() || crate::harness::for_command(&self.resolved_harness()).id() != "codex" {
+            return false;
+        }
+        let wanted = effort.to_string();
+        crate::harness::codex::cached_models()
+            .into_iter()
+            .find(|m| m.slug == model)
+            .is_some_and(|m| !m.supported_reasoning_levels.iter().any(|l| l.effort == wanted))
     }
 
     /// `Left`/`Right` on the harness row: steps `harness_input` to the next (or previous)
