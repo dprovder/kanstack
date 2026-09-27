@@ -186,6 +186,71 @@ fn merge_hooks_json(existing: Option<&str>, report: &str) -> String {
     serde_json::to_string_pretty(&doc).unwrap_or_default() + "\n"
 }
 
+/// One entry from Codex's own locally cached model catalog (see [`cached_models`]) — just
+/// the two fields kanstack's model/effort picker (`crate::app::branch_modal`) needs, not the
+/// whole schema Codex itself keeps (pricing tier, context window, available plans, and so
+/// on, all irrelevant here). `#[serde(default)]` on every field but `slug` so an older or
+/// newer cache — Codex's own schema is free to add fields kanstack doesn't know about yet —
+/// still parses instead of failing the whole read over one missing key.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct CachedModel {
+    /// What `-c model=` (see [`Codex::model_effort_args`]) actually takes — confirmed
+    /// against Codex's own docs, which say to use the slug, not a fully-qualified name.
+    pub slug: String,
+    #[serde(default)]
+    pub supported_reasoning_levels: Vec<SupportedReasoningLevel>,
+}
+
+/// One of a [`CachedModel`]'s valid `model_reasoning_effort` values — `effort` is confirmed
+/// to use the same three words (`low`/`medium`/`high`) [`Effort`] does, at least for every
+/// model seen so far; `description` is kept only because it costs nothing to, not used yet.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct SupportedReasoningLevel {
+    pub effort: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct ModelsCache {
+    #[serde(default)]
+    models: Vec<CachedModel>,
+}
+
+/// Codex's own locally cached model catalog — `$CODEX_HOME/models_cache.json`
+/// (`$CODEX_HOME` resolved the same way Codex's own CLI does: itself if set, else
+/// `$HOME/.codex`), a plain JSON file `codex-rs/models-manager`'s `ModelsManager` writes
+/// after fetching the live list from OpenAI's own API, confirmed against that module's own
+/// source rather than guessed at: a `fetched_at`/`etag`/`client_version` for staleness
+/// alongside a `models` array, each entry's `slug` exactly what [`Codex::model_effort_args`]
+/// hands `-c model=`, and a `supported_reasoning_levels` list this crate has no other way to
+/// learn (Codex has no CLI flag to list models — see this module's own top-level doc comment
+/// for what was and wasn't found there). Reading the file directly, rather than shelling out
+/// to `codex` for it, costs nothing and needs no network access of kanstack's own.
+///
+/// Best-effort, the same spirit as [`Codex::status_hooks`]'s own `Option` return: a missing
+/// file (Codex never run, or never run online, on this machine), an unparseable one, or no
+/// home directory to look in at all reads as "nothing cached" — an empty list — rather than
+/// an error. This is a convenience suggestion for the model/effort picker, not something
+/// launching a pane depends on; every call site here already treats an empty list the same
+/// as "no suggestions to offer," same as before this existed.
+pub fn cached_models() -> Vec<CachedModel> {
+    let Some(path) = models_cache_path() else { return Vec::new() };
+    let Ok(raw) = std::fs::read_to_string(path) else { return Vec::new() };
+    serde_json::from_str::<ModelsCache>(&raw).map(|c| c.models).unwrap_or_default()
+}
+
+/// `$CODEX_HOME/models_cache.json`, `$CODEX_HOME` defaulting to `$HOME/.codex` — the same
+/// resolution Codex's own CLI uses (confirmed against `codex-rs`'s own `DefaultHome`), so
+/// this reads exactly the file a locally installed Codex would have written. `None` only
+/// when neither `$CODEX_HOME` nor `$HOME` can be resolved at all.
+fn models_cache_path() -> Option<PathBuf> {
+    let home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".codex")))?;
+    Some(home.join("models_cache.json"))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::harness::launch::NoteDelivery;
@@ -372,6 +437,97 @@ mod tests {
             assert!(line.contains(r#"'-c' 'model_reasoning_effort="medium"'"#), "{line:?}");
 
             let _ = std::fs::remove_dir_all(&repo);
+        });
+    }
+
+    // `cached_models`/`models_cache_path`.
+
+    /// Runs `body` with `CODEX_HOME` pointed at a fresh temp directory (and `HOME` cleared,
+    /// so a stray real `~/.codex` on the machine running this test can never leak in),
+    /// restoring both afterward. Holds the same env-mutation lock every other test that
+    /// touches process environment here shares, so two of these can't interleave.
+    fn with_codex_home(tag: &str, body: impl FnOnce(&std::path::Path)) {
+        let _guard = crate::SPLIT_BACKEND_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("kanstack-codex-home-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old_home = std::env::var_os("CODEX_HOME");
+        std::env::set_var("CODEX_HOME", &dir);
+        body(&dir);
+        match old_home {
+            Some(v) => std::env::set_var("CODEX_HOME", v),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The shape `codex-rs`'s own `ModelsManager` writes: a `models` array alongside cache
+    /// bookkeeping (`fetched_at`, `etag`, `client_version`) this crate has no use for and
+    /// must tolerate rather than choke on.
+    fn sample_cache() -> &'static str {
+        r#"{
+            "fetched_at": "2026-01-01T00:00:00Z",
+            "etag": "abc123",
+            "client_version": "0.153.0",
+            "models": [
+                {
+                    "slug": "gpt-6-sol",
+                    "display_name": "GPT-6-Sol",
+                    "supported_reasoning_levels": [
+                        {"effort": "low", "description": "fast"},
+                        {"effort": "medium", "description": "balanced"}
+                    ]
+                },
+                {
+                    "slug": "gpt-6-astra",
+                    "supported_reasoning_levels": [
+                        {"effort": "high", "description": "frontier"}
+                    ]
+                }
+            ]
+        }"#
+    }
+
+    #[test]
+    fn cached_models_reads_every_slug_and_its_supported_reasoning_levels() {
+        with_codex_home("read", |dir| {
+            std::fs::write(dir.join("models_cache.json"), sample_cache()).unwrap();
+            let models = super::cached_models();
+            assert_eq!(models.len(), 2);
+            assert_eq!(models[0].slug, "gpt-6-sol");
+            assert_eq!(models[0].supported_reasoning_levels[0].effort, "low");
+            assert_eq!(models[1].slug, "gpt-6-astra");
+            assert_eq!(models[1].supported_reasoning_levels[0].effort, "high");
+        });
+    }
+
+    /// Codex is free to add fields to its own schema (pricing, plan gating, and so on) that
+    /// this crate has never heard of — `#[serde(default)]`/plain field skipping must not
+    /// choke on them.
+    #[test]
+    fn cached_models_ignores_fields_it_does_not_know_about() {
+        with_codex_home("extra-fields", |dir| {
+            let raw = r#"{"models":[{"slug":"gpt-6-sol","priority":1,"context_window":272000,"available_in_plans":["pro"]}]}"#;
+            std::fs::write(dir.join("models_cache.json"), raw).unwrap();
+            let models = super::cached_models();
+            assert_eq!(models, vec![super::CachedModel { slug: "gpt-6-sol".to_string(), supported_reasoning_levels: vec![] }]);
+        });
+    }
+
+    /// No file at all — Codex has never run, or never run online, on this machine — reads as
+    /// an empty list, not an error: this is a convenience suggestion, nothing depends on it.
+    #[test]
+    fn cached_models_with_no_cache_file_is_an_empty_list_not_an_error() {
+        with_codex_home("missing", |_dir| {
+            assert!(super::cached_models().is_empty());
+        });
+    }
+
+    #[test]
+    fn cached_models_with_a_malformed_cache_file_is_an_empty_list_not_a_panic() {
+        with_codex_home("malformed", |dir| {
+            std::fs::write(dir.join("models_cache.json"), "{ not json").unwrap();
+            assert!(super::cached_models().is_empty());
         });
     }
 }
