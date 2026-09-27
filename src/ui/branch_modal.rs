@@ -116,8 +116,9 @@ pub(super) fn draw_branch_modal(f: &mut Frame, app: &App, area: Rect, hits: &mut
         None
     };
 
-    // Harness/model/effort ride along with the split row's own visibility — all three are
-    // meaningless without a split backend to hand a harness pane's launch line to in the
+    // Harness/model/effort/advisory ride along with the split row's own visibility — all of
+    // them are meaningless without a split backend to hand a harness pane's launch line to
+    // (or, for advisory, a pane whose workstream there'd be anything to record about) in the
     // first place.
     if app.branch_modal_split_row_visible() {
         let harness_prefix = format!("{}harness  ", row_marker(BranchModalRow::Harness));
@@ -184,6 +185,22 @@ pub(super) fn draw_branch_modal(f: &mut Frame, app: &App, area: Rect, hits: &mut
             effort_label,
             theme::tone(crate::board::Tone::Accent),
             "←/→",
+            content_width,
+        ));
+
+        // Checkbox-shaped like the split row, since it's the same kind of two-state toggle —
+        // `kanstack spawn --advisory`. Says what it means rather than just its name: nothing
+        // else in the modal hints that "advisory" is about commits.
+        let (glyph, style) = if app.advisory {
+            ("[x] advisory — not expected to commit", theme::tone(crate::board::Tone::Accent))
+        } else {
+            ("[ ] advisory — not expected to commit", theme::faint())
+        };
+        body.push(hint_row(
+            &format!("{}advisory ", row_marker(BranchModalRow::Advisory)),
+            glyph,
+            style,
+            "←/→ space",
             content_width,
         ));
     }
