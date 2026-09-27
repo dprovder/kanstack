@@ -2310,6 +2310,127 @@ mod tests {
         assert_eq!(app.branch_input.as_str(), "feature", "the name field must be untouched");
     }
 
+    /// Points `CODEX_HOME` at a fresh temp directory holding `models_cache.json` with `raw`,
+    /// runs `body`, then restores the environment — holds the same env-mutation lock every
+    /// other test that touches process environment here shares, so two of these (or one of
+    /// these and `crate::harness::codex`'s own) can't interleave.
+    fn with_codex_models_cache(tag: &str, raw: &str, body: impl FnOnce()) {
+        let _guard = crate::SPLIT_BACKEND_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("kanstack-app-codex-home-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("models_cache.json"), raw).unwrap();
+        let old = std::env::var_os("CODEX_HOME");
+        std::env::set_var("CODEX_HOME", &dir);
+        body();
+        match old {
+            Some(v) => std::env::set_var("CODEX_HOME", v),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const SAMPLE_CODEX_CACHE: &str = r#"{
+        "models": [
+            {"slug": "gpt-6-sol", "supported_reasoning_levels": [{"effort": "low"}, {"effort": "medium"}]},
+            {"slug": "gpt-6-astra", "supported_reasoning_levels": [{"effort": "high"}]}
+        ]
+    }"#;
+
+    /// No harness picked (blank `harness_input`, and no `$KANSTACK_HARNESS` set) resolves to
+    /// `claude`, which has no cached catalog of its own — `model_choices` must be empty, and
+    /// the model row stays plain text-cursor movement, not cycling.
+    #[test]
+    fn model_choices_is_empty_for_a_non_codex_harness() {
+        let mut app = App::from_board(board());
+        with_fake_splitter(&mut app);
+        app.begin_branch();
+        assert!(app.model_choices().is_empty());
+    }
+
+    /// With `codex` picked as the harness, `model_choices` reads Codex's own locally cached
+    /// slugs — the same file `crate::harness::codex::cached_models` reads.
+    #[test]
+    fn model_choices_reads_codexs_cached_slugs_once_codex_is_picked() {
+        with_codex_models_cache("choices", SAMPLE_CODEX_CACHE, || {
+            let mut app = App::from_board(board());
+            with_fake_splitter(&mut app);
+            app.begin_branch();
+            app.harness_input.set("codex");
+
+            assert_eq!(app.model_choices(), vec!["gpt-6-sol".to_string(), "gpt-6-astra".to_string()]);
+        });
+    }
+
+    /// `Left`/`Right` on `Model` cycles Codex's cached slugs, the same wrap-around rule
+    /// `cycle_harness_choice` uses, once there's something to cycle through.
+    #[test]
+    fn left_right_on_the_model_row_cycles_codexs_cached_slugs_when_available() {
+        with_codex_models_cache("cycle", SAMPLE_CODEX_CACHE, || {
+            let mut app = App::from_board(board());
+            with_fake_splitter(&mut app);
+            app.begin_branch();
+            app.harness_input.set("codex");
+            app.branch_modal_row = BranchModalRow::Model;
+
+            app.handle_key(key(ratatui::crossterm::event::KeyCode::Right));
+            assert_eq!(app.model_input.as_str(), "gpt-6-sol");
+            app.handle_key(key(ratatui::crossterm::event::KeyCode::Right));
+            assert_eq!(app.model_input.as_str(), "gpt-6-astra");
+            app.handle_key(key(ratatui::crossterm::event::KeyCode::Right));
+            assert_eq!(app.model_input.as_str(), "gpt-6-sol", "wraps back around");
+        });
+    }
+
+    /// With nothing cached (no `codex` picked, or nothing on disk), `Left`/`Right` on `Model`
+    /// falls back to ordinary text-cursor movement — the exact pre-existing behavior, still
+    /// reachable now that the row is conditionally a picker instead of always one.
+    #[test]
+    fn left_right_on_the_model_row_moves_the_text_cursor_with_nothing_cached() {
+        let mut app = App::from_board(board());
+        with_fake_splitter(&mut app);
+        app.begin_branch();
+        for c in "o3".chars() {
+            app.model_input.insert(c);
+        }
+        app.branch_modal_row = BranchModalRow::Model;
+
+        app.handle_key(key(ratatui::crossterm::event::KeyCode::Left));
+        app.handle_key(key(ratatui::crossterm::event::KeyCode::Char('!')));
+
+        assert_eq!(app.model_input.as_str(), "o!3", "Left moved the text cursor, not a row/pick");
+    }
+
+    /// `effort_unsupported_by_typed_model` flags only a *known* mismatch — a model Codex's
+    /// cache lists, with an effort it doesn't list for that model — and stays quiet for
+    /// every other case: no effort picked, no model typed, a non-Codex harness, or a model
+    /// the cache has never heard of.
+    #[test]
+    fn effort_unsupported_by_typed_model_flags_only_a_known_mismatch() {
+        with_codex_models_cache("mismatch", SAMPLE_CODEX_CACHE, || {
+            let mut app = App::from_board(board());
+            with_fake_splitter(&mut app);
+            app.begin_branch();
+            app.harness_input.set("codex");
+            app.model_input.set("gpt-6-astra");
+
+            assert!(!app.effort_unsupported_by_typed_model(), "no effort picked yet");
+
+            app.effort = Some(crate::harness::Effort::High);
+            assert!(!app.effort_unsupported_by_typed_model(), "high is exactly what gpt-6-astra supports");
+
+            app.effort = Some(crate::harness::Effort::Low);
+            assert!(app.effort_unsupported_by_typed_model(), "gpt-6-astra only lists high");
+
+            app.model_input.set("some-future-model");
+            assert!(!app.effort_unsupported_by_typed_model(), "unlisted model: nothing to positively contradict");
+
+            app.model_input.set("gpt-6-astra");
+            app.harness_input.set("claude");
+            assert!(!app.effort_unsupported_by_typed_model(), "not codex: no catalog to check against");
+        });
+    }
+
     /// `Left`/`Right` on the `Effort` row cycles through no hint, then `low` → `medium` →
     /// `high`, wrapping at either end — a four-state picker, not the two-state toggle
     /// `Action`/`Split` use.
