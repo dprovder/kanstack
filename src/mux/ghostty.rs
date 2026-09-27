@@ -310,13 +310,26 @@ impl Multiplexer for Ghostty {
         Ok(id.to_string())
     }
 
-    /// A deliberate no-op: Ghostty has no way to move a terminal that already exists. Its
-    /// AppleScript dictionary (`macos/Ghostty.sdef`) can `split` a terminal, open a `new tab`
-    /// or `new window`, and `focus`, `close`, `input text` and `send key` — all of which make a
-    /// new terminal or act on one where it stands — and `perform action` reaches only its
-    /// keybinding actions, whose moves (`move_tab`, `move_tab_to_new_window`) reorder or detach
-    /// a whole tab, never carry one split into another tab or beside another terminal. So a
-    /// branch that joins a stack after its pane opened keeps its pane where it is. `Ok(())`
+    /// A deliberate no-op: Ghostty can move a live split, but only by hand, and nothing a script
+    /// can reach does it. Checked against `ghostty-org/ghostty` main at b40acce (2026-09-26):
+    ///
+    /// - The macOS app does move splits — drag one by its grab handle onto another and it is
+    ///   re-split there, process and all (`TerminalSplitTreeView.swift`'s `SplitDropDelegate`,
+    ///   since 1.3). But that is SwiftUI drag-and-drop on a private pasteboard type, and the
+    ///   notifications behind it are in-process, so there is no way in from outside short of
+    ///   synthesizing a real mouse drag — which needs Accessibility permission and pixel
+    ///   geometry AppleScript doesn't expose, and would take the user's pointer away.
+    /// - The AppleScript dictionary (`macos/Ghostty.sdef`) has `split`, `new tab`, `new
+    ///   window`, `focus`, `close`, `input text`, `send key`, the mouse-event commands and
+    ///   `perform action`; its Standard Suite adds only `count`, `exists` and `quit`, and every
+    ///   property of a window, tab or terminal is read-only. None moves anything.
+    /// - `perform action` reaches the keybinding actions, whose only moves (`move_tab`,
+    ///   `move_tab_to_new_window`) reorder or detach a whole tab.
+    /// - Upstream wants more: discussion #12126 ("full surface mobility") and #11709, and PR
+    ///   #13527, an unmerged `detach_split` action. Even that would only pop a split out into a
+    ///   new *window*, not put it beside another terminal.
+    ///
+    /// So a branch that joins a stack after its pane opened keeps its pane where it is. `Ok(())`
     /// rather than an error, because an out-of-place pane is cosmetic and must not fail the
     /// board refresh that noticed it.
     fn regroup(&self, _req: &RegroupRequest<'_>) -> Result<()> {

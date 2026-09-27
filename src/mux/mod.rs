@@ -115,7 +115,8 @@ pub trait Multiplexer: Send + Sync {
     ///
     /// No default, unlike `open_tab`: there is no creating-only fallback that would do
     /// anything useful here, so each backend states for itself whether it can move a live pane
-    /// at all. One that can't (Orca, Ghostty) returns `Ok(())` and says why in its own docs —
+    /// at all. One that can't (Ghostty), or can't in a given layout (Orca, which moves whole
+    /// tabs only), returns `Ok(())` and says why in its own docs —
     /// the pane staying where it is is cosmetic, and must not fail whatever caller is
     /// refreshing the board around it.
     fn regroup(&self, req: &RegroupRequest<'_>) -> Result<()>;

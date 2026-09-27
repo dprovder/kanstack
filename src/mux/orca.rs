@@ -71,6 +71,14 @@
 //! the pane where `right`/`down` would. That is why the defaults here are `down` then `right`
 //! rather than the `up`/`right` of the other two backends.
 //!
+//! # Moving a terminal that is already open
+//!
+//! No CLI verb moves a terminal, but the runtime has an RPC that does, `session.tabs.move`,
+//! and kanstack calls it over the same Unix socket the CLI uses (`Orca::rpc`). It moves whole
+//! *tabs* between tab groups, which is all an outside caller can do in the desktop app — see
+//! `regroup` for what that means for kanstack's lanes, which normally share one tab. From
+//! source only (`stablyai/orca` at 080c4ad); not yet run against a live Orca.
+//!
 //! # Busy/idle
 //!
 //! Unlike `cmux.rs` and `tmux.rs`, nothing here polls CPU: Orca tracks agent state itself.
@@ -90,13 +98,16 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
-use crate::mux::{command_exists, Multiplexer, OpenRequest, RegroupRequest};
+use crate::mux::{command_exists, Multiplexer, OpenRequest, RegroupRequest, StackPlacement};
 use crate::mux::pane_status::PaneStatus;
 
 /// How long each `terminal wait --for tui-idle` probe may block before its timeout is read
 /// as "busy". Probes for every tracked terminal run in parallel, so this is roughly what one
 /// poll costs in total.
 const IDLE_PROBE_TIMEOUT_MS: u32 = 1500;
+
+/// How long [`Orca::rpc`] waits for the runtime to answer before giving up on it.
+const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Orca, through its own CLI. Stateless: which terminal belongs to which branch is
 /// `crate::splitter::Splitter`'s business, and this only knows how to act on a handle.
@@ -149,6 +160,51 @@ impl Orca {
             .args(args)
             .output()
             .with_context(|| format!("failed to spawn `{} {}`", self.bin.display(), args.join(" ")))
+    }
+
+    /// Calls one of the runtime's RPC methods directly, for the few (`session.tabs.*`) no CLI
+    /// verb exposes, the way the `orca` CLI itself reaches the runtime (from source,
+    /// `src/cli/runtime/transport.ts`): read `orca-runtime.json` from Orca's user-data
+    /// directory (see [`runtime_metadata_path`]) for the Unix socket and auth token, write one
+    /// JSON line `{id, authToken, method, params}`, and read newline-delimited JSON back,
+    /// skipping `{"_keepalive":true}` frames and anything not answering this `id`. The answer
+    /// is the same envelope `--json` prints, so [`parse_response`] reads it.
+    fn rpc<T: DeserializeOwned>(&self, method: &str, params: serde_json::Value) -> Result<T> {
+        use std::io::{BufRead, BufReader, Write};
+
+        let path = runtime_metadata_path().context("can't tell where Orca keeps its runtime metadata")?;
+        let raw = std::fs::read_to_string(&path)
+            .with_context(|| format!("can't read Orca's runtime metadata at {} — is Orca running?", path.display()))?;
+        let metadata: RuntimeMetadata =
+            serde_json::from_str(&raw).with_context(|| format!("unexpected Orca runtime metadata at {}", path.display()))?;
+        let socket = metadata
+            .transports
+            .iter()
+            .chain(metadata.transport.iter())
+            .find(|t| t.kind == "unix")
+            .with_context(|| format!("Orca's runtime metadata at {} names no Unix socket", path.display()))?;
+        let token = metadata.auth_token.with_context(|| format!("Orca's runtime metadata at {} has no auth token", path.display()))?;
+
+        let described = || format!("orca runtime `{method}`");
+        let mut stream = std::os::unix::net::UnixStream::connect(&socket.endpoint)
+            .with_context(|| format!("{} failed: can't connect to {}", described(), socket.endpoint))?;
+        stream.set_read_timeout(Some(RPC_TIMEOUT))?;
+        let id = format!("kanstack-{}-{method}", std::process::id());
+        let request = serde_json::json!({ "id": id, "authToken": token, "method": method, "params": params });
+        writeln!(stream, "{request}").with_context(|| format!("{} failed to send", described()))?;
+
+        for line in BufReader::new(stream).lines() {
+            let line = line.with_context(|| format!("{} failed while waiting for its answer", described()))?;
+            let answers_this = serde_json::from_str::<serde_json::Value>(&line).is_ok_and(|frame| frame["id"] == id.as_str());
+            if !answers_this {
+                continue;
+            }
+            return match parse_response::<T>(&line)? {
+                Response::Ok(result) => Ok(result),
+                Response::Failed(e) => bail!("{} failed: {}: {}", described(), e.code, e.message),
+            };
+        }
+        bail!("{} failed: the runtime closed the connection without answering", described())
     }
 
     /// [`Self::run_raw`], then the envelope parsed and unwrapped: the `result` on success, an
@@ -254,16 +310,66 @@ impl Multiplexer for Orca {
         }
     }
 
-    /// A deliberate no-op: Orca's CLI has no way to move a terminal that already exists. The
-    /// `terminal` verbs in the published CLI reference are `create`, `split`, `rename`, `send`,
-    /// `switch`, `show`, `read`, `wait`, `list` and `close` — every one either makes a new
-    /// terminal or acts on one where it stands — and the drag-to-split and tab-group moves
-    /// Orca's app offers are UI-only, with no CLI verb behind them. So a branch that joins a
-    /// stack after its terminal opened keeps its terminal where it is; only a stacked spawn
-    /// places one next to its sibling (as a split off it, through `open_tab`'s default).
-    /// `Ok(())` rather than an error, because an out-of-place pane is cosmetic and must not
-    /// fail the board refresh that noticed it.
-    fn regroup(&self, _req: &RegroupRequest<'_>) -> Result<()> {
+    /// Moves `req.pane`'s whole Orca *tab* into the tab group holding `req.anchor` — right
+    /// after the anchor's tab (`tabbed`), or into a new group split off that one in
+    /// `req.split_direction` (`split`) — through the runtime's `session.tabs.move` RPC (see
+    /// [`Self::rpc`]; no CLI verb exposes it). The desktop app hands that RPC to the very
+    /// `dropUnifiedTab` its tab drag-and-drop uses, so this is the same move a person dragging
+    /// the tab would make: the terminal, its process and its handle all carry on (from
+    /// source, `stablyai/orca` at 080c4ad: `session-tab-mutation-methods.ts`,
+    /// `session-tab-ipc-bridge.ts`, `tabs-drop-actions.ts`).
+    ///
+    /// Orca nests two levels: tab groups (side-by-side columns) hold tabs, and each tab holds
+    /// a split tree of terminals. Only the tab level can be moved from outside — the one RPC
+    /// that rewrites a tab's split tree, `session.tabs.updatePaneLayout`, is ignored whenever
+    /// the desktop window is up, because the window owns pane geometry (from source). So:
+    ///
+    /// - `req.pane` already in the anchor's tab (the usual case for kanstack's own lanes,
+    ///   which split kanstack's terminal and so share its tab): already grouped as closely as
+    ///   Orca allows, and nothing is moved.
+    /// - `req.pane` sharing its tab with any other terminal: not moved, because moving the tab
+    ///   would drag those terminals — kanstack's own, possibly — along with it. Likewise when
+    ///   `terminal list` is truncated and can't prove the tab holds only this terminal.
+    /// - Different worktrees: not moved; Orca's drop refuses moves across worktrees anyway.
+    ///
+    /// Each of those is `Ok(())`: an out-of-place pane is cosmetic. Anything that goes wrong
+    /// talking to Orca is an error, reported by the caller.
+    ///
+    /// **Not run live**: Orca wasn't available where this was written (see the module doc),
+    /// so the RPC names, parameters, id spaces and the desktop routing come from source only.
+    fn regroup(&self, req: &RegroupRequest<'_>) -> Result<()> {
+        let list: ListResult = self.run_json(&list_args())?;
+        let find = |handle: &str| {
+            list.terminals.iter().find(|t| t.handle == handle).with_context(|| format!("orca lists no terminal {handle}"))
+        };
+        let (pane, anchor) = (find(req.pane)?, find(req.anchor)?);
+        let (Some(tab), Some(anchor_tab), Some(worktree)) = (&pane.tab_id, &anchor.tab_id, &anchor.worktree_id) else {
+            bail!("`orca terminal list` didn't say which tab {} and {} are in", req.pane, req.anchor);
+        };
+        let shares_its_tab = list.terminals.iter().any(|t| t.handle != pane.handle && t.tab_id.as_ref() == Some(tab));
+        if tab == anchor_tab || shares_its_tab || list.truncated || pane.worktree_id.as_ref() != Some(worktree) {
+            return Ok(());
+        }
+
+        let worktree = format!("id:{worktree}");
+        let tabs: SessionTabs = self.rpc("session.tabs.list", serde_json::json!({ "worktree": worktree }))?;
+        let (group, index) = tabs
+            .tab_groups
+            .iter()
+            .find_map(|g| g.tab_order.iter().position(|id| is_tab(id, anchor_tab)).map(|i| (g, i)))
+            .with_context(|| format!("no Orca tab group holds {}'s tab", req.anchor))?;
+        let mut params = serde_json::json!({ "worktree": worktree, "tabId": tab, "targetGroupId": group.id });
+        match req.placement {
+            StackPlacement::Tabbed => {
+                params["kind"] = "move-to-group".into();
+                params["index"] = (index + 1).into();
+            }
+            StackPlacement::Split => {
+                params["kind"] = "split".into();
+                params["splitDirection"] = req.split_direction.into();
+            }
+        }
+        self.rpc::<serde_json::Value>("session.tabs.move", params)?;
         Ok(())
     }
 
@@ -512,6 +618,75 @@ struct TerminalSummary {
     /// Absent while the process is running; present once it has ended, however it ended.
     #[serde(default, rename = "exitCause")]
     exit_cause: Option<serde_json::Value>,
+    /// The Orca tab this terminal is a split of — the unit `session.tabs.move` moves (see
+    /// `regroup`). Several terminals split off one another share it.
+    #[serde(default, rename = "tabId")]
+    tab_id: Option<String>,
+    #[serde(default, rename = "worktreeId")]
+    worktree_id: Option<String>,
+}
+
+/// `session.tabs.list` → the worktree's tabs and the groups (side-by-side columns) holding
+/// them; only the groups matter here.
+#[derive(Deserialize)]
+struct SessionTabs {
+    #[serde(default, rename = "tabGroups")]
+    tab_groups: Vec<TabGroup>,
+}
+
+#[derive(Deserialize)]
+struct TabGroup {
+    id: String,
+    /// Top-level tab ids, left to right — a terminal tab's is the `tabId` `terminal list`
+    /// reports (from source).
+    #[serde(default, rename = "tabOrder")]
+    tab_order: Vec<String>,
+}
+
+/// Whether `id`, from a group's `tabOrder`, is `tab`: the tab's own id, or — defensively, in
+/// case a runtime ever lists surfaces there — one of its terminals' `<tab>::<leaf>` ids.
+fn is_tab(id: &str, tab: &str) -> bool {
+    id == tab || id.strip_prefix(tab).is_some_and(|rest| rest.starts_with("::"))
+}
+
+/// `orca-runtime.json`, which the running Orca writes into its user-data directory: where its
+/// RPC socket is and the token every request must carry (from source,
+/// `src/shared/runtime-bootstrap.ts`). Older runtimes wrote one `transport` instead of the
+/// `transports` list.
+#[derive(Deserialize)]
+struct RuntimeMetadata {
+    #[serde(default)]
+    transports: Vec<RuntimeTransport>,
+    #[serde(default)]
+    transport: Option<RuntimeTransport>,
+    #[serde(default, rename = "authToken")]
+    auth_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RuntimeTransport {
+    kind: String,
+    endpoint: String,
+}
+
+/// Where the Orca CLI looks for `orca-runtime.json`, and so where kanstack does too (from
+/// source, `src/cli/runtime/metadata.ts`): `$ORCA_USER_DATA_PATH` if set — Orca's own way of
+/// pointing its CLI at a particular instance — else Electron's default user-data directory:
+/// `~/Library/Application Support/orca` on macOS, `$XDG_CONFIG_HOME/orca` (or
+/// `~/.config/orca`) elsewhere.
+fn runtime_metadata_path() -> Option<PathBuf> {
+    let dir = match std::env::var_os("ORCA_USER_DATA_PATH") {
+        Some(dir) => PathBuf::from(dir),
+        None => {
+            let home = PathBuf::from(std::env::var_os("HOME")?);
+            if cfg!(target_os = "macos") {
+                home.join("Library/Application Support/orca")
+            } else {
+                std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".config")).join("orca")
+            }
+        }
+    };
+    Some(dir.join("orca-runtime.json"))
 }
 
 /// `terminal wait` → `{"wait": {"satisfied": …, "blockedReason"?: …, …}}`. Not satisfied
@@ -942,15 +1117,22 @@ mod tests {
     /// the `Splitter` is what kanstack itself does, so these cover the shared layer's use of
     /// the backend too. Cleans up after itself.
     fn with_fake_orca(tag: &str, body: &str, test: impl FnOnce(Splitter, &Path)) {
+        with_fake_orca_and(tag, body, &[], test)
+    }
+
+    /// [`with_fake_orca`] with `extra` variables swapped in as well.
+    fn with_fake_orca_and(tag: &str, body: &str, extra: &[(&str, Option<&str>)], test: impl FnOnce(Splitter, &Path)) {
         let (bin, log) = fake_orca(tag, body);
+        let mut vars = vec![
+            ("KANSTACK_ORCA_BIN", Some(bin.to_str().unwrap())),
+            ("ORCA_TERMINAL_HANDLE", Some("term_own")),
+            ("KANSTACK_ORCA_DIRECTION", None),
+            ("KANSTACK_ORCA_CHAIN_DIRECTION", None),
+            ("KANSTACK_HARNESS", Some("claude")),
+        ];
+        vars.extend_from_slice(extra);
         with_env(
-            &[
-                ("KANSTACK_ORCA_BIN", Some(bin.to_str().unwrap())),
-                ("ORCA_TERMINAL_HANDLE", Some("term_own")),
-                ("KANSTACK_ORCA_DIRECTION", None),
-                ("KANSTACK_ORCA_CHAIN_DIRECTION", None),
-                ("KANSTACK_HARNESS", Some("claude")),
-            ],
+            &vars,
             || {
                 let orca = Orca::discover().unwrap();
                 test(Splitter::new(std::sync::Arc::new(orca), crate::harness::HarnessConfig::new("claude")), &log)
@@ -1116,17 +1298,177 @@ esac"#;
         });
     }
 
-    /// Orca's CLI can't move a live terminal (see `regroup`), so a branch joining a stack after
-    /// its terminal opened leaves it where it is: nothing reaches `orca`, and nothing fails.
+    /// A stand-in for the Orca runtime's RPC socket: writes `orca-runtime.json` into a fresh
+    /// user-data directory (for `ORCA_USER_DATA_PATH`) and answers each connection's one request
+    /// with `answer(method)`, preceded by a keepalive and a frame for some other request — both
+    /// of which `Orca::rpc` must skip. Every request it receives is kept, in order.
+    struct FakeRuntime {
+        dir: PathBuf,
+        requests: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    }
+
+    impl FakeRuntime {
+        /// Short paths: a Unix socket's must fit in about 100 bytes.
+        fn start(tag: &str, answer: fn(&str) -> serde_json::Value) -> FakeRuntime {
+            use std::io::{BufRead, BufReader, Write};
+            let dir = std::env::temp_dir().join(format!("ks-orca-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let socket = dir.join("s");
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            let metadata = serde_json::json!({
+                "runtimeId": "r", "pid": 1, "startedAt": 0, "authToken": "tok",
+                "transports": [{"kind": "unix", "endpoint": socket}],
+            });
+            std::fs::write(dir.join("orca-runtime.json"), metadata.to_string()).unwrap();
+            let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = requests.clone();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { return };
+                    let mut line = String::new();
+                    BufReader::new(&stream).read_line(&mut line).unwrap();
+                    let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    let reply = serde_json::json!({"id": request["id"], "ok": true, "result": answer(request["method"].as_str().unwrap())});
+                    seen.lock().unwrap().push(request);
+                    let _ = writeln!(stream, "{{\"_keepalive\":true}}");
+                    let _ = writeln!(stream, "{{\"id\":\"someone-else\",\"ok\":false,\"error\":{{\"code\":\"nope\"}}}}");
+                    let _ = writeln!(stream, "{reply}");
+                }
+            });
+            FakeRuntime { dir, requests }
+        }
+
+        fn user_data(&self) -> &str {
+            self.dir.to_str().unwrap()
+        }
+
+        fn requests(&self) -> Vec<serde_json::Value> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for FakeRuntime {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Kanstack's own terminal and one sibling lane split off it share tab `tab-own`; `feat-base`
+    /// is alone in `tab-base`, and `feat-top` alone in `tab-top`. The groups: `tab-own` and
+    /// `tab-base` in `g1`, `tab-top` in `g2`.
+    const TABS_LISTING: &str = r#"
+case "$2" in
+  list) cat <<'JSON'
+{"id":"r","ok":true,"result":{"terminals":[
+ {"handle":"term_own","tabId":"tab-own","leafId":"l0","worktreeId":"W::/repo"},
+ {"handle":"term_lane","tabId":"tab-own","leafId":"l1","worktreeId":"W::/repo"},
+ {"handle":"term_base","tabId":"tab-base","leafId":"l2","worktreeId":"W::/repo"},
+ {"handle":"term_top","tabId":"tab-top","leafId":"l3","worktreeId":"W::/repo"}],"totalCount":4,"truncated":false}}
+JSON
+  ;;
+esac"#;
+
+    fn tab_groups(method: &str) -> serde_json::Value {
+        match method {
+            "session.tabs.list" => serde_json::json!({
+                "worktree": "id:W::/repo", "publicationEpoch": "e", "snapshotVersion": 3, "tabs": [],
+                "tabGroups": [
+                    {"id": "g1", "activeTabId": "tab-own", "tabOrder": ["tab-own", "tab-base"]},
+                    {"id": "g2", "activeTabId": "tab-top", "tabOrder": ["tab-top"]},
+                ],
+            }),
+            _ => serde_json::json!({"moved": true}),
+        }
+    }
+
+    /// Joins `feat-top` (in `term_top`) onto `feat-base` (in `term_base`), after a first look
+    /// that only records.
+    fn restack_top_onto_base(orca: &mut Splitter) -> Result<()> {
+        orca.adopt("feat-top", "term_top");
+        orca.adopt("feat-base", "term_base");
+        orca.restack_moved_branches(&crate::splitter::status_with_stacks(&[&["feat-base"], &["feat-top"]])).unwrap();
+        orca.restack_moved_branches(&crate::splitter::status_with_stacks(&[&["feat-top", "feat-base"]]))
+    }
+
+    /// `tabbed` (the default): `feat-top`'s tab moves into the group holding `feat-base`'s,
+    /// right after it — the drop a person dragging the tab there would make — over the
+    /// runtime socket, with the auth token, naming the worktree by id.
     #[test]
-    fn a_regroup_is_a_documented_no_op_that_never_calls_orca() {
-        with_fake_orca("regroup", SPLITS_AND_ACKS, |mut orca, log| {
-            orca.adopt("feat-top", "term_top");
+    fn a_regroup_moves_the_terminals_tab_into_the_anchors_group_right_after_it() {
+        let runtime = FakeRuntime::start("tab", tab_groups);
+        let vars = [("ORCA_USER_DATA_PATH", Some(runtime.user_data())), ("KANSTACK_STACK_PANES", None)];
+        with_fake_orca_and("regroup-tab", TABS_LISTING, &vars, |mut orca, log| {
+            restack_top_onto_base(&mut orca).unwrap();
+            assert_eq!(log_lines(log), ["terminal list --json"]);
+            let requests = runtime.requests();
+            assert_eq!(requests.len(), 2, "{requests:#?}");
+            assert_eq!(requests[0]["method"], "session.tabs.list");
+            assert_eq!(requests[0]["authToken"], "tok");
+            assert_eq!(requests[0]["params"], serde_json::json!({"worktree": "id:W::/repo"}));
+            assert_eq!(requests[1]["method"], "session.tabs.move");
+            assert_eq!(
+                requests[1]["params"],
+                serde_json::json!({"worktree": "id:W::/repo", "tabId": "tab-top", "targetGroupId": "g1", "kind": "move-to-group", "index": 2})
+            );
+            assert_eq!(orca.pane_id("feat-top").as_deref(), Some("term_top"), "a moved terminal keeps its handle");
+        });
+    }
+
+    /// `split`: a new group split off the anchor's, in the orthogonal direction (`down`, off
+    /// Orca's default `right` chain).
+    #[test]
+    fn a_split_regroup_splits_the_terminals_tab_off_the_anchors_group() {
+        let runtime = FakeRuntime::start("split", tab_groups);
+        let vars = [("ORCA_USER_DATA_PATH", Some(runtime.user_data())), ("KANSTACK_STACK_PANES", Some("split"))];
+        with_fake_orca_and("regroup-split", TABS_LISTING, &vars, |mut orca, _| {
+            restack_top_onto_base(&mut orca).unwrap();
+            assert_eq!(
+                runtime.requests()[1]["params"],
+                serde_json::json!({"worktree": "id:W::/repo", "tabId": "tab-top", "targetGroupId": "g1", "kind": "split", "splitDirection": "down"})
+            );
+        });
+    }
+
+    /// Kanstack's own lanes split its terminal, so they share its tab: already as close to a
+    /// sibling as Orca can put them, and nothing is asked of the runtime.
+    #[test]
+    fn a_terminal_already_in_the_anchors_tab_is_left_where_it_is() {
+        let runtime = FakeRuntime::start("same", tab_groups);
+        let vars = [("ORCA_USER_DATA_PATH", Some(runtime.user_data())), ("KANSTACK_STACK_PANES", None)];
+        with_fake_orca_and("regroup-same", TABS_LISTING, &vars, |mut orca, _| {
+            orca.adopt("feat-top", "term_lane");
+            orca.adopt("feat-base", "term_own");
+            orca.restack_moved_branches(&crate::splitter::status_with_stacks(&[&["feat-base"], &["feat-top"]])).unwrap();
+            orca.restack_moved_branches(&crate::splitter::status_with_stacks(&[&["feat-top", "feat-base"]])).unwrap();
+            assert!(runtime.requests().is_empty(), "{:#?}", runtime.requests());
+        });
+    }
+
+    /// Moving a tab moves every terminal in it, so one that shares its tab — here with
+    /// kanstack's own terminal — is never moved, rather than dragging kanstack along.
+    #[test]
+    fn a_terminal_sharing_its_tab_with_another_is_never_moved() {
+        let runtime = FakeRuntime::start("shared", tab_groups);
+        let vars = [("ORCA_USER_DATA_PATH", Some(runtime.user_data())), ("KANSTACK_STACK_PANES", None)];
+        with_fake_orca_and("regroup-shared", TABS_LISTING, &vars, |mut orca, _| {
+            orca.adopt("feat-top", "term_lane");
             orca.adopt("feat-base", "term_base");
             orca.restack_moved_branches(&crate::splitter::status_with_stacks(&[&["feat-base"], &["feat-top"]])).unwrap();
             orca.restack_moved_branches(&crate::splitter::status_with_stacks(&[&["feat-top", "feat-base"]])).unwrap();
-            assert!(log_lines(log).is_empty(), "{:#?}", log_lines(log));
-            assert_eq!(orca.pane_id("feat-top").as_deref(), Some("term_top"));
+            assert!(runtime.requests().is_empty(), "{:#?}", runtime.requests());
+        });
+    }
+
+    /// No runtime metadata where Orca keeps it: the move fails with where it looked, rather
+    /// than silently doing nothing.
+    #[test]
+    fn a_regroup_with_no_runtime_to_talk_to_says_where_it_looked() {
+        let missing = std::env::temp_dir().join(format!("ks-orca-none-{}", std::process::id()));
+        let vars = [("ORCA_USER_DATA_PATH", Some(missing.to_str().unwrap())), ("KANSTACK_STACK_PANES", None)];
+        with_fake_orca_and("regroup-none", TABS_LISTING, &vars, |mut orca, _| {
+            let err = restack_top_onto_base(&mut orca).unwrap_err().to_string();
+            assert!(err.contains("feat-top") && err.contains("orca-runtime.json") && err.contains("is Orca running"), "{err}");
         });
     }
 }

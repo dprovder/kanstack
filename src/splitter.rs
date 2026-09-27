@@ -386,7 +386,8 @@ impl Splitter {
     /// the previous call saw, and asks the multiplexer to move the pane
     /// ([`Multiplexer::regroup`]) — as a tab or a split, per the same `KANSTACK_STACK_PANES`
     /// ([`StackPlacement::from_env`]) and in the same orthogonal direction the stacked spawn
-    /// uses. Orca and Ghostty can't move a live pane, so there it changes nothing.
+    /// uses. Orca can only move a pane that is alone in its tab, and Ghostty can't move one at
+    /// all, so there it often or always changes nothing — see each backend's `regroup`.
     ///
     /// **Meant to be called once per board refresh**, with the `WorkspaceStatus` the board was
     /// just rebuilt from, alongside `sync_pane_statuses` in `crate::app` (which `clamp` runs
