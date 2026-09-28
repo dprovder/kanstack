@@ -1,0 +1,22 @@
+[package]
+name = "kanstack-recipe-runner"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Reference orchestrator that drives kanstack's CLI/JSON contract to run a small Markdown+YAML recipe DAG. Disposable example, not part of kanstack itself."
+
+[lib]
+name = "kanstack_recipe_runner"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kanstack-recipe"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+
+[dev-dependencies]
+tempfile = "3"

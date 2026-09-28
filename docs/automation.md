@@ -18,6 +18,11 @@ This is deliberate, not an oversight — kanstack stays a thin, inspectable laye
 a multiplexer. An orchestrator that wants scheduling, retries, or a dependency graph builds
 that itself, on top of the primitives below.
 
+Kanstack intentionally does not contain a workflow engine. The repository includes a small
+reference recipe runner (`examples/recipe-runner/`) demonstrating how an external orchestrator
+can build a dependency graph over the public CLI. It is an example consumer of kanstack's
+automation contract, not part of kanstack's workstream semantics.
+
 ## The primitives
 
 Everything an orchestrator needs is a subcommand, each documented in the README:
