@@ -95,9 +95,9 @@ pub trait Multiplexer: Send + Sync {
     /// The default falls back to [`Self::open_pane`]'s ordinary split, using whatever
     /// direction the caller already put in `req.chain_direction` — which is exactly what
     /// `KANSTACK_STACK_PANES=split` asks for anyway, so a backend with no real tab concept
-    /// (Orca, Ghostty, today) degrades to that split instead of erroring or silently doing
-    /// nothing. Not an oversight: only tmux and cmux override this so far, because only
-    /// those two could be verified live against the real thing before shipping.
+    /// (Ghostty, today) degrades to that split instead of erroring or silently doing nothing.
+    /// tmux and cmux override this, verified live; Orca does too, from its source only, and
+    /// falls back to this split when its runtime can't be reached.
     fn open_tab(&self, req: &OpenRequest<'_>) -> Result<String> {
         self.open_pane(req)
     }

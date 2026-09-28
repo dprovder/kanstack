@@ -196,25 +196,31 @@ Orca marks with `ORCA_TERMINAL_HANDLE`) and isn't in a cmux or tmux pane, or wit
 
 Orca's own model is one git worktree per agent, but every kanstack lane shares GitButler's
 single workspace checkout. So kanstack **never runs `orca worktree create`**: a lane's
-terminal is split off kanstack's own, and lives in whichever Orca worktree kanstack is in.
-If that split isn't possible (a stale terminal handle, say) the lane opens as a new tab in
-the repository's existing worktree instead, which needs the repository to have been added to
-Orca.
+terminal lives in whichever Orca worktree kanstack is in.
+
+Each lane opens as an Orca **tab of its own**, in a new tab group split off the previous
+lane's (kanstack's own, for the first), so lanes sit side by side as columns. Being alone in
+its tab is what lets kanstack move a lane later: Orca only lets an outside program move whole
+tabs, not the splits inside one. When kanstack can't reach Orca's runtime, it falls back to
+splitting the previous lane's terminal, as it did before. If that isn't possible either (a
+stale terminal handle, say), the lane opens as a new tab in the repository's existing
+worktree, which needs the repository to have been added to Orca.
 
 A few things differ from the other two:
 
-- **Direction.** Orca can only place a new pane to the right of, or below, the one it splits.
-  `KANSTACK_ORCA_DIRECTION` and `KANSTACK_ORCA_CHAIN_DIRECTION` default to `below` and
-  `right`; `left` and `above` are accepted but behave as `right` and `below`, and so does
-  `KANSTACK_SPAWN_DIRECTION`.
+- **Direction.** `KANSTACK_ORCA_DIRECTION` and `KANSTACK_ORCA_CHAIN_DIRECTION` default to
+  `below` and `right`. Tab groups honor all four directions. The split fallback can only
+  place a pane to the right of or below the one it splits, so there `left` and `above` behave
+  as `right` and `below`, and so does `KANSTACK_SPAWN_DIRECTION`.
 - **Busy and idle** come from Orca's own agent detection rather than from CPU usage. A
   harness Orca doesn't recognize will read as busy, and so will one waiting on an approval
   prompt.
 - **`t` doesn't wait for the harness.** In testing, Orca accepted a message sent to a
   terminal with no agent running, so pressing `t` before the harness has finished starting
   can type the task into whatever is there — wait for it to be ready, as with the others.
-- **No real tab support yet for a stacked branch's pane.** `KANSTACK_STACK_PANES=tabbed`
-  (the default) falls back to the orthogonal split below, the same as `=split` — see
+- **Stacked branches.** `KANSTACK_STACK_PANES=tabbed` (the default) opens a real tab right
+  after the sibling's, in the sibling's tab group; `=split` opens a new tab group split off
+  the sibling's. Without Orca's runtime, both fall back to the orthogonal split — see
   "Driving panes from a script or an agent" above.
 
 Orca support was written against Orca's CLI reference and source, and exercised against
@@ -304,7 +310,7 @@ another, and when that other branch already has a pane open — an agent finishi
 turn and spawning a successor on the branch stacked above it, say — the new pane is grouped
 with the sibling's instead of chaining off wherever the last spawn happened to land, so a
 stack's agents stay visually together. By default that's a real tab alongside the sibling
-(tmux and cmux both have one; Orca and Ghostty don't yet, and fall back to the split below).
+(tmux, cmux and Orca all have one; Ghostty doesn't yet, and falls back to the split below).
 `KANSTACK_STACK_PANES=split` places it as a split instead, off the sibling, in the direction
 orthogonal to the ordinary chain direction — so a horizontal lane chain gets a vertical stack
 split and vice versa — which still reads as its own cluster rather than continuing the chain.
@@ -312,7 +318,7 @@ Saveable in the config file, same as the other standing preferences above.
 
 The board's own `b`/`shift-tab` groups the same way when you stack a branch with the split
 checkbox checked and its base already has a pane open — same `KANSTACK_STACK_PANES` choice,
-same fallback for Orca and Ghostty. Unlike a parallel lane, the checkbox defaults off for a
+same fallback for Ghostty. Unlike a parallel lane, the checkbox defaults off for a
 stacked branch, so `b` keeps its long-standing "stacking shares the base's pane" behavior
 unless you opt in.
 
