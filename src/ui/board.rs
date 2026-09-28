@@ -20,6 +20,23 @@ pub(super) fn pane_status_tone(status: PaneStatus) -> Tone {
     }
 }
 
+/// The one glyph a lane (or stacked branch) header carries for what its orchestrator has
+/// said about it, appended right where its pane status renders (`● busy ⚠`). A pending ask
+/// wins: it wants a human, so it gets `Tone::Warn` — the same hue as the pane's own
+/// `◆ needs you` — while an intent is only ever informational and gets a quieter `»` in the
+/// faint neutral tone. Neither prints the text itself: that lives in the ask inbox (`i`) or,
+/// for an intent, an advisory lane's body and `kanstack status` — a header is one line, and a
+/// question squeezed into what's left of it would read as neither.
+pub(super) fn orchestration_glyph(pending_ask: bool, intent: bool) -> Option<(&'static str, Tone)> {
+    if pending_ask {
+        Some(("⚠", Tone::Warn))
+    } else if intent {
+        Some(("»", Tone::Neutral))
+    } else {
+        None
+    }
+}
+
 /// Chooses a column width and the first visible position (an index into `indices`, not into
 /// `app.board.columns` itself) so the current column stays on screen.
 pub(super) fn visible_columns(app: &App, indices: &[usize], area: Rect) -> (u16, usize, usize) {
@@ -170,6 +187,12 @@ pub(super) fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect, hits
         header.push_span(Span::styled("  ", theme::faint()));
         header.push_span(Span::styled(pane_status_label(status), theme::tone(pane_status_tone(status))));
     }
+    if let Some((glyph, tone)) = orchestration_glyph(col.pending_ask.is_some(), col.intent.is_some()) {
+        // One space when it follows a pane status, so the two read as one phrase
+        // (`● busy ⚠`); the usual two-space gap when there's no pane to attach to.
+        header.push_span(Span::raw(if col.pane_status.is_some() { " " } else { "  " }));
+        header.push_span(Span::styled(glyph, theme::tone(tone)));
+    }
     if header_is_target || is_current {
         header = header.style(theme::selected_bg());
     }
@@ -295,10 +318,17 @@ pub(super) fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect, hits
         lines.extend(card_lines);
     }
 
-    // A branch lane already carries an "empty" status badge, so a placeholder underneath
-    // it just says the same thing twice. Only the backlog lane, which has no badges of its
-    // own, needs one.
-    if col.cards.is_empty() && col.badges.is_empty() {
+    // An advisory lane isn't expected to have cards at all, so an empty one isn't "empty"
+    // in the sense the badge means — its body shows what its orchestrator has been saying
+    // instead. Only when it truly has no cards: one that commits after all shows those
+    // cards like any other lane, never hidden behind this.
+    //
+    // Otherwise: a branch lane already carries an "empty" status badge, so a placeholder
+    // underneath it just says the same thing twice. Only the backlog lane, which has no
+    // badges of its own, needs one.
+    if col.cards.is_empty() && col.advisory {
+        lines.extend(advisory_body(col, inner_w));
+    } else if col.cards.is_empty() && col.badges.is_empty() {
         lines.push(Line::styled("  empty", theme::faint()));
     }
 
@@ -339,6 +369,38 @@ pub(super) fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect, hits
             HitTarget::Card(idx, ci),
         );
     }
+}
+
+/// An advisory lane's body in place of the cards it isn't expected to have (see
+/// `draw_column`): a faint label saying why there are none, its intent if one is set, then
+/// its most recent notes, newest first — just text lines in the same scrolling area cards
+/// would use, not a new card type. The intent keeps its `»` (the same glyph its header
+/// carries) and the full text, wrapped, since this is the one place on the board that has
+/// room for it; notes get a faint `·` each. What any of it says is the orchestrator's
+/// business — rendered verbatim, never interpreted.
+pub(super) fn advisory_body(col: &crate::board::Column, width: usize) -> Vec<Line<'static>> {
+    let mut out = vec![Line::styled("  advisory — not expected to commit", theme::faint())];
+    let text_width = width.saturating_sub(4).max(1);
+    let item = |bullet: &'static str, text: &str, style: Style, out: &mut Vec<Line<'static>>| {
+        for (i, l) in wrap(text, text_width).into_iter().enumerate() {
+            let lead = if i == 0 { bullet } else { "    " };
+            out.push(Line::from(vec![Span::styled(lead, theme::faint()), Span::styled(l, style)]));
+        }
+    };
+    if let Some(intent) = &col.intent {
+        out.push(Line::raw(""));
+        item("  » ", intent, theme::muted(), &mut out);
+    }
+    if !col.notes.is_empty() {
+        out.push(Line::raw(""));
+        for note in &col.notes {
+            item("  · ", note, theme::faint(), &mut out);
+        }
+    }
+    if col.intent.is_none() && col.notes.is_empty() {
+        out.push(Line::styled("  no intent or notes yet", theme::faint()));
+    }
+    out
 }
 
 /// The count shown next to a lane's name.
@@ -422,6 +484,10 @@ pub(super) fn section_header(section: &crate::board::Section, width: usize) -> V
     if let Some(status) = section.pane_status {
         out[0].push_span(Span::styled("  ", theme::faint()));
         out[0].push_span(Span::styled(pane_status_label(status), theme::tone(pane_status_tone(status))));
+    }
+    if let Some((glyph, tone)) = orchestration_glyph(section.pending_ask.is_some(), section.intent.is_some()) {
+        out[0].push_span(Span::raw(if section.pane_status.is_some() { " " } else { "  " }));
+        out[0].push_span(Span::styled(glyph, theme::tone(tone)));
     }
     if !section.badges.is_empty() {
         out.push(Line::from(

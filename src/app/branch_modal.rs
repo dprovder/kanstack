@@ -17,9 +17,13 @@ pub(super) struct PendingBranch {
 
 /// Which row of the branch-creation modal `Left`/`Right`/`Up`/`Down` currently act on —
 /// see `App::branch_modal_row_down`/`_up`. Top-to-bottom order matches the modal's own
-/// layout, `Split`/`Model`/`Effort` included only when `App::branch_modal_split_row_visible`
-/// says they're shown — all three are meaningless without a split backend to hand a model or
-/// an effort hint to in the first place, the same reasoning `Split` already followed alone.
+/// layout, `Split`/`Harness`/`Model`/`Effort` included only when
+/// `App::branch_modal_split_row_visible` says they're shown — all of them are meaningless
+/// without a split backend to hand a model or an effort hint to in the first place, the same
+/// reasoning `Split` already followed alone. There is deliberately no `Advisory` row here:
+/// creating a branch is, by default, for making real changes, and `kanstack spawn --advisory`
+/// stays a CLI-only opt-in for the rarer case (a review/research agent) rather than a choice
+/// this everyday flow should be offering up front.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BranchModalRow {
     Name,
@@ -151,10 +155,10 @@ impl App {
     }
 
     /// `Down` in the name step: moves the row cursor along Name → Action → Split → Harness →
-    /// Model → Effort (skipping Split/Harness/Model/Effort together when
+    /// Model → Effort (skipping everything after Action together when
     /// `branch_modal_split_row_visible` says they aren't shown — there's no split backend to
-    /// hand any of the four to) → on to the optional message step, the same top-to-bottom
-    /// order the modal itself renders in.
+    /// hand any of them to) → on to the optional message step, the same top-to-bottom order
+    /// the modal itself renders in.
     pub(super) fn branch_modal_row_down(&mut self) {
         self.branch_modal_row = match self.branch_modal_row {
             BranchModalRow::Name => BranchModalRow::Action,
@@ -186,9 +190,9 @@ impl App {
     }
 
     /// `Left`/`Right` on whichever row is focused: moves the name/model field's text cursor,
-    /// toggles the action/split/advisory row exactly as `Tab`/`Shift-Tab`/`space` already do
-    /// (direction doesn't matter for a two-state toggle, so both keys reach the same
-    /// handler), or steps the harness/effort picker one way or the other (see
+    /// toggles the action/split row exactly as `Tab`/`Shift-Tab` already do (direction
+    /// doesn't matter for a two-state toggle, so both keys reach the same handler), or steps
+    /// the harness/effort picker one way or the other (see
     /// `cycle_harness_choice`/`cycle_effort`, where direction does matter). `Harness` never
     /// moves a text cursor on `Left`/`Right` — same as `crate::setup`'s own harness field,
     /// those two keys are reserved for cycling there, and typing still edits the field by
@@ -380,7 +384,15 @@ impl App {
         self.harness_input.clear();
         self.model_input.clear();
         self.mode = Mode::Normal;
-        self.create_branch(&name, anchor.as_deref(), message.as_deref(), open_harness, harness.as_deref(), model.as_deref(), effort);
+        self.create_branch(
+            &name,
+            anchor.as_deref(),
+            message.as_deref(),
+            open_harness,
+            harness.as_deref(),
+            model.as_deref(),
+            effort,
+        );
     }
 
     /// The last step of `branch_modal_row_down`'s descent through the name step's rows:

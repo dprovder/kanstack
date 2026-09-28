@@ -20,6 +20,7 @@ use crate::hit::{HitMap, HitTarget};
 use crate::mux::pane_status::PaneStatus;
 use crate::theme;
 
+mod asks;
 mod board;
 mod branch_modal;
 mod confirms;
@@ -31,6 +32,7 @@ mod help;
 mod pr;
 mod resolve;
 
+use asks::draw_asks;
 use board::draw_board;
 use branch_modal::draw_branch_modal;
 use confirms::{
@@ -127,6 +129,7 @@ pub fn draw(f: &mut Frame, app: &App) -> HitMap {
 
     match app.mode {
         Mode::Help => draw_help(f, f.area(), &mut hits),
+        Mode::Asks => draw_asks(f, app, f.area()),
         Mode::PushConfirm => draw_push_confirm(f, app, f.area(), &mut hits),
         Mode::LandConfirm => draw_land_confirm(f, app, f.area(), &mut hits),
         Mode::Landing => draw_landing(f, app, f.area()),

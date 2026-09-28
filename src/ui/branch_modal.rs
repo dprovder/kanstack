@@ -116,7 +116,7 @@ pub(super) fn draw_branch_modal(f: &mut Frame, app: &App, area: Rect, hits: &mut
         None
     };
 
-    // Harness/model/effort ride along with the split row's own visibility — all three are
+    // Harness/model/effort ride along with the split row's own visibility — all of them are
     // meaningless without a split backend to hand a harness pane's launch line to in the
     // first place.
     if app.branch_modal_split_row_visible() {
@@ -149,6 +149,10 @@ pub(super) fn draw_branch_modal(f: &mut Frame, app: &App, area: Rect, hits: &mut
             ));
         }
 
+        // Codex's own locally cached model list, when the picked harness has one — turns the
+        // model row's `Left`/`Right` from cursor movement into cycling, same as `Harness`,
+        // and its hint reflects whichever mode is actually live right now.
+        let model_choices = app.model_choices();
         let model_prefix = format!("{}model    ", row_marker(BranchModalRow::Model));
         if app.branch_modal_row == BranchModalRow::Model {
             let (before, after) = app.model_input.split_at_cursor();
@@ -161,16 +165,23 @@ pub(super) fn draw_branch_modal(f: &mut Frame, app: &App, area: Rect, hits: &mut
                 Span::styled(after, theme::title(true)),
             ]));
         } else if app.model_input.is_empty() {
-            body.push(Line::from(vec![
-                Span::styled(model_prefix, theme::faint()),
-                Span::styled("optional — $KANSTACK_HARNESS's own default", theme::faint()),
-            ]));
+            let hint = if model_choices.is_empty() { "" } else { "←/→ cycle" };
+            body.push(hint_row(
+                &model_prefix,
+                "optional — $KANSTACK_HARNESS's own default",
+                theme::faint(),
+                hint,
+                content_width,
+            ));
         } else {
-            let value = truncate(app.model_input.as_str(), content_width.saturating_sub(model_prefix.chars().count()));
-            body.push(Line::from(vec![
-                Span::styled(model_prefix, theme::faint()),
-                Span::styled(value, theme::title(true)),
-            ]));
+            let hint = if model_choices.is_empty() { "" } else { "←/→ cycle" };
+            body.push(hint_row(
+                &model_prefix,
+                app.model_input.as_str(),
+                theme::title(true),
+                hint,
+                content_width,
+            ));
         }
 
         let effort_label = match app.effort {
@@ -179,13 +190,25 @@ pub(super) fn draw_branch_modal(f: &mut Frame, app: &App, area: Rect, hits: &mut
             Some(Effort::Medium) => "medium",
             Some(Effort::High) => "high",
         };
-        body.push(hint_row(
-            &format!("{}effort   ", row_marker(BranchModalRow::Effort)),
-            effort_label,
-            theme::tone(crate::board::Tone::Accent),
-            "←/→",
-            content_width,
-        ));
+        // Flagged only when Codex's own cache positively says the typed model doesn't
+        // support this effort — never a block, just a heads-up before the pane opens.
+        if app.effort_unsupported_by_typed_model() {
+            body.push(hint_row(
+                &format!("{}effort   ", row_marker(BranchModalRow::Effort)),
+                effort_label,
+                theme::tone(crate::board::Tone::Bad),
+                "not supported by this model ←/→",
+                content_width,
+            ));
+        } else {
+            body.push(hint_row(
+                &format!("{}effort   ", row_marker(BranchModalRow::Effort)),
+                effort_label,
+                theme::tone(crate::board::Tone::Accent),
+                "←/→",
+                content_width,
+            ));
+        }
     }
 
     if will_prompt {

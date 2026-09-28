@@ -29,6 +29,7 @@ use crate::splitter::Splitter;
 use crate::text_input::TextInput;
 use crate::tutorial::Tutorial;
 
+mod asks;
 mod blocked;
 mod branch_modal;
 mod commit;
@@ -130,6 +131,11 @@ pub enum Mode {
     /// Reading a diff, hunk by hunk.
     Diff,
     Help,
+    /// The ask inbox (`i`): every lane whose orchestrator is waiting on a human
+    /// (`kanstack ask`), in one list reachable from anywhere on the board — see
+    /// `app::asks`. Jumping to a lane or answering its ask inline both happen from here;
+    /// nothing on the board is interpreted or acted on beyond that one `answer`.
+    Asks,
     /// The workspace is broken in the one way that stops `but` answering anything at all
     /// (see [`crate::but::is_workspace_block`]). Every key is swallowed except the two
     /// recoveries and quit — the board behind this is a snapshot of a repository that has
@@ -154,6 +160,14 @@ pub struct App {
     but: Option<Arc<But>>,
     /// `None` when no harness-split backend is usable — see [`crate::splitter::Splitter::discover`].
     splitter: Option<Splitter>,
+    /// The repository kanstack's own per-repo state is keyed by — the workstream registry,
+    /// intents, pending asks and the events log (see `crate::workstream::state_path` and its
+    /// siblings) — which is `but`'s working directory, the same path every `kanstack`
+    /// subcommand run from here would use. `None` in snapshot mode, which then shows no
+    /// orchestration state at all rather than some other repository's. A plain path rather
+    /// than a `Registry`/`Orchestration` handle on purpose: `sync_orchestration` reloads
+    /// from it every time, so nothing here can go stale across a refresh.
+    repo: Option<std::path::PathBuf>,
     pub board: Board,
     pub col: usize,
     pub card: usize,
@@ -259,6 +273,16 @@ pub struct App {
     pub resolve_view: Option<ResolveView>,
     /// The diff being read, valid while `mode == Diff`.
     pub diff: Option<DiffView>,
+    /// Cursor within the ask inbox, an index into `pending_asks()`, valid while
+    /// `mode == Asks`.
+    pub ask_sel: usize,
+    /// The branch whose ask is being answered inline, while `mode == Asks` — `None` while
+    /// just browsing the list. Resolved once in `begin_answer` rather than re-derived from
+    /// `ask_sel` on submit, the same reasoning as `task_target`: the list is rebuilt from
+    /// the board, which can reshuffle while the answer is being typed.
+    pub ask_answering: Option<String>,
+    /// The answer being typed, valid while `ask_answering` is `Some`.
+    pub ask_answer_input: TextInput,
     /// Whether the diff takes the whole width. Split by default so the board stays
     /// visible — reading a diff should not cost you your place on the board.
     pub diff_full: bool,
@@ -345,6 +369,11 @@ pub struct App {
     /// own to key off.
     last_card_click: Option<((usize, usize), std::time::Instant)>,
 }
+
+/// How many of an advisory lane's most recent notes its body shows — see
+/// `App::sync_orchestration`. Enough to see what it's been up to lately; the full history is
+/// `kanstack events`' job, not a lane body's.
+const ADVISORY_NOTES: usize = 5;
 
 /// How close together two clicks on the same card have to land to count as opening its
 /// diff (like a keyboard `Enter`) rather than two unrelated selects.
@@ -444,9 +473,11 @@ impl App {
                 Notice::Info,
             ));
         }
+        let repo = Some(but.cwd().to_path_buf());
         Ok(App {
             but: Some(Arc::new(but)),
             splitter,
+            repo,
             board,
             col: 0,
             card: 0,
@@ -488,6 +519,9 @@ impl App {
             pull_preview: None,
             resolve_view: None,
             diff: None,
+            ask_sel: 0,
+            ask_answering: None,
+            ask_answer_input: TextInput::default(),
             diff_full: false,
             move_source: None,
             commit_stats,
@@ -520,6 +554,7 @@ impl App {
         App {
             but: None,
             splitter: None,
+            repo: None,
             board,
             col: 0,
             card: 0,
@@ -555,6 +590,9 @@ impl App {
             pull_preview: None,
             resolve_view: None,
             diff: None,
+            ask_sel: 0,
+            ask_answering: None,
+            ask_answer_input: TextInput::default(),
             diff_full: false,
             move_source: None,
             commit_stats: HashMap::new(),
@@ -626,6 +664,7 @@ impl App {
         let n = self.cards_in_current_column();
         self.card = if n == 0 { 0 } else { self.card.min(n - 1) };
         self.sync_pane_statuses();
+        self.sync_orchestration();
     }
 
     /// Copies each tracked split pane's last known status onto the matching
@@ -640,6 +679,60 @@ impl App {
                 section.pane_status = splitter.pane_status(&section.name);
             }
             col.pane_status = col.sections.first().and_then(|s| s.pane_status);
+        }
+    }
+
+    /// Copies what kanstack's own per-repo state says about each branch onto the matching
+    /// column/section — its workstream's `advisory` flag (the registry), its `intent` and
+    /// `pending_ask` (`crate::orchestration`), and, for an advisory lane only, its most recent
+    /// notes (the events log) — so `Board::build` never needs to know any of it exists. The
+    /// exact same shape as `sync_pane_statuses`, and called right beside it: from `clamp`
+    /// after every board rebuild, and after a background split poll resolves (`poll_split`),
+    /// which is what lets an ask raised from another terminal reach the header within a
+    /// poll interval even while nothing on the board itself changes. `begin_asks` calls it
+    /// once more, so the inbox never opens on a list older than the keypress.
+    ///
+    /// Loaded fresh each call — a registry, a couple of tiny files per branch, and the
+    /// events log only for advisory lanes — the same reads every `kanstack` subcommand
+    /// already makes on each invocation. Every failure reads as "nothing to show", never as
+    /// an error: an unreadable registry is no advisory lanes, a missing intent is none. This
+    /// only ever renders what an orchestrator chose to say; the board never interprets,
+    /// schedules or validates any of it, so there's nothing a bad file could make it do.
+    fn sync_orchestration(&mut self) {
+        let Some(repo) = &self.repo else { return };
+        let registry = crate::workstream::Registry::load(repo).unwrap_or_default();
+        let orchestration = crate::orchestration::Orchestration::for_repo(repo);
+        let events = crate::events::EventLog::for_repo(repo);
+        for col in &mut self.board.columns {
+            for section in &mut col.sections {
+                section.advisory = registry.get(&section.name).is_some_and(|w| w.advisory);
+                section.intent = orchestration.intent(&section.name);
+                section.pending_ask = orchestration.pending_ask(&section.name);
+            }
+            let tip = col.sections.first();
+            col.advisory = tip.is_some_and(|s| s.advisory);
+            col.intent = tip.and_then(|s| s.intent.clone());
+            col.pending_ask = tip.and_then(|s| s.pending_ask.clone());
+            col.notes = match &col.branch_name {
+                Some(branch) if col.advisory => {
+                    events.recent_notes(branch, ADVISORY_NOTES).into_iter().map(|(_, text)| text).collect()
+                }
+                _ => Vec::new(),
+            };
+        }
+    }
+
+    /// Moves a branch's pane to sit with its new stack siblings when `but status` says it
+    /// just joined one — see `Splitter::restack_moved_branches`. Called from `refresh` and
+    /// `refresh_quietly`, the two places a fresh `WorkspaceStatus` reflects the world having
+    /// actually changed (not `toggle_unassigned_grouping`, which re-fetches status only to
+    /// rebuild the board under an unrelated display preference — moving someone's pane as a
+    /// side effect of that would be a surprise, not a service). Best-effort: a multiplexer
+    /// that can't be reached or refuses the move is no worse than today's behavior, so this
+    /// never turns into a notice or blocks the refresh it rides along with.
+    fn restack_moved_branches(&mut self, status: &WorkspaceStatus) {
+        if let Some(splitter) = &mut self.splitter {
+            let _ = splitter.restack_moved_branches(status);
         }
     }
 
@@ -698,6 +791,7 @@ impl App {
         match but.status() {
             Ok(s) => {
                 self.board = Self::board_from(but, &mut self.commit_stats, &s);
+                self.restack_moved_branches(&s);
                 self.clamp();
             }
             Err(e) => self.note_refresh_failure(e),
@@ -758,6 +852,7 @@ impl App {
         match but.status() {
             Ok(s) => {
                 self.board = Self::board_from(but, &mut self.commit_stats, &s);
+                self.restack_moved_branches(&s);
                 self.clamp();
             }
             Err(e) => self.note_refresh_failure(e),
@@ -934,6 +1029,7 @@ impl App {
                     splitter.apply_statuses(statuses);
                 }
                 self.sync_pane_statuses();
+                self.sync_orchestration();
             }
             // Transient — a hiccup every few seconds shouldn't spam the footer the way a
             // user-triggered action's failure should.
@@ -1089,6 +1185,7 @@ impl App {
             }
             Mode::Branch if self.branch_modal_row == BranchModalRow::Model => self.model_input.paste(text, false),
             Mode::Branch if self.branch_modal_row == BranchModalRow::Harness => self.harness_input.paste(text, false),
+            Mode::Asks if self.ask_answering.is_some() => self.ask_answer_input.paste(text, false),
             Mode::PrModal => match self.pr_modal_row {
                 PrModalRow::Title => self.pr_title_input.paste(text, false),
                 PrModalRow::Message => self.pr_message_input.paste(text, true),
@@ -1262,6 +1359,7 @@ impl App {
             Mode::DeleteConfirm => return self.handle_key_delete_confirm(key),
             Mode::UnapplyConfirm => return self.handle_key_unapply_confirm(key),
             Mode::Branches => return self.handle_key_branches(key),
+            Mode::Asks => return self.handle_key_asks(key),
             // Help swallows everything except the keys that dismiss it. Small enough (and
             // general enough — it isn't really "a feature") to leave right here rather
             // than in a file of its own.
@@ -1383,6 +1481,7 @@ impl App {
             K::Char('U') if self.mode == Mode::Normal => self.begin_unapply(),
             K::Char('r') if self.mode == Mode::Normal => self.begin_rebase(),
             K::Char('f') if self.mode == Mode::Normal => self.begin_resolve(),
+            K::Char('i') if self.mode == Mode::Normal => self.begin_asks(),
             K::Tab if self.mode == Mode::Normal => self.toggle_unassigned_grouping(),
             K::Enter if self.mode == Mode::Normal => self.open_diff(),
             K::Enter if self.mode == Mode::Restacking => self.confirm_restack(),
@@ -2175,7 +2274,7 @@ mod tests {
         assert_eq!(app.mode, Mode::HarnessMessage, "past Effort, Down reaches the message step");
     }
 
-    /// `Up` from the message step lands back on `Effort` (not `Split`, now that
+    /// `Up` from the message step lands back on `Effort` (the last row, now that
     /// Harness/Model/Effort sit between Split and the message step), and restores the
     /// harness/model/effort that were typed/picked before `Down` moved on — same "moving
     /// between fields must not throw anything away" guarantee `branch_input`/`stack_onto`
@@ -3098,4 +3197,220 @@ mod tests {
 
         assert_eq!(app.mode, Mode::Diff, "a click well away from the back control must not close it");
     }
+
+    use ratatui::crossterm::event::KeyCode as K;
+
+    /// Points `KANSTACK_STATE_PATH` at a fresh scratch directory for the duration of `f`, so
+    /// the registry, intents, asks and events log a test writes for `repo` are its own —
+    /// under `SPLIT_BACKEND_ENV_LOCK`, since every test touching that variable, in any file,
+    /// shares the one process environment. Same shape as `crate::workstream`'s own tests.
+    fn with_state_dir<T>(tag: &str, f: impl FnOnce(&std::path::Path) -> T) -> T {
+        let _guard = crate::SPLIT_BACKEND_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("kanstack-app-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("KANSTACK_STATE_PATH", &dir);
+        let out = f(std::path::Path::new("/repo/app-orchestration"));
+        std::env::remove_var("KANSTACK_STATE_PATH");
+        let _ = std::fs::remove_dir_all(&dir);
+        out
+    }
+
+    fn register(repo: &std::path::Path, branch: &str, advisory: bool) {
+        use crate::workstream::{BranchId, PaneId, Registry, Workstream};
+        let mut registry = Registry::load(repo).unwrap();
+        registry.upsert(Workstream {
+            branch_id: BranchId(branch.into()),
+            pane_id: Some(PaneId(format!("%{branch}"))),
+            agent: None,
+            item: None,
+            advisory,
+        });
+        registry.save().unwrap();
+    }
+
+    fn at(secs: u64) -> std::time::SystemTime {
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)
+    }
+
+    /// A board rebuild (`clamp`) picks up the registry's `advisory`, the orchestration
+    /// store's intent and pending ask, and — for an advisory lane only — its recent notes,
+    /// on the tip and on a branch stacked below it alike, exactly as `sync_pane_statuses`
+    /// does for pane status. The lane-level fields mirror the tip, never a lower branch.
+    #[test]
+    fn a_board_rebuild_fills_in_advisory_intent_pending_ask_and_notes_from_kanstacks_own_state() {
+        use crate::orchestration::{Orchestration, PendingAsk};
+        with_state_dir("sync", |repo| {
+            // [unassigned, feat-auth +1 (feat-auth, fix-flaky-tests), feat-ui]
+            let mut app = App::from_board(board_with_a_stacked_lane());
+            register(repo, "feat-auth", false);
+            register(repo, "feat-ui", true);
+            let o = Orchestration::for_repo(repo);
+            o.set_intent("feat-auth", "waiting for cargo test", at(1000)).unwrap();
+            o.set_intent("feat-ui", "reviewing the auth diff", at(1000)).unwrap();
+            o.ask("fix-flaky-tests", "ship it?", at(1001)).unwrap();
+            let events = crate::events::EventLog::for_repo(repo);
+            events.record_note("feat-ui", "started on the middleware", at(1002));
+            events.record_note("feat-ui", "found two unchecked unwraps", at(1003));
+            events.record_note("feat-auth", "a note on a lane that isn't advisory", at(1004));
+
+            app.clamp();
+            assert!(app.board.columns.iter().all(|c| !c.advisory && c.intent.is_none()), "no repo, nothing read");
+
+            app.repo = Some(repo.to_path_buf());
+            app.clamp();
+
+            let stacked = &app.board.columns[1];
+            assert!(!stacked.advisory);
+            assert_eq!(stacked.intent.as_deref(), Some("waiting for cargo test"));
+            assert_eq!(stacked.pending_ask, None, "the ask is on the branch below the tip, not the lane");
+            assert!(stacked.notes.is_empty(), "notes are only read for an advisory lane");
+            assert_eq!(stacked.sections[1].name, "fix-flaky-tests");
+            assert_eq!(
+                stacked.sections[1].pending_ask,
+                Some(PendingAsk { question: "ship it?".into(), asked_at: at(1001) })
+            );
+            assert!(!stacked.sections[1].advisory, "not registered at all reads as not advisory");
+
+            let advisory = &app.board.columns[2];
+            assert!(advisory.advisory && advisory.sections[0].advisory);
+            assert_eq!(advisory.intent.as_deref(), Some("reviewing the auth diff"));
+            assert_eq!(advisory.notes, ["found two unchecked unwraps", "started on the middleware"], "newest first");
+
+            // Answered elsewhere: the next sync drops it, same as a pane going idle would.
+            o.answer("fix-flaky-tests", "yes", at(1005)).unwrap();
+            app.clamp();
+            assert_eq!(app.board.columns[1].sections[1].pending_ask, None);
+        });
+    }
+
+    /// `i` opens the inbox on every pending ask in board order — lanes left to right, a
+    /// stacked lane's branches tip first — and with nothing pending doesn't open at all.
+    /// Reads fresh on the keypress, so an ask raised since the last rebuild is there.
+    #[test]
+    fn i_opens_the_ask_inbox_on_every_pending_ask_in_board_order_or_says_there_are_none() {
+        use crate::orchestration::Orchestration;
+        with_state_dir("inbox-open", |repo| {
+            let mut app = App::from_board(board_with_a_stacked_lane());
+            app.repo = Some(repo.to_path_buf());
+
+            app.on_key(key(K::Char('i')));
+            assert_eq!(app.mode, Mode::Normal);
+            assert!(app.message.as_ref().is_some_and(|(m, _)| m == "no pending asks"));
+
+            let o = Orchestration::for_repo(repo);
+            o.ask("feat-ui", "which tests matter?", at(1000)).unwrap();
+            o.ask("fix-flaky-tests", "ship it?", at(1001)).unwrap();
+            o.set_intent("feat-auth", "an intent is not an ask", at(1002)).unwrap();
+
+            app.on_key(key(K::Char('i')));
+            assert_eq!(app.mode, Mode::Asks);
+            let listed: Vec<(usize, &str, &str)> =
+                app.pending_asks().into_iter().map(|(c, b, a)| (c, b, a.question.as_str())).collect();
+            assert_eq!(listed, [(1, "fix-flaky-tests", "ship it?"), (2, "feat-ui", "which tests matter?")]);
+
+            app.on_key(key(K::Esc));
+            assert_eq!(app.mode, Mode::Normal);
+        });
+    }
+
+    /// `Enter` closes the inbox and moves the board cursor to the selected ask's lane — onto
+    /// the stacked branch's own first card when the ask is below the lane's tip, so its
+    /// header is actually on screen.
+    #[test]
+    fn enter_in_the_ask_inbox_jumps_to_that_lane_and_closes_it() {
+        use crate::orchestration::Orchestration;
+        with_state_dir("inbox-jump", |repo| {
+            let mut app = App::from_board(board_with_a_stacked_lane());
+            app.repo = Some(repo.to_path_buf());
+            let o = Orchestration::for_repo(repo);
+            o.ask("fix-flaky-tests", "ship it?", at(1000)).unwrap();
+            o.ask("feat-ui", "which tests matter?", at(1000)).unwrap();
+
+            app.on_key(key(K::Char('i')));
+            app.on_key(key(K::Down));
+            app.on_key(key(K::Enter));
+            assert_eq!(app.mode, Mode::Normal);
+            assert_eq!((app.col, app.card), (2, 0), "feat-ui is its own lane's tip");
+
+            app.on_key(key(K::Char('i')));
+            app.on_key(key(K::Enter));
+            assert_eq!(app.col, 1);
+            let card = &app.board.columns[1].cards[app.card];
+            assert_eq!(card.group.as_deref(), Some("fix-flaky-tests"), "lands on the stacked branch's own commits");
+            assert!(app.pending_asks().len() == 2, "jumping answers nothing");
+        });
+    }
+
+    /// `a` then typing then `Enter` answers the selected ask through
+    /// `Orchestration::answer` — clearing it and logging exactly that branch and text, the
+    /// same as `kanstack answer` — and it drops out of the list while the inbox stays open
+    /// on what's left, closing itself once nothing is. Letters that are keys elsewhere in
+    /// the inbox (`i`, `q`, `a`) are just text while answering.
+    #[test]
+    fn answering_in_the_inbox_calls_answer_and_drops_that_entry() {
+        use crate::orchestration::Orchestration;
+        with_state_dir("inbox-answer", |repo| {
+            let mut app = App::from_board(board_with_a_stacked_lane());
+            app.repo = Some(repo.to_path_buf());
+            let o = Orchestration::for_repo(repo);
+            o.ask("fix-flaky-tests", "ship it?", at(1000)).unwrap();
+            o.ask("feat-ui", "which tests matter?", at(1000)).unwrap();
+
+            app.on_key(key(K::Char('i')));
+            app.on_key(key(K::Char('a')));
+            assert_eq!(app.ask_answering.as_deref(), Some("fix-flaky-tests"));
+            for c in "i'd say yes, as-is".chars() {
+                app.on_key(key(K::Char(c)));
+            }
+            assert_eq!(app.mode, Mode::Asks, "typed letters never close the inbox");
+            app.on_key(key(K::Enter));
+
+            assert_eq!(o.pending_ask("fix-flaky-tests"), None, "answered on disk");
+            assert!(o.pending_ask("feat-ui").is_some(), "the other ask is untouched");
+            let log = std::fs::read_to_string(crate::workstream::events_path(repo).unwrap()).unwrap();
+            let last = log.lines().last().unwrap();
+            assert!(
+                last.contains(r#""branch":"fix-flaky-tests","kind":"answer","text":"i'd say yes, as-is""#),
+                "{last}"
+            );
+            assert_eq!(app.mode, Mode::Asks, "still open on what's left");
+            assert_eq!(app.ask_answering, None);
+            assert_eq!(app.pending_asks().iter().map(|(_, b, _)| *b).collect::<Vec<_>>(), ["feat-ui"]);
+            assert_eq!(app.board.columns[1].sections[1].pending_ask, None, "the lane's glyph goes with it");
+
+            app.on_key(key(K::Char('a')));
+            for c in "the auth ones".chars() {
+                app.on_key(key(K::Char(c)));
+            }
+            app.on_key(key(K::Enter));
+            assert_eq!(app.mode, Mode::Normal, "nothing left pending closes the inbox");
+            assert!(app.message.as_ref().is_some_and(|(m, n)| m == "answered feat-ui" && *n == Notice::Success));
+        });
+    }
+
+    /// `Esc` while answering backs out to the list without sending anything, and an empty
+    /// answer is refused rather than sent — the same as `kanstack answer` needing its text.
+    #[test]
+    fn esc_while_answering_sends_nothing_and_an_empty_answer_is_refused() {
+        use crate::orchestration::Orchestration;
+        with_state_dir("inbox-cancel", |repo| {
+            let mut app = App::from_board(board_with_a_stacked_lane());
+            app.repo = Some(repo.to_path_buf());
+            let o = Orchestration::for_repo(repo);
+            o.ask("feat-ui", "which tests matter?", at(1000)).unwrap();
+
+            app.on_key(key(K::Char('i')));
+            app.on_key(key(K::Char('a')));
+            app.on_key(key(K::Enter));
+            assert!(app.message.as_ref().is_some_and(|(m, _)| m.contains("needs some text")));
+            assert_eq!(app.ask_answering.as_deref(), Some("feat-ui"), "still answering");
+
+            app.on_key(key(K::Char('n')));
+            app.on_key(key(K::Esc));
+            assert_eq!((app.mode, app.ask_answering.as_deref()), (Mode::Asks, None), "back to the list, still open");
+            assert!(app.ask_answer_input.is_empty());
+            assert!(o.pending_ask("feat-ui").is_some(), "nothing was sent");
+        });
+    }
+
 }

@@ -177,6 +177,22 @@ pub struct Section {
     /// `group_unassigned_by_folder` is reapplied post-build rather than threaded through
     /// `build` itself.
     pub pane_status: Option<crate::mux::pane_status::PaneStatus>,
+    /// Whether this branch's workstream was spawned `--advisory` — see
+    /// `crate::workstream::Workstream::advisory`. `false` straight out of [`Board::build`],
+    /// for the same reason as `pane_status`: it lives in the workstream registry, not in
+    /// [`WorkspaceStatus`], so the app sets it afterwards (`App::sync_orchestration`).
+    pub advisory: bool,
+    /// Whatever this branch's orchestrator last said about *why* it looks the way it does
+    /// (`kanstack intent`) — informational, nothing is waiting on anyone. Only ever rendered
+    /// as a quiet glyph in the header (the text itself lives in an advisory lane's body, and
+    /// in `kanstack status`), never interpreted. `None` out of [`Board::build`], set the same
+    /// way as `advisory`.
+    pub intent: Option<String>,
+    /// A question this branch's orchestrator is waiting on a human to answer (`kanstack
+    /// ask`) — unlike `intent`, this one *does* want someone, which is why it gets a louder
+    /// glyph and a place in the ask inbox. `None` out of [`Board::build`], set the same way
+    /// as `advisory`.
+    pub pending_ask: Option<crate::orchestration::PendingAsk>,
 }
 
 #[derive(Debug, Clone)]
@@ -202,6 +218,16 @@ pub struct Column {
     /// Mirrors the tip section's `pane_status`, so the column header can show it without
     /// the renderer reaching into `sections[0]` itself.
     pub pane_status: Option<crate::mux::pane_status::PaneStatus>,
+    /// Mirror the tip section's fields of the same names, for the same reason as
+    /// `pane_status`. Defaulted out of [`Board::build`] — see [`Section::advisory`].
+    pub advisory: bool,
+    pub intent: Option<String>,
+    pub pending_ask: Option<crate::orchestration::PendingAsk>,
+    /// The tip branch's most recent `kanstack note`s, newest first — only ever filled in for
+    /// an advisory lane (see `App::sync_orchestration`), whose body shows them in place of
+    /// the cards it isn't expected to have. Kept here rather than read at draw time because
+    /// `ui::draw` never touches the filesystem; empty out of [`Board::build`].
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -413,6 +439,10 @@ impl Board {
             drop_target: UNASSIGNED_TARGET.into(),
             branch_name: None,
             pane_status: None,
+            advisory: false,
+            intent: None,
+            pending_ask: None,
+            notes: Vec::new(),
         });
 
         for stack in &s.stacks {
@@ -496,6 +526,9 @@ impl Board {
                         commits: b.commits.len(),
                         stats: (sum != (0, 0)).then_some(sum),
                         pane_status: None,
+                        advisory: false,
+                        intent: None,
+                        pending_ask: None,
                     }
                 })
                 .collect();
@@ -511,6 +544,10 @@ impl Board {
                 drop_target: top.name.clone(),
                 branch_name: Some(top.name.clone()),
                 pane_status: None,
+                advisory: false,
+                intent: None,
+                pending_ask: None,
+                notes: Vec::new(),
             });
         }
 
@@ -702,6 +739,10 @@ mod tests {
             drop_target: UNASSIGNED_TARGET.into(),
             branch_name: None,
             pane_status: None,
+            advisory: false,
+            intent: None,
+            pending_ask: None,
+            notes: Vec::new(),
         };
         group_unassigned_by_folder(&mut col);
         let got: Vec<(Option<&str>, &str)> = col
@@ -735,6 +776,10 @@ mod tests {
             drop_target: "feat-auth".into(),
             branch_name: Some("feat-auth".into()),
             pane_status: None,
+            advisory: false,
+            intent: None,
+            pending_ask: None,
+            notes: Vec::new(),
         };
         group_unassigned_by_folder(&mut col);
         assert_eq!(
@@ -743,6 +788,30 @@ mod tests {
             "grouping only ever applies to the unassigned lane"
         );
         assert!(col.cards.iter().all(|c| c.group.is_none()));
+    }
+
+    /// `advisory`/`intent`/`pending_ask`/`notes` live in kanstack's own state, not in `but
+    /// status`, so a bare build knows nothing about them — every lane and every stacked
+    /// branch starts out plain, and only `App::sync_orchestration` fills them in.
+    #[test]
+    fn a_bare_build_leaves_every_lane_and_section_non_advisory_with_no_intent_ask_or_notes() {
+        // Fold one lane into another so there's a section below a tip to check too.
+        let mut s = sample();
+        let extra = s.stacks.remove(2).branches.remove(0);
+        s.stacks[0].branches.push(extra);
+        let b = Board::from_status(&s);
+        for col in &b.columns {
+            assert!(!col.advisory, "{}", col.title);
+            assert_eq!(col.intent, None, "{}", col.title);
+            assert_eq!(col.pending_ask, None, "{}", col.title);
+            assert!(col.notes.is_empty(), "{}", col.title);
+            for section in &col.sections {
+                assert!(!section.advisory, "{}", section.name);
+                assert_eq!(section.intent, None, "{}", section.name);
+                assert_eq!(section.pending_ask, None, "{}", section.name);
+            }
+        }
+        assert!(b.columns.iter().any(|c| c.sections.len() > 1), "must include a stacked lane to cover sections below a tip");
     }
 
     #[test]

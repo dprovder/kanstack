@@ -144,7 +144,7 @@ pub(super) fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         }
         Mode::PushConfirm | Mode::LandConfirm | Mode::DeleteConfirm | Mode::RebaseConfirm
         | Mode::ResolveConflict | Mode::Landing | Mode::Blocked | Mode::SetupRequired
-        | Mode::UnapplyConfirm | Mode::PrModal | Mode::PrRunning => "",
+        | Mode::UnapplyConfirm | Mode::PrModal | Mode::PrRunning | Mode::Asks => "",
         Mode::Branches if app.branch_preview.is_some() => {
             "  ↑/↓ scroll · a apply into a new lane · esc/← back"
         }

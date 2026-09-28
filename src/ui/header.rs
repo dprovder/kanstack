@@ -55,6 +55,17 @@ pub(super) fn draw_header(f: &mut Frame, app: &App, area: Rect) {
             theme::tone(crate::board::Tone::Bad),
         ));
     }
+    // Silent with nothing pending; with anything, a count and the key that opens the inbox
+    // — the one board-wide signal that some lane's orchestrator is waiting on a human, since
+    // the lane's own `⚠` may well be scrolled off screen. Same Warn hue as that glyph.
+    let asks = app.pending_asks().len();
+    if asks > 0 {
+        spans.push(Span::styled("  ·  ", theme::faint()));
+        spans.push(Span::styled(
+            format!("⚠ {asks} {} · i to answer", if asks == 1 { "ask" } else { "asks" }),
+            theme::tone(crate::board::Tone::Warn),
+        ));
+    }
     // A selection can span lanes, and its cards can scroll off screen individually — this
     // is the one place it's always visible, the same reasoning as the lane position above.
     if !app.selected.is_empty() {

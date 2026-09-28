@@ -1197,4 +1197,145 @@ mod tests {
             assert!(line.chars().count() <= 120);
         }
     }
+
+    fn fixture_board() -> Board {
+        Board::from_status(&crate::but::parse_status(include_str!("../tests/fixtures/status.json")).unwrap())
+    }
+
+    fn ask(question: &str) -> Option<crate::orchestration::PendingAsk> {
+        Some(crate::orchestration::PendingAsk { question: question.into(), asked_at: std::time::UNIX_EPOCH })
+    }
+
+    /// The line of `out` that mentions `needle` — for asserting on one lane header without
+    /// the others on the same screen row getting in the way. Lanes sit side by side, so this
+    /// is the whole screen row; callers check for things only that lane could have put there.
+    fn row_with<'a>(out: &'a str, needle: &str) -> &'a str {
+        out.lines().find(|l| l.contains(needle)).unwrap_or_else(|| panic!("no row with {needle:?}:\n{out}"))
+    }
+
+    /// A pending ask puts a `⚠` right after the lane's pane status (`● busy ⚠`); an intent
+    /// alone puts a quieter `»` in the same spot; neither prints its text in the header. The
+    /// app header counts the asks (reading the board's sections, which is what
+    /// `App::sync_orchestration` fills in), and says nothing at all with none pending.
+    #[test]
+    fn an_ask_and_an_intent_get_different_lane_glyphs_and_the_header_counts_asks() {
+        let quiet = render_app(&App::from_board(fixture_board()), 160, 24);
+        assert!(!quiet.contains('⚠') && !quiet.contains('»'), "silent by default:\n{quiet}");
+
+        let mut board = fixture_board();
+        board.columns[1].pane_status = Some(crate::mux::pane_status::PaneStatus::Busy);
+        board.columns[1].pending_ask = ask("ship it to staging first?");
+        board.columns[1].sections[0].pending_ask = ask("ship it to staging first?");
+        board.columns[1].intent = Some("an ask outranks an intent".into());
+        board.columns[2].intent = Some("reviewing the diff".into());
+        board.columns[2].sections[0].intent = Some("reviewing the diff".into());
+        let out = render_app(&App::from_board(board), 160, 24);
+
+        assert!(out.contains("● busy ⚠"), "the ask glyph follows the pane status:\n{out}");
+        assert!(out.contains("feat-ui  2  »"), "an intent alone gets the quieter glyph:\n{out}");
+        assert_eq!(row_with(&out, "feat-ui").matches('»').count(), 1, "one glyph, not one per signal:\n{out}");
+        assert!(!out.contains("ship it to staging") && !out.contains("reviewing the diff"), "no text in headers:\n{out}");
+        assert!(row_with(&out, "workspace").contains("⚠ 1 ask · i to answer"), "{out}");
+    }
+
+    /// A branch stacked below a lane's tip gets the same glyph on its own `○` header, and
+    /// its ask counts in the app header just like a tip's does.
+    #[test]
+    fn a_stacked_branchs_ask_marks_its_own_section_header() {
+        let mut status = crate::but::parse_status(include_str!("../tests/fixtures/status.json")).unwrap();
+        let extra = status.stacks.remove(2).branches.remove(0);
+        status.stacks[0].branches.push(extra);
+        let mut board = Board::from_status(&status);
+        board.columns[1].sections[1].pending_ask = ask("ship it?");
+
+        let out = render_app(&App::from_board(board), 150, 30);
+        assert!(row_with(&out, "○ fix-flaky-tests").contains('⚠'), "{out}");
+        assert!(!row_with(&out, "feat-auth +1").contains('⚠'), "the lane header is the tip's, which has none:\n{out}");
+        assert!(out.contains("⚠ 1 ask"), "{out}");
+    }
+
+    /// An advisory lane with no cards shows its intent and recent notes where a plain lane
+    /// shows nothing but its badge; take `advisory` away and the same lane's body renders
+    /// exactly as it did before any of this existed — only its header's `»` for the intent
+    /// remains, as on any lane.
+    #[test]
+    fn an_empty_advisory_lane_shows_its_intent_and_notes_and_a_plain_empty_lane_does_not() {
+        let empty_lane = |advisory: bool| {
+            let mut board = fixture_board();
+            let col = &mut board.columns[3]; // fix-flaky-tests
+            col.cards.clear();
+            col.advisory = advisory;
+            col.intent = Some("reading through the flaky test history".into());
+            col.notes = vec!["retries hide a real race".into(), "started with ci logs".into()];
+            render_app(&App::from_board(board), 160, 24)
+        };
+
+        let advisory = empty_lane(true);
+        assert!(advisory.contains("advisory — not expected to commit"), "{advisory}");
+        assert!(advisory.contains("» reading through the flaky"), "{advisory}");
+        let newest = advisory.find("· retries hide a real race").expect(&advisory);
+        let oldest = advisory.find("· started with ci logs").expect(&advisory);
+        assert!(newest < oldest, "newest note first:\n{advisory}");
+
+        let plain_lane = empty_lane(false);
+        assert!(!plain_lane.contains("advisory"), "{plain_lane}");
+        assert!(!plain_lane.contains("reading through") && !plain_lane.contains("retries hide"), "{plain_lane}");
+        let mut untouched = fixture_board();
+        untouched.columns[3].cards.clear();
+        untouched.columns[3].intent = Some("the header glyph is the same on any lane".into());
+        assert_eq!(plain_lane, render_app(&App::from_board(untouched), 160, 24), "a non-advisory lane is unchanged");
+    }
+
+    /// With neither an intent nor a note, an empty advisory lane still says what it is
+    /// rather than going blank — distinguishable at a glance from a lane that just hasn't
+    /// committed yet.
+    #[test]
+    fn an_empty_advisory_lane_with_nothing_said_yet_says_so() {
+        let mut board = fixture_board();
+        board.columns[3].cards.clear();
+        board.columns[3].advisory = true;
+        let out = render_app(&App::from_board(board), 160, 24);
+        assert!(out.contains("advisory — not expected to commit"), "{out}");
+        assert!(out.contains("no intent or notes yet"), "{out}");
+    }
+
+    /// An advisory lane that commits after all shows those commits like any other lane —
+    /// the advisory body is only ever a stand-in for cards it doesn't have.
+    #[test]
+    fn an_advisory_lane_with_cards_still_shows_them_and_not_the_advisory_body() {
+        let mut board = fixture_board();
+        board.columns[2].advisory = true;
+        board.columns[2].intent = Some("reviewing".into());
+        board.columns[2].notes = vec!["a note".into()];
+        let out = render_app(&App::from_board(board), 160, 24);
+        assert!(out.contains("Fix settings tab focus ring") && out.contains("Redesign settings page"), "{out}");
+        assert!(!out.contains("not expected to commit") && !out.contains("· a note"), "{out}");
+    }
+
+    /// The inbox lists each pending ask as its branch above its question, marks the
+    /// selected one, and — only while answering — shows the answer field under it, with
+    /// hints to match.
+    #[test]
+    fn the_ask_inbox_lists_branch_and_question_and_shows_the_answer_field_only_while_answering() {
+        let mut board = fixture_board();
+        board.columns[1].sections[0].pending_ask = ask("ship it to staging first?");
+        board.columns[2].sections[0].pending_ask = ask("which tests matter?");
+        let mut app = App::from_board(board);
+        app.mode = crate::app::Mode::Asks;
+        app.ask_sel = 1;
+
+        let out = render_app(&app, 160, 30);
+        assert!(out.contains("ask inbox  ·  2 pending"), "{out}");
+        assert!(out.contains("  feat-auth") && out.contains("ship it to staging first?"), "{out}");
+        assert!(out.contains("▸ feat-ui") && out.contains("which tests matter?"), "{out}");
+        assert!(out.contains("⏎ go to lane      a answer") && !out.contains("answer  █"), "{out}");
+
+        app.ask_answering = Some("feat-ui".into());
+        for c in "the auth ones".chars() {
+            app.ask_answer_input.insert(c);
+        }
+        let out = render_app(&app, 160, 30);
+        assert!(out.contains("answer  the auth ones█"), "{out}");
+        assert!(out.contains("⏎ send answer      esc back to the list"), "{out}");
+    }
 }
