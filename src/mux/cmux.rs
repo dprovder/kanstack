@@ -37,7 +37,7 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 pub use crate::mux::pane_status::PaneStatus;
-use crate::mux::{command_exists, Multiplexer, OpenRequest};
+use crate::mux::{command_exists, Multiplexer, OpenRequest, RegroupRequest, StackPlacement};
 use crate::mux::pane_status::CPU_BUSY_THRESHOLD_PERCENT;
 
 /// Pixels of slack allowed when treating two pane edges as touching. Frames come back as
@@ -334,6 +334,34 @@ impl Multiplexer for Cmux {
         self.type_and_submit(&surface_ref, req.launch)?;
         self.run_scoped(&["rename-tab", "--surface", &surface_ref, req.title])?;
         Ok(surface_ref)
+    }
+
+    /// `move-surface --pane <anchor's pane> --after <anchor>` makes `req.pane` a tab beside the
+    /// anchor — where [`Self::open_tab`]'s `new-surface --pane` would have put it — and, for
+    /// `split`, `split-off <direction>` then moves it out of that pane into a new split next to
+    /// it, which is where [`Self::open_pane`]'s `new-split` off the anchor would have put it.
+    /// Going through the anchor's pane first is what makes the split land beside the *anchor*:
+    /// `split-off` only splits relative to the pane a surface is already in.
+    ///
+    /// Measured live against a running cmux, in a scratch workspace: `move-surface` answers
+    /// `OK surface=… pane=…`, keeps the surface's ref (so the caller's tracked id stays good),
+    /// closes the pane it left if that pane is now empty, and is a harmless repeat when the
+    /// surface is already there; it selects the moved surface in its new pane even with
+    /// `--focus false`, which only keeps keyboard focus where it was. `split-off` answers `OK
+    /// surface:N pane:M` with the same surface ref and a new pane. The surface's tab title
+    /// travels with it, so `req.title` isn't needed.
+    ///
+    /// The anchor's pane is looked up in `pane.list` the same way `open_tab` does, and for the
+    /// same reason: `--pane` wants the pane, not a surface ref.
+    fn regroup(&self, req: &RegroupRequest<'_>) -> Result<()> {
+        let list_out = self.run(&["rpc", "pane.list"])?;
+        let pane = pane_containing_surface(&list_out, req.anchor)
+            .with_context(|| format!("no cmux pane found holding {}", req.anchor))?;
+        self.run_scoped(&["move-surface", "--surface", req.pane, "--pane", &pane, "--after", req.anchor, "--focus", "false"])?;
+        if req.placement == StackPlacement::Split {
+            self.run_scoped(&["split-off", "--surface", req.pane, req.split_direction])?;
+        }
+        Ok(())
     }
 
     fn type_line(&self, pane: &str, text: &str) -> Result<()> {
@@ -840,6 +868,70 @@ esac"#;
             assert!(err.contains("no cmux pane found holding surface:9"), "{err}");
             assert!(!splitter.has_pane("feat-top"));
             assert_eq!(stand_in::log_lines(log).len(), 1, "nothing may be typed once the pane can't be found");
+        });
+    }
+
+    /// Replies as a real cmux did in a scratch workspace: `surface:9` lives in `pane:7`, and a
+    /// move or split-off keeps the surface's ref.
+    const REGROUPS: &str = r#"case "$1" in
+  rpc) printf '{"panes":[{"ref":"pane:7","pixel_frame":{"height":1,"width":1,"x":0,"y":0},"surface_ids":[],"selected_surface_ref":"surface:9","surface_refs":["surface:9"]}]}' ;;
+  move-surface) echo "OK surface=surface:5 pane=pane:7 workspace=workspace:2 window=window:1" ;;
+  split-off) echo "OK surface:5 pane:8 workspace:2 window:1" ;;
+esac"#;
+
+    /// `feat-top`, open in `surface:5`, joins `feat-base`'s stack after the fact: by default it
+    /// moves into the anchor's pane as a tab right after the anchor's own, the same place
+    /// `open_tab`'s `new-surface --pane` would have put it — without taking focus.
+    #[test]
+    fn a_regroup_moves_the_surface_into_the_anchors_pane_as_a_tab() {
+        with_fake_cmux("regroup-tab", REGROUPS, &[("KANSTACK_STACK_PANES", None)], |mut splitter, log| {
+            splitter.adopt("feat-top", "surface:5");
+            splitter.adopt("feat-base", "surface:9");
+            splitter.restack_moved_branches(&crate::splitter::status_with_stacks(&[&["feat-base"], &["feat-top"]])).unwrap();
+            splitter.restack_moved_branches(&crate::splitter::status_with_stacks(&[&["feat-top", "feat-base"]])).unwrap();
+            assert_eq!(
+                stand_in::log_lines(log),
+                ["rpc pane.list", "move-surface --surface surface:5 --pane pane:7 --after surface:9 --focus false"]
+            );
+            assert_eq!(splitter.pane_id("feat-top").as_deref(), Some("surface:5"));
+        });
+    }
+
+    /// `KANSTACK_STACK_PANES=split`: the same move, then `split-off` out of the anchor's pane
+    /// in the orthogonal direction (`down`, off cmux's default `right` chain) — and scoped to
+    /// the pinned workspace like every other call that names a surface.
+    #[test]
+    fn a_split_regroup_moves_the_surface_beside_the_anchor_then_splits_it_off() {
+        with_fake_cmux("regroup-split", REGROUPS, &[("KANSTACK_STACK_PANES", Some("split"))], |mut splitter, log| {
+            splitter.set_workspace(Some(WS));
+            splitter.adopt("feat-top", "surface:5");
+            splitter.adopt("feat-base", "surface:9");
+            splitter.restack_moved_branches(&crate::splitter::status_with_stacks(&[&["feat-base"], &["feat-top"]])).unwrap();
+            splitter.restack_moved_branches(&crate::splitter::status_with_stacks(&[&["feat-top", "feat-base"]])).unwrap();
+            assert_eq!(
+                stand_in::log_lines(log),
+                [
+                    "rpc pane.list".to_string(),
+                    format!("move-surface --workspace {WS} --surface surface:5 --pane pane:7 --after surface:9 --focus false"),
+                    format!("split-off --workspace {WS} --surface surface:5 down"),
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn a_regroup_whose_anchor_has_no_pane_is_an_error_and_moves_nothing() {
+        let body = r#"case "$1" in rpc) echo '{"panes":[]}' ;; esac"#;
+        with_fake_cmux("regroup-no-pane", body, &[("KANSTACK_STACK_PANES", None)], |mut splitter, log| {
+            splitter.adopt("feat-top", "surface:5");
+            splitter.adopt("feat-base", "surface:9");
+            splitter.restack_moved_branches(&crate::splitter::status_with_stacks(&[&["feat-base"], &["feat-top"]])).unwrap();
+            let err = splitter
+                .restack_moved_branches(&crate::splitter::status_with_stacks(&[&["feat-top", "feat-base"]]))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("feat-top: no cmux pane found holding surface:9"), "{err}");
+            assert_eq!(stand_in::log_lines(log), ["rpc pane.list"]);
         });
     }
 

@@ -112,7 +112,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 
 use crate::harness::launch::shell_quote;
-use crate::mux::{command_exists, Multiplexer, OpenRequest};
+use crate::mux::{command_exists, Multiplexer, OpenRequest, RegroupRequest};
 use crate::mux::pane_status::PaneStatus;
 
 /// How long the first lane waits for its marker title to show up in Ghostty's terminal list.
@@ -308,6 +308,32 @@ impl Multiplexer for Ghostty {
             bail!("Ghostty's `split` did not report a terminal id");
         }
         Ok(id.to_string())
+    }
+
+    /// A deliberate no-op: Ghostty can move a live split, but only by hand, and nothing a script
+    /// can reach does it. Checked against `ghostty-org/ghostty` main at b40acce (2026-09-26):
+    ///
+    /// - The macOS app does move splits — drag one by its grab handle onto another and it is
+    ///   re-split there, process and all (`TerminalSplitTreeView.swift`'s `SplitDropDelegate`,
+    ///   since 1.3). But that is SwiftUI drag-and-drop on a private pasteboard type, and the
+    ///   notifications behind it are in-process, so there is no way in from outside short of
+    ///   synthesizing a real mouse drag — which needs Accessibility permission and pixel
+    ///   geometry AppleScript doesn't expose, and would take the user's pointer away.
+    /// - The AppleScript dictionary (`macos/Ghostty.sdef`) has `split`, `new tab`, `new
+    ///   window`, `focus`, `close`, `input text`, `send key`, the mouse-event commands and
+    ///   `perform action`; its Standard Suite adds only `count`, `exists` and `quit`, and every
+    ///   property of a window, tab or terminal is read-only. None moves anything.
+    /// - `perform action` reaches the keybinding actions, whose only moves (`move_tab`,
+    ///   `move_tab_to_new_window`) reorder or detach a whole tab.
+    /// - Upstream wants more: discussion #12126 ("full surface mobility") and #11709, and PR
+    ///   #13527, an unmerged `detach_split` action. Even that would only pop a split out into a
+    ///   new *window*, not put it beside another terminal.
+    ///
+    /// So a branch that joins a stack after its pane opened keeps its pane where it is. `Ok(())`
+    /// rather than an error, because an out-of-place pane is cosmetic and must not fail the
+    /// board refresh that noticed it.
+    fn regroup(&self, _req: &RegroupRequest<'_>) -> Result<()> {
+        Ok(())
     }
 
     /// A paste, then Enter as its own key: a paste alone is not submitted.
@@ -979,6 +1005,19 @@ probe) printf 'OWN\nOTHER\nNEW-after-OWN\n' ;;"#;
             let line = detection();
             assert!(line.starts_with('✗') && line.to_lowercase().contains("ghostty"), "{line}");
             assert!(line.contains("macOS only") || line.contains("TERM_PROGRAM"), "{line}");
+        });
+    }
+
+    /// Ghostty can't move a live terminal (see `regroup`), so a branch joining a stack after
+    /// its pane opened leaves it where it is: no script runs, and nothing fails.
+    #[test]
+    fn a_regroup_is_a_documented_no_op_that_never_runs_a_script() {
+        with_fake("regroup", ARMS, &[], |mut splitter, fake| {
+            splitter.adopt("feat-top", "TOP");
+            splitter.adopt("feat-base", "BASE");
+            splitter.restack_moved_branches(&crate::splitter::status_with_stacks(&[&["feat-base"], &["feat-top"]])).unwrap();
+            splitter.restack_moved_branches(&crate::splitter::status_with_stacks(&[&["feat-top", "feat-base"]])).unwrap();
+            assert!(fake.calls().is_empty(), "{:#?}", fake.ops());
         });
     }
 }

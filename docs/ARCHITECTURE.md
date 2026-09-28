@@ -425,6 +425,20 @@ seen; how a blocked approval prompt is reported is likewise unseen; `orcad` acce
 `send_task` cannot rely on that guard; and `orcad` may differ from the renderer-backed app.
 Those replies in `orca.rs`'s tests are shaped from Orca's TypeScript types instead.
 
+**Lanes as tabs.** Orca nests tab groups (side-by-side columns) holding tabs, each holding a
+split tree of terminals, and from outside only whole tabs can be moved: `session.tabs.move`
+reaches the desktop app's own tab drag-and-drop (`dropUnifiedTab`), while
+`session.tabs.updatePaneLayout` is ignored whenever a window owns the layout. So each lane
+opens as a tab of its own (`session.tabs.createTerminal`) and moves into a new group split off
+the previous lane's, and `regroup` moves a lane's tab into, or beside, its stack sibling's
+group. Neither is a CLI verb; `Orca::rpc` speaks the runtime's socket protocol the way the CLI
+does (`orca-runtime.json` → Unix socket + token, one JSON request line, newline-delimited JSON
+back). Against `orcad` (`stablyai/orca` at 080c4ad, built with `pnpm build:orcad`, run with
+`ORCA_USER_DATA` on a short path) the socket, `terminal list`'s tab/leaf ids and
+`session.tabs.list`'s groups all behaved as `orca.rs` expects, and `createTerminal` was refused
+(`runtime_unavailable`: only a window publishes the tab graph it needs), so lanes fell back to
+`terminal split`. The tab path answered by the desktop app is unverified.
+
 **Discovery order.** cmux, then tmux, then Orca, then Ghostty, except that inside an Orca
 terminal with neither `$CMUX_SURFACE_ID` nor `$TMUX_PANE` set, Orca is tried first, and inside
 plain Ghostty (below) Ghostty is. `Cmux::discover` only checks for its binary on `PATH`, so a

@@ -19,7 +19,8 @@ use crate::mux::cmux::Cmux;
 use crate::mux::ghostty::Ghostty;
 use crate::mux::orca::Orca;
 use crate::mux::tmux::Tmux;
-use crate::mux::{configured_directions, normalize_direction, Multiplexer, OpenRequest};
+use crate::model::WorkspaceStatus;
+use crate::mux::{configured_directions, normalize_direction, Multiplexer, OpenRequest, RegroupRequest, StackPlacement};
 use crate::mux::pane_status::PaneStatus;
 use crate::procs::{
     reading_from_pid, real_age, real_killer, real_ps, record_pid_prefix, started_before, subtree, tracking_applies, AgeReader,
@@ -186,6 +187,12 @@ pub struct Splitter {
     kill: Killer,
     /// How long to wait between the looks that confirm a pane is really quiet.
     quiet_gap: Duration,
+    /// Which GitButler stack each branch was in the last time [`Self::restack_moved_branches`]
+    /// looked, as a key of this splitter's own making — see that method for why neither the
+    /// stack's `cliId` nor any branch name will do. Empty until it first runs.
+    stack_of: HashMap<String, u64>,
+    /// The last key handed out for [`Self::stack_of`], so each new one is unique.
+    last_stack_key: u64,
 }
 
 impl Splitter {
@@ -207,6 +214,8 @@ impl Splitter {
             age: real_age(),
             kill: real_killer(),
             quiet_gap: QUIET_GAP,
+            stack_of: HashMap::new(),
+            last_stack_key: 0,
         }
     }
 
@@ -372,6 +381,105 @@ impl Splitter {
         };
         self.panes.insert(name.to_string(), Pane { id: id.clone(), status: PaneStatus::Unknown });
         Ok(id)
+    }
+
+    /// Moves the pane of every branch that has just joined a GitButler stack so it sits with a
+    /// sibling's, the way [`Self::spawn_stacked_harness_with`] would have placed it had the
+    /// branch already been stacked when its pane opened. That spawn-time grouping only ever
+    /// runs once, as a pane is created; an agent that later runs `but move` or `but branch new
+    /// --above` itself, never going through `kanstack spawn`, changes which stack its branch is
+    /// in without anything noticing, and its pane is left visually apart from the sibling it
+    /// is now logically stacked with. This notices, by comparing `status.stacks` against what
+    /// the previous call saw, and asks the multiplexer to move the pane
+    /// ([`Multiplexer::regroup`]) — as a tab or a split, per the same `KANSTACK_STACK_PANES`
+    /// ([`StackPlacement::from_env`]) and in the same orthogonal direction the stacked spawn
+    /// uses. Orca can only move a pane that is alone in its tab (as its lanes now normally are),
+    /// and Ghostty can't move one at all — see each backend's `regroup`.
+    ///
+    /// **Meant to be called once per board refresh**, with the `WorkspaceStatus` the board was
+    /// just rebuilt from, alongside `sync_pane_statuses` in `crate::app` (which `clamp` runs
+    /// after every rebuild and background poll). It is deliberately not called from there
+    /// yet: that code was being reworked on another branch when this landed, and the one-line
+    /// call belongs there once it has. Nothing else calls it either.
+    ///
+    /// **Which stack a branch is "in"** needs a key that survives from one call to the next.
+    /// The stack's own `cliId` won't do — `but` hands those out by position (`t0`, `u0`, …),
+    /// so every stack after a new one shifts — and nor will any one branch's name: the tip
+    /// changes with every `--above`, the base with every `--below`. So each stack gets a key
+    /// of this splitter's own making, carried forward from the *lowest* of its branches that
+    /// the last call saw (branches run tip first, base last in `status`, and the base is the
+    /// one least likely to have moved: `--above` and a `but move` onto a stack both add on
+    /// top). A stack none of whose branches were seen before gets a fresh key, as does one
+    /// whose inherited key another stack already took this call (a stack split in two can't
+    /// both be the old one). When two stacks that were both seen before merge, nothing in
+    /// `status` says which of them `but` moved, so this rule decides: the lower one stays, and
+    /// the upper one's panes go to it — grouped either way, just possibly the other pane moved.
+    ///
+    /// **A branch has "joined"** when it was seen last call under a different key than its
+    /// stack carries now. A branch seen for the first time hasn't: there's nothing to compare
+    /// against, and a branch `kanstack spawn --above` just created was already grouped by that
+    /// spawn. So the first call after start-up only records, and moves nothing.
+    ///
+    /// **Where it goes** mirrors `kanstack spawn`'s own `group_with` (see `crate::cli::spawn`):
+    /// the first sibling in stack order with a live pane, where a pane that isn't known to be
+    /// [`PaneStatus::Dead`] counts as live. One refinement: a sibling that has itself just
+    /// joined doesn't count, since it is moving too — two branches carried into a stack
+    /// together are grouped with a pane that was already there, not with each other. A
+    /// joined branch with no live pane, or with no live sibling to go to, is left alone.
+    ///
+    /// **Out of scope for v1:** a branch *leaving* a stack. Its pane stays grouped with its
+    /// old siblings; nothing splits it back out. (It does get a fresh key, so it can later
+    /// rejoin and be moved like any other.)
+    ///
+    /// A failed move is reported, after every other branch has still been tried, and is not
+    /// retried: the new membership is recorded regardless, so a backend that keeps refusing
+    /// doesn't get asked again on every refresh.
+    pub fn restack_moved_branches(&mut self, status: &WorkspaceStatus) -> Result<()> {
+        let placement = StackPlacement::from_env();
+        let split_direction = crate::mux::orthogonal_direction(&self.chain_direction);
+        let mut stack_of: HashMap<String, u64> = HashMap::new();
+        let mut failures = Vec::new();
+        for stack in &status.stacks {
+            let names: Vec<&str> = stack.branches.iter().map(|b| b.name.as_str()).collect();
+            let key = match names.iter().rev().find_map(|name| self.stack_of.get(*name).copied()) {
+                Some(key) if !stack_of.values().any(|k| *k == key) => key,
+                _ => {
+                    self.last_stack_key += 1;
+                    self.last_stack_key
+                }
+            };
+            let joined: Vec<&str> =
+                names.iter().copied().filter(|name| self.stack_of.get(*name).is_some_and(|k| *k != key)).collect();
+            for &branch in &joined {
+                let Some(pane) = self.live_pane(branch) else {
+                    continue;
+                };
+                let anchor = names
+                    .iter()
+                    .copied()
+                    .filter(|name| !joined.contains(name))
+                    .find_map(|name| self.live_pane(name).filter(|anchor| *anchor != pane));
+                let Some(anchor) = anchor else {
+                    continue;
+                };
+                let req = RegroupRequest { pane, anchor, title: branch, placement, split_direction };
+                if let Err(e) = self.mux.regroup(&req) {
+                    failures.push(format!("{branch}: {e:#}"));
+                }
+            }
+            stack_of.extend(names.iter().map(|name| (name.to_string(), key)));
+        }
+        self.stack_of = stack_of;
+        if !failures.is_empty() {
+            bail!("couldn't move {} pane to its new stack: {}", self.mux.name(), failures.join("; "));
+        }
+        Ok(())
+    }
+
+    /// `branch`'s pane id, unless it is known to be gone. Unknown counts as live, as it does
+    /// for `kanstack spawn`'s own choice of sibling.
+    fn live_pane(&self, branch: &str) -> Option<&str> {
+        self.panes.get(branch).filter(|p| p.status != PaneStatus::Dead).map(|p| p.id.as_str())
     }
 
     /// The shared first half of both spawn methods: the launch line, with the harness's
@@ -647,6 +755,34 @@ impl Splitter {
             }
         }
     }
+}
+
+/// A `WorkspaceStatus` holding nothing but `stacks` — one per entry, each listing its branches
+/// tip first and base last, the order `but status` reports them in — for testing
+/// [`Splitter::restack_moved_branches`], here and in each backend's own tests. Everything else
+/// is the least `WorkspaceStatus` will parse.
+#[cfg(test)]
+pub(crate) fn status_with_stacks(stacks: &[&[&str]]) -> WorkspaceStatus {
+    use serde_json::json;
+    let commit = json!({
+        "cliId": "c0", "commitId": "0000000", "createdAt": "2026-01-01T00:00:00+00:00",
+        "message": "", "authorName": "", "authorEmail": "",
+    });
+    let stacks: Vec<_> = stacks
+        .iter()
+        .enumerate()
+        .map(|(i, branches)| {
+            let branches: Vec<_> =
+                branches.iter().map(|name| json!({"cliId": name, "name": name, "branchStatus": "completelyUnpushed"})).collect();
+            json!({"cliId": format!("s{i}"), "branches": branches})
+        })
+        .collect();
+    serde_json::from_value(json!({
+        "stacks": stacks,
+        "mergeBase": commit,
+        "upstreamState": {"behind": 0, "latestCommit": commit, "lastFetched": null},
+    }))
+    .unwrap()
 }
 
 #[cfg(test)]
@@ -1192,6 +1328,169 @@ mod tests {
             splitter.spawn_harness(cwd(), "feat-base", None).unwrap();
             splitter.spawn_stacked_harness_with(cwd(), "feat-top", None, None, None, None, "p1").unwrap();
             assert!(mux.lines()[1].starts_with("open p2 right of p1"), "{:#?}", mux.lines());
+        });
+    }
+
+    /// A fake splitter already tracking a pane for each of `branches`: `p-<branch>`.
+    fn restacking_splitter(branches: &[&str]) -> (Splitter, Arc<FakeMux>) {
+        let (mut splitter, mux) = fake_splitter();
+        for branch in branches {
+            splitter.adopt(branch, &format!("p-{branch}"));
+        }
+        (splitter, mux)
+    }
+
+    #[test]
+    fn a_branch_whose_stack_is_unchanged_is_never_moved() {
+        with_env(&[("KANSTACK_STACK_PANES", None)], || {
+            let (mut splitter, mux) = restacking_splitter(&["feat-top", "feat-base", "feat-other"]);
+            let status = status_with_stacks(&[&["feat-top", "feat-base"], &["feat-other"]]);
+            splitter.restack_moved_branches(&status).unwrap();
+            splitter.restack_moved_branches(&status).unwrap();
+            // A new stack appearing ahead of them shifts every `cliId` after it (`s0` → `s1`),
+            // which must not read as all of them moving.
+            let shifted = status_with_stacks(&[&["feat-new"], &["feat-top", "feat-base"], &["feat-other"]]);
+            splitter.restack_moved_branches(&shifted).unwrap();
+            assert!(mux.lines().is_empty(), "{:#?}", mux.lines());
+        });
+    }
+
+    /// The motivating case: an agent ran `but move` itself, so `feat-top`'s pane, opened as a
+    /// lane of its own, is now stacked on `feat-base` — and goes to sit with it, as a tab by
+    /// default, exactly where a stacked spawn would have put it. Once, not on every refresh.
+    #[test]
+    fn a_branch_that_joins_a_stack_with_a_live_sibling_is_moved_into_a_tab_beside_it() {
+        with_env(&[("KANSTACK_STACK_PANES", None)], || {
+            let (mut splitter, mux) = restacking_splitter(&["feat-top", "feat-base"]);
+            splitter.restack_moved_branches(&status_with_stacks(&[&["feat-base"], &["feat-top"]])).unwrap();
+            let joined = status_with_stacks(&[&["feat-top", "feat-base"]]);
+            splitter.restack_moved_branches(&joined).unwrap();
+            assert_eq!(mux.lines(), ["regroup p-feat-top alongside p-feat-base as feat-top"]);
+
+            splitter.restack_moved_branches(&joined).unwrap();
+            assert_eq!(mux.lines().len(), 1, "already moved: {:#?}", mux.lines());
+            assert_eq!(splitter.pane_id("feat-top").as_deref(), Some("p-feat-top"), "a move keeps the pane's id");
+        });
+    }
+
+    /// Two stacks that were both seen before merging look the same whichever of them `but`
+    /// moved, so the lower one keeps its identity and the upper one's panes go to it —
+    /// whether the upper branch moved on top, or the lower one moved underneath.
+    #[test]
+    fn when_two_seen_stacks_merge_the_upper_ones_pane_moves_to_the_lower_ones() {
+        with_env(&[("KANSTACK_STACK_PANES", None)], || {
+            let (mut splitter, mux) = restacking_splitter(&["feat-top", "feat-under"]);
+            splitter.restack_moved_branches(&status_with_stacks(&[&["feat-top"], &["feat-under"]])).unwrap();
+            splitter.restack_moved_branches(&status_with_stacks(&[&["feat-top", "feat-under"]])).unwrap();
+            assert_eq!(mux.lines(), ["regroup p-feat-top alongside p-feat-under as feat-top"]);
+        });
+    }
+
+    /// `KANSTACK_STACK_PANES=split` splits instead, in the same orthogonal direction a stacked
+    /// spawn uses (`down`, off the default `right` chain).
+    #[test]
+    fn a_joined_branch_is_split_off_its_sibling_when_stack_panes_are_split() {
+        with_env(&[("KANSTACK_STACK_PANES", Some("split"))], || {
+            let (mut splitter, mux) = restacking_splitter(&["feat-top", "feat-base"]);
+            splitter.restack_moved_branches(&status_with_stacks(&[&["feat-base"], &["feat-top"]])).unwrap();
+            splitter.restack_moved_branches(&status_with_stacks(&[&["feat-top", "feat-base"]])).unwrap();
+            assert_eq!(mux.lines(), ["regroup p-feat-top down of p-feat-base as feat-top"]);
+        });
+    }
+
+    /// Nothing to group with: the sibling has no pane at all, or only one that has closed.
+    #[test]
+    fn a_branch_that_joins_a_stack_with_no_live_sibling_pane_is_left_where_it_is() {
+        with_env(&[("KANSTACK_STACK_PANES", None)], || {
+            let (mut splitter, mux) = restacking_splitter(&["feat-top"]);
+            splitter.restack_moved_branches(&status_with_stacks(&[&["feat-base"], &["feat-top"]])).unwrap();
+            splitter.restack_moved_branches(&status_with_stacks(&[&["feat-top", "feat-base"]])).unwrap();
+            assert!(mux.lines().is_empty(), "no pane for feat-base: {:#?}", mux.lines());
+
+            let (mut splitter, mux) = restacking_splitter(&["feat-top", "feat-base"]);
+            splitter.apply_statuses(HashMap::from([("feat-base".to_string(), PaneStatus::Dead)]));
+            splitter.restack_moved_branches(&status_with_stacks(&[&["feat-base"], &["feat-top"]])).unwrap();
+            splitter.restack_moved_branches(&status_with_stacks(&[&["feat-top", "feat-base"]])).unwrap();
+            assert!(mux.lines().is_empty(), "feat-base's pane is dead: {:#?}", mux.lines());
+        });
+    }
+
+    /// The first look has nothing to compare against — kanstack just started, and every pane
+    /// is wherever it was put — so it records and moves nothing, however stacked things are.
+    /// That includes a branch `kanstack spawn --above` just created, which that spawn grouped.
+    #[test]
+    fn the_first_look_at_a_branchs_stack_moves_nothing() {
+        with_env(&[("KANSTACK_STACK_PANES", None)], || {
+            let (mut splitter, mux) = restacking_splitter(&["feat-top", "feat-base"]);
+            splitter.restack_moved_branches(&status_with_stacks(&[&["feat-top", "feat-base"]])).unwrap();
+            assert!(mux.lines().is_empty(), "{:#?}", mux.lines());
+
+            splitter.adopt("feat-new", "p-feat-new");
+            splitter.restack_moved_branches(&status_with_stacks(&[&["feat-new", "feat-top", "feat-base"]])).unwrap();
+            assert!(mux.lines().is_empty(), "a branch seen for the first time hasn't moved: {:#?}", mux.lines());
+        });
+    }
+
+    /// Deliberately out of scope for v1, not forgotten: a branch leaving a stack keeps its
+    /// pane with its old siblings, whichever of the two resulting stacks `but` lists first.
+    #[test]
+    fn a_branch_leaving_a_stack_is_not_split_back_out_in_v1() {
+        with_env(&[("KANSTACK_STACK_PANES", None)], || {
+            for after in [&[&["feat-top"][..], &["feat-base"][..]], &[&["feat-base"][..], &["feat-top"][..]]] {
+                let (mut splitter, mux) = restacking_splitter(&["feat-top", "feat-base"]);
+                splitter.restack_moved_branches(&status_with_stacks(&[&["feat-top", "feat-base"]])).unwrap();
+                splitter.restack_moved_branches(&status_with_stacks(after)).unwrap();
+                assert!(mux.lines().is_empty(), "{after:?}: {:#?}", mux.lines());
+            }
+        });
+    }
+
+    /// The same rule `kanstack spawn` picks a sibling by: the first in stack order (tip first)
+    /// with a live pane, skipping one with no pane and one whose pane has closed.
+    #[test]
+    fn a_joined_branch_goes_to_the_first_live_sibling_in_stack_order() {
+        with_env(&[("KANSTACK_STACK_PANES", None)], || {
+            let (mut splitter, mux) = restacking_splitter(&["feat-mover", "feat-dead", "feat-base", "feat-low"]);
+            splitter.apply_statuses(HashMap::from([("feat-dead".to_string(), PaneStatus::Dead)]));
+            let before = status_with_stacks(&[&["feat-no-pane", "feat-dead", "feat-base", "feat-low"], &["feat-mover"]]);
+            splitter.restack_moved_branches(&before).unwrap();
+            let after = status_with_stacks(&[&["feat-mover", "feat-no-pane", "feat-dead", "feat-base", "feat-low"]]);
+            splitter.restack_moved_branches(&after).unwrap();
+            assert_eq!(mux.lines(), ["regroup p-feat-mover alongside p-feat-base as feat-mover"]);
+        });
+    }
+
+    /// Two branches carried into a stack together are both moving, so neither is an anchor
+    /// for the other: both go to the pane that was already there.
+    #[test]
+    fn branches_that_join_together_group_with_the_pane_already_there_not_each_other() {
+        with_env(&[("KANSTACK_STACK_PANES", None)], || {
+            let (mut splitter, mux) = restacking_splitter(&["feat-y", "feat-x", "feat-base"]);
+            splitter.restack_moved_branches(&status_with_stacks(&[&["feat-y", "feat-x"], &["feat-base"]])).unwrap();
+            splitter.restack_moved_branches(&status_with_stacks(&[&["feat-y", "feat-x", "feat-base"]])).unwrap();
+            assert_eq!(
+                mux.lines(),
+                ["regroup p-feat-y alongside p-feat-base as feat-y", "regroup p-feat-x alongside p-feat-base as feat-x"]
+            );
+        });
+    }
+
+    /// A move the multiplexer refuses is reported, doesn't stop the others, and isn't asked
+    /// for again on the next refresh.
+    #[test]
+    fn a_failed_move_is_reported_without_stopping_the_others_and_is_not_retried() {
+        with_env(&[("KANSTACK_STACK_PANES", None)], || {
+            let (mut splitter, mux) = restacking_splitter(&["feat-a", "feat-b", "feat-base-1", "feat-base-2"]);
+            *mux.fail_regroup.lock().unwrap() = true;
+            let before = status_with_stacks(&[&["feat-a"], &["feat-base-1"], &["feat-b"], &["feat-base-2"]]);
+            splitter.restack_moved_branches(&before).unwrap();
+            let after = status_with_stacks(&[&["feat-a", "feat-base-1"], &["feat-b", "feat-base-2"]]);
+            let err = splitter.restack_moved_branches(&after).unwrap_err().to_string();
+            assert!(err.contains("feat-a: fake regroup failed") && err.contains("feat-b: fake regroup failed"), "{err}");
+            assert_eq!(mux.lines().len(), 2, "{:#?}", mux.lines());
+
+            splitter.restack_moved_branches(&after).unwrap();
+            assert_eq!(mux.lines().len(), 2, "not retried: {:#?}", mux.lines());
         });
     }
 
