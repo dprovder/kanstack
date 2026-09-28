@@ -205,12 +205,6 @@ pub struct App {
     /// picker; blank means "no `--model` given", same as `kanstack spawn` with the flag
     /// omitted.
     pub model_input: TextInput,
-    /// Whether the branch's workstream is recorded as advisory — not expected to produce
-    /// commits, same as `kanstack spawn --advisory` — valid while `mode == Branch` (see
-    /// `BranchModalRow::Advisory`) and carried the same way as `model_input`. `false` — the
-    /// default, reset each time branch naming starts — records it exactly as a plain `spawn`
-    /// would.
-    pub advisory: bool,
     /// Reasoning-effort hint being picked for the branch's harness pane, valid while
     /// `mode == Branch` (see `BranchModalRow::Effort`) and carried the same way as
     /// `model_input`. `None` — the default, reset each time branch naming starts — means "no
@@ -503,7 +497,6 @@ impl App {
             harness_input: TextInput::default(),
             harness_choices: Vec::new(),
             model_input: TextInput::default(),
-            advisory: false,
             effort: None,
             task_input: TextInput::default(),
             task_target: None,
@@ -575,7 +568,6 @@ impl App {
             harness_input: TextInput::default(),
             harness_choices: Vec::new(),
             model_input: TextInput::default(),
-            advisory: false,
             effort: None,
             task_input: TextInput::default(),
             task_target: None,
@@ -2256,10 +2248,10 @@ mod tests {
     }
 
     /// With a splitter available, `Down` walks every row — Name, Action, Split, Harness,
-    /// Model, Effort, Advisory — before finally dropping into the optional message step, in
-    /// exactly that top-to-bottom order.
+    /// Model, Effort — before finally dropping into the optional message step, in exactly
+    /// that top-to-bottom order.
     #[test]
-    fn down_walks_through_the_harness_model_effort_and_advisory_rows_when_a_splitter_is_available() {
+    fn down_walks_through_the_harness_model_and_effort_rows_when_a_splitter_is_available() {
         let mut app = App::from_board(board());
         with_fake_splitter(&mut app);
         app.begin_branch(); // col 0: a parallel lane, open_harness defaults on
@@ -2277,20 +2269,18 @@ mod tests {
         assert_eq!(app.branch_modal_row, BranchModalRow::Model);
         app.handle_key(key(ratatui::crossterm::event::KeyCode::Down));
         assert_eq!(app.branch_modal_row, BranchModalRow::Effort);
-        app.handle_key(key(ratatui::crossterm::event::KeyCode::Down));
-        assert_eq!(app.branch_modal_row, BranchModalRow::Advisory);
 
         app.handle_key(key(ratatui::crossterm::event::KeyCode::Down));
-        assert_eq!(app.mode, Mode::HarnessMessage, "past Advisory, Down reaches the message step");
+        assert_eq!(app.mode, Mode::HarnessMessage, "past Effort, Down reaches the message step");
     }
 
-    /// `Up` from the message step lands back on `Advisory` (the last row, now that
-    /// Harness/Model/Effort/Advisory sit between Split and the message step), and restores
-    /// the harness/model/effort/advisory that were typed/picked before `Down` moved on — same
-    /// "moving between fields must not throw anything away" guarantee
-    /// `branch_input`/`stack_onto` already get.
+    /// `Up` from the message step lands back on `Effort` (the last row, now that
+    /// Harness/Model/Effort sit between Split and the message step), and restores the
+    /// harness/model/effort that were typed/picked before `Down` moved on — same "moving
+    /// between fields must not throw anything away" guarantee `branch_input`/`stack_onto`
+    /// already get.
     #[test]
-    fn up_from_the_harness_message_step_restores_harness_model_effort_and_advisory_too() {
+    fn up_from_the_harness_message_step_restores_harness_model_and_effort_too() {
         let mut app = App::from_board(board());
         with_fake_splitter(&mut app);
         app.begin_branch();
@@ -2304,10 +2294,8 @@ mod tests {
             app.model_input.insert(c);
         }
         app.effort = Some(crate::harness::Effort::Medium);
-        app.advisory = true;
         app.advance_to_harness_message();
         assert_eq!(app.mode, Mode::HarnessMessage);
-        assert!(app.pending_branch.as_ref().is_some_and(|p| p.advisory), "carried into the message step");
 
         app.back_to_branch_name();
 
@@ -2315,8 +2303,7 @@ mod tests {
         assert_eq!(app.harness_input.as_str(), "codex");
         assert_eq!(app.model_input.as_str(), "opus");
         assert_eq!(app.effort, Some(crate::harness::Effort::Medium));
-        assert!(app.advisory);
-        assert_eq!(app.branch_modal_row, BranchModalRow::Advisory, "the last row before the message step");
+        assert_eq!(app.branch_modal_row, BranchModalRow::Effort, "the last row before the message step");
     }
 
     /// Once the row cursor is on `Harness`, ordinary character keys edit `harness_input` —
@@ -2719,7 +2706,6 @@ mod tests {
             harness: None,
             model: None,
             effort: None,
-            advisory: false,
         });
         for c in "an initial message".chars() {
             app.harness_message_input.insert(c);
@@ -3427,60 +3413,4 @@ mod tests {
         });
     }
 
-    /// The advisory checkbox resets with everything else when naming starts, and flips
-    /// with `Left`/`Right` or `space` — but only on its own row: `space` on the model row is
-    /// just a space in the model name.
-    #[test]
-    fn the_advisory_row_flips_with_left_right_or_space_and_resets_when_naming_starts() {
-        let mut app = App::from_board(board());
-        with_fake_splitter(&mut app);
-        app.advisory = true;
-        app.begin_branch();
-        assert!(!app.advisory, "reset each time naming starts");
-
-        app.branch_modal_row = BranchModalRow::Model;
-        app.handle_key(key(K::Char(' ')));
-        assert!(!app.advisory);
-
-        app.branch_modal_row = BranchModalRow::Advisory;
-        app.handle_key(key(K::Right));
-        assert!(app.advisory);
-        app.handle_key(key(K::Left));
-        assert!(!app.advisory);
-        app.handle_key(key(K::Char(' ')));
-        assert!(app.advisory);
-    }
-
-    /// Without a split backend the advisory row isn't shown — nothing would be spawned for
-    /// it to describe — so `Down` from Action still goes straight on, same as before.
-    #[test]
-    fn without_a_splitter_down_skips_the_advisory_row_with_the_rest() {
-        let mut app = App::from_board(board());
-        app.begin_branch();
-        app.branch_modal_row = BranchModalRow::Action;
-        app.handle_key(key(K::Down));
-        assert_ne!(app.branch_modal_row, BranchModalRow::Advisory);
-    }
-
-    /// What the modal's checkbox actually does once a pane opens: overwrite whatever
-    /// `record_spawn` carried over from an earlier spawn on the same branch name — this spawn
-    /// says what it is, same as `kanstack spawn --advisory` — and never invent a workstream
-    /// for a branch that has none.
-    #[test]
-    fn record_advisory_sets_the_new_panes_flag_either_way_and_invents_nothing() {
-        use crate::workstream::{record_spawn, Registry};
-        with_state_dir("record-advisory", |repo| {
-            record_spawn(repo, "review-auth", "%1", Some("claude"), None);
-            branch_modal::record_advisory(repo, "review-auth", true);
-            assert!(Registry::load(repo).unwrap().get("review-auth").unwrap().advisory);
-
-            record_spawn(repo, "review-auth", "%2", Some("claude"), None);
-            assert!(Registry::load(repo).unwrap().get("review-auth").unwrap().advisory, "record_spawn carries it over");
-            branch_modal::record_advisory(repo, "review-auth", false);
-            assert!(!Registry::load(repo).unwrap().get("review-auth").unwrap().advisory, "the checkbox wins");
-
-            branch_modal::record_advisory(repo, "never-spawned", true);
-            assert!(Registry::load(repo).unwrap().get("never-spawned").is_none());
-        });
-    }
 }

@@ -4,7 +4,7 @@ use ratatui::crossterm::event::KeyCode as K;
 
 /// A branch named in `Mode::Branch` but not yet created, waiting on
 /// `Mode::HarnessMessage`'s prompt — see `App::advance_to_harness_message`. Carries the
-/// harness/model/effort/advisory choice too, gathered on the name step same as the branch name and
+/// harness/model/effort choice too, gathered on the name step same as the branch name and
 /// stack target, so `App::confirm_harness_message` has them once the branch is actually
 /// created.
 pub(super) struct PendingBranch {
@@ -13,16 +13,17 @@ pub(super) struct PendingBranch {
     pub(super) harness: Option<String>,
     pub(super) model: Option<String>,
     pub(super) effort: Option<Effort>,
-    pub(super) advisory: bool,
 }
 
 /// Which row of the branch-creation modal `Left`/`Right`/`Up`/`Down` currently act on —
 /// see `App::branch_modal_row_down`/`_up`. Top-to-bottom order matches the modal's own
-/// layout, `Split`/`Harness`/`Model`/`Effort`/`Advisory` included only when
+/// layout, `Split`/`Harness`/`Model`/`Effort` included only when
 /// `App::branch_modal_split_row_visible` says they're shown — all of them are meaningless
-/// without a split backend to hand a model or an effort hint to (or, for `Advisory`, a pane
-/// whose workstream there'd be anything to record about) in the first place, the same
-/// reasoning `Split` already followed alone.
+/// without a split backend to hand a model or an effort hint to in the first place, the same
+/// reasoning `Split` already followed alone. There is deliberately no `Advisory` row here:
+/// creating a branch is, by default, for making real changes, and `kanstack spawn --advisory`
+/// stays a CLI-only opt-in for the rarer case (a review/research agent) rather than a choice
+/// this everyday flow should be offering up front.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BranchModalRow {
     Name,
@@ -46,11 +47,6 @@ pub enum BranchModalRow {
     /// `low` → `medium` → `high` — the same two-key cycling `Action`/`Split` already use,
     /// just with four states instead of two.
     Effort,
-    /// A checkbox, flipped with `Left`/`Right` or `space` — the same two-state toggle
-    /// `Split` is, for `kanstack spawn --advisory`: whether the workstream is recorded as
-    /// one not expected to produce commits (see `crate::workstream::Workstream::advisory`).
-    /// Changes nothing about how the pane is spawned; only how the board renders the lane.
-    Advisory,
 }
 
 /// How the branch-naming/harness-message flow is presented: a dedicated modal (the
@@ -101,7 +97,6 @@ impl App {
         self.harness_choices = crate::setup::detect_harnesses();
         self.model_input.clear();
         self.effort = None;
-        self.advisory = false;
         self.stack_onto = self
             .board
             .columns
@@ -160,7 +155,7 @@ impl App {
     }
 
     /// `Down` in the name step: moves the row cursor along Name → Action → Split → Harness →
-    /// Model → Effort → Advisory (skipping everything after Action together when
+    /// Model → Effort (skipping everything after Action together when
     /// `branch_modal_split_row_visible` says they aren't shown — there's no split backend to
     /// hand any of them to) → on to the optional message step, the same top-to-bottom order
     /// the modal itself renders in.
@@ -175,8 +170,7 @@ impl App {
             BranchModalRow::Split => BranchModalRow::Harness,
             BranchModalRow::Harness => BranchModalRow::Model,
             BranchModalRow::Model => BranchModalRow::Effort,
-            BranchModalRow::Effort => BranchModalRow::Advisory,
-            BranchModalRow::Advisory => {
+            BranchModalRow::Effort => {
                 self.advance_to_harness_message();
                 return;
             }
@@ -187,7 +181,6 @@ impl App {
     /// a no-op already at the top row.
     pub(super) fn branch_modal_row_up(&mut self) {
         self.branch_modal_row = match self.branch_modal_row {
-            BranchModalRow::Advisory => BranchModalRow::Effort,
             BranchModalRow::Effort => BranchModalRow::Model,
             BranchModalRow::Model => BranchModalRow::Harness,
             BranchModalRow::Harness => BranchModalRow::Split,
@@ -197,9 +190,9 @@ impl App {
     }
 
     /// `Left`/`Right` on whichever row is focused: moves the name/model field's text cursor,
-    /// toggles the action/split/advisory row exactly as `Tab`/`Shift-Tab`/`space` already do
-    /// (direction doesn't matter for a two-state toggle, so both keys reach the same
-    /// handler), or steps the harness/effort picker one way or the other (see
+    /// toggles the action/split row exactly as `Tab`/`Shift-Tab` already do (direction
+    /// doesn't matter for a two-state toggle, so both keys reach the same handler), or steps
+    /// the harness/effort picker one way or the other (see
     /// `cycle_harness_choice`/`cycle_effort`, where direction does matter). `Harness` never
     /// moves a text cursor on `Left`/`Right` — same as `crate::setup`'s own harness field,
     /// those two keys are reserved for cycling there, and typing still edits the field by
@@ -216,7 +209,6 @@ impl App {
             BranchModalRow::Model if left => self.model_input.move_left(),
             BranchModalRow::Model => self.model_input.move_right(),
             BranchModalRow::Effort => self.cycle_effort(left),
-            BranchModalRow::Advisory => self.advisory = !self.advisory,
         }
     }
 
@@ -387,7 +379,6 @@ impl App {
         let harness = trimmed_or_none(&self.harness_input);
         let model = trimmed_or_none(&self.model_input);
         let effort = self.effort;
-        let advisory = self.advisory;
         self.branch_input.clear();
         self.harness_message_input.clear();
         self.harness_input.clear();
@@ -401,7 +392,6 @@ impl App {
             harness.as_deref(),
             model.as_deref(),
             effort,
-            advisory,
         );
     }
 
@@ -427,11 +417,10 @@ impl App {
         let harness = trimmed_or_none(&self.harness_input);
         let model = trimmed_or_none(&self.model_input);
         let effort = self.effort;
-        let advisory = self.advisory;
         self.branch_input.clear();
         self.harness_input.clear();
         self.model_input.clear();
-        self.pending_branch = Some(PendingBranch { name, anchor, harness, model, effort, advisory });
+        self.pending_branch = Some(PendingBranch { name, anchor, harness, model, effort });
         self.mode = Mode::HarnessMessage;
     }
 
@@ -449,10 +438,9 @@ impl App {
         self.harness_input.set(pending.harness.unwrap_or_default());
         self.model_input.set(pending.model.unwrap_or_default());
         self.effort = pending.effort;
-        self.advisory = pending.advisory;
         self.mode = Mode::Branch;
         self.branch_modal_row = if self.branch_modal_split_row_visible() {
-            BranchModalRow::Advisory
+            BranchModalRow::Effort
         } else {
             BranchModalRow::Action
         };
@@ -478,7 +466,6 @@ impl App {
             pending.harness.as_deref(),
             pending.model.as_deref(),
             pending.effort,
-            pending.advisory,
         );
     }
 
@@ -502,9 +489,7 @@ impl App {
     /// `initial_message` and forwarded exactly as `kanstack spawn --model`/`--effort` would —
     /// see `crate::harness::Harness::model_effort_args`. `None` for all three (the modal's
     /// default, and every call site before this feature existed) reproduces the launch line
-    /// byte for byte. `advisory` is the modal's Advisory checkbox, recorded against the new
-    /// pane's workstream once it opens (`record_advisory`) — it never touches the launch line
-    /// at all, only how the board renders the lane afterwards.
+    /// byte for byte.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn create_branch(
         &mut self,
@@ -515,7 +500,6 @@ impl App {
         harness: Option<&str>,
         model: Option<&str>,
         effort: Option<Effort>,
-        advisory: bool,
     ) {
         let Some(but) = &self.but else {
             self.notify("snapshot is read-only", Notice::Info);
@@ -562,7 +546,6 @@ impl App {
                         match spawned {
                             Ok(pane) => {
                                 crate::workstream::record_spawn(&cwd, name, &pane, harness, splitter.workspace().as_deref());
-                                record_advisory(&cwd, name, advisory);
                                 self.notify(format!("created {name} — harness open"), Notice::Success);
                             }
                             Err(e) => self.notify(format!("{label}: {e}"), Notice::Error),
@@ -573,23 +556,6 @@ impl App {
             Err(e) => self.notify(format!("{e}"), Notice::Error),
         }
     }
-}
-
-/// Records `advisory` against `branch`'s workstream, which `record_spawn` has just written.
-/// Separate from it because `record_spawn` deliberately carries over whatever an earlier
-/// spawn on the same branch name recorded — the right call for a spawn that has no advisory
-/// opinion of its own (a `t` dispatch's first pane) — while the modal's checkbox, like
-/// `kanstack spawn --advisory`, *is* this spawn's opinion: a respawn is a new agent that may
-/// well be doing a different kind of work (see `crate::cli::spawn`'s own note on this).
-/// Best-effort, same as `record_spawn`: a registry that can't be written must not undo a
-/// pane that did open, it just leaves the lane rendered as whatever it was.
-pub(super) fn record_advisory(cwd: &std::path::Path, branch: &str, advisory: bool) {
-    let _ = crate::workstream::Registry::with_lock(cwd, |registry| {
-        if let Some(w) = registry.workstreams.iter_mut().find(|w| w.branch_id.0 == branch) {
-            w.advisory = advisory;
-        }
-        Ok(())
-    });
 }
 
 impl App {
@@ -604,7 +570,6 @@ impl App {
         let on_name_row = !modal || self.branch_modal_row == BranchModalRow::Name;
         let on_harness_row = modal && self.branch_modal_row == BranchModalRow::Harness;
         let on_model_row = modal && self.branch_modal_row == BranchModalRow::Model;
-        let on_advisory_row = modal && self.branch_modal_row == BranchModalRow::Advisory;
         match key.code {
             K::Esc => {
                 self.mode = Mode::Normal;
@@ -621,7 +586,6 @@ impl App {
             K::Right => self.branch_input.move_right(),
             K::Tab => self.toggle_stack_onto(),
             K::BackTab => self.toggle_open_harness(),
-            K::Char(' ') if on_advisory_row => self.advisory = !self.advisory,
             _ if on_name_row => {
                 if self.branch_input.handle_key(key) {
                     self.branch_name_missing = false;
