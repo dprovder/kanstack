@@ -1,6 +1,6 @@
 //! The exit-code and `--json` error contract shared by every headless subcommand.
 //!
-//! `kanstack spawn/send/status/focus/stop/report/prune` are meant to be driven by a script
+//! `kanstack spawn/send/status/focus/stop/report/prune/note/intent/ask/answer` are meant to be driven by a script
 //! or another agent, not just typed by hand, so failure needs to be as parseable as success:
 //! a stable, small set of process exit codes for "what kind of thing went wrong", and — under
 //! `--json` — a symbolic `error.code` precise enough that a caller who needs to branch on the
@@ -12,7 +12,7 @@
 //! | `0` | success | — |
 //! | `1` | internal: a bug, a corrupt registry, an I/O failure below everything else here | `internal` |
 //! | `2` | invalid arguments — caught before anything ran | `invalid_arguments` |
-//! | `3` | nothing to act on: the target names no workstream, or it has no pane | `unknown_workstream`, `no_pane` |
+//! | `3` | nothing to act on: the target names no workstream, it has no pane, or `answer` found no pending ask | `unknown_workstream`, `no_pane`, `no_pending_ask` |
 //! | `4` | conflict: `spawn` on a branch that already has a live pane, or `--above`/`--below` on a branch that already exists | `workstream_exists`, `branch_already_exists` |
 //! | `5` | an external dependency is unavailable or refused: the split backend, `but`, the harness, or delivering a message to a pane | `multiplexer_unavailable`, `harness_unavailable`, `but_failed`, `delivery_failed` |
 //!
@@ -49,6 +49,12 @@ pub enum ErrorCode {
     BranchAlreadyExists,
     /// The workstream has no pane for this command to act on.
     NoPane,
+    /// `answer` on a branch with no pending ask — never asked, already answered, or dropped
+    /// when its lane was stopped or respawned. As narrow as `NoPane` and in the same bucket
+    /// for the same reason: there's nothing to act on, and a caller retrying an `answer` it
+    /// isn't sure landed can read this as "already done", exactly as `stop` does with
+    /// `unknown_workstream`.
+    NoPendingAsk,
     /// No split backend could be reached — none found, or a call to the one found failed.
     MultiplexerUnavailable,
     /// The configured harness could not be launched. Reserved: nothing raises this today —
@@ -72,6 +78,7 @@ impl ErrorCode {
             ErrorCode::WorkstreamExists => "workstream_exists",
             ErrorCode::BranchAlreadyExists => "branch_already_exists",
             ErrorCode::NoPane => "no_pane",
+            ErrorCode::NoPendingAsk => "no_pending_ask",
             ErrorCode::MultiplexerUnavailable => "multiplexer_unavailable",
             ErrorCode::HarnessUnavailable => "harness_unavailable",
             ErrorCode::ButFailed => "but_failed",
@@ -87,7 +94,7 @@ impl ErrorCode {
         match self {
             ErrorCode::Internal => 1,
             ErrorCode::InvalidArguments => 2,
-            ErrorCode::UnknownWorkstream | ErrorCode::NoPane => 3,
+            ErrorCode::UnknownWorkstream | ErrorCode::NoPane | ErrorCode::NoPendingAsk => 3,
             ErrorCode::WorkstreamExists | ErrorCode::BranchAlreadyExists => 4,
             ErrorCode::MultiplexerUnavailable
             | ErrorCode::HarnessUnavailable
@@ -186,9 +193,10 @@ pub fn report_error(command: &str, e: anyhow::Error, json: bool, out: &mut impl 
 
 /// Which lifecycle event, if any, `command` should ring the events-log doorbell for
 /// (`crate::events`) once it succeeds — `spawn`/`stop`/`prune` only, the branch it named when
-/// it named one. `report` already rings it, from `Reports::write`, not from here; `send`,
-/// `focus`, `status` and `events` don't change what "lifecycle" means for a workstream, so
-/// none of them log anything here.
+/// it named one. `report` already rings it, from `Reports::write`, not from here, and so do
+/// `note`/`ask`/`answer`, each logging its own kind of event from where it writes; `send`,
+/// `focus`, `status`, `events`, `claim` and `intent` don't change what "lifecycle" means for
+/// a workstream, so none of them log anything here.
 fn lifecycle_event(command: &Command) -> Option<(&'static str, Option<String>)> {
     match command {
         Command::Spawn { branch, .. } => Some(("spawn", Some(branch.clone()))),
@@ -198,7 +206,16 @@ fn lifecycle_event(command: &Command) -> Option<(&'static str, Option<String>)> 
         // `prune` can remove several workstreams or none; one event marks that it ran rather
         // than guessing which branches it touched.
         Command::Prune { .. } => Some(("prune", None)),
-        Command::Send { .. } | Command::Status { .. } | Command::Focus { .. } | Command::Report { .. } | Command::Events { .. } | Command::Claim { .. } => None,
+        Command::Send { .. }
+        | Command::Status { .. }
+        | Command::Focus { .. }
+        | Command::Report { .. }
+        | Command::Events { .. }
+        | Command::Claim { .. }
+        | Command::Note { .. }
+        | Command::Intent { .. }
+        | Command::Ask { .. }
+        | Command::Answer { .. } => None,
     }
 }
 
@@ -226,12 +243,13 @@ pub fn dispatch(command: Command, cwd: &Path, out: &mut impl Write, err_out: &mu
 mod tests {
     use super::*;
 
-    const ALL: [ErrorCode; 10] = [
+    const ALL: [ErrorCode; 11] = [
         ErrorCode::InvalidArguments,
         ErrorCode::UnknownWorkstream,
         ErrorCode::WorkstreamExists,
         ErrorCode::BranchAlreadyExists,
         ErrorCode::NoPane,
+        ErrorCode::NoPendingAsk,
         ErrorCode::MultiplexerUnavailable,
         ErrorCode::HarnessUnavailable,
         ErrorCode::ButFailed,
@@ -265,6 +283,7 @@ mod tests {
         assert_eq!(ErrorCode::InvalidArguments.exit_code(), 2);
         assert_eq!(ErrorCode::UnknownWorkstream.exit_code(), 3);
         assert_eq!(ErrorCode::NoPane.exit_code(), 3);
+        assert_eq!(ErrorCode::NoPendingAsk.exit_code(), 3);
         assert_eq!(ErrorCode::WorkstreamExists.exit_code(), 4);
         assert_eq!(ErrorCode::BranchAlreadyExists.exit_code(), 4);
         assert_eq!(ErrorCode::MultiplexerUnavailable.exit_code(), 5);
@@ -335,6 +354,7 @@ mod tests {
                 below: None,
                 model: None,
                 effort: None,
+                advisory: false,
                 json: false,
             }),
             Some(("spawn", Some("fix-login".to_string())))
@@ -354,6 +374,14 @@ mod tests {
         );
         assert_eq!(lifecycle_event(&Command::Events { since: 0, follow: false, new: false, json: false }), None);
         assert_eq!(lifecycle_event(&Command::Claim { branch: None, json: false }), None);
+        assert_eq!(lifecycle_event(&Command::Intent { branch: "fix-login".into(), text: "x".into(), json: false }), None);
+        for (command, why) in [
+            (Command::Note { branch: "fix-login".into(), text: "x".into(), json: false }, "note"),
+            (Command::Ask { branch: "fix-login".into(), question: "x?".into(), json: false }, "ask"),
+            (Command::Answer { branch: "fix-login".into(), text: "x".into(), json: false }, "answer"),
+        ] {
+            assert_eq!(lifecycle_event(&command), None, "{why} logs its own kind of event, not a lifecycle one");
+        }
     }
 
     /// `dispatch` is what `main` actually calls, and it's the one place that knows both a
@@ -382,6 +410,7 @@ mod tests {
                     pane_id: Some(PaneId("%3".into())),
                     agent: Some(AgentId("claude".into())),
                     item: None,
+                    advisory: false,
                 });
                 registry.save().unwrap();
 

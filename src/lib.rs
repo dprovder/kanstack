@@ -15,6 +15,7 @@ pub mod harness;
 pub mod hit;
 pub mod mux;
 pub mod model;
+pub mod orchestration;
 pub mod procs;
 pub mod report;
 pub mod setup;

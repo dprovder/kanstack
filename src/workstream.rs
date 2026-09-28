@@ -65,6 +65,15 @@ pub struct Workstream {
     pub pane_id: Option<PaneId>,
     pub agent: Option<AgentId>,
     pub item: Option<WorkItemRef>,
+    /// Spawned with `--advisory`: a lane that isn't expected to produce commits (a review,
+    /// critique or research agent rather than one editing code). Purely a recorded fact for
+    /// whatever renders the lane — nothing in kanstack changes how an advisory lane is
+    /// spawned, messaged, polled or stopped, and one that does commit after all is neither
+    /// blocked nor warned about: kanstack describes state, it doesn't police it.
+    /// `#[serde(default)]` so a registry written before this field existed still loads, with
+    /// every workstream in it `false`.
+    #[serde(default)]
+    pub advisory: bool,
 }
 
 /// Where the registry for the repository at `repo` lives: under `KANSTACK_STATE_PATH` if
@@ -133,6 +142,24 @@ pub fn claims_dir(repo: &Path) -> Option<PathBuf> {
 pub fn gemini_hooks_dir(repo: &Path) -> Option<PathBuf> {
     let (dir, key) = repo_state(repo)?;
     Some(dir.join(format!("gemini-hooks-{key:016x}")))
+}
+
+/// Where `repo`'s per-branch intents live — one small file per branch, see
+/// `crate::orchestration`. A sibling of `reports_dir`, same repository key and the same
+/// reasoning: `kanstack intent` is run by whatever is orchestrating a lane, from its own
+/// process, whenever it likes, so sharing the registry (rewritten whole) would lose updates.
+pub fn intents_dir(repo: &Path) -> Option<PathBuf> {
+    let (dir, key) = repo_state(repo)?;
+    Some(dir.join(format!("intents-{key:016x}")))
+}
+
+/// Where `repo`'s per-branch pending asks live — one small file per branch, see
+/// `crate::orchestration`. Its own directory rather than sharing `intents_dir`'s, so the
+/// two stay separately inspectable on disk the same way they stay separate in `status --json`:
+/// an intent is informational, a pending ask wants someone's answer.
+pub fn asks_dir(repo: &Path) -> Option<PathBuf> {
+    let (dir, key) = repo_state(repo)?;
+    Some(dir.join(format!("asks-{key:016x}")))
 }
 
 /// The state directory, and the key identifying `repo` within it.
@@ -323,7 +350,8 @@ pub fn record_spawn(repo: &Path, branch: &str, pane_id: &str, agent: Option<&str
             branch_id: BranchId(branch.to_string()),
             pane_id: Some(PaneId(pane_id.to_string())),
             agent: agent.map(|a| AgentId(a.to_string())),
-            item: existing.and_then(|w| w.item),
+            item: existing.as_ref().and_then(|w| w.item.clone()),
+            advisory: existing.is_some_and(|w| w.advisory),
         });
         Ok(())
     });
@@ -339,6 +367,7 @@ mod tests {
             pane_id: pane.map(|p| PaneId(p.into())),
             agent: Some(AgentId("claude".into())),
             item: None,
+            advisory: false,
         }
     }
 

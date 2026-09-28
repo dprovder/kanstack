@@ -14,6 +14,7 @@ use anyhow::Result;
 
 use super::exit::{tag, ErrorCode::*};
 use super::{resolve_branch, seeded_splitter, PaneResult};
+use crate::report::Reports;
 use crate::workstream::Registry;
 
 pub(super) fn run(target: String, json: bool, cwd: &Path, out: &mut impl Write) -> Result<()> {
@@ -23,10 +24,15 @@ pub(super) fn run(target: String, json: bool, cwd: &Path, out: &mut impl Write) 
     let (branch, pane) = Registry::with_lock(cwd, |registry| {
         let branch = resolve_branch(registry, &target)?;
         let pane = registry.get(&branch).and_then(|w| w.pane_id.clone());
-        // A workstream with no pane has nothing to close; forgetting it is the stop.
+        // A workstream with no pane has nothing to close; forgetting it is the stop. Its
+        // per-branch state goes too — `Splitter::stop` forgets that for a lane with a pane,
+        // but a paneless one can still have had an intent or ask set on it (see
+        // `crate::orchestration`), and it mustn't outlive the workstream either.
         if pane.is_some() {
             let mut splitter = seeded_splitter(registry)?;
             splitter.stop(&branch).map_err(|e| tag(MultiplexerUnavailable, e))?;
+        } else {
+            Reports::for_repo(cwd).forget(&branch);
         }
         registry.remove(&branch);
         Ok((branch, pane))
@@ -43,6 +49,7 @@ pub(super) fn run(target: String, json: bool, cwd: &Path, out: &mut impl Write) 
 mod tests {
     use crate::cli::test_support::*;
     use crate::cli::{dispatch, Command};
+    use crate::orchestration::Orchestration;
     use crate::workstream::Registry;
 
     #[test]
@@ -137,6 +144,40 @@ mod tests {
                     printed.contains(r#""code":"unknown_workstream""#),
                     "a retried stop must report a specific, non-ambiguous condition: {printed}"
                 );
+            },
+        );
+    }
+
+    /// `stop` drops the lane's intent and pending ask along with its report — with a pane
+    /// (through `Splitter::stop`'s `Reports::forget`) and without one (directly) — so neither
+    /// haunts whatever is spawned on the branch next. Another lane's are left alone.
+    #[test]
+    fn stop_forgets_the_intent_and_pending_ask_with_or_without_a_pane() {
+        with_tmux_registry(
+            "stop-forgets-orchestration",
+            r#"printf '%%3 2000000000\n'"#,
+            vec![
+                workstream("fix-login", Some("%3"), Some("claude"), None),
+                workstream("planned", None, None, None),
+                workstream("add-search", None, None, None),
+            ],
+            |repo| {
+                let orchestration = Orchestration::for_repo(repo);
+                let now = std::time::SystemTime::now();
+                for branch in ["fix-login", "planned", "add-search"] {
+                    orchestration.set_intent(branch, "busy with something", now).unwrap();
+                    orchestration.ask(branch, "ship it?", now).unwrap();
+                }
+
+                crate::cli::run(Command::Stop { target: "fix-login".into(), json: false }, repo, &mut Vec::new()).unwrap();
+                crate::cli::run(Command::Stop { target: "planned".into(), json: false }, repo, &mut Vec::new()).unwrap();
+
+                for branch in ["fix-login", "planned"] {
+                    assert_eq!(orchestration.intent(branch), None, "{branch}");
+                    assert_eq!(orchestration.pending_ask(branch), None, "{branch}");
+                }
+                assert!(orchestration.intent("add-search").is_some(), "a lane that wasn't stopped keeps its intent");
+                assert!(orchestration.pending_ask("add-search").is_some());
             },
         );
     }

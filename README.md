@@ -282,7 +282,7 @@ agent in one pane can start and talk to others. Run these inside the cmux, tmux,
 panes live in:
 
 ```sh
-kanstack spawn <branch> [--agent codex] [--prompt "..."] [--model <name>] [--effort <low|medium|high>] [--json]   # creates <branch> if it doesn't exist
+kanstack spawn <branch> [--agent codex] [--prompt "..."] [--model <name>] [--effort <low|medium|high>] [--advisory] [--json]   # creates <branch> if it doesn't exist
 kanstack send <branch|session> "..." [--json]
 kanstack status [--json]
 kanstack focus <branch|session> [--json]
@@ -290,6 +290,10 @@ kanstack stop <branch|session> [--json]                     # closes the pane, e
 kanstack report <busy|idle> [<branch>] [--json]              # what an agent says about itself
 kanstack prune [--json]                                     # forgets workstreams whose pane is confirmed gone
 kanstack events [--since <offset>|--new] [--follow] [--json]  # tails the append-only events log
+kanstack note <branch> "..." [--json]                       # a remark for the events log, nothing else
+kanstack intent <branch> "..." [--json]                     # why the lane looks the way it does right now
+kanstack ask <branch> "..." [--json]                        # a question that wants a human's answer
+kanstack answer <branch> "..." [--json]                     # answers it, clearing it
 ```
 
 Every one of these takes `--json`, for a script or another agent to drive kanstack without
@@ -308,6 +312,14 @@ board's own branch-creation modal (`b`) offers a harness picker too, right below
 checkbox: `←`/`→` cycles through whatever's actually on `PATH` (the same detection `--setup`
 uses), and typing overrides it with anything else, same as `--agent` — plus the same model and
 effort fields as `kanstack spawn --model`/`--effort`.
+
+`--advisory` records the workstream as one that isn't expected to produce commits — a review,
+critique or research agent rather than one editing code — for `status --json` (`"advisory":
+true`, and `spawn --json`'s own `result.advisory`) and the board to show. That's all it does:
+it changes nothing about how the pane is spawned, messaged, polled or stopped, and an advisory
+lane that commits something after all is neither blocked nor warned about — kanstack describes
+what a harness does, it doesn't police it. A respawn takes whatever the new `spawn` says; it
+isn't carried over from the last one on that branch.
 
 **Handing off to a stacked branch.** `spawn <branch>` works on a branch already stacked on
 another, and when that other branch already has a pane open — an agent finishing its own
@@ -334,8 +346,11 @@ agent to parse:
  "workstreams":[
   {"branch":"fix-login","pane":"%3","agent":"claude","item":"GH-4","status":"busy",
    "lane":{"commits":3,"conflicted":false,"behind":0,"rebase":"clean","landed":false,
-           "push":"unpushed","uncommitted":0}},
-  {"branch":"planned","pane":null,"agent":null,"item":null,"status":"no-pane","lane":null}
+           "push":"unpushed","uncommitted":0},
+   "advisory":false,"intent":"waiting for cargo test",
+   "pending_ask":{"question":"ship it?","asked_at":"2026-09-22T13:07:00Z"}},
+  {"branch":"planned","pane":null,"agent":null,"item":null,"status":"no-pane","lane":null,
+   "advisory":false,"intent":null,"pending_ask":null}
  ],
  "workspace":{"behind":2,"uncommitted":1,"fetched":"2026-09-21T03:07:40.977+00:00"},
  "workspace_blocked":null}
@@ -347,6 +362,11 @@ workstream, in registry order. `status` is `busy`, `idle`, `waiting`, `dead`, `u
 the same `schema` number, so ignore keys you don't know and read a `status` you don't
 recognize as `unknown`; it changes only if an existing field is renamed, removed or
 reinterpreted.
+
+`advisory` is `spawn --advisory` (always `true` or `false`, never `null`). `intent` and
+`pending_ask` are whatever an orchestrator last said about the lane with `kanstack intent` and
+`kanstack ask` — see "Saying what an orchestrator is doing" below — each `null` when nothing is
+set. `pending_ask.asked_at` is RFC3339 UTC, the same format as an events-log line's `ts`.
 
 `lane` is the branch's git state, from `but status`, so an agent can tell without running it:
 
@@ -425,8 +445,8 @@ resolves "now" to the log's current length when the command runs, so it doesn't 
 tracking an offset between invocations — handy for an orchestrator that just wants to watch
 for whatever happens next.
 
-Two commands write to it. `kanstack report <busy|idle|waiting>` appends one line every time
-it's called:
+`report`, the lifecycle commands, and `note`/`ask`/`answer` write to it. `kanstack report
+<busy|idle|waiting>` appends one line every time it's called:
 
 ```json
 {"schema":1,"ts":"2026-09-22T13:04:05Z","branch":"fix-login","kind":"report","state":"busy"}
@@ -441,10 +461,20 @@ several workstreams or none, so it logs one event with no `branch` rather than g
 {"schema":1,"ts":"2026-09-22T13:05:10Z","kind":"lifecycle","command":"prune"}
 ```
 
-`schema` versions this shape independently of every other `--json` schema in kanstack. Both
-kinds are deliberately thin — a doorbell, not the payload: seeing a line is a cue to go read
-`kanstack status --json` for what actually happened, not something to parse for the state
-itself. Appending is best-effort, like every other write in this file — a full disk or a
+And `note`, `ask` and `answer` each append a line carrying their text (see "Saying what an
+orchestrator is doing" below) — always with a `branch`:
+
+```json
+{"schema":1,"ts":"2026-09-22T13:06:00Z","branch":"fix-login","kind":"note","text":"tests pass, moving on to docs"}
+{"schema":1,"ts":"2026-09-22T13:07:00Z","branch":"fix-login","kind":"ask","question":"ship it?"}
+{"schema":1,"ts":"2026-09-22T13:08:00Z","branch":"fix-login","kind":"answer","text":"yes"}
+```
+
+`schema` versions this shape independently of every other `--json` schema in kanstack. The
+`report` and `lifecycle` kinds are deliberately thin — a doorbell, not the payload: seeing a
+line is a cue to go read `kanstack status --json` for what actually happened, not something to
+parse for the state itself. (A `note`'s text *is* the whole event, so it has nowhere else to
+live.) Appending is best-effort, like every other write in this file — a full disk or a
 missing state directory never fails the command it's attached to, it just means that one event
 doesn't get logged.
 
@@ -455,22 +485,59 @@ workstream registry, so — like `report` — it's safe to run from anywhere. Th
 rotation or size limit yet; if a repository's log ever grows enough to matter, that's worth
 revisiting, but nothing does that today.
 
+### Saying what an orchestrator is doing: `note`, `intent`, `ask`, `answer`
+
+Whatever is driving the panes — you, an agent improvising turn by turn, or a structured
+runner like [`examples/recipe-runner`](examples/recipe-runner) — knows things kanstack can't
+see from the outside: that a lane sitting idle is deliberately waiting on something, or that
+it's stopped until someone answers a question. kanstack doesn't schedule or interpret any of
+that; these four just give an orchestrator somewhere to say it, for `status --json`, the
+events log and (later) the board to show:
+
+```sh
+kanstack note fix-login "tests pass, moving on to docs"      # a remark for the record
+kanstack intent fix-login "waiting for cargo test to finish" # the lane's current "why"
+kanstack ask fix-login "ship it, or wait for review?"        # wants a human
+kanstack answer fix-login "ship it"                          # clears it
+```
+
+- **`note`** only appends a `"note"` line to the events log. Nothing latches; `status --json`
+  doesn't change.
+- **`intent`** sets the lane's one-line intent, shown as `status --json`'s `"intent"`,
+  replacing whatever was there. It's a current value, not an event, so it isn't logged, and it
+  never expires on its own.
+- **`ask`** sets the lane's pending question — shown as `"pending_ask"`, kept apart from
+  `"intent"` because this one wants somebody's answer — replacing any already pending, and
+  logs an `"ask"` line.
+- **`answer`** clears the pending question and logs an `"answer"` line. With nothing pending
+  — never asked, already answered — it fails with `no_pending_ask` (exit `3`), which a caller
+  retrying an `answer` it isn't sure landed can read as "already done".
+
+A lane's intent and pending ask are dropped when it's stopped, and when something is
+respawned on the same branch, so a finished task's "waiting for cargo test", or its
+unanswered question, doesn't haunt the next agent. Like `report`, none of these read the
+workstream registry, need a multiplexer, or check that `<branch>` is a registered
+workstream — something written about a lane nobody tracks is simply never shown — and none
+print anything without `--json`. The branch and text are shaped like `send`'s: the first word
+is the branch, everything after it is joined into one message.
+
 ### Exit codes, and `--json` for every subcommand
 
-`spawn`, `send`, `focus`, `stop` and `report` take `--json` too, for the same reason
+`spawn`, `send`, `focus`, `stop`, `report`, `note`, `intent`, `ask` and `answer` take `--json` too, for the same reason
 `status`/`prune` do: something driving kanstack from a script or another agent shouldn't have
 to parse human-readable text. Success is one document on stdout, this shape for every command
 but `status` and `prune` (which keep the shapes documented above, independently versioned):
 
 ```json
 {"schema":1,"ok":true,"command":"spawn","workstream":"fix-login",
- "result":{"created":true,"pane":"%7","agent":"claude","workspace":null,"model":null,"effort":null}}
+ "result":{"created":true,"pane":"%7","agent":"claude","workspace":null,"model":null,"effort":null,"advisory":false}}
 ```
 
 `spawn`'s own `result.model`/`result.effort` echo back `--model`/`--effort` verbatim (`effort` as
 its wire word, `"low"`/`"medium"`/`"high"`), `null` for either when it wasn't given — e.g.
 `kanstack spawn fix-login --agent codex --model o3 --effort high --json` reports
-`"result":{...,"model":"o3","effort":"high"}`.
+`"result":{...,"model":"o3","effort":"high"}`. `result.advisory` echoes `--advisory`, `false`
+when it wasn't given.
 
 `workstream` is always the branch the command acted on. `result` is command-specific:
 `spawn`'s `created` says whether the branch was new; `workspace` is the multiplexer's
@@ -479,7 +546,10 @@ don't) — same idea as `spawn`'s own text output, `(workspace:1)`. `send`/`focu
 back `{"pane":"..."}`, the pane the command acted on (`null` for `stop` on a workstream that
 had none to close). `report`'s is `{"state":"busy"}` — but only when `--json` is given;
 without it, `report` still prints nothing at all, same as before this existed, since Claude
-adds a `UserPromptSubmit` hook's stdout to what the model sees.
+adds a `UserPromptSubmit` hook's stdout to what the model sees. The same goes for `note`
+(`{}`), `intent` (`{"intent":"..."}`), `ask` (`{"question":"..."}`) and `answer`
+(`{"question":"...","answer":"..."}`, the question it answered and the answer): a result
+under `--json`, nothing at all without it.
 
 A failure is one document too, with the same `command` and a `null`-free `error`:
 
@@ -497,7 +567,7 @@ stdout. Either way, the process exit code says what kind of thing went wrong —
 | `0` | success | — |
 | `1` | internal: a bug, a corrupt registry, an I/O failure below everything else | `internal` |
 | `2` | invalid arguments — caught before anything ran | `invalid_arguments` |
-| `3` | nothing to act on: the target names no workstream, or it has no pane | `unknown_workstream`, `no_pane` |
+| `3` | nothing to act on: the target names no workstream, it has no pane, or `answer` found no pending ask | `unknown_workstream`, `no_pane`, `no_pending_ask` |
 | `4` | conflict: `spawn` on a branch that already has a live pane | `workstream_exists` |
 | `5` | an external dependency is unavailable or refused: the split backend, `but`, the harness, or delivering a message to a pane | `multiplexer_unavailable`, `harness_unavailable`, `but_failed`, `delivery_failed` |
 

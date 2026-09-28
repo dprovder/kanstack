@@ -1,13 +1,15 @@
-//! The headless subcommands — `kanstack spawn/send/status/focus/stop`, and `report` for the
-//! panes to talk back — for driving harness panes from a script or from an agent in another
-//! pane, without the board.
+//! The headless subcommands — `kanstack spawn/send/status/focus/stop`, `report` for the
+//! panes to talk back, and `note`/`intent`/`ask`/`answer` for whatever is orchestrating them
+//! to say what it's doing and what it needs — for driving harness panes from a script or
+//! from an agent in another pane, without the board.
 //!
 //! Each invocation is its own process, so none of them can see the pane handles another
 //! one opened. They share state through [`Registry`] instead: every command loads it, seeds
 //! a fresh [`Splitter`] with it, acts, and writes back whatever changed.
 //!
 //! Each subcommand's argument parsing and dispatch logic lives in its own sibling module
-//! (`spawn`, `send`, `status`, `focus`, `stop`, `report_cmd`, `prune`, `claim`), so work on one
+//! (`spawn`, `send`, `status`, `focus`, `stop`, `report_cmd`, `prune`, `claim`, `note`,
+//! `intent`, and `ask` for both `ask` and `answer`), so work on one
 //! subcommand touches one file. What's shared across more than one of them — the [`Command`]
 //! enum and its [`parse`], the generic `--json` result envelope, and small helpers like
 //! [`seeded_splitter`] — stays here.
@@ -27,9 +29,12 @@ mod exit;
 pub use exit::{dispatch, error_code, invalid_arguments, report_error, ErrorCode};
 use exit::{tag, ErrorCode::*, RESULT_SCHEMA};
 
+mod ask;
 mod claim;
 mod events;
 mod focus;
+mod intent;
+mod note;
 mod prune;
 mod report_cmd;
 mod send;
@@ -40,11 +45,13 @@ mod stop;
 pub use prune::PRUNE_SCHEMA;
 pub use status::STATUS_SCHEMA;
 
-pub const SUBCOMMANDS: &[&str] = &["spawn", "send", "status", "focus", "stop", "report", "prune", "events", "claim"];
+pub const SUBCOMMANDS: &[&str] =
+    &["spawn", "send", "status", "focus", "stop", "report", "prune", "events", "claim", "note", "intent", "ask", "answer"];
 
 pub const HELP: &str = "\
 kanstack spawn <branch> [--agent <name>] [--prompt \"...\"] [--item <ref>]
-    [--above <base>|--below <base>] [--model <name>] [--effort <low|medium|high>] [--json]
+    [--above <base>|--below <base>] [--model <name>] [--effort <low|medium|high>]
+    [--advisory] [--json]
     open a harness pane on <branch>, creating the branch first if it doesn't exist.
     --agent runs that harness (e.g. codex) instead of $KANSTACK_HARNESS; --prompt is
     the harness's first message; --item attaches an opaque work-item reference (e.g.
@@ -59,7 +66,10 @@ kanstack spawn <branch> [--agent <name>] [--prompt \"...\"] [--item <ref>]
     mapping of its own either as a literal --model <name> argument, which is not guaranteed
     to be one that harness understands — see the README for which harnesses map each to
     something real and which get the generic (or, for a harness with no model concept at
-    all, no) treatment
+    all, no) treatment. --advisory records the workstream as one not expected to produce
+    commits (a review or research agent, say), for `status --json` and the board to show;
+    it changes nothing about how the pane is spawned or driven, and an advisory lane that
+    commits anyway is neither blocked nor warned about
 kanstack send <branch|session> \"...\" [--json]
     type a message into a pane and submit it
 kanstack status [--json]
@@ -104,6 +114,21 @@ kanstack claim [<branch>] [--json]
     two lanes editing different parts of the same file are still blocked from each other. Never
     fails outward: a broken claims file or malformed stdin always allows the edit rather than
     risk blocking one by mistake
+kanstack note <branch> \"...\" [--json]
+    append a free-text remark about <branch> to the events log (kind \"note\"), for an
+    orchestrator to leave a record of what it's doing. Nothing else keeps it
+kanstack intent <branch> \"...\" [--json]
+    set <branch>'s one-line intent — why the lane looks the way it does right now (e.g.
+    \"waiting for cargo test\") — replacing any before it; `status --json` shows it as
+    \"intent\" until it's replaced or the lane is stopped or respawned
+kanstack ask <branch> \"...\" [--json]
+    set <branch>'s pending question — something that wants a human's answer — replacing any
+    already pending, and log it (kind \"ask\"); `status --json` shows it as \"pending_ask\"
+kanstack answer <branch> \"...\" [--json]
+    answer <branch>'s pending question: clears it and logs the answer (kind \"answer\"). With
+    nothing pending that's an error, no_pending_ask. Like `report`, none of note/intent/ask/
+    answer check that <branch> is a registered workstream, need a multiplexer, or print
+    anything without --json
 
 <session> is a pane id as `kanstack status` prints it. These need to run inside the
 multiplexer the panes live in (see README).
@@ -124,6 +149,7 @@ pub enum Command {
         below: Option<String>,
         model: Option<String>,
         effort: Option<Effort>,
+        advisory: bool,
         json: bool,
     },
     Send { target: String, text: String, json: bool },
@@ -134,6 +160,10 @@ pub enum Command {
     Prune { json: bool },
     Events { since: u64, follow: bool, new: bool, json: bool },
     Claim { branch: Option<String>, json: bool },
+    Note { branch: String, text: String, json: bool },
+    Intent { branch: String, text: String, json: bool },
+    Ask { branch: String, question: String, json: bool },
+    Answer { branch: String, text: String, json: bool },
 }
 
 impl Command {
@@ -149,6 +179,10 @@ impl Command {
             Command::Prune { .. } => "prune",
             Command::Events { .. } => "events",
             Command::Claim { .. } => "claim",
+            Command::Note { .. } => "note",
+            Command::Intent { .. } => "intent",
+            Command::Ask { .. } => "ask",
+            Command::Answer { .. } => "answer",
         }
     }
 
@@ -162,7 +196,11 @@ impl Command {
             | Command::Report { json, .. }
             | Command::Prune { json }
             | Command::Events { json, .. }
-            | Command::Claim { json, .. } => *json,
+            | Command::Claim { json, .. }
+            | Command::Note { json, .. }
+            | Command::Intent { json, .. }
+            | Command::Ask { json, .. }
+            | Command::Answer { json, .. } => *json,
         }
     }
 }
@@ -184,6 +222,7 @@ pub fn parse(name: &str, args: Vec<String>) -> Result<Option<Command>> {
     let mut below = None;
     let mut model = None;
     let mut effort = None;
+    let mut advisory = false;
     let mut json = false;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -227,6 +266,12 @@ pub fn parse(name: &str, args: Vec<String>) -> Result<Option<Command>> {
                         .ok_or_else(|| anyhow::anyhow!("--effort must be low, medium or high, not {raw:?}\n\n{HELP}"))?,
                 );
             }
+            "--advisory" if name == "spawn" => {
+                if inline.is_some() {
+                    bail!("--advisory takes no value\n\n{HELP}");
+                }
+                advisory = true;
+            }
             "--json" => {
                 if inline.is_some() {
                     bail!("--json takes no value\n\n{HELP}");
@@ -249,15 +294,30 @@ pub fn parse(name: &str, args: Vec<String>) -> Result<Option<Command>> {
             if above.is_some() && below.is_some() {
                 bail!("`kanstack spawn` takes --above or --below, not both\n\n{HELP}");
             }
-            Command::Spawn { branch: one("<branch>")?, agent, prompt, item, above, below, model, effort, json }
+            Command::Spawn { branch: one("<branch>")?, agent, prompt, item, above, below, model, effort, advisory, json }
         }
-        "send" => {
-            let target = one("<branch|session>")?;
+        // `<target> "free text..."`: the first word names the lane, every word after it is
+        // joined into one message, so a caller needn't quote it — the same shape for all five.
+        "send" | "note" | "intent" | "ask" | "answer" => {
+            let target = one(if name == "send" { "<branch|session>" } else { "<branch>" })?;
             let text = positional.collect::<Vec<_>>().join(" ");
             if text.trim().is_empty() {
-                bail!("`kanstack send` needs a message\n\n{HELP}");
+                let what = match name {
+                    "note" => "a note",
+                    "intent" => "an intent",
+                    "ask" => "a question",
+                    "answer" => "an answer",
+                    _ => "a message",
+                };
+                bail!("`kanstack {name}` needs {what}\n\n{HELP}");
             }
-            return Ok(Some(Command::Send { target, text, json }));
+            return Ok(Some(match name {
+                "send" => Command::Send { target, text, json },
+                "note" => Command::Note { branch: target, text, json },
+                "intent" => Command::Intent { branch: target, text, json },
+                "ask" => Command::Ask { branch: target, question: text, json },
+                _ => Command::Answer { branch: target, text, json },
+            }));
         }
         "status" => Command::Status { json },
         "focus" => Command::Focus { target: one("<branch|session>")?, json },
@@ -360,8 +420,8 @@ struct PaneResult {
 
 pub fn run(command: Command, cwd: &Path, out: &mut impl Write) -> Result<()> {
     match command {
-        Command::Spawn { branch, agent, prompt, item, above, below, model, effort, json } => {
-            spawn::run(branch, agent, prompt, item, above, below, model, effort, json, cwd, out)
+        Command::Spawn { branch, agent, prompt, item, above, below, model, effort, advisory, json } => {
+            spawn::run(branch, agent, prompt, item, above, below, model, effort, advisory, json, cwd, out)
         }
         Command::Send { target, text, json } => send::run(target, text, json, cwd, out),
         Command::Status { json } => status::run(json, cwd, out),
@@ -377,6 +437,14 @@ pub fn run(command: Command, cwd: &Path, out: &mut impl Write) -> Result<()> {
         // `Report`: this runs from a harness's `PreToolUse` hook, on every file-editing tool
         // call, so it must stay fast and must never fail outward — see `claim`'s module doc.
         Command::Claim { branch, json: _ } => claim::run(branch, cwd, out),
+        // Also not routed through the registry-loading machinery, for the same reason as
+        // `Report`, and for one of their own: none of these validate that `branch` is a
+        // registered workstream — a write for a lane nobody is tracking is simply never read
+        // by anything, not an error. See `crate::orchestration`'s module doc.
+        Command::Note { branch, text, json } => note::run(branch, text, json, cwd, out),
+        Command::Intent { branch, text, json } => intent::run(branch, text, json, cwd, out),
+        Command::Ask { branch, question, json } => ask::run_ask(branch, question, json, cwd, out),
+        Command::Answer { branch, text, json } => ask::run_answer(branch, text, json, cwd, out),
     }
 }
 
@@ -400,6 +468,7 @@ pub(crate) mod test_support {
             pane_id: pane.map(|p| PaneId(p.into())),
             agent: agent.map(|a| AgentId(a.into())),
             item: item.map(|i| WorkItemRef(i.into())),
+            advisory: false,
         }
     }
 
@@ -461,6 +530,7 @@ mod tests {
                 below: None,
                 model: None,
                 effort: None,
+                advisory: false,
                 json: false,
             })
         );
@@ -475,6 +545,7 @@ mod tests {
                 below: None,
                 model: None,
                 effort: None,
+                advisory: false,
                 json: false,
             })
         );
@@ -489,6 +560,7 @@ mod tests {
                 below: None,
                 model: None,
                 effort: None,
+                advisory: false,
                 json: false,
             })
         );
@@ -507,6 +579,7 @@ mod tests {
                 below: None,
                 model: None,
                 effort: None,
+                advisory: false,
                 json: false,
             })
         );
@@ -521,6 +594,7 @@ mod tests {
                 below: None,
                 model: None,
                 effort: None,
+                advisory: false,
                 json: false,
             })
         );
@@ -541,6 +615,7 @@ mod tests {
                 below: None,
                 model: None,
                 effort: None,
+                advisory: false,
                 json: false,
             })
         );
@@ -555,6 +630,7 @@ mod tests {
                 below: Some("main-feature".into()),
                 model: None,
                 effort: None,
+                advisory: false,
                 json: false,
             })
         );
@@ -579,6 +655,7 @@ mod tests {
                 below: None,
                 model: Some("o3".into()),
                 effort: Some(crate::harness::Effort::High),
+                advisory: false,
                 json: false,
             })
         );
@@ -593,12 +670,37 @@ mod tests {
                 below: None,
                 model: Some("opus".into()),
                 effort: Some(crate::harness::Effort::Low),
+                advisory: false,
                 json: false,
             })
         );
         assert!(parse("spawn", args(&["b", "--model"])).is_err(), "--model requires a value");
         assert!(parse("send", args(&["b", "--model", "opus"])).is_err(), "--model is spawn-only");
         assert!(parse("send", args(&["b", "--effort", "low"])).is_err(), "--effort is spawn-only");
+    }
+
+    /// `--advisory` is a switch, like `--json`: present or not, never given a value, and only
+    /// `spawn` takes it.
+    #[test]
+    fn spawn_takes_an_advisory_switch() {
+        assert_eq!(
+            parse("spawn", args(&["review-auth", "--advisory", "--prompt", "critique the diff"])).unwrap(),
+            Some(Command::Spawn {
+                branch: "review-auth".into(),
+                agent: None,
+                prompt: Some("critique the diff".into()),
+                item: None,
+                above: None,
+                below: None,
+                model: None,
+                effort: None,
+                advisory: true,
+                json: false,
+            })
+        );
+        assert!(parse("spawn", args(&["b", "--advisory=true"])).is_err(), "it is a switch, not an option with a value");
+        assert!(parse("send", args(&["b", "hi", "--advisory"])).is_err(), "--advisory is spawn-only");
+        assert!(parse("intent", args(&["b", "hi", "--advisory"])).is_err());
     }
 
     /// An `--effort` word other than `low`/`medium`/`high` is `invalid_arguments` (exit `2`),
@@ -640,7 +742,7 @@ mod tests {
         assert!(parse("status", args(&["--json", "extra"])).is_err());
         assert_eq!(
             parse("spawn", args(&["b", "--json"])).unwrap(),
-            Some(Command::Spawn { branch: "b".into(), agent: None, prompt: None, item: None, above: None, below: None, model: None, effort: None, json: true })
+            Some(Command::Spawn { branch: "b".into(), agent: None, prompt: None, item: None, above: None, below: None, model: None, effort: None, advisory: false, json: true })
         );
         // `--json` is recognized as a flag wherever it falls among the arguments (flags are
         // split out before the remaining words are joined into the message), same as before
