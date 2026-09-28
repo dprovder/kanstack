@@ -730,6 +730,20 @@ impl App {
         }
     }
 
+    /// Moves a branch's pane to sit with its new stack siblings when `but status` says it
+    /// just joined one — see `Splitter::restack_moved_branches`. Called from `refresh` and
+    /// `refresh_quietly`, the two places a fresh `WorkspaceStatus` reflects the world having
+    /// actually changed (not `toggle_unassigned_grouping`, which re-fetches status only to
+    /// rebuild the board under an unrelated display preference — moving someone's pane as a
+    /// side effect of that would be a surprise, not a service). Best-effort: a multiplexer
+    /// that can't be reached or refuses the move is no worse than today's behavior, so this
+    /// never turns into a notice or blocks the refresh it rides along with.
+    fn restack_moved_branches(&mut self, status: &WorkspaceStatus) {
+        if let Some(splitter) = &mut self.splitter {
+            let _ = splitter.restack_moved_branches(status);
+        }
+    }
+
     pub fn notify(&mut self, msg: impl Into<String>, kind: Notice) {
         self.message = Some((msg.into(), kind));
     }
@@ -785,6 +799,7 @@ impl App {
         match but.status() {
             Ok(s) => {
                 self.board = Self::board_from(but, &mut self.commit_stats, &s);
+                self.restack_moved_branches(&s);
                 self.clamp();
             }
             Err(e) => self.note_refresh_failure(e),
@@ -845,6 +860,7 @@ impl App {
         match but.status() {
             Ok(s) => {
                 self.board = Self::board_from(but, &mut self.commit_stats, &s);
+                self.restack_moved_branches(&s);
                 self.clamp();
             }
             Err(e) => self.note_refresh_failure(e),
