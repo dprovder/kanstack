@@ -9,14 +9,21 @@
 //! Everything happens inside a temporary directory with `HOME` redirected, so these do
 //! not touch the caller's GitButler project registry or settings.
 
-use std::path::PathBuf;
+use std::cell::RefCell;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use kanstack::board::{Board, CardKind, ColumnKind};
 use kanstack::but::{But, Placement, MIN_VERSION};
+use kanstack::splitter::Splitter;
+use kanstack::workstream::Registry;
 
 struct Sandbox {
     root: PathBuf,
+    name: String,
+    /// Every real multiplexer [`Self::splitter`] handed out, so `Drop` can close what the
+    /// test opened through it before the directory those panes were told to `cd` into goes.
+    live: RefCell<Vec<LiveMux>>,
 }
 
 impl Sandbox {
@@ -26,11 +33,22 @@ impl Sandbox {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("home")).unwrap();
         std::fs::create_dir_all(root.join("repo")).unwrap();
-        let sb = Sandbox { root };
+        alive_sandboxes().push(root.clone());
+        sweep_husks();
+        let sb = Sandbox { root, name: name.to_string(), live: RefCell::new(Vec::new()) };
 
         // Redirect HOME for this process so `But`'s spawned commands inherit it and write
         // their config into the sandbox rather than the developer's real one.
         std::env::set_var("HOME", sb.home());
+        // The workstream registry too: it otherwise follows `XDG_STATE_HOME` when that's set,
+        // which would put this sandbox's lanes in the developer's real state directory — and
+        // `Drop` reads it back to find the panes to close, so it must be this sandbox's own.
+        std::env::set_var("KANSTACK_STATE_PATH", sb.state());
+        // Every `but` command forks a detached `but metrics` process (parent pid 1) that goes
+        // on writing into `HOME` and the repo's `.git/gitbutler` after the command returns —
+        // after `Drop` has removed them, recreating a husk of the sandbox each time. Measured:
+        // three such processes per handful of commands with telemetry on, none with it off.
+        sb.disable_but_telemetry();
 
         sb.git(&["init", "-q", "."]);
         sb.git(&["config", "user.email", "test@example.com"]);
@@ -117,6 +135,108 @@ impl Sandbox {
         self.root.join("repo")
     }
 
+    fn state(&self) -> PathBuf {
+        self.root.join("state")
+    }
+
+    /// Turns `but`'s telemetry off for this sandbox's `HOME` — see [`Self::bare`] for why.
+    /// Written where macOS and where XDG systems keep GitButler's settings, since which one
+    /// `but` reads depends on the platform.
+    fn disable_but_telemetry(&self) {
+        let settings =
+            r#"{"telemetry":{"appMetricsEnabled":false,"appErrorReportingEnabled":false,"appNonAnonMetricsEnabled":false}}"#;
+        for dir in [self.home().join("Library/Application Support/gitbutler"), self.home().join(".config/gitbutler")] {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("settings.json"), settings).unwrap();
+        }
+    }
+
+    /// The multiplexer kanstack would really use here — `Splitter::discover`, so a test that
+    /// opens a lane runs the real spawn path — but pointed somewhere of this sandbox's own,
+    /// so what it opens never lands among the developer's panes, and `Drop` can close all of
+    /// it by an id nothing else shares:
+    ///
+    /// - cmux: a fresh workspace, created unfocused, that every pane is pinned into.
+    /// - tmux: a private server on a socket named after this sandbox, which a wrapper
+    ///   `KANSTACK_TMUX_BIN` sends every command to.
+    /// - anything else (Orca, Ghostty): this suite knows no private space to make, so panes
+    ///   open where they would for a person. `Drop` still closes each one, by the exact id
+    ///   the registry recorded for it.
+    ///
+    /// Panes launch a stand-in harness that notes where it started and then sleeps, not
+    /// `$KANSTACK_HARNESS`: kanstack's half of a spawn — open, type the launch line, title,
+    /// record — is the same either way, and a test has no business starting a real agent
+    /// that spends money. `KANSTACK_LIVE_HARNESS` launches something else instead.
+    fn splitter(&self) -> Option<Splitter> {
+        let backend = Splitter::discover()?.label();
+        let harness = std::env::var("KANSTACK_LIVE_HARNESS").unwrap_or_else(|_| self.stand_in_harness());
+        let tag = format!("kanstack-live-{}-{}", self.name, std::process::id());
+        // Recorded the moment it exists, before anything else here can fail, so `Drop` takes
+        // it down even if discovery then does.
+        let mut live = self.live.borrow_mut();
+        let (isolation, mut env) = match backend {
+            "cmux" => (Isolation::Cmux(CmuxWorkspace::create(&tag, &self.root)), vec![]),
+            "tmux" => {
+                let (server, wrapper, pane) = PrivateTmux::start(&tag, &self.root);
+                let env = vec![("KANSTACK_TMUX_BIN", wrapper.to_string_lossy().into_owned()), ("TMUX_PANE", pane)];
+                (Isolation::Tmux(server), env)
+            }
+            _ => (Isolation::None, vec![]),
+        };
+        live.push(LiveMux { splitter: None, isolation });
+        let mux = live.last_mut().unwrap();
+
+        // Pinned to the backend the isolation was made for, so the splitter can't come back
+        // as some other one whose panes the isolation above doesn't contain.
+        env.push(("KANSTACK_SPLIT_BACKEND", backend.to_string()));
+        env.push(("KANSTACK_HARNESS", harness));
+        let mut splitter = with_env(&env, Splitter::discover)?;
+        if let Isolation::Cmux(workspace) = &mux.isolation {
+            splitter.set_workspace(Some(&workspace.uuid));
+        }
+        // A clone shares the multiplexer (and so its pinned workspace) with the one the test
+        // gets, which is all `Drop` needs to close a pane through.
+        mux.splitter = Some(splitter.clone());
+        Some(splitter)
+    }
+
+    /// Whether [`Self::splitter`] found a real multiplexer, so a lane opened through it is
+    /// expected to have actually opened a pane.
+    fn has_live_mux(&self) -> bool {
+        self.live.borrow().iter().any(|l| l.splitter.is_some())
+    }
+
+    /// The pane the registry recorded for `branch` — what the board writes the moment a
+    /// spawn succeeds, and nothing else does.
+    fn spawned_pane(&self, branch: &str) -> Option<String> {
+        let registry = Registry::load(&self.repo()).ok()?;
+        registry.get(branch)?.pane_id.as_ref().map(|p| p.0.clone())
+    }
+
+    /// The directory each stand-in harness found itself in, one per launch that got as far
+    /// as running it.
+    fn harness_launches(&self) -> Vec<String> {
+        let log = std::fs::read_to_string(self.root.join("harness-launches")).unwrap_or_default();
+        log.lines().map(str::to_string).collect()
+    }
+
+    /// Writes the stand-in harness [`Self::splitter`] launches by default, returning the
+    /// command to launch it with.
+    fn stand_in_harness(&self) -> String {
+        let bin = self.root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let path = bin.join("live-harness");
+        // Whatever the launch line passes it (a branch note, a first message) is ignored;
+        // `exec` so closing the pane ends the sleep rather than leaving it orphaned.
+        let script = format!(
+            "#!/bin/sh\npwd >> '{}'\nexec sleep 3600\n",
+            self.root.join("harness-launches").display()
+        );
+        std::fs::write(&path, script).unwrap();
+        make_executable(&path);
+        path.to_string_lossy().into_owned()
+    }
+
     fn write(&self, rel: &str, contents: &str) {
         std::fs::write(self.repo().join(rel), contents).unwrap();
     }
@@ -154,7 +274,321 @@ impl Sandbox {
 
 impl Drop for Sandbox {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
+        // Panes first, directory second: a pane's launch line `cd`s into the repo, and one
+        // still starting when the repo goes dies at that `cd` and lingers as an empty shell.
+        //
+        // Each pane is closed by the id it was opened under, whatever it's doing, rather than
+        // waited on to be "up" first. Closing a surface or pane works the same whether its
+        // shell has run anything yet, while "up" has no signal to wait on that doesn't depend
+        // on the harness — a stand-in, a real agent, or one that fails to start at all —
+        // and a wait would cost every test that opens a pane its full timeout in that last
+        // case. Nothing here may panic either: this may already be running because the test
+        // did, and a second panic aborts the run before any later sandbox cleans up.
+        let live = std::mem::take(self.live.get_mut());
+        if !live.is_empty() {
+            // `Registry::load` finds the registry through the environment, which a later
+            // sandbox in the same process may since have repointed.
+            std::env::set_var("KANSTACK_STATE_PATH", self.state());
+            let repo = self.repo();
+            for mut mux in live {
+                let torn_down = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    mux.close_registered_panes(&repo);
+                    drop(mux);
+                }));
+                if torn_down.is_err() {
+                    eprintln!("live teardown: closing {}'s panes panicked; some may be left open", self.name);
+                }
+            }
+        }
+        self.end_stragglers();
+        alive_sandboxes().retain(|r| r != &self.root);
+        // A `but` still finishing (a background refresh the test's `App` started) can write
+        // into the tree while it's being removed, so one pass isn't always the last.
+        for _ in 0..20 {
+            let _ = std::fs::remove_dir_all(&self.root);
+            if !self.root.exists() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        eprintln!("live teardown: could not remove {}", self.root.display());
+    }
+}
+
+impl Sandbox {
+    /// Ends every process still running with this sandbox as its `HOME`. `but` detaches
+    /// background jobs that outlive the command that started them — after a `status` or a
+    /// `pull`, a `but refresh-remote-data --fetch --pr --ci --updates`, measured still running
+    /// more than five seconds after its test returned, with no setting found that turns it
+    /// off — and one of those writing a fresh `settings.json` into a `HOME` that `Drop` just
+    /// removed is what leaves a husk of the sandbox behind. Ended rather than waited on: it
+    /// is fetching for a repository about to be deleted, and waiting cost the suite minutes.
+    ///
+    /// Selected on the exact `HOME=` this sandbox set — a path with this test's name and
+    /// this process's pid in it — so only `but`s this sandbox launched can match. Best-effort:
+    /// `ps -E` is the BSD spelling, and elsewhere this finds nothing and does nothing.
+    fn end_stragglers(&self) {
+        let needle = format!("HOME={} ", self.home().display());
+        // `ps` and `kill` themselves would otherwise inherit this sandbox's `HOME` from this
+        // process (see `bare`) and so match it, `ps` finding itself on every look.
+        let stragglers = || -> Vec<String> {
+            let Ok(out) = Command::new("ps").args(["-ww", "-E", "-axo", "pid=,command="]).env_remove("HOME").output()
+            else {
+                return vec![];
+            };
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter(|l| l.contains(&needle) || l.ends_with(needle.trim_end()))
+                .filter_map(|l| l.split_whitespace().next().map(str::to_string))
+                .filter(|pid| *pid != std::process::id().to_string())
+                .collect()
+        };
+        let pids = stragglers();
+        if pids.is_empty() {
+            return;
+        }
+        if reap_dry_run() {
+            eprintln!("live teardown [dry run]: would end {pids:?} (HOME={})", self.home().display());
+            return;
+        }
+        eprintln!("live teardown: ending {pids:?} (HOME={})", self.home().display());
+        let _ = Command::new("kill").arg("-TERM").args(&pids).env_remove("HOME").output();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !stragglers().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+}
+
+/// The roots of the sandboxes this process has made and not yet dropped.
+fn alive_sandboxes() -> std::sync::MutexGuard<'static, Vec<PathBuf>> {
+    static ALIVE: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+    ALIVE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Removes what's left of this process's earlier sandboxes. `Drop` can't see the future: a
+/// `but` it never saw running — once a run, in `rebasing_brings_upstream_work_in`, writing
+/// a fresh `settings.json` after teardown had already found no straggler — can still put a
+/// husk back after its sandbox is gone. Only directories named for this process's pid, and
+/// only ones no sandbox here still owns, so neither another run's sandboxes nor a live one
+/// in a parallel run of this one are ever touched.
+fn sweep_husks() {
+    let suffix = format!("-{}", std::process::id());
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else { return };
+    let alive = alive_sandboxes();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("kanstack-live-") && name.ends_with(&suffix) && !alive.contains(&entry.path()) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// One real multiplexer a [`Sandbox`] handed out, and what to take down with it.
+struct LiveMux {
+    /// `None` only if discovery failed after the isolation was already made.
+    splitter: Option<Splitter>,
+    isolation: Isolation,
+}
+
+impl LiveMux {
+    /// Closes every pane the sandbox's registry records — written by the board itself as each
+    /// spawn succeeds — through kanstack's own `stop`. The ids come from what the multiplexer
+    /// answered when each pane opened, never from matching titles or directories, so nothing
+    /// this sandbox didn't open can be among them.
+    fn close_registered_panes(&mut self, repo: &Path) {
+        let Some(splitter) = &mut self.splitter else { return };
+        let Ok(registry) = Registry::load(repo) else { return };
+        for ws in &registry.workstreams {
+            let Some(pane) = &ws.pane_id else { continue };
+            let branch = &ws.branch_id.0;
+            if reap_dry_run() {
+                eprintln!("live teardown [dry run]: would close {} ({branch})", pane.0);
+                continue;
+            }
+            splitter.adopt(branch, &pane.0);
+            match splitter.stop(branch) {
+                Ok(()) => eprintln!("live teardown: closed {} ({branch})", pane.0),
+                Err(e) => eprintln!("live teardown: closing {} ({branch}) failed: {e:#}", pane.0),
+            }
+        }
+    }
+}
+
+/// Where a [`Sandbox`]'s panes open, when it isn't among the developer's own. Each variant
+/// takes its space down when dropped, after `LiveMux::close_registered_panes` has closed the
+/// panes in it — which catches anything the registry missed: a pane whose spawn failed
+/// after it opened, or one whose registry write didn't land.
+enum Isolation {
+    Cmux(CmuxWorkspace),
+    Tmux(#[allow(dead_code, reason = "held only for its Drop, which kills the server")] PrivateTmux),
+    None,
+}
+
+/// `KANSTACK_LIVE_REAP_DRY_RUN=1` logs what teardown would close instead of closing it — for
+/// checking what it selects on a machine full of other work before trusting it there. Panes
+/// are left open (and their sandbox's directory still removed) in that mode.
+fn reap_dry_run() -> bool {
+    std::env::var_os("KANSTACK_LIVE_REAP_DRY_RUN").is_some_and(|v| v == "1")
+}
+
+/// Runs `f` with `vars` set, then puts back whatever was there before — for settings that
+/// discovery reads once, which the next sandbox's discovery shouldn't inherit.
+fn with_env<T>(vars: &[(&str, String)], f: impl FnOnce() -> T) -> T {
+    let saved: Vec<_> = vars.iter().map(|(k, _)| (*k, std::env::var_os(k))).collect();
+    for (k, v) in vars {
+        std::env::set_var(k, v);
+    }
+    let out = f();
+    for (k, v) in saved {
+        match v {
+            Some(v) => std::env::set_var(k, v),
+            None => std::env::remove_var(k),
+        }
+    }
+    out
+}
+
+fn make_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Runs the cmux CLI kanstack would (`KANSTACK_CMUX_BIN`, else `cmux`), returning its
+/// output when it succeeds.
+fn cmux(args: &[&str]) -> Option<String> {
+    let bin = std::env::var_os("KANSTACK_CMUX_BIN").unwrap_or_else(|| "cmux".into());
+    let out = Command::new(bin).args(args).env("CMUX_QUIET", "1").output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The UUIDs of the workspaces in this window. UUIDs, not `workspace:N` refs, are what get
+/// kept: a UUID is never handed to a different workspace later.
+fn cmux_workspace_uuids() -> Vec<String> {
+    let listing = cmux(&["--id-format", "both", "workspace", "list"]).unwrap_or_default();
+    listing
+        .lines()
+        .filter_map(|line| line.trim_start().trim_start_matches('*').split_whitespace().nth(1).map(str::to_string))
+        .collect()
+}
+
+/// Every surface in every workspace, as both its `surface:N` ref and its UUID.
+fn cmux_all_surfaces() -> std::collections::HashSet<String> {
+    let tree = cmux(&["--id-format", "both", "tree", "--all"]).unwrap_or_default();
+    let mut surfaces = std::collections::HashSet::new();
+    for line in tree.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if let Some(i) = tokens.windows(2).position(|w| w[0] == "surface" && w[1].starts_with("surface:")) {
+            surfaces.extend(tokens[i + 1..].iter().take(2).map(|t| t.to_string()));
+        }
+    }
+    surfaces
+}
+
+/// A cmux workspace made for one test, closed again when dropped. Only ever closed by the
+/// UUID cmux gave it at creation, and only after checking that UUID wasn't already in use
+/// and isn't the workspace running the tests.
+struct CmuxWorkspace {
+    uuid: String,
+}
+
+impl CmuxWorkspace {
+    fn create(name: &str, cwd: &Path) -> CmuxWorkspace {
+        let before = cmux_workspace_uuids();
+        let cwd = cwd.to_string_lossy();
+        let out = cmux(&["new-workspace", "--name", name, "--cwd", &cwd, "--focus", "false"])
+            .unwrap_or_else(|| panic!("`cmux new-workspace` failed for {name}"));
+        let reference = out
+            .split_whitespace()
+            .find(|t| t.starts_with("workspace:"))
+            .unwrap_or_else(|| panic!("`cmux new-workspace` reported no workspace: {out:?}"));
+        let listing = cmux(&["--id-format", "both", "workspace", "list"]).unwrap_or_default();
+        let uuid = listing
+            .lines()
+            .find_map(|line| {
+                let mut tokens = line.trim_start().trim_start_matches('*').split_whitespace();
+                (tokens.next() == Some(reference)).then(|| tokens.next().map(str::to_string)).flatten()
+            })
+            .unwrap_or_else(|| panic!("no UUID listed for {reference}"));
+        // Not constructed — and so never closed — unless this is unmistakably new.
+        assert!(!before.contains(&uuid), "{reference} ({uuid}) already existed; refusing to adopt it");
+        assert_ne!(std::env::var("CMUX_WORKSPACE_ID").ok().as_deref(), Some(uuid.as_str()));
+        CmuxWorkspace { uuid }
+    }
+
+    /// The `surface:N` refs in this workspace.
+    fn surfaces(&self) -> Vec<String> {
+        let listing = cmux(&["--id-format", "both", "list-panels", "--workspace", &self.uuid]).unwrap_or_default();
+        listing
+            .lines()
+            .filter_map(|line| line.trim_start().trim_start_matches('*').split_whitespace().next())
+            .filter(|t| t.starts_with("surface:"))
+            .map(str::to_string)
+            .collect()
+    }
+}
+
+impl Drop for CmuxWorkspace {
+    fn drop(&mut self) {
+        if reap_dry_run() {
+            eprintln!("live teardown [dry run]: would close workspace {}", self.uuid);
+            return;
+        }
+        match cmux(&["close-workspace", "--workspace", &self.uuid]) {
+            Some(_) => eprintln!("live teardown: closed workspace {}", self.uuid),
+            None => eprintln!("live teardown: closing workspace {} failed (already gone?)", self.uuid),
+        }
+    }
+}
+
+/// A tmux server of one test's own, on a socket named after its sandbox, killed when
+/// dropped. Nothing outside the test talks to it, so killing it can't touch anyone's panes.
+struct PrivateTmux {
+    socket: String,
+    /// Where tmux put the socket, which `kill-server` leaves behind.
+    socket_path: Option<PathBuf>,
+}
+
+impl PrivateTmux {
+    /// Starts the server and returns it, a wrapper that points `tmux` at it (for
+    /// `KANSTACK_TMUX_BIN`), and its first pane's id (for `TMUX_PANE`: kanstack's "own pane").
+    fn start(socket: &str, root: &Path) -> (PrivateTmux, PathBuf, String) {
+        let out = Command::new("tmux")
+            .args(["-L", socket, "-f", "/dev/null", "new-session", "-d", "-s", "live", "-x", "200", "-y", "50"])
+            .arg("-c")
+            .arg(root)
+            .args(["-P", "-F", "#{pane_id}"])
+            .output()
+            .expect("tmux must run");
+        assert!(out.status.success(), "starting a private tmux server failed: {}", String::from_utf8_lossy(&out.stderr));
+        let socket_path = Command::new("tmux")
+            .args(["-L", socket, "display-message", "-p", "#{socket_path}"])
+            .output()
+            .ok()
+            .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))
+            .filter(|p| p.file_name().is_some_and(|n| n == socket));
+        let server = PrivateTmux { socket: socket.to_string(), socket_path };
+        let pane = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let wrapper = bin.join("tmux");
+        std::fs::write(&wrapper, format!("#!/bin/sh\nexec tmux -L '{socket}' \"$@\"\n")).unwrap();
+        make_executable(&wrapper);
+        (server, wrapper, pane)
+    }
+}
+
+impl Drop for PrivateTmux {
+    fn drop(&mut self) {
+        if reap_dry_run() {
+            eprintln!("live teardown [dry run]: would kill tmux server {}", self.socket);
+            return;
+        }
+        let _ = Command::new("tmux").args(["-L", &self.socket, "kill-server"]).output();
+        if let Some(path) = &self.socket_path {
+            let _ = std::fs::remove_file(path);
+        }
+        eprintln!("live teardown: killed tmux server {}", self.socket);
     }
 }
 
@@ -1283,7 +1717,6 @@ fn creating_a_branch_from_the_empty_unassigned_column_does_not_panic() {
         return;
     }
     use kanstack::app::App;
-    use kanstack::splitter::Splitter;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyCode, KeyEvent};
     use ratatui::Terminal;
@@ -1293,7 +1726,7 @@ fn creating_a_branch_from_the_empty_unassigned_column_does_not_panic() {
     // Real detection, not `None`: if `cmux` (or, failing that, `tmux`) happens to be
     // usable (as `cmux` is on the machine this was first reproduced on), the
     // spawn-a-harness path actually runs.
-    let mut app = App::new(but, Splitter::discover()).expect("build the app against a fresh workspace");
+    let mut app = App::new(but, sb.splitter()).expect("build the app against a fresh workspace");
     let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
 
     assert_eq!(app.column_count(), 1, "only the backlog column exists yet");
@@ -1312,6 +1745,12 @@ fn creating_a_branch_from_the_empty_unassigned_column_does_not_panic() {
     press(&mut app, KeyCode::Enter);
 
     assert_eq!(app.column_count(), 2, "the backlog plus the new lane");
+    // `create_branch` reports a failed spawn only as a footer notice, which nothing above
+    // looks at: without this, the test passes the same whether the pane opened or not, and
+    // the coverage the comment at the top promises is never actually checked.
+    if sb.has_live_mux() {
+        assert!(sb.spawned_pane("first-branch").is_some(), "a multiplexer was found, so the lane should have opened a pane");
+    }
 }
 
 /// Same issue, a second guess at repro: unassigned holds real file cards, the card cursor
@@ -1328,7 +1767,6 @@ fn creating_a_branch_from_unassigned_with_cards_and_a_moved_cursor_does_not_pani
         return;
     }
     use kanstack::app::App;
-    use kanstack::splitter::Splitter;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyCode, KeyEvent};
     use ratatui::Terminal;
@@ -1337,7 +1775,7 @@ fn creating_a_branch_from_unassigned_with_cards_and_a_moved_cursor_does_not_pani
     sb.write("a.txt", "a\n");
     sb.write("b.txt", "b\n");
     let but = But::discover(&sb.repo()).unwrap();
-    let mut app = App::new(but, Splitter::discover()).expect("build the app against the workspace");
+    let mut app = App::new(but, sb.splitter()).expect("build the app against the workspace");
     let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
     term.draw(|f| {
         kanstack::ui::draw(f, &app);
@@ -1362,6 +1800,9 @@ fn creating_a_branch_from_unassigned_with_cards_and_a_moved_cursor_does_not_pani
     press(&mut app, KeyCode::Enter);
 
     assert_eq!(app.column_count(), 2);
+    if sb.has_live_mux() {
+        assert!(sb.spawned_pane("second-branch").is_some(), "a multiplexer was found, so the lane should have opened a pane");
+    }
 
     // Pressed again immediately, from the lane `begin_branch` just landed the cursor on:
     // that lane now has a `branch_name`, so this stacks rather than opening a new column
@@ -1374,6 +1815,78 @@ fn creating_a_branch_from_unassigned_with_cards_and_a_moved_cursor_does_not_pani
     press(&mut app, KeyCode::Enter);
 
     assert_eq!(app.column_count(), 2, "stacked onto the existing lane, not a new column");
+    assert_eq!(sb.spawned_pane("third-branch"), None, "a stacked branch opens no pane of its own by default");
+}
+
+/// The guarantee every test that opens a real pane leans on: a sandbox's teardown closes the
+/// panes its test opened and nothing else — not a pane titled the same as its lane, not one
+/// whose shell sits in the sandbox's own repo, not the pane running these tests. cmux only:
+/// a tmux sandbox gets a server of its own, which can't reach anyone else's panes at all.
+///
+/// Other sessions open and close panes of their own while this runs, so "nothing else
+/// closed" is checked as "everything that vanished was the sandbox's" over the short window
+/// of the teardown itself: one of theirs closing in exactly that window fails this, falsely,
+/// on the side of caution.
+#[test]
+#[ignore = "requires the GitButler CLI and cmux"]
+fn sandbox_teardown_closes_only_the_panes_it_opened() {
+    if skip_if_no_but() {
+        return;
+    }
+    let sb = Sandbox::new("reapselective");
+    let Some(mut splitter) = sb.splitter() else {
+        eprintln!("skipping: no multiplexer");
+        return;
+    };
+    if splitter.label() != "cmux" {
+        eprintln!("skipping: {} isn't cmux", splitter.label());
+        return;
+    }
+    let lane = "reaped-lane";
+
+    // A decoy built to fool a loose reaper: outside the sandbox, but titled like its lane and
+    // with its shell sitting in its repo. Closed by its own `Drop` at the end, pass or fail.
+    let decoy = CmuxWorkspace::create(&format!("kanstack-live-decoy-{}", std::process::id()), &sb.repo());
+    let decoy_surfaces = decoy.surfaces();
+    assert!(!decoy_surfaces.is_empty());
+    cmux(&["rename-tab", "--workspace", &decoy.uuid, "--surface", &decoy_surfaces[0], lane]).expect("title the decoy");
+    let own = std::env::var("CMUX_SURFACE_ID").ok();
+
+    let pane = splitter.spawn_harness(&sb.repo(), lane, None).expect("open the lane's pane");
+    kanstack::workstream::record_spawn(&sb.repo(), lane, &pane, None, splitter.workspace().as_deref());
+    let workspace = CmuxWorkspace { uuid: splitter.workspace().expect("the pane's workspace is pinned") };
+    let sandbox_surfaces = workspace.surfaces();
+    std::mem::forget(workspace); // not this test's to close: the sandbox owns it
+    assert!(sandbox_surfaces.contains(&pane), "the lane opened in the sandbox's workspace: {sandbox_surfaces:?}");
+    assert!(!decoy_surfaces.contains(&pane));
+
+    // Closed live, not mid-start: wait for the harness to be running in it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while sb.harness_launches().is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let launches = sb.harness_launches();
+    assert!(
+        launches.len() == 1 && launches[0].ends_with("/repo"),
+        "the stand-in harness should have started once, in the repo: {launches:?}"
+    );
+
+    let before = cmux_all_surfaces();
+    assert!(before.contains(&pane));
+    drop(sb);
+    let after = cmux_all_surfaces();
+
+    assert!(!after.contains(&pane), "the lane's pane outlived its sandbox");
+    for surface in &decoy_surfaces {
+        assert!(after.contains(surface), "the decoy {surface} was closed");
+    }
+    if let Some(own) = own {
+        assert!(after.contains(&own), "the pane running these tests was closed");
+    }
+    let gone: Vec<&String> = before.difference(&after).filter(|s| s.starts_with("surface:")).collect();
+    for surface in &gone {
+        assert!(sandbox_surfaces.contains(surface), "teardown closed {surface}, which the sandbox never opened");
+    }
 }
 
 /// `M` then `⏎` used to call `but land` synchronously, freezing the whole UI for however
@@ -1389,14 +1902,13 @@ fn landing_through_the_app_runs_on_a_background_thread_and_updates_the_board() {
     }
     use kanstack::app::{App, Mode};
     use kanstack::board::CardKind;
-    use kanstack::splitter::Splitter;
     use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
     let sb = Sandbox::new("threadedland");
     sb.branch_with_commit("feat", "a.txt", "Threaded landable");
 
     let but = But::discover(&sb.repo()).unwrap();
-    let mut app = App::new(but, Splitter::discover()).expect("build the app against the workspace");
+    let mut app = App::new(but, sb.splitter()).expect("build the app against the workspace");
 
     let lane = app
         .board
@@ -1453,11 +1965,10 @@ fn background_refresh_picks_up_an_external_change_without_blocking() {
         return;
     }
     use kanstack::app::App;
-    use kanstack::splitter::Splitter;
 
     let sb = Sandbox::new("bgrefresh");
     let but = But::discover(&sb.repo()).unwrap();
-    let mut app = App::new(but, Splitter::discover()).expect("build the app");
+    let mut app = App::new(but, sb.splitter()).expect("build the app");
     assert_eq!(app.column_count(), 1, "only the backlog column exists yet");
 
     // Stand in for a change made outside kanstack entirely -- another terminal, an editor,
@@ -1494,12 +2005,11 @@ fn a_stale_background_refresh_does_not_clobber_a_newer_mutation() {
         return;
     }
     use kanstack::app::App;
-    use kanstack::splitter::Splitter;
 
     let sb = Sandbox::new("bgrefreshstale");
     sb.branch_with_commit("feat", "a.txt", "first");
     let but = But::discover(&sb.repo()).unwrap();
-    let mut app = App::new(but, Splitter::discover()).expect("build the app");
+    let mut app = App::new(but, sb.splitter()).expect("build the app");
     assert_eq!(app.column_count(), 2, "backlog plus the one lane so far");
 
     // Start a refresh as the watcher would, but don't poll it yet -- its result is still
@@ -1542,7 +2052,6 @@ fn tab_groups_the_unassigned_lane_by_folder_and_back() {
         return;
     }
     use kanstack::app::App;
-    use kanstack::splitter::Splitter;
     use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
     let sb = Sandbox::new("foldergroup");
@@ -1553,7 +2062,7 @@ fn tab_groups_the_unassigned_lane_by_folder_and_back() {
     sb.write("wip3.txt", "c\n");
 
     let but = But::discover(&sb.repo()).unwrap();
-    let mut app = App::new(but, Splitter::discover()).expect("build the app");
+    let mut app = App::new(but, sb.splitter()).expect("build the app");
     assert_eq!(app.col, 0, "starts on the backlog lane");
     assert!(!app.unassigned_grouped_by_folder);
 
@@ -1586,13 +2095,12 @@ fn tab_from_a_stack_lane_explains_itself_instead_of_toggling() {
         return;
     }
     use kanstack::app::App;
-    use kanstack::splitter::Splitter;
     use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
     let sb = Sandbox::new("foldergroupwronglane");
     sb.branch_with_commit("feat", "a.txt", "work");
     let but = But::discover(&sb.repo()).unwrap();
-    let mut app = App::new(but, Splitter::discover()).expect("build the app");
+    let mut app = App::new(but, sb.splitter()).expect("build the app");
 
     app.on_key(KeyEvent::from(KeyCode::Right)); // off the backlog, onto "feat"
     assert_eq!(app.col, 1);
@@ -1616,7 +2124,6 @@ fn shift_arrows_page_lanes_and_skip_groups_through_the_app() {
         return;
     }
     use kanstack::app::App;
-    use kanstack::splitter::Splitter;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     let sb = Sandbox::new("shiftarrows");
@@ -1641,7 +2148,7 @@ fn shift_arrows_page_lanes_and_skip_groups_through_the_app() {
     sb.branch_with_commit("other-work", "c.txt", "other work");
 
     let but = But::discover(&sb.repo()).unwrap();
-    let mut app = App::new(but, Splitter::discover()).expect("build the app");
+    let mut app = App::new(but, sb.splitter()).expect("build the app");
     app.terminal_width = 60;
 
     // The stacked lane ("mid-work +1") sits after the backlog; land the cursor there and
@@ -1677,7 +2184,6 @@ fn landing_a_stacked_lane_lands_every_branch_base_first() {
         return;
     }
     use kanstack::app::{App, Mode};
-    use kanstack::splitter::Splitter;
     use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
     let sb = Sandbox::new("cascadeland");
@@ -1718,7 +2224,7 @@ fn landing_a_stacked_lane_lands_every_branch_base_first() {
     );
 
     let but = But::discover(&sb.repo()).unwrap();
-    let mut app = App::new(but, Splitter::discover()).expect("build the app");
+    let mut app = App::new(but, sb.splitter()).expect("build the app");
     let lane = app
         .board
         .columns
@@ -1764,7 +2270,6 @@ fn space_selecting_several_unassigned_files_then_m_moves_them_all_at_once() {
         return;
     }
     use kanstack::app::{App, Mode};
-    use kanstack::splitter::Splitter;
     use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
     let sb = Sandbox::new("multiselect");
@@ -1775,7 +2280,7 @@ fn space_selecting_several_unassigned_files_then_m_moves_them_all_at_once() {
     but.branch_new("feat", None).unwrap();
 
     let but = But::discover(&sb.repo()).unwrap();
-    let mut app = App::new(but, Splitter::discover()).expect("build the app");
+    let mut app = App::new(but, sb.splitter()).expect("build the app");
     assert_eq!(app.col, 0, "starts on the backlog");
     let backlog_names: Vec<&str> = app.board.columns[0]
         .cards
@@ -1854,7 +2359,6 @@ fn a_commit_on_the_workspace_head_blocks_the_board_until_recovered() {
     }
     use kanstack::app::{App, Mode};
     use kanstack::but::is_workspace_block;
-    use kanstack::splitter::Splitter;
     use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
     let sb = Sandbox::new("blocked");
@@ -1874,7 +2378,7 @@ fn a_commit_on_the_workspace_head_blocks_the_board_until_recovered() {
 
     // Startup opens into the modal rather than aborting. Bailing here printed one line of
     // prose and vanished, which reads as a crash.
-    let mut app = App::new(But::discover(&sb.repo()).unwrap(), Splitter::discover())
+    let mut app = App::new(But::discover(&sb.repo()).unwrap(), sb.splitter())
         .expect("a blocked workspace still starts the app");
     assert_eq!(app.mode, Mode::Blocked);
 
