@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use kanstack::board::{Board, CardKind, ColumnKind};
-use kanstack::but::{But, Placement, MIN_VERSION};
+use kanstack::but::{But, Placement, Version, MIN_VERSION};
 use kanstack::splitter::Splitter;
 use kanstack::workstream::Registry;
 
@@ -61,15 +61,48 @@ impl Sandbox {
 
     fn new(name: &str) -> Sandbox {
         let sb = Sandbox::bare(name);
-        sb.but(&["setup", "--init", "--json"]);
+        sb.enter_workspace();
         sb
+    }
+
+    /// Turns the repo into a GitButler workspace — or back into one, after `but teardown` —
+    /// whichever `but` is installed.
+    ///
+    /// Up to 0.22 that is `but setup --init`, which also picks the target: the repo's push
+    /// remote, or with none it invents `gb-local`, a remote pointing at the repo itself, so
+    /// lands move local refs instead of pushing anywhere. 0.23 removed `setup` (it now only
+    /// errors, pointing at `but init`) and nothing in it creates `gb-local` any more: a repo
+    /// with no remote has no target and `switch --workspace` refuses it. So for 0.23 the
+    /// `gb-local` setup used to make is made here instead, then the target set and the
+    /// workspace entered explicitly. It has to be a whole remote, fetch refspec and all —
+    /// the bare `url` 0.22 wrote is enough for a target 0.22 configured, but `config target`
+    /// on 0.23 can't place `refs/remotes/gb-local/main` under any remote without one. And the
+    /// refspec tracks the target branch alone (`-t`): the default `refs/heads/*` makes any
+    /// fetch of a remote that *is* this repo mirror every branch back as its own upstream,
+    /// so a lane's very first commit is refused as "merged upstream" whenever `but`'s
+    /// background fetch lands between `branch new` and `commit`.
+    fn enter_workspace(&self) {
+        if but_version() < SETUP_REMOVED_IN {
+            self.but(&["setup", "--init", "--json"]);
+            return;
+        }
+        // A no-op in an existing repo; run for parity with `setup --init`, which did this.
+        self.but(&["init", "--json"]);
+        if self.git(&["remote"]).trim().is_empty() {
+            let branch = self.git(&["symbolic-ref", "--short", "HEAD"]).trim().to_string();
+            self.git(&["remote", "add", "-t", &branch, "gb-local", self.repo().to_str().unwrap()]);
+            self.git(&["fetch", "-q", "gb-local"]);
+            self.git(&["remote", "set-head", "gb-local", &branch]);
+            self.but(&["config", "target", &format!("gb-local/{branch}")]);
+        }
+        self.but(&["switch", "--workspace", "--json"]);
     }
 
     /// A sandbox whose target is a real remote.
     ///
-    /// The remote has to exist *before* `but setup`, because setup picks the push target
-    /// then: with no remote it invents a local `gb-local` and pushes go there instead of
-    /// anywhere useful.
+    /// The remote has to exist before the workspace is entered, because that is when the
+    /// target is picked: with no remote it is `gb-local` (see [`Self::enter_workspace`]) and
+    /// pushes go there instead of anywhere useful.
     fn with_remote(name: &str) -> Sandbox {
         let sb = Sandbox::bare(name);
         let remote = sb.root.join("remote.git");
@@ -80,7 +113,7 @@ impl Sandbox {
             .unwrap();
         sb.git(&["remote", "add", "origin", remote.to_str().unwrap()]);
         sb.git(&["push", "-q", "origin", "HEAD:main"]);
-        sb.but(&["setup", "--init", "--json"]);
+        sb.enter_workspace();
         sb
     }
 
@@ -590,6 +623,20 @@ impl Drop for PrivateTmux {
         }
         eprintln!("live teardown: killed tmux server {}", self.socket);
     }
+}
+
+/// The first `but` that ships without `but setup`.
+const SETUP_REMOVED_IN: Version = Version { major: 0, minor: 23, patch: 0 };
+
+/// The installed `but`'s version, asked once. A gate local to this suite rather than one of
+/// `kanstack::but`'s: what it decides — how a test repo becomes a workspace — is fixture
+/// setup, not anything the client itself does.
+fn but_version() -> Version {
+    static VERSION: std::sync::OnceLock<Version> = std::sync::OnceLock::new();
+    *VERSION.get_or_init(|| {
+        let out = Command::new("but").arg("--version").output().expect("`but --version` must run");
+        Version::parse(&String::from_utf8_lossy(&out.stdout)).expect("`but --version` names a version")
+    })
 }
 
 fn skip_if_no_but() -> bool {
@@ -1536,7 +1583,7 @@ fn hunks_of_one_file_can_be_committed_to_different_lanes() {
     );
     sb.git(&["add", "."]);
     sb.git(&["commit", "-qm", "seed"]);
-    sb.but(&["setup", "--init", "--json"]);
+    sb.enter_workspace();
     sb.but(&["branch", "new", "top"]);
     sb.but(&["branch", "new", "bottom"]);
     // Two edits far enough apart to be separate hunks.
@@ -1622,7 +1669,7 @@ fn cards_carry_real_line_counts() {
     sb.write("a.txt", "one\ntwo\nthree\n");
     sb.git(&["add", "."]);
     sb.git(&["commit", "-qm", "seed"]);
-    sb.but(&["setup", "--init", "--json"]);
+    sb.enter_workspace();
     // One line changed, two added: +3 -1.
     sb.write("a.txt", "ONE\ntwo\nthree\nfour\nfive\n");
 
@@ -2445,7 +2492,7 @@ fn the_headerless_workspace_commit_is_still_identified() {
     // Round-trip out of and back into GitButler mode, which is what produces the
     // header-less variant.
     sb.but(&["teardown"]);
-    sb.but(&["setup", "--init", "--json"]);
+    sb.enter_workspace();
     let header_block = sb.git(&["cat-file", "-p", "HEAD"]);
     assert!(
         !header_block.contains("gitbutler-headers-version"),
