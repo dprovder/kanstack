@@ -1,7 +1,7 @@
 ---
 name: kanstack
 description: "Run several coding tasks at once, each on its own GitButler branch with its own coding agent in its own terminal pane, using kanstack — then check on, message, and clean up those agents. Use when the user wants work split up and done in parallel, or asks about agents, lanes or workstreams kanstack already started."
-when_to_use: "Examples: \"run these in parallel\", \"spin up agents for these\", \"parallelize this\", \"split this work up\", \"have another agent do X while you do Y\", \"check on the agents\", \"how are the lanes doing?\", \"tell the agent on fix-login to...\", \"stop that agent\". Also use BEFORE hand-rolling parallelism yourself: creating a `git worktree`, splitting a tmux or terminal pane to run another agent, or fanning code-editing work out to Agent/Task subagents. kanstack does that with real branches and visible panes; the skill says how to fall back if kanstack isn't installed."
+when_to_use: "Examples: \"run these in parallel\", \"spin up agents for these\", \"parallelize this\", \"split this work up\", \"have another agent do X while you do Y\", \"check on the agents\", \"watch the lanes\", \"tell me when they're done\", \"how are the lanes doing?\", \"tell the agent on fix-login to...\", \"stop that agent\". Also use BEFORE hand-rolling parallelism yourself: creating a `git worktree`, splitting a tmux or terminal pane to run another agent, or fanning code-editing work out to Agent/Task subagents. kanstack does that with real branches and visible panes; the skill says how to fall back if kanstack isn't installed."
 ---
 
 # Operating kanstack
@@ -63,15 +63,72 @@ a lane that's mid-task to change direction just orphans its pane and its
 context. Check `status --json` first: if the branch already has a pane, send;
 if it doesn't, spawn.
 
+## Watching lanes: arm one watch, don't poll
+
+Once lanes are running, don't call `kanstack status` over and over to see
+how they're doing. Checking by hand is how you miss a lane that went idle
+and has been waiting on you since your last look. Instead, right after
+spawning, start one long-running watch on the events log:
+
+    kanstack events --follow --new
+
+`--new` skips the backlog and `--follow` keeps streaming new lines. Run it
+as a background command that your harness notifies you from when it prints
+(in Claude Code, a background Bash command or a monitor), in the same
+repository as the lanes, or with `kanstack -C <repo>`. One watch covers
+every lane, because each line carries its own `branch`. Don't start one
+watcher per lane.
+
+**Don't consume the raw stream.** A `report` line is appended on every hook
+fire, not only when a lane's state changes. A working lane re-reports
+`{"kind":"report","state":"busy"}` on every tool call, every few seconds,
+for as long as it's working; in a real log, over 95% of lines are these
+repeats. A plain tail floods you with them. Collapse the stream to
+*transitions* (remember each branch's last state and pass a line only when
+the state differs), and drop the `busy` direction, which never needs you:
+
+```sh
+kanstack events --follow --new | jq --unbuffered -nc '
+  foreach inputs as $e ({last: {}};
+    if $e.kind == "report" then
+      .emit = (.last[$e.branch] != $e.state and $e.state != "busy")
+      | .last[$e.branch] = $e.state
+    else .emit = true end;
+    select(.emit) | $e)'
+```
+
+The filter still records `busy`, so `idle` → `busy` → `idle` prints the
+second `idle`. What reaches you is a lane going `idle` or `waiting`, plus
+every non-report line (spawn/stop/prune lifecycle, and note/ask/answer).
+
+Each line is a doorbell, not the payload: when one arrives, read
+`kanstack status --json` for the real state, then act on it:
+
+- **`waiting`**: the lane is stopped on a permission prompt and needs a
+  *human*. Tell the user which lane it is and what it's blocked on. Don't
+  `stop` it, and don't `send` to it, because a send types into the prompt
+  itself.
+- **`idle`**: usually the lane finished a turn and is waiting for your next
+  `send`. It does *not* mean the task is done. Look at its branch, then
+  either send the next instruction or, if the work really is finished,
+  wrap it up (see below).
+- **`dead`**: the pane is gone (closed outside kanstack, or its process
+  died), and the entry wants `kanstack prune`. This state never appears in
+  the events stream: it comes from `status --json` polling the multiplexer.
+
+Coverage gaps: only harnesses kanstack hands status hooks to (Claude Code,
+Gemini CLI and Codex, today) ever report. A lane running any other harness
+never rings the doorbell, and neither does a pane dying. So if the stream
+has been quiet for a long while, one `status --json` check is reasonable.
+That's an occasional check, not a loop.
+
 ## Before a destructive move: check state
 
 `kanstack stop` and `kanstack prune` are hard to undo — `stop` ends the
 harness and closes the pane; `prune` forgets any workstream whose pane is
-confirmed gone. Before either, read `kanstack status --json` (or
-`kanstack events --follow --new` if you're waiting on a specific workstream
-to finish rather than polling — `--new` skips straight to the log's current
-end so you don't sit through the whole backlog first) so you know what
-you're about to end. Don't stop
+confirmed gone. Before either, read `kanstack status --json` so you know
+what you're about to end. (Waiting for a lane to finish first? That's the
+watch above, not a polling loop.) Don't stop
 a workstream just because it's `idle` — idle often means it's waiting for
 your next `send`, not that it's done. `waiting` means it's stopped on a
 permission prompt and needs a human, not a `stop`.
