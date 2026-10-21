@@ -135,6 +135,33 @@ pub trait Harness: Sync {
             None => Vec::new(),
         }
     }
+
+    /// Finds this harness's input box in `screen`, a plain-text capture of its pane (what
+    /// `cmux read-screen` or `tmux capture-pane -p` print). This is what lets `kanstack send`
+    /// confirm that a message reached the box and then left it on Enter, instead of assuming
+    /// both (see `crate::mux::delivery`).
+    ///
+    /// `None`, the default, means kanstack doesn't know this harness's screen well enough to
+    /// find its input box. A send to it still goes out, but it is reported as unconfirmed.
+    /// [`claude::Claude`] is the only implementor so far. Each other harness needs its own
+    /// layout checked against the real program before it can claim to confirm anything.
+    fn read_prompt(&self, _screen: &str) -> Option<Prompt> {
+        None
+    }
+}
+
+/// What [`Harness::read_prompt`] found on a pane's screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Prompt {
+    /// The input box is on screen. `text` is what it holds: wrapped rows joined with `\n`,
+    /// with the prompt glyph and continuation indent removed. It may be placeholder or
+    /// suggestion text, which a plain-text capture can't tell apart from typed text.
+    /// `collapsed_paste` means part of it is folded into a placeholder for a long paste
+    /// (Claude Code's `[Pasted text #3 +24 lines]`), so the pasted text itself isn't visible.
+    Shown { text: String, collapsed_paste: bool },
+    /// The input box isn't on screen. A dialog or permission prompt may have replaced it, or
+    /// the harness may not have drawn it yet.
+    Hidden,
 }
 
 /// Anything not in [`KNOWN`]: a wrapper script, a harness kanstack hasn't heard of. Gets

@@ -1,5 +1,5 @@
 use crate::harness::launch::{shell_quote, LaunchExtras, NoteDelivery};
-use crate::harness::Harness;
+use crate::harness::{Harness, Prompt};
 
 /// Confirmed `--append-system-prompt <text>`, additive to (not replacing) its own default
 /// system prompt.
@@ -81,6 +81,38 @@ impl Harness for Claude {
         });
         Some(LaunchExtras { args: vec!["--settings".to_string(), settings.to_string()], env: Vec::new() })
     }
+
+    /// Claude Code (v2.1, measured through `cmux read-screen`) draws its input box between
+    /// two full-width `─` rules near the bottom of the pane. The first row starts with `❯ `,
+    /// and wrapped or multi-line input continues on rows indented by two spaces. A long paste
+    /// collapses to `[Pasted text #N +M lines]`. Input taller than the box scrolls so its *end*
+    /// stays visible, which is why `crate::mux::delivery` matches the end of a message.
+    ///
+    /// Past user messages in the transcript also start with `❯`, but they don't sit directly
+    /// under a rule. That rule is how the live box is told apart from history. A message
+    /// queued while Claude is busy leaves the box and appears above the rule (`ctrl+enter to
+    /// send now`), and the box then shows `Press up to edit queued messages`.
+    ///
+    /// A permission prompt, the folder-trust screen, or a non-default input mode (`!` bash
+    /// mode) shows no `❯` box, so it reads as [`Prompt::Hidden`].
+    fn read_prompt(&self, screen: &str) -> Option<Prompt> {
+        let rows: Vec<&str> = screen.lines().collect();
+        let is_rule = |row: &str| row.trim().starts_with("────");
+        let Some(top) = (1..rows.len()).rev().find(|&i| rows[i].starts_with('❯') && is_rule(rows[i - 1])) else {
+            return Some(Prompt::Hidden);
+        };
+        let Some(len) = rows[top..].iter().position(|row| is_rule(row)) else {
+            return Some(Prompt::Hidden);
+        };
+        let text = rows[top..top + len]
+            .iter()
+            .enumerate()
+            .map(|(i, row)| if i == 0 { row.trim_start_matches('❯').trim() } else { row.trim() })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let collapsed_paste = text.contains("[Pasted text #");
+        Some(Prompt::Shown { text, collapsed_paste })
+    }
 }
 
 #[cfg(test)]
@@ -153,6 +185,84 @@ mod tests {
             "no other events are hooked — in particular not Notification/idle_prompt, which never fired: {:?}",
             hooks.keys().collect::<Vec<_>>()
         );
+    }
+
+    // The input box. Each screen is a real `cmux read-screen` capture of Claude Code v2.1.306,
+    // cut down to its last rows with the rules shortened.
+
+    use crate::harness::Prompt;
+
+    const RULE: &str = "──────────────────────────────────────────";
+
+    fn read(rows: &[&str]) -> Prompt {
+        let screen = rows.iter().map(|row| row.replace("{rule}", RULE)).collect::<Vec<_>>().join("\n");
+        for_command("claude").read_prompt(&screen).expect("claude's input box is readable")
+    }
+
+    fn shown(text: &str) -> Prompt {
+        Prompt::Shown { text: text.to_string(), collapsed_paste: false }
+    }
+
+    const STATUS: [&str; 2] = ["  ░░░░░ 4% | $0.00 | +0 -0 | Haiku 5.5", "  ⏵⏵ auto mode on (shift+tab to cycle)"];
+
+    #[test]
+    fn the_box_is_the_prompt_row_between_two_rules_not_a_past_message() {
+        let idle = read(&["❯ Reply with just the word PONG-ALPHA-7.", "⏺ PONG-ALPHA-7", "{rule}", "❯ ", "{rule}", STATUS[0], STATUS[1]]);
+        assert_eq!(idle, shown(""), "the transcript's `❯` row is history, not the box");
+    }
+
+    #[test]
+    fn wrapped_and_multi_line_input_is_joined_without_its_indent() {
+        let typed = read(&[
+            "{rule}",
+            "❯ Paragraph 11: this is filler text about the send verification experiment, this is",
+            "  filler text about the send verification experiment,",
+            "",
+            "  Final instruction: reply with only the word PONG-BRAVO-9.",
+            "{rule}",
+            STATUS[0],
+            "  paste again to expand",
+        ]);
+        assert_eq!(
+            typed,
+            shown("Paragraph 11: this is filler text about the send verification experiment, this is\nfiller text about the send verification experiment,\n\nFinal instruction: reply with only the word PONG-BRAVO-9.")
+        );
+    }
+
+    #[test]
+    fn a_collapsed_paste_is_flagged() {
+        let collapsed = read(&["✻ Brewed for 6s · done 10:51 PM", "{rule}", "❯ [Pasted text #7 +24 lines]", "{rule}", STATUS[0], "  paste again to expand"]);
+        assert_eq!(collapsed, Prompt::Shown { text: "[Pasted text #7 +24 lines]".into(), collapsed_paste: true });
+    }
+
+    /// Queued while busy: the message has left the box (that is what makes it delivered), and
+    /// the box shows a hint instead.
+    #[test]
+    fn a_queued_message_is_above_the_box_not_in_it() {
+        let queued = read(&[
+            "  Final instruction: reply with only the word PONG-QUEUED-2.",
+            "  ctrl+enter to send now",
+            "{rule}",
+            "❯ Press up to edit queued messages",
+            "{rule}",
+            STATUS[0],
+        ]);
+        assert_eq!(queued, shown("Press up to edit queued messages"));
+    }
+
+    #[test]
+    fn a_dialog_in_place_of_the_box_is_hidden() {
+        let trust = read(&[
+            "{rule}",
+            " Accessing workspace:",
+            " Quick safety check: Is this a project you created or one you trust?",
+            " ❯ No, exit",
+            "   Yes, I trust this folder",
+            " Enter to confirm · Esc to cancel",
+        ]);
+        assert_eq!(trust, Prompt::Hidden, "a dialog's own `❯` is indented and not under a rule");
+        assert_eq!(read(&["{rule}", "❯ half a box, its closing rule not drawn yet"]), Prompt::Hidden);
+        assert_eq!(read(&[]), Prompt::Hidden);
     }
 
     #[test]

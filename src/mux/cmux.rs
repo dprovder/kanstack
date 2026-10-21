@@ -31,28 +31,18 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 pub use crate::mux::pane_status::PaneStatus;
-use crate::mux::{command_exists, Multiplexer, OpenRequest, RegroupRequest, StackPlacement};
+use crate::mux::{command_exists, Multiplexer, OpenRequest, RegroupRequest, Screen, StackPlacement};
 use crate::mux::pane_status::CPU_BUSY_THRESHOLD_PERCENT;
 
 /// Pixels of slack allowed when treating two pane edges as touching. Frames come back as
 /// floats (e.g. `461.5`); this absorbs rounding without false-matching panes that are
 /// merely near each other.
 const ADJACENCY_EPSILON: f64 = 4.0;
-
-/// How long [`Cmux::wait_for_pane_to_settle`] waits between `read-screen` polls.
-const PANE_SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(100);
-
-/// How long [`Cmux::wait_for_pane_to_settle`] will keep polling before giving up on a pane that
-/// never stops changing (or never answers at all) and letting [`Cmux::type_and_submit`] send
-/// Enter anyway. Bounded so a pane that is independently busy rendering something unrelated can
-/// never hang a send forever — see that function's doc comment for what this is standing in for.
-const PANE_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// cmux, through its own CLI. Which pane belongs to which branch is
 /// `crate::splitter::Splitter`'s business; the one thing this remembers itself is the cmux
@@ -65,10 +55,6 @@ pub struct Cmux {
     /// says" — which is right for the board, running inside its own pane, but is only as
     /// good as that variable is for anything else.
     workspace: Mutex<Option<String>>,
-    /// [`PANE_SETTLE_TIMEOUT`] by default; shortened by tests so the bounded-timeout path in
-    /// [`Self::wait_for_pane_to_settle`] doesn't have to actually burn multiple real seconds to
-    /// exercise it.
-    settle_timeout: Duration,
 }
 
 impl Cmux {
@@ -85,7 +71,7 @@ impl Cmux {
                 candidate
             }
         };
-        Some(Cmux { bin, workspace: Mutex::new(None), settle_timeout: PANE_SETTLE_TIMEOUT })
+        Some(Cmux { bin, workspace: Mutex::new(None) })
     }
 
     fn pinned_workspace(&self) -> Option<String> {
@@ -112,52 +98,13 @@ impl Cmux {
             .unwrap_or_else(|| workspace_ref.to_string())
     }
 
-    /// Types `text` into `surface_ref`, waits for the pane to stop changing (see
-    /// [`Self::wait_for_pane_to_settle`]), then presses Enter as a separate key. A trailing
-    /// newline in the same `cmux send` reaches the terminal as a carriage return in the
-    /// same burst as the text, which a TUI like Claude Code reads as part of a paste rather
-    /// than as Enter — the text lands in its input box and never submits. Verified against
-    /// a real `claude` with a ~4KB message: one send with a trailing newline stays in the
-    /// input box; the same text followed by its own `send-key enter` is submitted at once.
-    /// `tmux.rs` sends its Enter as a separate key for the same reason.
+    /// Pastes `text` into `surface_ref`, then presses Enter as a separate key. Used for the
+    /// launch line, typed into a fresh shell, and for a send nothing can confirm. A send that
+    /// can be confirmed goes through `crate::mux::delivery` instead, which calls the same two
+    /// steps through [`Screen`] and checks the pane between and after them.
     fn type_and_submit(&self, surface_ref: &str, text: &str) -> Result<()> {
-        self.run_scoped(&["send", "--surface", surface_ref, text])?;
-        self.wait_for_pane_to_settle(surface_ref);
-        self.run_scoped(&["send-key", "--surface", surface_ref, "enter"])?;
-        Ok(())
-    }
-
-    /// Closes a second race behind [`Self::type_and_submit`]'s trailing-Enter one: `cmux send`'s
-    /// process exits as soon as cmux's daemon *accepts* the paste, not once the target pane has
-    /// actually finished receiving and rendering it. For a short message that gap is too small
-    /// to matter; for a multi-kilobyte one, `send-key enter` can reach the pty while the paste
-    /// is still landing, where it's absorbed as ordinary input (e.g. a stray newline inside the
-    /// still-arriving text) instead of submitting — observed live as a several-paragraph message
-    /// staying an unsubmitted draft until a bare Enter, sent 10+ seconds later, finally went
-    /// through.
-    ///
-    /// Polls `cmux read-screen --surface <surface_ref>` every [`PANE_SETTLE_POLL_INTERVAL`] and
-    /// treats two consecutive identical reads as "the paste has stopped changing the screen".
-    /// Gives up after [`Self::settle_timeout`] and returns anyway, so a pane that's independently
-    /// busy for unrelated reasons (or a `cmux` too old to have `read-screen`, which just keeps
-    /// erroring) can never hang a send forever — best-effort settle detection, not a general
-    /// synchronization primitive, in the same spirit as `splitter.rs`'s
-    /// `CORROBORATION_GRACE`/`QUIET_CONFIRMATIONS`.
-    fn wait_for_pane_to_settle(&self, surface_ref: &str) {
-        let read = || self.run_scoped(&["read-screen", "--surface", surface_ref]).ok();
-        let started = Instant::now();
-        let mut previous = read();
-        loop {
-            if started.elapsed() >= self.settle_timeout {
-                return;
-            }
-            std::thread::sleep(PANE_SETTLE_POLL_INTERVAL);
-            let current = read();
-            if current.is_some() && current == previous {
-                return;
-            }
-            previous = current;
-        }
+        self.paste(surface_ref, text)?;
+        self.press_enter(surface_ref)
     }
 
     /// Looks for a pane already touching kanstack's own pane on `direction`'s side, via
@@ -222,6 +169,45 @@ impl Cmux {
             );
         }
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+}
+
+impl Screen for Cmux {
+    /// `cmux rpc terminal.paste` with `submit_key: none`: cmux's Cmd+V path, which hands
+    /// `text` to the terminal unchanged as a bracketed paste when the program in the pane has
+    /// asked for one. Measured against a raw-mode reader (`cmux` 0.64.20): `ESC[200~`, the
+    /// bytes exactly as given, `ESC[201~`, and no Enter.
+    ///
+    /// `cmux send`, which this replaced, types `text` as keystrokes instead (`surface.send_text`).
+    /// Measured against the same reader, it ignores bracketed paste, turns every newline into
+    /// `\r` (the Enter key), and turns a literal backslash-n or backslash-t in the text into
+    /// Enter or Tab. Claude Code guesses which keystrokes belong to a paste from how fast they
+    /// arrive, and a multi-line message typed that way regularly left its final Enter unread:
+    /// against an idle Claude Code, a multi-line message followed two seconds later by
+    /// `send-key enter` stayed in the input box 5 times out of 6. The same messages pasted this
+    /// way were submitted 6 times out of 6.
+    ///
+    /// A cmux without `terminal.paste` (`method_not_found`) falls back to `cmux send`.
+    fn paste(&self, surface_ref: &str, text: &str) -> Result<()> {
+        let mut params = serde_json::json!({ "surface_id": surface_ref, "text": text, "submit_key": "none" });
+        if let Some(workspace) = self.pinned_workspace() {
+            params["workspace_id"] = workspace.into();
+        }
+        match self.run(&["rpc", "terminal.paste", &params.to_string()]) {
+            Err(e) if e.to_string().contains("method_not_found") => {
+                self.run_scoped(&["send", "--surface", surface_ref, "--", text]).map(drop)
+            }
+            result => result.map(drop),
+        }
+    }
+
+    fn press_enter(&self, surface_ref: &str) -> Result<()> {
+        self.run_scoped(&["send-key", "--surface", surface_ref, "enter"]).map(drop)
+    }
+
+    /// `cmux read-screen`: the visible rows of the surface, as plain text.
+    fn read(&self, surface_ref: &str) -> Result<String> {
+        self.run_scoped(&["read-screen", "--surface", surface_ref])
     }
 }
 
@@ -366,6 +352,10 @@ impl Multiplexer for Cmux {
 
     fn type_line(&self, pane: &str, text: &str) -> Result<()> {
         self.type_and_submit(pane, text)
+    }
+
+    fn screen(&self) -> Option<&dyn Screen> {
+        Some(self)
     }
 
     /// cmux's "panel" refs are the same `surface:N` refs `new-split` reports.
@@ -765,7 +755,10 @@ mod tests {
 
     use std::sync::Arc;
 
-    use crate::harness::HarnessConfig;
+    use std::time::Duration;
+
+    use crate::harness::{for_command, HarnessConfig};
+    use crate::mux::delivery::{self, Delivery, Timing};
     use crate::mux::stand_in;
     use crate::splitter::Splitter;
 
@@ -812,12 +805,12 @@ esac"#
             let lines = stand_in::log_lines(log);
             assert_eq!(lines[0], "new-split up", "no workspace pinned yet, so none is named: {lines:#?}");
             assert_eq!(lines[1], "--id-format both workspace list", "a ref is only an ordinal; the UUID is what is kept");
-            assert!(lines[2].starts_with(&format!("send --workspace {WS} --surface surface:41 cd '/repo' && claude ")), "{}", lines[2]);
-            assert_eq!(lines[3], format!("read-screen --workspace {WS} --surface surface:41"), "settle-detection reads the pane before Enter is sent");
-            assert_eq!(lines[4], format!("read-screen --workspace {WS} --surface surface:41"));
-            assert_eq!(lines[5], format!("send-key --workspace {WS} --surface surface:41 enter"));
-            assert_eq!(lines[6], format!("rename-tab --workspace {WS} --surface surface:41 feat-a"));
-            assert_eq!(lines.len(), 7, "{lines:#?}");
+            let launch = pasted(&lines[2]);
+            assert_eq!((&launch["surface_id"], &launch["workspace_id"]), (&"surface:41".into(), &WS.into()));
+            assert!(launch["text"].as_str().unwrap().starts_with("cd '/repo' && claude "), "{launch}");
+            assert_eq!(lines[3], format!("send-key --workspace {WS} --surface surface:41 enter"));
+            assert_eq!(lines[4], format!("rename-tab --workspace {WS} --surface surface:41 feat-a"));
+            assert_eq!(lines.len(), 5, "{lines:#?}");
             assert_eq!(splitter.workspace().as_deref(), Some(WS));
         });
     }
@@ -828,8 +821,8 @@ esac"#
             splitter.spawn_harness(Path::new("/repo"), "feat-a", None).unwrap();
             splitter.spawn_harness(Path::new("/repo"), "feat-b", None).unwrap();
             let lines = stand_in::log_lines(log);
-            assert_eq!(lines[7], format!("list-panels --workspace {WS}"), "the pinned workspace is checked to still exist");
-            assert_eq!(lines[8], format!("new-split right --surface surface:41 --workspace {WS}"), "{lines:#?}");
+            assert_eq!(lines[5], format!("list-panels --workspace {WS}"), "the pinned workspace is checked to still exist");
+            assert_eq!(lines[6], format!("new-split right --surface surface:41 --workspace {WS}"), "{lines:#?}");
         });
     }
 
@@ -849,12 +842,10 @@ esac"#;
             let lines = stand_in::log_lines(log);
             assert_eq!(lines[0], "rpc pane.list");
             assert_eq!(lines[1], "new-surface --pane pane:7 --working-directory /repo");
-            assert!(lines[2].starts_with("send --surface surface:99 cd '/repo' && claude "), "{}", lines[2]);
-            assert_eq!(lines[3], "read-screen --surface surface:99");
-            assert_eq!(lines[4], "read-screen --surface surface:99");
-            assert_eq!(lines[5], "send-key --surface surface:99 enter");
-            assert_eq!(lines[6], "rename-tab --surface surface:99 feat-top");
-            assert_eq!(lines.len(), 7, "{lines:#?}");
+            assert!(pasted(&lines[2])["text"].as_str().unwrap().starts_with("cd '/repo' && claude "), "{}", lines[2]);
+            assert_eq!(lines[3], "send-key --surface surface:99 enter");
+            assert_eq!(lines[4], "rename-tab --surface surface:99 feat-top");
+            assert_eq!(lines.len(), 5, "{lines:#?}");
         });
     }
 
@@ -978,107 +969,163 @@ esac"#;
         });
     }
 
-    /// The submit is its own key press: a newline in the same burst reads as part of a
-    /// paste to a TUI, and the text never sends. A settle read is taken twice (stabilizing
-    /// immediately, since the stand-in's `read-screen` reports the same nothing both times)
-    /// before Enter is sent — see the dedicated settle-detection tests below for a pane that
-    /// actually takes a few reads to stabilize.
+    /// The text of a `rpc terminal.paste <params>` log line, read back out of its JSON.
+    fn pasted(line: &str) -> serde_json::Value {
+        let params = line.strip_prefix("rpc terminal.paste ").unwrap_or_else(|| panic!("not a paste: {line}"));
+        serde_json::from_str(params).unwrap()
+    }
+
+    /// A cmux whose surface runs Claude Code: `read-screen` shows an empty input box until
+    /// something is pasted, the message in the box after that, and an empty box again after
+    /// `send-key`. The screens are cut down from real `cmux read-screen` captures.
+    const CLAUDE_TAKES_IT: &str = r#"case "$1" in
+  rpc) echo pasted > "$0.state" ;;
+  send-key) echo entered > "$0.state" ;;
+  read-screen)
+    case "$(cat "$0.state" 2>/dev/null)" in
+      pasted) printf '────────\n❯ run the tests\n────────\n  status\n' ;;
+      *) printf '────────\n❯ \n────────\n  status\n' ;;
+    esac ;;
+esac"#;
+
+    /// The message goes in as one bracketed paste (`terminal.paste`, which hands the text over
+    /// unchanged, with no Enter of its own), and Enter is pressed as its own key, but only
+    /// once the message is seen in Claude's input box. The send is confirmed only once the
+    /// box is seen to be clear again.
+    ///
+    /// This replaces the old contract, where the text went through `cmux send` (keystrokes)
+    /// and Enter waited for two identical `read-screen`s in a row. That stillness check never
+    /// held against a busy Claude Code, whose screen animates constantly, and passed too early
+    /// on an idle one, where nothing had changed yet.
     #[test]
-    fn a_message_is_sent_and_then_submitted_with_its_own_enter() {
-        with_fake_cmux("send", "", &[], |mut splitter, log| {
+    fn a_message_is_pasted_and_submitted_with_its_own_enter_once_seen_in_the_box() {
+        with_fake_cmux("send", CLAUDE_TAKES_IT, &[], |mut splitter, log| {
             splitter.set_workspace(Some(WS));
             splitter.adopt("feat-a", "surface:5");
-            splitter.send_task("feat-a", "run the tests").unwrap();
+            let delivery = splitter.deliver("feat-a", Some("claude"), "run the tests").unwrap();
+            assert_eq!(delivery, Delivery::Confirmed);
+            let lines = stand_in::log_lines(log);
+            let read = format!("read-screen --workspace {WS} --surface surface:5");
+            assert_eq!(lines[0], read, "the box is looked for before anything is typed");
             assert_eq!(
-                stand_in::log_lines(log),
-                [
-                    format!("send --workspace {WS} --surface surface:5 run the tests"),
-                    format!("read-screen --workspace {WS} --surface surface:5"),
-                    format!("read-screen --workspace {WS} --surface surface:5"),
-                    format!("send-key --workspace {WS} --surface surface:5 enter"),
-                ]
+                pasted(&lines[1]),
+                serde_json::json!({ "surface_id": "surface:5", "workspace_id": WS, "text": "run the tests", "submit_key": "none" })
             );
+            assert_eq!(lines[2], read, "Enter waits until the message is seen");
+            assert_eq!(lines[3], format!("send-key --workspace {WS} --surface surface:5 enter"));
+            assert_eq!(lines[4], read, "and success waits until the box is seen clear");
+            assert_eq!(lines.len(), 5, "{lines:#?}");
         });
     }
 
-    /// Like [`with_fake_cmux`], but lets a test shorten `settle_timeout` so the
-    /// bounded-timeout path in [`Cmux::wait_for_pane_to_settle`] doesn't have to burn the real
-    /// [`PANE_SETTLE_TIMEOUT`] to be exercised.
-    fn with_fake_cmux_settle(tag: &str, body: &str, settle_timeout: Duration, test: impl FnOnce(Splitter, &Path)) {
-        let (bin, log) = stand_in::install(tag, "cmux", body);
-        let vars = [
-            ("KANSTACK_CMUX_BIN", Some(bin.to_str().unwrap())),
-            ("CMUX_SURFACE_ID", None),
-            ("CMUX_WORKSPACE_ID", None),
-            ("KANSTACK_CMUX_DIRECTION", None),
-            ("KANSTACK_CMUX_CHAIN_DIRECTION", None),
-        ];
-        stand_in::with_env(&vars, || {
-            let mut cmux = Cmux::discover().unwrap();
-            cmux.settle_timeout = settle_timeout;
-            test(Splitter::new(Arc::new(cmux), HarnessConfig::new("claude")), &log)
-        });
-        stand_in::remove(&bin);
-    }
-
-    /// A pane that is still settling — `read-screen` reports a changing screen for the first
-    /// couple of reads before it stabilizes — must not get its Enter sent early: `send-key`
-    /// only shows up in the log once two consecutive `read-screen`s agree, not right after
-    /// `send` returns. This is the race documented on [`Cmux::wait_for_pane_to_settle`]: a long
-    /// paste can still be landing after `cmux send`'s own process has already exited.
+    /// `cmux send` turns a literal backslash-n in its text into Enter (measured), which would
+    /// have split this message in two. A paste carries it, the newline, and a leading `-`
+    /// through unchanged.
     #[test]
-    fn send_key_waits_for_two_consecutive_matching_reads_before_it_fires() {
-        let body = r#"case "$1" in
-  read-screen)
-    n=$(cat "$0.n" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$0.n"
-    if [ "$n" -le 2 ]; then echo "still-settling-$n"; else echo "stable"; fi
-    ;;
-esac"#;
-        with_fake_cmux_settle("settle", body, Duration::from_secs(2), |mut splitter, log| {
+    fn a_paste_carries_the_text_unchanged() {
+        with_fake_cmux("paste-text", "", &[], |mut splitter, log| {
+            splitter.adopt("feat-a", "surface:5");
+            let text = "--flag first\nthen printf 'a\\nb'";
+            splitter.send_task("feat-a", text).unwrap();
+            let lines = stand_in::log_lines(log);
+            assert_eq!(pasted(&lines[0])["text"], text);
+        });
+    }
+
+    /// A cmux too old for `terminal.paste` still gets the message, through `cmux send`.
+    #[test]
+    fn a_cmux_without_terminal_paste_falls_back_to_send() {
+        let body = r#"case "$1" in rpc) echo "Error: method_not_found: Unknown method" >&2; exit 1 ;; esac"#;
+        with_fake_cmux("no-paste", body, &[], |mut splitter, log| {
             splitter.adopt("feat-a", "surface:5");
             splitter.send_task("feat-a", "run the tests").unwrap();
             let lines = stand_in::log_lines(log);
-            assert_eq!(
-                lines,
-                [
-                    "send --surface surface:5 run the tests",
-                    "read-screen --surface surface:5",
-                    "read-screen --surface surface:5",
-                    "read-screen --surface surface:5",
-                    "read-screen --surface surface:5",
-                    "send-key --surface surface:5 enter",
-                ],
-                "{lines:#?}"
-            );
+            assert_eq!(lines[1], "send --surface surface:5 -- run the tests", "{lines:#?}");
+            assert_eq!(lines[2], "send-key --surface surface:5 enter");
         });
     }
 
-    /// A pane whose screen never stops changing, and one whose `read-screen` only ever errors,
-    /// must not hang `send_task` forever: once polling exhausts a (shortened, for this test)
-    /// `settle_timeout`, Enter is still sent — the settle wait is best-effort, not a hard
-    /// requirement for the message to ever submit at all.
+    /// A pane this process only adopted, with no harness named, can't have its prompt read,
+    /// so the send goes out as before (paste, then Enter) and says it is unconfirmed rather
+    /// than claiming a confirmation nothing checked.
     #[test]
-    fn a_pane_that_never_settles_or_never_answers_still_gets_its_enter_eventually() {
-        let never_settles = r#"case "$1" in
-  read-screen)
-    n=$(cat "$0.n" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$0.n"; echo "still-changing-$n"
-    ;;
-esac"#;
-        with_fake_cmux_settle("never-settles", never_settles, Duration::from_millis(150), |mut splitter, log| {
+    fn a_pane_of_unknown_harness_is_sent_to_unconfirmed() {
+        with_fake_cmux("unknown-harness", "", &[], |mut splitter, log| {
             splitter.adopt("feat-a", "surface:5");
-            splitter.send_task("feat-a", "run the tests").unwrap();
+            let delivery = splitter.deliver("feat-a", None, "run the tests").unwrap();
+            assert!(matches!(delivery, Delivery::Unconfirmed(_)), "{delivery:?}");
             let lines = stand_in::log_lines(log);
-            assert_eq!(lines.last().map(String::as_str), Some("send-key --surface surface:5 enter"), "{lines:#?}");
-            assert!(lines.iter().filter(|l| l.starts_with("read-screen")).count() >= 2, "{lines:#?}");
+            assert!(lines[0].starts_with("rpc terminal.paste "), "{lines:#?}");
+            assert_eq!(lines[1], "send-key --surface surface:5 enter");
+            assert_eq!(lines.len(), 2, "nothing read, because nothing could be checked: {lines:#?}");
+        });
+    }
+
+    /// Like [`with_fake_cmux`], but hands the test the `Cmux` itself, so it can call
+    /// `delivery::deliver` with its waits shortened.
+    fn with_cmux(tag: &str, body: &str, test: impl FnOnce(&Cmux, &Path)) {
+        with_fake_cmux(tag, body, &[], |_, log| test(&Cmux::discover().unwrap(), log));
+    }
+
+    fn quick() -> Timing {
+        Timing { poll: Duration::from_millis(1), arrival: Duration::from_millis(100), enter_waits: vec![Duration::from_millis(20); 3] }
+    }
+
+    /// The live failure: Enter pressed, and the message still in Claude's input box. Enter is
+    /// pressed again, a bounded number of times, and then the send is an error, so
+    /// `kanstack send` reports a failure instead of `ok: true`.
+    #[test]
+    fn a_message_left_sitting_in_the_box_is_retried_then_reported_as_not_delivered() {
+        let stuck = r#"case "$1" in
+  rpc) echo pasted > "$0.state" ;;
+  read-screen)
+    if [ -f "$0.state" ]; then printf '────────\n❯ run the tests\n────────\n'; else printf '────────\n❯ \n────────\n'; fi ;;
+esac"#;
+        with_cmux("stuck", stuck, |cmux, log| {
+            let err = delivery::deliver(cmux, "surface:5", "run the tests", Some(for_command("claude")), &quick()).unwrap_err();
+            assert!(err.to_string().contains("still sitting unsubmitted"), "{err}");
+            let enters = stand_in::log_lines(log).iter().filter(|l| l.starts_with("send-key")).count();
+            assert_eq!(enters, 3);
+        });
+    }
+
+    /// The paste never shows up. Enter is never pressed, which is what keeps a half-arrived
+    /// paste from being submitted early.
+    #[test]
+    fn a_message_never_seen_in_the_box_never_gets_its_enter() {
+        let never_lands = r#"case "$1" in read-screen) printf '────────\n❯ \n────────\n' ;; esac"#;
+        with_cmux("never-lands", never_lands, |cmux, log| {
+            let err = delivery::deliver(cmux, "surface:5", "run the tests", Some(for_command("claude")), &quick()).unwrap_err();
+            assert!(err.to_string().contains("never showed up"), "{err}");
+            assert!(!stand_in::log_lines(log).iter().any(|l| l.starts_with("send-key")));
         });
 
         let always_errors = r#"case "$1" in read-screen) echo "no such surface" >&2; exit 1 ;; esac"#;
-        with_fake_cmux_settle("errors-forever", always_errors, Duration::from_millis(150), |mut splitter, log| {
-            splitter.adopt("feat-a", "surface:5");
-            splitter.send_task("feat-a", "run the tests").unwrap();
-            let lines = stand_in::log_lines(log);
-            assert_eq!(lines.last().map(String::as_str), Some("send-key --surface surface:5 enter"), "{lines:#?}");
+        with_cmux("errors-forever", always_errors, |cmux, log| {
+            let err = delivery::deliver(cmux, "surface:5", "run the tests", Some(for_command("claude")), &quick()).unwrap_err();
+            assert!(err.to_string().contains("nothing was typed"), "{err}");
+            assert!(stand_in::log_lines(log).iter().all(|l| l.starts_with("read-screen")));
         });
+    }
+
+    /// Against a real cmux and a real Claude Code: sends `KANSTACK_LIVE_SEND_TEXT` (or a
+    /// short default) to `KANSTACK_LIVE_SEND_SURFACE` and prints how the send turned out and
+    /// how long it took. Only point it at a surface you created yourself, because it types into
+    /// whatever runs there. `KANSTACK_LIVE_SEND_WORKSPACE` names that surface's workspace when
+    /// it isn't this shell's own.
+    ///
+    /// `cargo test --lib live_send_to_a_real_claude -- --ignored --nocapture`
+    #[test]
+    #[ignore = "types into a real cmux surface named by KANSTACK_LIVE_SEND_SURFACE"]
+    fn live_send_to_a_real_claude() {
+        let surface = std::env::var("KANSTACK_LIVE_SEND_SURFACE").expect("KANSTACK_LIVE_SEND_SURFACE names a surface you created");
+        let text = std::env::var("KANSTACK_LIVE_SEND_TEXT").unwrap_or_else(|_| "Reply with only the word PONG.".to_string());
+        let cmux = Cmux::discover().expect("cmux on PATH");
+        cmux.set_scope(std::env::var("KANSTACK_LIVE_SEND_WORKSPACE").ok().as_deref());
+        let started = std::time::Instant::now();
+        let outcome = delivery::deliver(&cmux, &surface, &text, Some(for_command("claude")), &Timing::default());
+        println!("{} bytes to {surface}: {outcome:?} after {:?}", text.len(), started.elapsed());
+        outcome.unwrap();
     }
 
     #[test]

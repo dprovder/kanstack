@@ -12,6 +12,7 @@
 //! `surface:12`, Orca's terminal handle.
 
 pub mod cmux;
+pub mod delivery;
 pub mod ghostty;
 pub mod orca;
 pub mod pane_status;
@@ -124,7 +125,18 @@ pub trait Multiplexer: Send + Sync {
     /// Types `text` into `pane` as literal input, then submits it. The submit is a separate
     /// key press rather than a trailing newline in the same burst, which a TUI reads as part
     /// of a paste and never submits.
+    ///
+    /// Nothing here checks that the text arrived or was submitted. That is
+    /// [`delivery::deliver`]'s job, for a backend that offers [`Self::screen`]. Without that,
+    /// this is all a send gets, and it is reported as unconfirmed.
     fn type_line(&self, pane: &str, text: &str) -> Result<()>;
+
+    /// The finer-grained typing and screen reading [`delivery::deliver`] needs to confirm a
+    /// send, for a backend that can read a pane's screen back. `None`, the default, means it
+    /// can't (Ghostty's scripting and Orca's CLI, today).
+    fn screen(&self) -> Option<&dyn Screen> {
+        None
+    }
 
     /// Brings `pane` to the front and gives it keyboard focus.
     fn focus(&self, pane: &str) -> Result<()>;
@@ -159,6 +171,21 @@ pub trait Multiplexer: Send + Sync {
     fn scope(&self) -> Option<String> {
         None
     }
+}
+
+/// What [`Multiplexer::screen`] offers: typing and submitting as two separate steps, and
+/// reading a pane back between them.
+pub trait Screen {
+    /// Pastes `text` into `pane` without submitting it. It must be a bracketed paste when the
+    /// program in the pane has asked for one, so the program can't mistake a newline in
+    /// `text` for Enter, and it must deliver `text` unchanged.
+    fn paste(&self, pane: &str, text: &str) -> Result<()>;
+
+    /// Presses Enter in `pane`.
+    fn press_enter(&self, pane: &str) -> Result<()>;
+
+    /// What `pane` shows right now, as plain text, one row per line.
+    fn read(&self, pane: &str) -> Result<String>;
 }
 
 /// Accepts the more readable `above`/`below` alongside `up`/`down`/`left`/`right`.
@@ -233,7 +260,8 @@ pub(crate) mod stand_in {
     use std::path::{Path, PathBuf};
 
     /// Writes an executable `name` that appends its arguments to a log, one line per call,
-    /// then runs `body`. Returns it with the log's path. Both live in a directory unique to
+    /// then runs `body`. They are logged with `printf`, not `echo`, whose `sh` version expands
+    /// backslash escapes and would garble JSON arguments such as `terminal.paste`'s. Returns it with the log's path. Both live in a directory unique to
     /// `tag`, which a test removes with [`remove`].
     pub fn install(tag: &str, name: &str, body: &str) -> (PathBuf, PathBuf) {
         use std::os::unix::fs::PermissionsExt;
@@ -241,7 +269,7 @@ pub(crate) mod stand_in {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let (bin, log) = (dir.join(name), dir.join("log"));
-        std::fs::write(&bin, format!("#!/bin/sh\necho \"$@\" >> '{}'\n{body}\n", log.display())).unwrap();
+        std::fs::write(&bin, format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n{body}\n", log.display())).unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         (bin, log)
     }

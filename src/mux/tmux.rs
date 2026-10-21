@@ -26,7 +26,7 @@ use std::process::{Command, Output};
 
 use anyhow::{bail, Context, Result};
 
-use crate::mux::{command_exists, Multiplexer, OpenRequest, RegroupRequest, StackPlacement};
+use crate::mux::{command_exists, Multiplexer, OpenRequest, RegroupRequest, Screen, StackPlacement};
 use crate::mux::pane_status::{PaneStatus, CPU_BUSY_THRESHOLD_PERCENT};
 use crate::procs::{read_ps_table, subtree_cpu, PsRow};
 
@@ -59,14 +59,13 @@ impl Tmux {
         Some(Tmux { bin, own_pane })
     }
 
-    /// Types `text` into `pane_id` as literal keystrokes, then presses Enter as a separate
-    /// key — the documented tmux pattern for sending arbitrary text (a `-l`-less `send-keys`
-    /// would risk interpreting text that happens to match a key name, like a message that's
-    /// literally the word `Enter`, as that key instead of literal characters).
+    /// Types `text` into `pane_id`, then presses Enter as a separate key: the documented tmux
+    /// pattern for sending arbitrary text. Used for the launch line and for a send nothing can
+    /// confirm. A send that can be confirmed goes through `crate::mux::delivery`, which calls
+    /// the same two steps through [`Screen`] and checks the pane between and after them.
     fn type_and_submit(&self, pane_id: &str, text: &str) -> Result<()> {
-        self.run(&["send-keys", "-t", pane_id, "-l", "--", text])?;
-        self.run(&["send-keys", "-t", pane_id, "Enter"])?;
-        Ok(())
+        self.paste(pane_id, text)?;
+        self.press_enter(pane_id)
     }
 
     fn run(&self, args: &[&str]) -> Result<String> {
@@ -88,6 +87,30 @@ impl Tmux {
             );
         }
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+}
+
+impl Screen for Tmux {
+    /// `send-keys -l`: `text` as literal keystrokes, so a message that happens to match a
+    /// key name (`Enter`) is typed rather than pressed. Unlike `cmux send`, this was measured
+    /// to work against Claude Code: a multi-line message of up to 4.5KB, typed this way and
+    /// followed two seconds later by its own Enter, was submitted 6 times out of 6. tmux sends
+    /// a newline in `text` as a line feed, which Claude Code adds to the input, where `cmux
+    /// send` sends it as the Enter key. `paste-buffer -p` (a bracketed paste) also went 6 for
+    /// 6, so there was no measured reason to switch.
+    fn paste(&self, pane_id: &str, text: &str) -> Result<()> {
+        self.run(&["send-keys", "-t", pane_id, "-l", "--", text])?;
+        Ok(())
+    }
+
+    fn press_enter(&self, pane_id: &str) -> Result<()> {
+        self.run(&["send-keys", "-t", pane_id, "Enter"])?;
+        Ok(())
+    }
+
+    /// `capture-pane -p`: the pane's visible rows, as plain text.
+    fn read(&self, pane_id: &str) -> Result<String> {
+        self.run(&["capture-pane", "-p", "-t", pane_id])
     }
 }
 
@@ -204,6 +227,10 @@ impl Multiplexer for Tmux {
 
     fn type_line(&self, pane: &str, text: &str) -> Result<()> {
         self.type_and_submit(pane, text)
+    }
+
+    fn screen(&self) -> Option<&dyn Screen> {
+        Some(self)
     }
 
     /// `select-window` first, since `select-pane` alone leaves a pane in another window out
@@ -422,6 +449,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::harness::HarnessConfig;
+    use crate::mux::delivery::Delivery;
     use crate::mux::stand_in;
     use crate::splitter::Splitter;
 
@@ -585,7 +613,9 @@ mod tests {
     }
 
     /// The text goes in as literal keystrokes, so a message that happens to be the name of a
-    /// key is typed rather than pressed, and the submit is a separate key.
+    /// key is typed rather than pressed, and the submit is a separate key. These panes were
+    /// adopted with no harness named, so nothing reads them back and the send is unconfirmed
+    /// (see the next test for one that is confirmed).
     #[test]
     fn a_message_is_typed_literally_and_submitted_with_its_own_enter() {
         with_fake_tmux("send", "", &[], |mut splitter, log| {
@@ -596,6 +626,27 @@ mod tests {
                 stand_in::log_lines(log),
                 ["send-keys -t %5 -l -- Enter", "send-keys -t %5 Enter", "send-keys -t %5 -l -- --fix the tests", "send-keys -t %5 Enter"]
             );
+        });
+    }
+
+    /// For a pane running Claude Code, the send is checked through `capture-pane`, the same
+    /// way `cmux.rs`'s tests check it through `read-screen`.
+    #[test]
+    fn a_send_to_claude_is_confirmed_through_capture_pane() {
+        let body = r#"case "$1" in
+  send-keys) if [ "$4" = "-l" ]; then echo typed > "$0.state"; else echo entered > "$0.state"; fi ;;
+  capture-pane)
+    case "$(cat "$0.state" 2>/dev/null)" in
+      typed) printf '────────\n❯ run the tests\n────────\n' ;;
+      *) printf '────────\n❯ \n────────\n' ;;
+    esac ;;
+esac"#;
+        with_fake_tmux("confirmed", body, &[], |mut splitter, log| {
+            splitter.adopt("feat-a", "%5");
+            assert_eq!(splitter.deliver("feat-a", Some("claude"), "run the tests").unwrap(), Delivery::Confirmed);
+            let lines = stand_in::log_lines(log);
+            let commands: Vec<_> = lines.iter().map(|l| l.split(' ').next().unwrap()).collect();
+            assert_eq!(commands, ["capture-pane", "send-keys", "capture-pane", "send-keys", "capture-pane"], "{lines:#?}");
         });
     }
 

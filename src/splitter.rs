@@ -21,6 +21,7 @@ use crate::mux::orca::Orca;
 use crate::mux::tmux::Tmux;
 use crate::model::WorkspaceStatus;
 use crate::mux::{configured_directions, normalize_direction, Multiplexer, OpenRequest, RegroupRequest, StackPlacement};
+use crate::mux::delivery::{self, Delivery, Timing};
 use crate::mux::pane_status::PaneStatus;
 use crate::procs::{
     reading_from_pid, real_age, real_killer, real_ps, record_pid_prefix, started_before, subtree, tracking_applies, AgeReader,
@@ -152,6 +153,9 @@ struct Pane {
     /// The multiplexer's own id for it.
     id: String,
     status: PaneStatus,
+    /// The harness command this process launched in it, or `None` for a pane it adopted
+    /// without being told (see [`Splitter::deliver`] for what that costs).
+    harness: Option<String>,
 }
 
 #[derive(Clone)]
@@ -339,7 +343,8 @@ impl Splitter {
             first_direction: &self.first_direction,
             chain_direction: &self.chain_direction,
         })?;
-        self.panes.insert(name.to_string(), Pane { id: id.clone(), status: PaneStatus::Unknown });
+        let harness = Some(harness.unwrap_or(self.harness.command()).to_string());
+        self.panes.insert(name.to_string(), Pane { id: id.clone(), status: PaneStatus::Unknown, harness });
         self.last_anchor = Some(id.clone());
         Ok(id)
     }
@@ -379,7 +384,8 @@ impl Splitter {
             crate::mux::StackPlacement::Tabbed => self.mux.open_tab(&req)?,
             crate::mux::StackPlacement::Split => self.mux.open_pane(&req)?,
         };
-        self.panes.insert(name.to_string(), Pane { id: id.clone(), status: PaneStatus::Unknown });
+        let harness = Some(harness.unwrap_or(self.harness.command()).to_string());
+        self.panes.insert(name.to_string(), Pane { id: id.clone(), status: PaneStatus::Unknown, harness });
         Ok(id)
     }
 
@@ -541,7 +547,7 @@ impl Splitter {
 
     /// Starts tracking a pane another process opened — see `crate::workstream::Registry`.
     pub fn adopt(&mut self, branch: &str, pane_id: &str) {
-        self.panes.insert(branch.to_string(), Pane { id: pane_id.to_string(), status: PaneStatus::Unknown });
+        self.panes.insert(branch.to_string(), Pane { id: pane_id.to_string(), status: PaneStatus::Unknown, harness: None });
     }
 
     /// Pins the multiplexer-level grouping new panes open in (cmux's workspace); a no-op
@@ -622,11 +628,24 @@ impl Splitter {
         }
     }
 
-    /// Sends `text` followed by Enter into `branch`'s tracked pane — the same
-    /// literal-then-Enter sequence spawning uses to type the launch command, just aimed at a
-    /// pane recorded earlier.
+    /// [`Self::deliver`], for a caller that only needs to know whether the send failed.
     pub fn send_task(&self, branch: &str, text: &str) -> Result<()> {
-        self.mux.type_line(&self.pane(branch)?.id, text).map_err(|e| anyhow!("{branch}: {e:#}"))
+        self.deliver(branch, None, text).map(drop)
+    }
+
+    /// Types `text` into `branch`'s tracked pane and submits it, confirming both steps where
+    /// the multiplexer and harness allow (see [`crate::mux::delivery`]). An error means the
+    /// send was not confirmed, and says how far it got.
+    ///
+    /// `harness` is the command running in the pane, when the caller knows it (`kanstack send`
+    /// reads it from the registry). Otherwise it is whatever this process launched there. A pane
+    /// it only adopted has no known harness, so a send to it is
+    /// [`Delivery::Unconfirmed`](crate::mux::delivery::Delivery::Unconfirmed) rather than read
+    /// with the wrong harness's layout.
+    pub fn deliver(&self, branch: &str, harness: Option<&str>, text: &str) -> Result<Delivery> {
+        let pane = self.pane(branch)?;
+        let harness = harness.or(pane.harness.as_deref()).map(crate::harness::for_command);
+        delivery::deliver(self.mux.as_ref(), &pane.id, text, harness, &Timing::default()).map_err(|e| anyhow!("{branch}: {e:#}"))
     }
 
     /// Re-derives the status of every tracked pane, keyed by branch, from what the multiplexer
