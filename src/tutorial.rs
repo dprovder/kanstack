@@ -240,9 +240,10 @@ pub fn build_practice_repo() -> Result<PathBuf> {
     std::fs::write(root.join("README.md"), "practice repo\n")?;
     run("git", &["add", "."], &root)?;
     run("git", &["commit", "-qm", "base"], &root)?;
-    run("but", &["setup", "--init", "--json"], &root)?;
-
+    // Through `But` rather than `run`, so a `but` too new for this setup path fails with
+    // the same precise explanation the setup-required screen gives.
     let but = But::discover(&root)?;
+    but.run_setup()?;
     but.branch_new("practice", None)?;
     std::fs::write(root.join("warmup.txt"), "warm up the board\n")?;
     let status = but.status()?;

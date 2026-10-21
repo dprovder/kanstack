@@ -74,15 +74,67 @@ stops one `cargo build` from drowning it in `target/` events.
 
 The JSON is stable by intent — upstream documents stability as a goal — but it carries no
 schema version and its types are `pub(crate)`, so there is no semver promise to lean on.
-`kanstack` therefore checks `but --version` at startup and refuses to run below 0.21, and
-notes in the UI when you are on a release newer than it has been verified against
-(`but::VERIFIED_THROUGH`).
+`kanstack` therefore checks `but --version` at startup and refuses to run below 0.22.0
+(`but::MIN_VERSION`), and notes in the UI when you are on a release newer than it has been
+verified against (`but::VERIFIED_THROUGH`, currently 0.22.3).
 
-0.21 is a hard floor, not a soft one: it dropped `-j`/`--json` and `--status-after` in
-favour of `--format json`, a syntax 0.19 does not understand, so there is no flag spelling
-that works on both sides of that release. `kanstack` picks a side rather than branching on
-version at every call site. If you're hacking on this against an earlier version of `but`,
-expect to re-verify every call site — see `but.rs` and `git log` for what changed.
+0.22 is a hard floor, not a soft one: it overhauled `commit`, `amend`, `squash`, `discard`,
+and `move`, removed `rub`, `stage`, and `unstage` outright, and replaced 0.21's
+`--format json` with a plain `--json` flag, so there is no flag or subcommand spelling that
+works on both sides of that release. (0.21 was the previous floor, for the same kind of
+reason: it had dropped `-j`/`--json` in favour of `--format json`.) `kanstack` picks a side
+rather than branching on version at every call site. If you're hacking on this against an
+earlier version of `but`, expect to re-verify every call site — see `src/but/` and
+`git log` for what changed.
+
+### Setup after 0.22.3
+
+Upstream `master` removed `but setup` after 0.22.3 (`424ce53e62`, PR #16323, plus a stub
+added back in `f9ff528335`). There is no tagged release with this yet, so kanstack does
+**not** implement the new path. It waits for a real tagged binary to verify against, because
+master has already added and then reverted other flags in this area. What kanstack does now is fail precisely:
+`But::run_setup` on a `but` newer than `VERIFIED_THROUGH` says it doesn't know that
+version's setup path (`but::setup::explain_setup_failure`), keeping `but`'s own text,
+rather than passing a raw error through.
+
+Verified by running a master build (`9fc1a2493e`, 2026-10-20) in throwaway repos:
+
+- **The version string is not a release number.** A plain source build reports `but dev`,
+  which `Version::parse` rejects. The nightly channel reports `0.5.NNNN`, which is below
+  `MIN_VERSION` and gets the misleading "too old" refusal. Testing against master means
+  building with `VERSION=0.23.0` (read via `option_env!` at compile time) to impersonate
+  the next release.
+- **`but setup` is a stub.** Bare `but setup` prints "You no longer need to run
+  `but setup`…" and exits 0 without touching the repo. `but setup --init` (with or without
+  `--json`) exits 1 with that message plus "Hint: Run `but init` instead".
+- **Errors are plain stderr text even with `--json`.** The `{"error","message","hint"}`
+  payload on stdout that `model::CliError` parses had one emission site at 0.22.3
+  (`setup_required`, `crates/but/src/setup.rs:502`) and none at master. So
+  `is_setup_required`'s `setup_required` spelling and `is_missing_git_identity` (0.22.3
+  prints `Error: Author identity is not configured` from `setup --init`; master's setup path
+  creates no commit) both go dead on the next release. They are left in place because
+  they still match on 0.22.3.
+- **`but init` is only `git init`**: no project registration, no workspace, no commit.
+- **Any `but` command now registers the repo and infers a target lazily** from the default
+  push remote (its `HEAD`, then `main`, then `master`). There is no `gb-local` fallback any
+  more: a repo with no remote gets "No target branch is configured and none could be
+  inferred", which `is_setup_required` does not match, so the setup screen wouldn't appear.
+  `but config target` refuses local branches.
+- **`but switch --workspace` enters `gitbutler/workspace`**, but only once a target exists,
+  so in practice only with a remote. Given one, `but switch --workspace --json` is a single
+  idempotent command: it prints `{"type":"switchedToWorkspace","conflictingBranches":[]}`
+  and exits 0 on the first run and on every later one. A repo with a self-remote (the
+  `gb-local` shape 0.22.3 created: a remote pointing at the repo itself, fetched so
+  `refs/remotes/gb-local/main` exists) also works. One with no commits does not.
+- **Single-branch mode is the default before that.** `but status --json` reports
+  `stacks: []`, and the first `but branch new` checks that branch out (HEAD is the branch,
+  not the workspace). The second `but branch new` enters the workspace on its own.
+- **Stack order is unchanged.** With four branches (three parallel, one stacked) the
+  `stacks` wire order was identical at 0.22.3 and master: newest-first, stacked branches
+  tip-first. `parse_status`'s reverse is still right.
+- **`zz` is reserved at master** (the uncommitted area is `@`). `board::UNASSIGNED_TARGET`
+  is `"zz"`, but by reading the move/push/land paths it never reaches `but` as an argument:
+  dropping onto the backlog either does nothing or runs `uncommit`, which takes no target.
 
 The bindings in `src/model.rs` track the *wire* format, which differs from upstream's Rust
 structs in ways worth knowing if you hack on this: `createdAt` is RFC3339 despite a doc
@@ -554,3 +606,16 @@ file is read too), launched with a scrubbed environment so it behaved as it does
   `explain` reports as needing 1.3; -2740/-2741/-1708), more than one Ghostty running, a
   window in native fullscreen, and a real Claude in a lane (a stand-in that logged its
   environment and arguments took its place).
+
+## The live suite is flaky at baseline
+
+Recorded, not fixed. `tests/live.rs` (the `#[ignore]`d tests that drive a real `but`) is
+not reliably green even on the verified release. Seven runs against `but` 0.22.3 on
+2026-10-20 (`cargo test --test live -- --ignored --test-threads=1`) failed 6, 1, 1, 3, 2,
+1 and 0 tests, a different set each time. Nearly every failure was the sandbox helper's
+`but commit -m … -b <branch>`, right after `but branch new <branch>`, refusing with
+`Error: Branch '<branch>' is merged upstream`. One run also hit `Error: database is locked`.
+Separately, the ignored tutorial test (`tutorial::tests::every_step_advances_on_the_prescribed_keys`)
+failed all three times at 0.22.3 with "step 5 did not advance — applying practice back
+failed". So before reading a live failure as an upstream regression, check that it passes
+on 0.22.3 more than once.
