@@ -51,7 +51,8 @@
         kanstackArgs = {
           pname = "kanstack";
           # crane's default cleanCargoSource only keeps .rs/.toml/Cargo.lock,
-          # which would drop tests/fixtures/*.json loaded via include_str!.
+          # which would drop tests/fixtures/*.json loaded via include_str! — and
+          # the agent skill src/skill/claude.rs embeds the same way.
           src = pkgs.lib.cleanSourceWith {
             src = pkgs.lib.cleanSource ./.;
             filter = path: type:
@@ -59,6 +60,7 @@
               == "directory"
               || builtins.match ".*\\.(rs|toml|json)$" path != null
               || baseNameOf path == "Cargo.lock"
+              || baseNameOf path == "SKILL.md"
               || (baseNameOf (dirOf path) == ".cargo" && baseNameOf path == "config");
           };
           cargoLock = ./Cargo.lock;

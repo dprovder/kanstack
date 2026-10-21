@@ -19,6 +19,7 @@ pub mod orchestration;
 pub mod procs;
 pub mod report;
 pub mod setup;
+pub mod skill;
 pub mod events;
 pub mod snapshot;
 pub mod splitter;

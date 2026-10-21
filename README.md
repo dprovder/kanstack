@@ -97,6 +97,48 @@ cargo install --path .
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how it talks to `but`, the wire-format
 notes, and the version-compatibility details a contributor would need.
 
+### Teaching your coding agent about kanstack
+
+kanstack ships a skill — instructions a coding agent loads on its own — that tells the agent
+kanstack exists and how to drive it, so asking it to "run these in parallel" or "check on the
+agents" reaches for kanstack without you having to say "use kanstack" every time. Install it
+into each repository you use kanstack in:
+
+```sh
+cd your-project
+kanstack skill install
+```
+
+That writes `.claude/skills/kanstack/SKILL.md` into the repository, which is a file in your
+working tree: commit it and everyone on the team whose agent is Claude Code gets the skill
+too. Run from a terminal, it shows you what it will write and asks first. If you'd rather keep
+it out of the repository, `kanstack skill install --global` puts it in
+`~/.claude/skills/kanstack/` instead, for every repository on your machine (including ones
+that don't use kanstack — the skill checks for kanstack before relying on it).
+
+The skill is built into the `kanstack` binary and stamped with its version. After upgrading
+kanstack, `kanstack skill check` lists every installed copy (this repository's and your home
+directory's) and whether it's behind, and `kanstack skill check --update` refreshes the ones
+that are. Neither command replaces a copy you've edited since kanstack wrote it: `check
+--update` leaves it alone, and `install` asks first, or without a terminal refuses unless
+given `--force`.
+
+Claude Code is the only coding agent kanstack writes a skill for so far. `install` writes one
+for every harness it finds on your `PATH` plus `$KANSTACK_HARNESS` (or just `--agent <name>`'s),
+and says "no skill format known for `<harness>` yet" for each one it can't.
+
+Homebrew installs can't write outside their own prefix, so `brew install` doesn't do this for
+you; run `kanstack skill install` yourself afterwards.
+
+Both commands take `--json`. `install`'s document is
+`{"schema":1,"version":"...","skills":[{"harness","format_name","scope","path","action","previous_version"}],"unsupported":[{"harness","message"}]}`,
+where `action` is `created`, `updated`, `replaced` or `unchanged`. `check`'s is
+`{"schema":1,"cli_version":"...","skills":[{"harness","format_name","scope","path","installed_version","up_to_date","modified","updated"}],"outdated_count":0,"unsupported":[...]}`.
+A failure is the usual error document, with two codes of its own: `unsupported_harness` (exit
+`3`) when no requested harness has a skill format, and `skill_modified` (exit `4`) when
+`install` would replace an edited copy without `--force`. Outside a git repository,
+`install` without `--global` is `invalid_arguments` (exit `2`).
+
 ## Setup
 
 The very first time kanstack runs on a machine, it opens a short wizard before the board:

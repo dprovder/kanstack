@@ -12,8 +12,8 @@
 //! | `0` | success | — |
 //! | `1` | internal: a bug, a corrupt registry, an I/O failure below everything else here | `internal` |
 //! | `2` | invalid arguments — caught before anything ran | `invalid_arguments` |
-//! | `3` | nothing to act on: the target names no workstream, it has no pane, or `answer` found no pending ask | `unknown_workstream`, `no_pane`, `no_pending_ask` |
-//! | `4` | conflict: `spawn` on a branch that already has a live pane, or `--above`/`--below` on a branch that already exists | `workstream_exists`, `branch_already_exists` |
+//! | `3` | nothing to act on: the target names no workstream, it has no pane, `answer` found no pending ask, or `skill install` has no skill format for the harness | `unknown_workstream`, `no_pane`, `no_pending_ask`, `unsupported_harness` |
+//! | `4` | conflict: `spawn` on a branch that already has a live pane, `--above`/`--below` on a branch that already exists, or `skill install` over an edited copy | `workstream_exists`, `branch_already_exists`, `skill_modified` |
 //! | `5` | an external dependency is unavailable or refused: the split backend, `but`, the harness, or delivering a message to a pane | `multiplexer_unavailable`, `harness_unavailable`, `but_failed`, `delivery_failed` |
 //!
 //! A condition is tagged with [`tag`] at the point in [`super::run`] that already knows which
@@ -66,6 +66,14 @@ pub enum ErrorCode {
     ButFailed,
     /// A message could not be delivered to a pane.
     DeliveryFailed,
+    /// `skill install` for a harness — or only harnesses — kanstack has no skill format for
+    /// yet (see `crate::skill::FORMATS`). In the "nothing to act on" bucket: there is no
+    /// artifact kanstack knows how to write for it.
+    UnsupportedHarness,
+    /// `skill install` would replace a copy edited since kanstack wrote it (or one it never
+    /// wrote), with no terminal to ask on and no `--force`. A conflict, like
+    /// `workstream_exists`: the thing is already there and isn't kanstack's to clobber.
+    SkillModified,
     /// Anything else: a bug, a corrupt registry, an I/O failure below all of the above.
     Internal,
 }
@@ -83,6 +91,8 @@ impl ErrorCode {
             ErrorCode::HarnessUnavailable => "harness_unavailable",
             ErrorCode::ButFailed => "but_failed",
             ErrorCode::DeliveryFailed => "delivery_failed",
+            ErrorCode::UnsupportedHarness => "unsupported_harness",
+            ErrorCode::SkillModified => "skill_modified",
             ErrorCode::Internal => "internal",
         }
     }
@@ -94,8 +104,8 @@ impl ErrorCode {
         match self {
             ErrorCode::Internal => 1,
             ErrorCode::InvalidArguments => 2,
-            ErrorCode::UnknownWorkstream | ErrorCode::NoPane | ErrorCode::NoPendingAsk => 3,
-            ErrorCode::WorkstreamExists | ErrorCode::BranchAlreadyExists => 4,
+            ErrorCode::UnknownWorkstream | ErrorCode::NoPane | ErrorCode::NoPendingAsk | ErrorCode::UnsupportedHarness => 3,
+            ErrorCode::WorkstreamExists | ErrorCode::BranchAlreadyExists | ErrorCode::SkillModified => 4,
             ErrorCode::MultiplexerUnavailable
             | ErrorCode::HarnessUnavailable
             | ErrorCode::ButFailed
@@ -215,7 +225,9 @@ fn lifecycle_event(command: &Command) -> Option<(&'static str, Option<String>)> 
         | Command::Note { .. }
         | Command::Intent { .. }
         | Command::Ask { .. }
-        | Command::Answer { .. } => None,
+        | Command::Answer { .. }
+        | Command::SkillInstall { .. }
+        | Command::SkillCheck { .. } => None,
     }
 }
 
@@ -243,7 +255,7 @@ pub fn dispatch(command: Command, cwd: &Path, out: &mut impl Write, err_out: &mu
 mod tests {
     use super::*;
 
-    const ALL: [ErrorCode; 11] = [
+    const ALL: [ErrorCode; 13] = [
         ErrorCode::InvalidArguments,
         ErrorCode::UnknownWorkstream,
         ErrorCode::WorkstreamExists,
@@ -254,6 +266,8 @@ mod tests {
         ErrorCode::HarnessUnavailable,
         ErrorCode::ButFailed,
         ErrorCode::DeliveryFailed,
+        ErrorCode::UnsupportedHarness,
+        ErrorCode::SkillModified,
         ErrorCode::Internal,
     ];
 

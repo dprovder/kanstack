@@ -38,15 +38,17 @@ mod note;
 mod prune;
 mod report_cmd;
 mod send;
+mod skill;
 mod spawn;
 mod status;
 mod stop;
 
 pub use prune::PRUNE_SCHEMA;
+pub use skill::SKILL_SCHEMA;
 pub use status::STATUS_SCHEMA;
 
 pub const SUBCOMMANDS: &[&str] =
-    &["spawn", "send", "status", "focus", "stop", "report", "prune", "events", "claim", "note", "intent", "ask", "answer"];
+    &["spawn", "send", "status", "focus", "stop", "report", "prune", "events", "claim", "note", "intent", "ask", "answer", "skill"];
 
 pub const HELP: &str = "\
 kanstack spawn <branch> [--agent <name>] [--prompt \"...\"] [--item <ref>]
@@ -129,6 +131,19 @@ kanstack answer <branch> \"...\" [--json]
     nothing pending that's an error, no_pending_ask. Like `report`, none of note/intent/ask/
     answer check that <branch> is a registered workstream, need a multiplexer, or print
     anything without --json
+kanstack skill install [--global] [--agent <name>] [--force] [--json]
+    install kanstack's agent skill — what tells a coding agent kanstack exists and how to
+    drive it — into this repository (.claude/skills/kanstack/SKILL.md), or with --global into
+    your home directory (~/.claude/skills/...) for every repository. Written for every harness
+    found on PATH plus $KANSTACK_HARNESS, or just --agent's; Claude Code is the only harness
+    with a skill format so far, and any other is reported as having none. Stamped with this
+    kanstack's version. Run from a terminal, asks before writing into the repository (the file
+    lands in `git status`); never asks under --json or without a terminal. Never replaces a
+    copy edited since kanstack wrote it unless asked at that prompt or given --force
+kanstack skill check [--update] [--json]
+    list every installed copy of the skill, in this repository and in your home directory, and
+    whether it's behind this kanstack. --update refreshes the ones behind in place, leaving
+    edited ones alone
 
 <session> is a pane id as `kanstack status` prints it. These need to run inside the
 multiplexer the panes live in (see README).
@@ -164,6 +179,8 @@ pub enum Command {
     Intent { branch: String, text: String, json: bool },
     Ask { branch: String, question: String, json: bool },
     Answer { branch: String, text: String, json: bool },
+    SkillInstall { global: bool, agent: Option<String>, force: bool, json: bool },
+    SkillCheck { update: bool, json: bool },
 }
 
 impl Command {
@@ -183,6 +200,8 @@ impl Command {
             Command::Intent { .. } => "intent",
             Command::Ask { .. } => "ask",
             Command::Answer { .. } => "answer",
+            Command::SkillInstall { .. } => "skill install",
+            Command::SkillCheck { .. } => "skill check",
         }
     }
 
@@ -200,7 +219,9 @@ impl Command {
             | Command::Note { json, .. }
             | Command::Intent { json, .. }
             | Command::Ask { json, .. }
-            | Command::Answer { json, .. } => *json,
+            | Command::Answer { json, .. }
+            | Command::SkillInstall { json, .. }
+            | Command::SkillCheck { json, .. } => *json,
         }
     }
 }
@@ -223,6 +244,9 @@ pub fn parse(name: &str, args: Vec<String>) -> Result<Option<Command>> {
     let mut model = None;
     let mut effort = None;
     let mut advisory = false;
+    let mut global = false;
+    let mut force = false;
+    let mut update = false;
     let mut json = false;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -237,7 +261,20 @@ pub fn parse(name: &str, args: Vec<String>) -> Result<Option<Command>> {
             _ => (arg.clone(), None),
         };
         match key.as_str() {
-            "--agent" if name == "spawn" => agent = Some(flag("--agent", inline.as_deref(), &mut args)?),
+            "--agent" if name == "spawn" || (name == "skill" && positional.first().is_some_and(|a| a == "install")) => {
+                agent = Some(flag("--agent", inline.as_deref(), &mut args)?)
+            }
+            "--global" | "--force" | "--update" if name == "skill" => {
+                if inline.is_some() {
+                    bail!("{key} takes no value\n\n{HELP}");
+                }
+                match (positional.first().map(String::as_str), key.as_str()) {
+                    (Some("install"), "--global") => global = true,
+                    (Some("install"), "--force") => force = true,
+                    (Some("check"), "--update") => update = true,
+                    _ => bail!("unknown option {key:?} for `kanstack skill {}`\n\n{HELP}", positional.first().map_or("", String::as_str)),
+                }
+            }
             "--prompt" if name == "spawn" => prompt = Some(flag("--prompt", inline.as_deref(), &mut args)?),
             "--since" if name == "events" => {
                 let raw = flag("--since", inline.as_deref(), &mut args)?;
@@ -337,6 +374,11 @@ pub fn parse(name: &str, args: Vec<String>) -> Result<Option<Command>> {
             Command::Events { since: since.unwrap_or(0), follow, new, json }
         }
         "claim" => Command::Claim { branch: positional.next(), json },
+        "skill" => match one("action, install or check")?.as_str() {
+            "install" => Command::SkillInstall { global, agent, force, json },
+            "check" => Command::SkillCheck { update, json },
+            other => bail!("`kanstack skill` takes install or check, not {other:?}\n\n{HELP}"),
+        },
         other => bail!("unknown subcommand {other:?}"),
     };
     if positional.next().is_some() {
@@ -445,6 +487,10 @@ pub fn run(command: Command, cwd: &Path, out: &mut impl Write) -> Result<()> {
         Command::Intent { branch, text, json } => intent::run(branch, text, json, cwd, out),
         Command::Ask { branch, question, json } => ask::run_ask(branch, question, json, cwd, out),
         Command::Answer { branch, text, json } => ask::run_answer(branch, text, json, cwd, out),
+        // Never touches the registry, the multiplexer or `but` — only files under the
+        // repository's and the home directory's own skill directories.
+        Command::SkillInstall { global, agent, force, json } => skill::run_install(global, agent, force, json, cwd, out),
+        Command::SkillCheck { update, json } => skill::run_check(update, json, cwd, out),
     }
 }
 
