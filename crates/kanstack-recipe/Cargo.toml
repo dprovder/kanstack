@@ -14,6 +14,8 @@ name = "kanstack-recipe"
 path = "src/main.rs"
 
 [dependencies]
+# flock(2) for the one-orchestrator-per-repo lock (src/lock.rs); kanstack already depends on it.
+libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"

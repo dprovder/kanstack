@@ -22,6 +22,7 @@ cargo run -p kanstack-recipe -- check examples/recipes/implement-review-docs.md 
   --kanstack-bin target/debug/kanstack
 
 cargo run -p kanstack-recipe -- run path/to/recipe.md
+cargo run -p kanstack-recipe -- resume        # after a crash or restart
 ```
 
 ## CLI surface
@@ -29,14 +30,18 @@ cargo run -p kanstack-recipe -- run path/to/recipe.md
 ```sh
 kanstack-recipe run   path/to/recipe.md [--kanstack-bin <path>]   # execute the recipe
 kanstack-recipe check path/to/recipe.md [--kanstack-bin <path>]   # parse + validate only, spawns nothing
+kanstack-recipe resume [<run-id>] [--force] [--kanstack-bin <path>]  # pick runs back up (default: every unfinished one)
+kanstack-recipe runs [--json]                                     # list runs and their steps' statuses
 ```
 
 `--kanstack-bin` overrides where the `kanstack` binary is found (default: looked up on `$PATH`).
+Every `run` is a durable run with its own id, printed when it starts (see "Durable runs" below).
 There is no TUI and no interactive mode; progress prints to stdout as steps launch and finish,
 roughly:
 
 ```text
 ✓ recipe valid
+→ run 1761609600-implement-review-docs
 → implement        running   codex / gpt-5.6 / high
 ✓ implement        complete
 → review           running   claude / default / high (on implement)
@@ -166,6 +171,58 @@ the failed step never launch regardless (their `needs` can never all become `com
 the actual causal-safety mechanism; the sibling policy is only about already-running, unrelated
 work.
 
+### Durable runs
+
+Each `run` keeps its state on disk, so a killed or restarted orchestrator picks up where it
+left off with `resume`: finished steps are never re-run, running steps are reattached to their
+lanes, and attempt counts survive.
+
+```text
+<kanstack state dir>/recipe-<key>/
+  orchestrator.lock           flock: one orchestrator per repository
+  runs/<run-id>/state.json    one run's state, one writer
+```
+
+The state dir and key are kanstack's own for the repository (`KANSTACK_STATE_PATH`, else
+`$XDG_STATE_HOME/kanstack`, else `~/.local/state/kanstack`; the key hashes the repository's
+root), mirrored in `src/state.rs`. `state.json` records the recipe's path and hash, the
+directory `run` was invoked in, and for each step its status (`pending`, `launching`,
+`running`, `verifying`, `done` or `failed`), `attempt`, `branch`, `pane`, `base` and `tip`
+(its branch's commit when it started and when it finished, from git), `started_at` and
+`last_error`.
+
+**Snapshots, not a journal.** Transitions are minutes apart, so the whole `state.json` is
+rewritten on each one: temp file, fsync, rename, fsync the directory. A reader such as `runs`
+only ever sees a whole snapshot, so it takes no lock.
+
+**Record before acting.** `launching`, with `attempt` incremented, is saved before
+`kanstack spawn`/`send` runs, and `running` with the pane id after. A crash mid-launch still
+uses up its attempt, and a launch that couldn't be recorded never happens: if a snapshot
+can't be saved, the run stops where it is, still unfinished, for a later `resume`.
+
+**Resume.** `done` steps are never touched. Every `launching`, `running` or `verifying` step
+is first matched against its lane in one `status --json` read:
+
+| The lane is | Resume does |
+| --- | --- |
+| busy (or waiting, or unknown) | Reattach and keep polling. |
+| idle | Run the step's `verify` commands, which must be safe to re-run. |
+| gone (absent, dead, or no pane) | Count a failed attempt. There are no retries yet, so the step fails. |
+
+Resume never sends a prompt to a lane that still exists — not even for a step that was only
+`launching`, whose send may never have landed — because a duplicate send garbles the agent's
+input. The first-read rule above still holds: unless the step was already `verifying`, an
+`idle` on resume's own read is only trusted on the next one. Several unfinished runs are
+resumed one after another; a lane keeps working in its pane while its run waits its turn.
+
+**One orchestrator per repository.** `run` and `resume` take an exclusive, non-blocking
+`flock` on `orchestrator.lock` and refuse to start if another orchestrator holds it. The
+kernel drops the lock when the process exits, however it exits.
+
+**Recipe edits.** `resume` refuses a run whose recipe file no longer matches the hash recorded
+when it started, unless given `--force`, which resumes it against the edited recipe and records
+the new hash.
+
 ### Validation errors
 
 `check` (and `run`, before doing anything) rejects a recipe with a specific message, e.g.:
@@ -185,9 +242,10 @@ YAML front matter.
 No DAG scheduling, recipe parsing, or workflow state lives inside kanstack itself — that stays
 entirely in this crate, which (as of v1):
 
-- never persists workflow state — if the process exits mid-run, nothing needs to be reconstructed
-  on the next run;
-- has no retry, timeout, or conditional-branching logic;
+- persists only its own run state (see "Durable runs"), never kanstack's or the tracker's, and
+  never as the source of truth for a lane — a resumed step always asks kanstack about its lane
+  first;
+- counts attempts but never retries one, and has no timeout or conditional-branching logic;
 - does not build a new file-locking system around `owns` — that stays advisory metadata;
 - does not talk to any provider SDK, MCP server, or run as a daemon/network service.
 

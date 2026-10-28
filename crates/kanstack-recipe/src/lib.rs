@@ -4,5 +4,8 @@
 
 pub mod graph;
 pub mod kanstack;
+pub mod lock;
 pub mod recipe;
+pub mod resume;
 pub mod run;
+pub mod state;

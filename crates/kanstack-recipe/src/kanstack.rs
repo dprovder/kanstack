@@ -69,8 +69,16 @@ pub struct SpawnResult {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct SendResult {
+    pub pane: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct WorkstreamStatus {
     pub branch: String,
+    /// The lane's pane id, so a resumed step can reattach to it.
+    #[serde(default)]
+    pub pane: Option<String>,
     pub status: String,
 }
 
@@ -145,15 +153,15 @@ impl KanstackClient {
         Self::result_of(value)
     }
 
-    pub fn send(&self, target: &str, message: &str) -> Result<(), KanstackError> {
+    pub fn send(&self, target: &str, message: &str) -> Result<SendResult, KanstackError> {
         let args = vec![
             "send".to_string(),
             target.to_string(),
             message.to_string(),
             "--json".to_string(),
         ];
-        self.invoke(&args)?;
-        Ok(())
+        let value = self.invoke(&args)?;
+        Self::result_of(value)
     }
 
     pub fn status(&self) -> Result<Vec<WorkstreamStatus>, KanstackError> {
