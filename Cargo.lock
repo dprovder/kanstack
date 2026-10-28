@@ -664,6 +664,7 @@ name = "kanstack-tracker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
  "serde",
  "tempfile",
 ]

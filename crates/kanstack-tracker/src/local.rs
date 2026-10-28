@@ -23,9 +23,11 @@
 //! The front matter is parsed by hand rather than as YAML: it's only ever flat lines, and a
 //! person editing a file by hand shouldn't need YAML's quoting rules to put a colon in a title.
 
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{anyhow, bail, Context, Result};
 
@@ -38,12 +40,26 @@ const REPORTS_HEADING: &str = "## Reports";
 /// Items as markdown files in one directory. Ids are sequential integers.
 ///
 /// Every write is atomic (a temp file renamed over the item), so a reader never sees half a
-/// file. Two processes rewriting the *same* item at once can still lose one's change, the
-/// last rename winning; ids, the one thing two creators would otherwise race on, are
-/// claimed exclusively (see [`LocalTracker::claim_id`]).
+/// file. Atomic isn't enough for a read-modify-write, though: two steps of one run
+/// commenting on the same item at once would each rewrite the file they read, and the last
+/// rename would drop the other's report. So [`Tracker::set_state`] and [`Tracker::comment`]
+/// hold the item's [`ItemLock`] from read to rename. Ids, the one thing two creators would
+/// otherwise race on, are claimed exclusively instead (see [`LocalTracker::claim_id`]).
 pub struct LocalTracker {
     dir: PathBuf,
 }
+
+/// An exclusive hold on one item, for the duration of a read-modify-write. Backed by
+/// `flock(2)` on `<id>.lock` beside the item rather than the item itself, because the
+/// rename at the end of every write replaces the item file, and a lock taken on the old one
+/// would no longer exclude anyone who opened the new one. The kernel releases it when this
+/// is dropped, so an error partway through still unlocks.
+///
+/// Lock files are never deleted: removing one while another process waits on it would let
+/// a third open a fresh file and lock that, and two writers would hold "the" lock at once.
+/// `flock` locks belong to the open file, not the process, so this excludes other threads
+/// of the same process too.
+struct ItemLock(#[allow(dead_code, reason = "held only for its Drop, which releases the flock")] File);
 
 /// [`crate::Open`] for `local`: the items directory for `repo` in kanstack's state dir.
 pub(crate) fn open(repo: &Path) -> Result<Box<dyn Tracker>> {
@@ -108,16 +124,42 @@ impl LocalTracker {
         }
     }
 
+    /// Blocks until no other writer holds `id`'s [`ItemLock`], then holds it. Checks the item
+    /// exists first, so a mistyped id is an error rather than a stray lock file.
+    fn lock(&self, id: &ItemId) -> Result<ItemLock> {
+        let item = self.path(id)?;
+        if !item.exists() {
+            bail!("no item {id} ({})", item.display());
+        }
+        let path = item.with_extension("lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            // Only the fd matters, for `flock`; the content is never read or written.
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        // SAFETY: `flock` only reads the fd, which `file` keeps open for this call.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| format!("locking {}", path.display()));
+        }
+        Ok(ItemLock(file))
+    }
+
     fn read(&self, id: &ItemId) -> Result<String> {
         let path = self.path(id)?;
         std::fs::read_to_string(&path).with_context(|| format!("reading item {id} ({})", path.display()))
     }
 
     /// Replaces `id`'s file with `contents` via a temp file and a rename, so a reader sees
-    /// either the old file or the new one, never a partial write.
+    /// either the old file or the new one, never a partial write. The temp name carries the
+    /// pid and a per-process count, so no two writes ever share one, even two threads of one
+    /// process writing the same item without its lock.
     fn write(&self, id: &ItemId, contents: &str) -> Result<()> {
+        static WRITES: AtomicU64 = AtomicU64::new(0);
         let path = self.path(id)?;
-        let tmp = self.dir.join(format!(".{id}.md.{}.tmp", std::process::id()));
+        let n = WRITES.fetch_add(1, Ordering::Relaxed);
+        let tmp = self.dir.join(format!(".{id}.md.{}.{n}.tmp", std::process::id()));
         std::fs::write(&tmp, contents).with_context(|| format!("writing {}", tmp.display()))?;
         std::fs::rename(&tmp, &path).with_context(|| format!("replacing {}", path.display()))
     }
@@ -188,6 +230,7 @@ impl Tracker for LocalTracker {
     /// Rewrites the `state:` line and nothing else: the body, and any front-matter line
     /// kanstack doesn't know (one a person added by hand), come back byte for byte.
     fn set_state(&self, id: &ItemId, state: ItemState) -> Result<()> {
+        let _lock = self.lock(id)?;
         let contents = self.read(id)?;
         let (front, rest) = split(&contents).with_context(|| format!("item {id}"))?;
         let mut lines: Vec<String> = Vec::new();
@@ -210,6 +253,7 @@ impl Tracker for LocalTracker {
     /// first time. Reports are separated by a blank line only, so a caller that wants them
     /// told apart (by step, by time) puts that in `body` itself.
     fn comment(&self, id: &ItemId, body: &str) -> Result<()> {
+        let _lock = self.lock(id)?;
         let mut contents = self.read(id)?;
         let (_, rest) = split(&contents).with_context(|| format!("item {id}"))?;
         let has_heading = rest.lines().any(|line| line.trim_end() == REPORTS_HEADING);
@@ -425,6 +469,38 @@ mod tests {
         );
     }
 
+    /// Two writers hammering one item at once: without the item lock, each would rewrite the
+    /// file it read and the last rename would drop the other's reports.
+    #[test]
+    fn concurrent_writers_to_one_item_both_land() {
+        let (_dir, tracker) = tracker();
+        let id = tracker.create(&draft("T", ItemState::Running)).unwrap();
+        const EACH: usize = 25;
+        std::thread::scope(|scope| {
+            for writer in ["a", "b"] {
+                let (tracker, id) = (&tracker, &id);
+                scope.spawn(move || {
+                    for i in 0..EACH {
+                        tracker.comment(id, &format!("report {writer}{i}")).unwrap();
+                        if writer == "b" {
+                            tracker.set_state(id, ItemState::ALL[i % ItemState::ALL.len()]).unwrap();
+                        }
+                    }
+                });
+            }
+        });
+        tracker.set_state(&id, ItemState::Review).unwrap();
+        let item = tracker.get(&id).unwrap();
+        for writer in ["a", "b"] {
+            for i in 0..EACH {
+                let report = format!("report {writer}{i}\n");
+                assert!(item.body.contains(&report), "lost {report:?} from:\n{}", item.body);
+            }
+        }
+        assert_eq!(item.body.matches(REPORTS_HEADING).count(), 1);
+        assert_eq!(item.state, ItemState::Review);
+    }
+
     #[test]
     fn comment_on_an_item_with_no_body() {
         let (_dir, tracker) = tracker();
@@ -451,6 +527,10 @@ mod tests {
         let (_dir, tracker) = tracker();
         assert!(tracker.get(&ItemId("../workstreams".to_string())).is_err());
         assert!(tracker.set_state(&ItemId("LIN-1".to_string()), ItemState::Done).is_err());
+        // A well-formed id with no item behind it is an error too, and leaves no lock file.
+        tracker.create(&draft("T", ItemState::Backlog)).unwrap();
+        assert!(tracker.comment(&ItemId("9".to_string()), "x").is_err());
+        assert!(!tracker.dir().join("9.lock").exists());
     }
 
     #[test]
