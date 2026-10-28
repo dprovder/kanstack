@@ -10,9 +10,10 @@ homepage = "https://github.com/dprovder/kanstack"
 readme = "README.md"
 
 # kanstack stays the root package, so a bare `cargo build`/`cargo test` here still means
-# kanstack alone; `--workspace` (or `-p kanstack-recipe`) reaches the orchestrator too.
+# kanstack alone; `--workspace` (or `-p kanstack-recipe`, `-p kanstack-tracker`) reaches the
+# orchestrator and the tracker library too.
 [workspace]
-members = [".", "crates/kanstack-recipe"]
+members = [".", "crates/kanstack-recipe", "crates/kanstack-tracker"]
 
 [lib]
 name = "kanstack"
