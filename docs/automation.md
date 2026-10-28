@@ -19,7 +19,7 @@ a multiplexer. An orchestrator that wants scheduling, retries, or a dependency g
 that itself, on top of the primitives below.
 
 Kanstack intentionally does not contain a workflow engine. The repository includes a small
-reference recipe runner (`examples/recipe-runner/`) demonstrating how an external orchestrator
+recipe runner (`crates/kanstack-recipe/`) demonstrating how an external orchestrator
 can build a dependency graph over the public CLI. It is an example consumer of kanstack's
 automation contract, not part of kanstack's workstream semantics.
 

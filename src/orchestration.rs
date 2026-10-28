@@ -2,7 +2,7 @@
 //! ask`/`answer`.
 //!
 //! kanstack doesn't schedule or interpret anything — a human, an agent improvising turn by
-//! turn, or a structured runner like `examples/recipe-runner` decides what happens next. But
+//! turn, or a structured runner like `crates/kanstack-recipe` decides what happens next. But
 //! a lane that has sat idle for ten minutes looks the same whether it's stuck or deliberately
 //! waiting on something, and only the orchestrator knows which. This module is where it can
 //! say so, in two conceptually separate latched values per branch:

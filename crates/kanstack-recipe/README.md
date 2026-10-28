@@ -1,28 +1,27 @@
-# kanstack-recipe-runner
+# kanstack-recipe
 
-A small, disposable **reference orchestrator** for kanstack. It reads a Markdown+YAML recipe
-describing a DAG of steps, and drives them to completion by shelling out to `kanstack`'s public
-CLI/JSON contract (`spawn`, `send`, `status --json`) — nothing else. It never imports kanstack's
-Rust crate or touches its internals.
+The orchestrator for kanstack. It reads a Markdown+YAML recipe describing a DAG of steps, and
+drives them to completion by shelling out to `kanstack`'s public CLI/JSON contract (`spawn`,
+`send`, `status --json`) — nothing else. It never imports kanstack's Rust crate or touches its
+internals.
 
 kanstack itself has no workflow engine, no scheduler, and no notion of a "task" or "plan" — see
-[`docs/automation.md`](../../docs/automation.md) in the main repository. This crate is an
-example of the orchestrator kanstack expects *you* to build on top of it, kept boring and small
-enough to throw away if the shape is wrong. It is independent of the root `kanstack` package:
-building or testing from the repository root never builds or tests this crate, and vice versa.
+[`docs/automation.md`](../../docs/automation.md). This crate is where those live, on top of
+kanstack rather than inside it. It's a member of the repository's Cargo workspace, but a bare
+`cargo build`/`cargo test` at the root still means kanstack alone; pass `-p kanstack-recipe`
+(or `--workspace`) to reach this crate.
 
 ## Build and run
 
 ```sh
-cd examples/recipe-runner
-cargo build
-cargo test
+cargo build -p kanstack-recipe
+cargo test -p kanstack-recipe
 
 # kanstack not on $PATH? point at it explicitly:
-cargo run -- check ../recipes/implement-review-docs.md \
-  --kanstack-bin ../../target/debug/kanstack
+cargo run -p kanstack-recipe -- check examples/recipes/implement-review-docs.md \
+  --kanstack-bin target/debug/kanstack
 
-cargo run -- run path/to/recipe.md
+cargo run -p kanstack-recipe -- run path/to/recipe.md
 ```
 
 ## CLI surface
@@ -184,7 +183,7 @@ YAML front matter.
 ## What this crate does not do
 
 No DAG scheduling, recipe parsing, or workflow state lives inside kanstack itself — that stays
-entirely in this example crate, which:
+entirely in this crate, which (as of v1):
 
 - never persists workflow state — if the process exits mid-run, nothing needs to be reconstructed
   on the next run;

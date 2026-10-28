@@ -1,4 +1,4 @@
-//! `kanstack-recipe-runner`: a small, disposable reference orchestrator that runs a
+//! `kanstack-recipe`: the orchestrator that runs a
 //! Markdown+YAML recipe DAG by driving `kanstack`'s public CLI/JSON contract exclusively.
 //! See the crate's README for the recipe format and design choices.
 

@@ -8,10 +8,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use kanstack_recipe_runner::graph::StepState;
-use kanstack_recipe_runner::kanstack::KanstackClient;
-use kanstack_recipe_runner::recipe;
-use kanstack_recipe_runner::run::{run_recipe, RunOptions};
+use kanstack_recipe::graph::StepState;
+use kanstack_recipe::kanstack::KanstackClient;
+use kanstack_recipe::recipe;
+use kanstack_recipe::run::{run_recipe, RunOptions};
 
 /// Writes an executable fake `kanstack` into `dir`. `fail_spawn_branch`, when set, makes
 /// `spawn` on that exact branch return `ok:false` (a `workstream_exists` conflict) instead of
@@ -211,7 +211,7 @@ fn on_places_dependent_step_on_the_same_branch_via_send() {
 #[test]
 fn check_smoke_test_on_acceptance_recipe_via_binary() {
     let repo_root = env!("CARGO_MANIFEST_DIR");
-    let acceptance = Path::new(repo_root).join("../recipes/implement-review-docs.md");
+    let acceptance = Path::new(repo_root).join("../../examples/recipes/implement-review-docs.md");
     assert!(
         acceptance.exists(),
         "expected {} to exist",

@@ -537,7 +537,7 @@ revisiting, but nothing does that today.
 ### Saying what an orchestrator is doing: `note`, `intent`, `ask`, `answer`
 
 Whatever is driving the panes — you, an agent improvising turn by turn, or a structured
-runner like [`examples/recipe-runner`](examples/recipe-runner) — knows things kanstack can't
+runner like [`kanstack-recipe`](crates/kanstack-recipe) — knows things kanstack can't
 see from the outside: that a lane sitting idle is deliberately waiting on something, or that
 it's stopped until someone answers a question. kanstack doesn't schedule or interpret any of
 that; these four just give an orchestrator somewhere to say it, for `status --json`, the

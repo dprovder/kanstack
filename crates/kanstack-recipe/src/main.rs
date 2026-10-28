@@ -2,9 +2,9 @@ use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use kanstack_recipe_runner::kanstack::KanstackClient;
-use kanstack_recipe_runner::recipe;
-use kanstack_recipe_runner::run::{run_recipe, RunOptions};
+use kanstack_recipe::kanstack::KanstackClient;
+use kanstack_recipe::recipe;
+use kanstack_recipe::run::{run_recipe, RunOptions};
 
 fn main() -> ExitCode {
     let mut args = env::args().skip(1);

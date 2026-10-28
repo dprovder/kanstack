@@ -526,7 +526,7 @@ mod tests {
 
     #[test]
     fn validates_the_acceptance_recipe() {
-        let source = include_str!("../../recipes/implement-review-docs.md");
+        let source = include_str!("../../../examples/recipes/implement-review-docs.md");
         let recipe = parse(source).expect("acceptance recipe should parse cleanly");
         assert_eq!(recipe.steps.len(), 3);
         assert!(recipe.steps.contains_key("implement"));
