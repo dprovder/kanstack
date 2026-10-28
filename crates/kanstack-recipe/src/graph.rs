@@ -170,6 +170,21 @@ mod tests {
     }
 
     #[test]
+    fn a_step_missing_from_states_counts_as_pending() {
+        let recipe = parse(
+            "---\nversion: 1\nsteps:\n  a:\n    agent: codex\n    prompt: A\n  b:\n    agent: codex\n    needs: [a]\n    prompt: B\n---\n",
+        )
+        .unwrap();
+
+        // No entry for either step: `a` is runnable, and `b` stays blocked because an absent
+        // need is not `complete`.
+        assert_eq!(runnable_steps(&recipe, &HashMap::new()), vec!["a".to_string()]);
+
+        let st = states(&[("a", StepState::Complete)]);
+        assert_eq!(runnable_steps(&recipe, &st), vec!["b".to_string()]);
+    }
+
+    #[test]
     fn resolve_workstream_does_not_hang_on_a_hand_built_cyclic_on_chain() {
         // parse() rejects this shape, so build it by hand — a library caller who skips
         // parse() is exactly who the guard in resolve_workstream protects.
