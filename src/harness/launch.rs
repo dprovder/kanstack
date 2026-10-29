@@ -40,18 +40,29 @@ pub struct LaunchExtras {
     pub args: Vec<String>,
     /// `NAME=value` assignments in front of the harness. Names must be plain identifiers.
     pub env: Vec<(String, String)>,
+    /// A directory to put in front of the pane shell's own `$PATH` for the harness, so a bare
+    /// command name inside the pane finds what's in it first.
+    pub path_prepend: Option<String>,
 }
 
 impl LaunchExtras {
-    /// `NAME='value' ` for each variable, ready to sit in front of the harness command.
+    /// `NAME='value' ` for each variable, then `PATH='<dir>':"$PATH" ` for
+    /// [`Self::path_prepend`], ready to sit in front of the harness command. `$PATH` is left
+    /// for the pane's shell to expand, so the harness keeps whatever that shell's rc files put
+    /// on it.
     fn env_prefix(&self) -> String {
-        self.env
+        let mut prefix: String = self
+            .env
             .iter()
             .map(|(name, value)| {
                 debug_assert!(name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'), "{name:?}");
                 format!("{name}={} ", shell_quote(value))
             })
-            .collect()
+            .collect();
+        if let Some(dir) = &self.path_prepend {
+            prefix.push_str(&format!("PATH={}:\"$PATH\" ", shell_quote(dir)));
+        }
+        prefix
     }
 }
 
@@ -436,6 +447,7 @@ mod tests {
         LaunchExtras {
             args: vec!["--settings".to_string(), HOOKS_JSON.to_string()],
             env: vec![("KANSTACK_BRANCH".to_string(), "feat-x".to_string())],
+            path_prepend: None,
         }
     }
 
@@ -472,6 +484,7 @@ mod tests {
         let extras = LaunchExtras {
             args: vec!["--settings".to_string(), json.to_string()],
             env: vec![("KANSTACK_BRANCH".to_string(), "it's a branch".to_string())],
+            path_prepend: None,
         };
         let tmp = scratch("extras");
         for message in ["fix it".to_string(), awkward_long_message()] {

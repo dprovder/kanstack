@@ -378,6 +378,15 @@ checkbox: `←`/`→` cycles through whatever's actually on `PATH` (the same det
 uses), and typing overrides it with anything else, same as `--agent` — plus the same model and
 effort fields as `kanstack spawn --model`/`--effort`.
 
+**A lane runs the kanstack that spawned it.** Every pane kanstack launches (`spawn`, and the
+board's own) starts its harness with `KANSTACK_BIN` set to the spawning kanstack executable
+and that executable's directory put in front of the pane shell's own `PATH`. So a bare
+`kanstack` (or `kanstack-recipe`, which cargo builds into the same directory) typed by the
+agent in the lane resolves to the same build, not to whichever one happens to be installed,
+and a script can call `"$KANSTACK_BIN"` to be sure. A development build in `target/debug`
+therefore hands its lanes `target/debug`'s binaries, commands an older installed release may
+not have.
+
 `--advisory` records the workstream as one that isn't expected to produce commits — a review,
 critique or research agent rather than one editing code — for `status --json` (`"advisory":
 true`, and `spawn --json`'s own `result.advisory`) and the board to show. That's all it does:

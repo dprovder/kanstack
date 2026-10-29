@@ -84,6 +84,7 @@ impl Harness for Gemini {
         Some(LaunchExtras {
             args: Vec::new(),
             env: vec![("GEMINI_CLI_SYSTEM_SETTINGS_PATH".to_string(), path.to_string_lossy().into_owned())],
+            path_prepend: None,
         })
     }
 }

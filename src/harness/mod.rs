@@ -17,7 +17,7 @@ pub mod launch;
 pub mod opencode;
 pub mod pi;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
@@ -225,6 +225,9 @@ pub struct HarnessConfig {
     /// The `kanstack report` command harnesses are handed as their status hooks, when they
     /// have a way to take them (see [`Harness::status_hooks`]).
     report_command: Option<String>,
+    /// The kanstack executable that launches panes, handed to every harness as
+    /// `$KANSTACK_BIN` with its directory in front of `$PATH` (see [`Self::launch_line`]).
+    kanstack_exe: Option<PathBuf>,
 }
 
 impl HarnessConfig {
@@ -233,16 +236,21 @@ impl HarnessConfig {
     pub fn new(command: impl Into<String>) -> Self {
         let command = command.into();
         let note_delivery = resolve_note_delivery(&command);
-        HarnessConfig { command, note_delivery, report_command: None }
+        HarnessConfig { command, note_delivery, report_command: None, kanstack_exe: None }
     }
 
     /// `$KANSTACK_HARNESS`, or `claude`, with status hooks pointing at this very executable
-    /// unless `KANSTACK_STATUS_HOOKS` turns them off (see [`reporter_command`]).
+    /// unless `KANSTACK_STATUS_HOOKS` turns them off (see [`reporter_command`]), and lanes
+    /// running this very executable when they call `kanstack` (see [`Self::with_kanstack_exe`]).
     pub fn from_env() -> Self {
-        let config = Self::new(std::env::var("KANSTACK_HARNESS").unwrap_or_else(|_| "claude".to_string()));
+        let mut config = Self::new(std::env::var("KANSTACK_HARNESS").unwrap_or_else(|_| "claude".to_string()));
+        let exe = std::env::current_exe().ok();
         let setting = std::env::var("KANSTACK_STATUS_HOOKS").ok();
-        match reporter_command(std::env::current_exe().ok().as_deref(), setting.as_deref()) {
-            Some(report) => config.with_reporter(report),
+        if let Some(report) = reporter_command(exe.as_deref(), setting.as_deref()) {
+            config = config.with_reporter(report);
+        }
+        match exe {
+            Some(exe) => config.with_kanstack_exe(exe),
             None => config,
         }
     }
@@ -250,6 +258,14 @@ impl HarnessConfig {
     /// Hands harnesses that can take it `report` as their status hooks.
     pub fn with_reporter(mut self, report: impl Into<String>) -> Self {
         self.report_command = Some(report.into());
+        self
+    }
+
+    /// Launches every harness with `$KANSTACK_BIN` set to `exe` and `exe`'s directory in front
+    /// of `$PATH`, so a bare `kanstack` (or `kanstack-recipe`, built next to it) typed by an
+    /// agent in the lane runs the build that spawned the lane, not whichever one is installed.
+    pub fn with_kanstack_exe(mut self, exe: impl Into<PathBuf>) -> Self {
+        self.kanstack_exe = Some(exe.into());
         self
     }
 
@@ -298,6 +314,14 @@ impl HarnessConfig {
         // positional flags a model/effort argument could shift), so the order is a free
         // choice; this just keeps everything about hooks together, model/effort after.
         extras.args.extend(for_command(command).model_effort_args(model, effort));
+        if let Some(exe) = &self.kanstack_exe {
+            extras.env.push(("KANSTACK_BIN".to_string(), exe.to_string_lossy().into_owned()));
+            // A `:` in the directory would split it in two on `PATH`; `KANSTACK_BIN` still works.
+            extras.path_prepend = exe
+                .parent()
+                .map(|dir| dir.to_string_lossy().into_owned())
+                .filter(|dir| !dir.is_empty() && !dir.contains(':'));
+        }
         let line = launch_line_with(cwd, command, &delivery, name, initial_message, &extras)?;
         Ok(line.trim_end_matches('\n').to_string())
     }
@@ -524,6 +548,58 @@ mod tests {
             assert_eq!(branch, "feat-x");
             assert!(args.iter().any(|a| a == "--settings"), "{args:?}");
             let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// The spawning build reaches the lane as `$KANSTACK_BIN`, with its directory in front of
+    /// `$PATH`, both quoted for a path with a space and a quote in it.
+    #[test]
+    fn launch_line_hands_the_lane_the_kanstack_that_spawned_it() {
+        with_system_flag_env(Some(""), || {
+            let config = HarnessConfig::new("pi").with_kanstack_exe("/a b/it's/kanstack");
+            let line = config.launch_line(Path::new("/repo"), "feat-x", Some("fix it"), None, None, None).unwrap();
+            assert_eq!(line, r#"cd '/repo' && KANSTACK_BIN='/a b/it'\''s/kanstack' PATH='/a b/it'\''s':"$PATH" pi 'fix it'"#);
+
+            // Alongside a hooked harness's own variable, not instead of it.
+            let config = HarnessConfig::new("claude").with_reporter(REPORT).with_kanstack_exe("/k/kanstack");
+            let line = config.launch_line(Path::new("/repo"), "feat-x", Some("fix it"), None, None, None).unwrap();
+            assert!(line.contains(r#"KANSTACK_BRANCH='feat-x' KANSTACK_BIN='/k/kanstack' PATH='/k':"$PATH" claude "#), "{line}");
+        });
+    }
+
+    /// Run for real, inline and spilled to files: a bare `kanstack` inside the lane is the one
+    /// next to the spawning executable, even with another `kanstack` on the shell's `PATH`.
+    #[test]
+    fn a_bare_kanstack_in_the_lane_resolves_to_the_spawning_build() {
+        use std::os::unix::fs::PermissionsExt;
+        with_system_flag_env(Some(""), || {
+            let root = std::env::temp_dir().join(format!("kanstack-harness-bin-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            let build = root.join("it's a build");
+            let installed = root.join("installed");
+            for (dir, says) in [(&build, "the spawning build"), (&installed, "the installed one")] {
+                std::fs::create_dir_all(dir).unwrap();
+                let path = dir.join("kanstack");
+                std::fs::write(&path, format!("#!/bin/sh\necho '{says}'\n")).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let agent = root.join("agent");
+            std::fs::write(&agent, "#!/bin/sh\nprintf '%s\\n' \"$KANSTACK_BIN\" \"$(kanstack)\" \"$1\"\n").unwrap();
+            std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            let config = HarnessConfig::new(agent.to_string_lossy().into_owned()).with_kanstack_exe(build.join("kanstack"));
+            let long = "x".repeat(3000);
+            for message in ["fix it", long.as_str()] {
+                let _guard = crate::SPLIT_BACKEND_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                let line = config.launch_line(Path::new("/tmp"), "feat-x", Some(message), None, None, None).unwrap();
+                assert_eq!(line.contains("\"$k0\""), message == long, "only the long message spills: {line}");
+                let path = format!("{}:{}", installed.display(), std::env::var("PATH").unwrap_or_default());
+                let out = std::process::Command::new("sh").arg("-c").arg(&line).env("PATH", path).output().unwrap();
+                assert!(out.status.success(), "{line:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+                let expected = format!("{}\nthe spawning build\n{message}\n", build.join("kanstack").display());
+                assert_eq!(String::from_utf8_lossy(&out.stdout), expected, "{line}");
+            }
+            let _ = std::fs::remove_dir_all(&root);
         });
     }
 

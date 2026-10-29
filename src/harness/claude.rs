@@ -79,7 +79,7 @@ impl Harness for Claude {
                 "StopFailure": hook("idle"),
             }
         });
-        Some(LaunchExtras { args: vec!["--settings".to_string(), settings.to_string()], env: Vec::new() })
+        Some(LaunchExtras { args: vec!["--settings".to_string(), settings.to_string()], ..LaunchExtras::default() })
     }
 
     /// Claude Code (v2.1, measured through `cmux read-screen`) draws its input box between
