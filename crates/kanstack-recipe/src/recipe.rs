@@ -132,7 +132,8 @@ pub struct Step {
     /// `None` when the recipe leaves it out: an `on:` step then picks `continue` or `handoff`
     /// at launch by the agent last run on its branch, and a step with no `on:` spawns its own.
     pub spawn: Option<SpawnMode>,
-    /// Already defaulted: `note` for an advisory step, `commits` otherwise.
+    /// Already defaulted: `note` for an advisory step or the aggregate step, `commits`
+    /// otherwise.
     pub done_when: DoneWhen,
 }
 
@@ -140,6 +141,9 @@ pub struct Step {
 pub struct Recipe {
     pub steps: BTreeMap<String, Step>,
     pub context: String,
+    /// The recipe's `aggregate:` step, if it names one: it runs last, after every other step,
+    /// and its prompt carries their outcomes (see [`crate::aggregate`]).
+    pub aggregate: Option<String>,
 }
 
 impl Recipe {
@@ -190,6 +194,10 @@ pub enum RecipeError {
     AdvisoryWithOn { step: String },
     /// `continue` would type this step's prompt into a pane running another agent.
     ContinueAgentMismatch { step: String, agent: String, branch: String, branch_agent: String },
+    /// `aggregate:` names a step the recipe doesn't have.
+    UnknownAggregate(String),
+    /// The aggregate step runs after every other step, so none can wait for or run on it.
+    AggregateReferenced { step: String, aggregate: String, field: &'static str },
 }
 
 impl fmt::Display for RecipeError {
@@ -252,6 +260,11 @@ impl fmt::Display for RecipeError {
                 "step \"{step}\" has `spawn: continue` with agent {agent}, but the agent on branch \"{branch}\" \
                  by then is {branch_agent}; use `spawn: handoff` to stop {branch_agent} and start {agent} there"
             ),
+            RecipeError::UnknownAggregate(step) => write!(f, "`aggregate` names unknown step \"{step}\""),
+            RecipeError::AggregateReferenced { step, aggregate, field } => write!(
+                f,
+                "step \"{step}\" names the aggregate step \"{aggregate}\" in its `{field}`, but the aggregate step runs after every other step"
+            ),
         }
     }
 }
@@ -262,6 +275,7 @@ impl std::error::Error for RecipeError {}
 struct RawFrontMatter {
     version: u64,
     retries: Option<u32>,
+    aggregate: Option<String>,
     #[serde(default)]
     steps: BTreeMap<String, RawStep>,
 }
@@ -353,7 +367,23 @@ fn validate(raw: RawFrontMatter, body: &str) -> Result<Recipe, RecipeError> {
     if raw.steps.is_empty() {
         return Err(RecipeError::NoSteps);
     }
+    if let Some(aggregate) = &raw.aggregate {
+        if !raw.steps.contains_key(aggregate) {
+            return Err(RecipeError::UnknownAggregate(aggregate.clone()));
+        }
+        for (id, step) in raw.steps.iter().filter(|(id, _)| *id != aggregate) {
+            let field = if step.needs.contains(aggregate) {
+                "needs"
+            } else if step.on.as_ref() == Some(aggregate) {
+                "on"
+            } else {
+                continue;
+            };
+            return Err(RecipeError::AggregateReferenced { step: id.clone(), aggregate: aggregate.clone(), field });
+        }
+    }
 
+    let ids: Vec<String> = raw.steps.keys().cloned().collect();
     let mut steps = BTreeMap::new();
     for (id, raw_step) in raw.steps {
         if id.trim().is_empty() {
@@ -386,11 +416,14 @@ fn validate(raw: RawFrontMatter, body: &str) -> Result<Recipe, RecipeError> {
                 field: "on",
             });
         }
+        let is_aggregate = raw.aggregate.as_ref() == Some(&id);
         let spawn = match raw_step.spawn {
             Some(s) => Some(SpawnMode::parse(&s).ok_or_else(|| RecipeError::InvalidSpawn {
                 step: id.clone(),
                 value: s.clone(),
             })?),
+            // The aggregate step reads and proposes; it needs no branch of anyone else's.
+            None if is_aggregate && raw_step.on.is_none() => Some(SpawnMode::Advisory),
             None => None,
         };
         match (spawn, &raw_step.on) {
@@ -405,9 +438,18 @@ fn validate(raw: RawFrontMatter, body: &str) -> Result<Recipe, RecipeError> {
                 step: id.clone(),
                 value: s.clone(),
             })?,
-            None if spawn == Some(SpawnMode::Advisory) => DoneWhen::Note,
+            None if spawn == Some(SpawnMode::Advisory) || is_aggregate => DoneWhen::Note,
             None => DoneWhen::Commits,
         };
+        // The aggregate step implicitly needs every other step, after whatever it lists.
+        let mut needs = raw_step.needs;
+        if is_aggregate {
+            for other in ids.iter().filter(|other| **other != id) {
+                if !needs.contains(other) {
+                    needs.push(other.clone());
+                }
+            }
+        }
 
         steps.insert(
             id.clone(),
@@ -417,7 +459,7 @@ fn validate(raw: RawFrontMatter, body: &str) -> Result<Recipe, RecipeError> {
                 model: raw_step.model,
                 effort,
                 prompt,
-                needs: raw_step.needs,
+                needs,
                 on: raw_step.on,
                 owns: raw_step.owns,
                 verify: raw_step.verify,
@@ -453,6 +495,7 @@ fn validate(raw: RawFrontMatter, body: &str) -> Result<Recipe, RecipeError> {
     let recipe = Recipe {
         steps,
         context: body.to_string(),
+        aggregate: raw.aggregate,
     };
     detect_continue_agent_mismatch(&recipe)?;
     Ok(recipe)

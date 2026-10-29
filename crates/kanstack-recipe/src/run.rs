@@ -22,7 +22,8 @@
 //! branch with its prompt and a note about what happened ([`Retry::Respawn`]). A `spawn` or
 //! `send` that fails in transport (kanstack unreachable, the multiplexer down) is retried with
 //! backoff and doesn't use up the budget. Out of budget, the step is marked `failed` and none
-//! of its dependents ever become runnable (their `needs` can never all be `complete`).
+//! of its dependents ever become runnable (their `needs` can never all be `complete`), except
+//! the recipe's aggregate step, which runs once nothing else can (see [`crate::aggregate`]).
 //! Independent sibling steps that are already running are left to finish on their own — see
 //! the README for why.
 //!
@@ -68,7 +69,8 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::graph::{resolve_workstream, runnable_steps, StepState};
+use crate::aggregate::{self, runnable_steps};
+use crate::graph::{resolve_workstream, StepState};
 use crate::kanstack::{KanstackClient, KanstackError, WorkstreamStatus};
 use crate::recipe::{Recipe, SpawnMode, Step};
 use crate::state::{now_secs, Retry, RunState, RunStatus, RunStore, StepRecord, StepStatus};
@@ -414,9 +416,9 @@ impl<'a> Driver<'a> {
         let step = &self.recipe.steps[step_id];
         let retry = run.steps[step_id].retry.clone();
         let (plan, prompt) = match &retry {
-            None => (self.plan_launch(run, step_id, branch), self.recipe.launch_prompt(step_id, branch)),
+            None => (self.plan_launch(run, step_id, branch), aggregate::launch_prompt(self.recipe, run, step_id, branch)),
             Some(Retry::FixForward { message }) => (Ok(Launch::Continue), message.clone()),
-            Some(Retry::Respawn { note }) => (Ok(Launch::Handoff), format!("{}\n\n{note}", self.recipe.launch_prompt(step_id, branch))),
+            Some(Retry::Respawn { note }) => (Ok(Launch::Handoff), format!("{}\n\n{note}", aggregate::launch_prompt(self.recipe, run, step_id, branch))),
         };
 
         let rec = &run.steps[step_id];

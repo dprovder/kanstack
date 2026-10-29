@@ -232,6 +232,7 @@ mod tests {
         let recipe = Recipe {
             steps,
             context: String::new(),
+            aggregate: None,
         };
 
         // Must return promptly rather than looping forever.
