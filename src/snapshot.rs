@@ -1436,6 +1436,36 @@ mod tests {
         assert!(out.contains("✗ gh: not logged in") && !out.contains("loading"), "{out}");
     }
 
+    /// The recipe picker over hundreds of recipes: the filtered count, a window of rows
+    /// around the cursor with more-above and more-below marks, and each row's name,
+    /// description and tags; the item it's for in the heading.
+    #[test]
+    fn the_recipe_picker_scrolls_hundreds_and_shows_the_count() {
+        use crate::app::{PickerTarget, RecipeEntry, RecipePicker};
+        let mut app = issues_app();
+        let entries: Vec<RecipeEntry> = (0..300)
+            .map(|n| RecipeEntry { name: format!("group{}/recipe-{n:03}", n % 7), description: Some(format!("Recipe number {n}")), tags: vec![format!("tag{n}")] })
+            .collect();
+        let target = PickerTarget::Item { id: kanstack_tracker::ItemId("44".into()), title: "Land from the board".into(), current: Some("group3/recipe-150".into()) };
+        let mut query = crate::text_input::TextInput::default();
+        query.set("recipe");
+        app.recipe_picker = Some(RecipePicker { target, matches: (0..300).collect(), entries, dirs: Vec::new(), query, sel: 150 });
+        app.mode = crate::app::Mode::RecipePicker;
+        let out = render_app(&app, 120, 30);
+        assert!(out.contains("recipe for #44 Land from the board"), "{out}");
+        assert!(out.contains("› recipe█") && out.contains("300/300"), "{out}");
+        let selected = row_with(&out, "▸ group3/recipe-150");
+        assert!(selected.contains("(current)") && selected.contains("Recipe number 150") && selected.contains("tag150"), "{selected}");
+        assert!(out.contains("↑ group") && out.contains("↓ group"), "more both ways:\n{out}");
+        assert!(!out.contains("recipe-000") && !out.contains("recipe-299"), "only a window is drawn:\n{out}");
+        assert!(out.contains("⏎ set") && out.contains("esc cancel"), "{out}");
+
+        let picker = app.recipe_picker.as_mut().unwrap();
+        picker.matches.clear();
+        let out = render_app(&app, 120, 30);
+        assert!(out.contains("nothing matches") && out.contains("0/300"), "{out}");
+    }
+
     /// Selecting a running item tags each lane whose branch is named `item-<id>-…` and
     /// draws its rule in the accent hue; an item with no lanes highlights nothing.
     #[test]

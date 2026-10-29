@@ -237,15 +237,22 @@ pub(super) fn draw_issue_draft(f: &mut Frame, app: &App, area: Rect, hits: &mut 
         }
     }
 
+    // Picked from the catalog, never typed, so it never shows a text cursor.
+    let on_recipe = issues.draft_row == DraftRow::Recipe;
+    let recipe_empty = if on_recipe { "tab to pick one" } else { "optional — serve only starts items with one" };
     body.push(single(
         format!("{}recipe   ", marker(DraftRow::Recipe)),
         &issues.draft_recipe,
-        issues.draft_row == DraftRow::Recipe,
-        ("optional — whoever starts it picks", theme::faint()),
+        false,
+        (recipe_empty, if on_recipe { theme::tone(Tone::Accent) } else { theme::faint() }),
     ));
 
     body.push(Line::raw(""));
-    let hint = "  ↑↓ field      ⏎ save to backlog      esc discard";
+    let hint = if on_recipe {
+        "  ↑ field    tab pick    ⌫ clear    ⏎ save to backlog    esc discard"
+    } else {
+        "  ↑↓ field      ⏎ save to backlog      esc discard"
+    };
     body.push(Line::styled(hint, theme::faint()));
 
     let h = (body.len() as u16 + 2).min(area.height.saturating_sub(2));
@@ -256,6 +263,125 @@ pub(super) fn draw_issue_draft(f: &mut Frame, app: &App, area: Rect, hits: &mut 
         height: h,
     };
     confirm_hitboxes(hits, popup, body.len(), hint);
+    f.render_widget(Clear, popup);
+    f.render_widget(
+        Paragraph::new(body).block(Block::bordered().border_style(theme::faint()).style(theme::selected_bg())),
+        popup,
+    );
+}
+
+/// The recipe picker: a filter line with the match count, then one row per matching recipe —
+/// its name, its description, and its tags dimmed — scrolled to keep the cursor in view.
+/// Everything comes from the catalog the picker read when it opened; nothing here reads a file.
+pub(super) fn draw_recipe_picker(f: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
+    let Some(picker) = &app.recipe_picker else { return };
+    let w = 84.min(area.width.saturating_sub(4));
+    let content_w = (w as usize).saturating_sub(2);
+    let cursor = theme::tone(Tone::Accent);
+
+    let (heading, current, confirm) = match &picker.target {
+        PickerTarget::Item { id, title, current } => {
+            let label = item_label(id);
+            let head = format!("  recipe for {label} ");
+            let room = content_w.saturating_sub(head.chars().count());
+            (
+                Line::from(vec![Span::styled(head, theme::muted()), Span::styled(truncate(title, room), theme::title(true))]),
+                current.as_deref(),
+                "⏎ set",
+            )
+        }
+        PickerTarget::Draft => (Line::styled("  recipe for the new issue", theme::muted()), None, "⏎ use"),
+    };
+    let mut body = vec![heading, Line::raw("")];
+
+    let count = format!("{}/{}", picker.matches.len(), picker.entries.len());
+    let (before, after) = picker.query.split_at_cursor();
+    let prefix = "  › ";
+    let budget = footer_input_budget(content_w as u16, prefix.chars().count(), count.chars().count() + 2);
+    let (before, after) = scroll_input(before, after, budget);
+    let used = prefix.chars().count() + before.chars().count() + 1 + after.chars().count();
+    let mut filter = vec![
+        Span::styled(prefix, theme::tone(Tone::Accent)),
+        Span::styled(before, theme::title(true)),
+        Span::styled("█", cursor),
+        Span::styled(after, theme::title(true)),
+    ];
+    if picker.query.is_empty() {
+        filter.push(Span::styled(" type to filter", theme::faint()));
+    }
+    let used = used + if picker.query.is_empty() { 15 } else { 0 };
+    filter.push(Span::raw(" ".repeat(content_w.saturating_sub(used + count.chars().count() + 2))));
+    filter.push(Span::styled(count, theme::faint()));
+    body.push(Line::from(filter));
+    body.push(Line::styled(format!("  {}", "─".repeat(content_w.saturating_sub(4))), theme::faint()));
+
+    // Rows left once the heading, filter, rule, blank line, hint and border are counted.
+    let room = (area.height as usize).saturating_sub(4 + body.len() + 2).clamp(1, 20);
+    if picker.entries.is_empty() {
+        let dirs = picker.dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(", ");
+        body.push(Line::styled("  no recipes yet — add one under:", theme::faint()));
+        for l in wrap(&dirs, content_w.saturating_sub(4).max(1)) {
+            body.push(Line::styled(format!("    {l}"), theme::faint()));
+        }
+    } else if picker.matches.is_empty() {
+        body.push(Line::styled("  nothing matches", theme::faint()));
+    } else {
+        let n = picker.matches.len();
+        let shown = n.min(room);
+        let offset = picker.sel.saturating_sub(shown / 2).min(n - shown);
+        let name_w = picker.matches[offset..offset + shown]
+            .iter()
+            .map(|&i| picker.entries[i].name.chars().count())
+            .max()
+            .unwrap_or(0)
+            .min(content_w * 2 / 5);
+        for (row, &i) in picker.matches[offset..offset + shown].iter().enumerate() {
+            let at = offset + row;
+            let entry = &picker.entries[i];
+            let selected = at == picker.sel;
+            let lead = if selected {
+                "▸ "
+            } else if row == 0 && offset > 0 {
+                "↑ "
+            } else if row == shown - 1 && offset + shown < n {
+                "↓ "
+            } else {
+                "  "
+            };
+            let mut spans = vec![
+                Span::styled(lead, if selected { cursor } else { theme::faint() }),
+                Span::styled(format!("{:<name_w$}", truncate(&entry.name, name_w)), theme::title(selected)),
+            ];
+            let mut left = content_w.saturating_sub(2 + name_w);
+            let mut push = |text: String, style: Style, spans: &mut Vec<Span<'static>>| {
+                if left > 2 && !text.is_empty() {
+                    let text = truncate(&format!("  {text}"), left);
+                    left -= text.chars().count();
+                    spans.push(Span::styled(text, style));
+                }
+            };
+            if current == Some(entry.name.as_str()) {
+                push("(current)".to_string(), theme::tone(Tone::Accent), &mut spans);
+            }
+            push(entry.description.clone().unwrap_or_default(), theme::muted(), &mut spans);
+            push(entry.tags.join(" "), theme::faint(), &mut spans);
+            let line = Line::from(spans);
+            body.push(if selected { line.style(theme::selected_bg()) } else { line });
+        }
+    }
+
+    body.push(Line::raw(""));
+    let hint = format!("  ↑↓ choose    {confirm}    esc cancel");
+    body.push(Line::styled(hint.clone(), theme::faint()));
+
+    let h = (body.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+    confirm_hitboxes(hits, popup, body.len(), &hint);
     f.render_widget(Clear, popup);
     f.render_widget(
         Paragraph::new(body).block(Block::bordered().border_style(theme::faint()).style(theme::selected_bg())),

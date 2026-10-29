@@ -30,6 +30,7 @@ pub(super) fn draw_help(f: &mut Frame, area: Rect, hits: &mut HitMap) {
         help_row("tab", "unassigned: flat → folders → issues"),
         help_row("  then n", "issues: draft one, saved to backlog"),
         help_row("  then p", "issues: promote a proposal"),
+        help_row("  then r", "issues: pick its recipe — type to filter, ⏎ sets it"),
         help_row("  then ⏎", "issues: read its body and reports"),
         help_row("⏎", "open the diff beside the board — ← goes back"),
         help_row("c", "commit the staged files in this lane"),

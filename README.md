@@ -214,8 +214,15 @@ repo is thrown away when you're done. `esc` or `q` leaves any time.
 `●` running, `◆` review, `✓` done, `✗` failed — its id and title, then its recipe (or `from #N`
 for a proposal) and how many lanes it's running on. A running item's lanes are the ones whose
 branch starts `item-<id>-`, and selecting the item marks them in their headers. In this view `n`
-drafts an issue into the backlog, `p` promotes a proposal to the backlog, and `⏎` opens an item's
-body and reports. The list refreshes in the background, so a slow tracker never blocks the board.
+drafts an issue into the backlog, `p` promotes a proposal to the backlog, `r` picks the selected
+item's recipe, and `⏎` opens an item's body and reports. The list refreshes in the background, so a
+slow tracker never blocks the board.
+
+`r` opens the recipe picker over the catalog `kanstack-recipe recipes` lists (`.kanstack/recipes/`,
+then `KANSTACK_RECIPE_PATH`): each recipe's name, description and, dimmed, its tags, with the
+filtered count. Typing filters by name, folder, description and tags, best matches first; `↑/↓`
+moves, `⏎` sets the item's recipe in the tracker, `esc` cancels. The draft modal's recipe field
+opens the same picker: `tab` onto it and `tab` again, or start typing there; `⌫` clears it.
 
 Nothing is ever "staged" ahead of a commit — GitButler 0.22 dropped that step entirely, so
 dropping a card onto a lane commits or amends it there immediately, and the footer spells

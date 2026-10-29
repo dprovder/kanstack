@@ -14,7 +14,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{columns_that_fit, App, BranchPreview, BranchUi, Mode, Notice, COL_GAP};
+use crate::app::{columns_that_fit, App, BranchPreview, BranchUi, Mode, Notice, PickerTarget, COL_GAP};
 use crate::board::{Card, ColumnKind, Tone};
 use crate::hit::{HitMap, HitTarget};
 use crate::mux::pane_status::PaneStatus;
@@ -45,7 +45,7 @@ use drawer::{draw_branches, draw_unapply_confirm};
 use footer::draw_footer;
 use header::draw_header;
 use help::draw_help;
-use issues::{draw_issue_detail, draw_issue_draft};
+use issues::{draw_issue_detail, draw_issue_draft, draw_recipe_picker};
 pub(crate) use issues::issue_detail_line_count;
 use pr::{draw_pr_modal, draw_pr_running};
 use resolve::draw_resolve_confirm;
@@ -135,6 +135,13 @@ pub fn draw(f: &mut Frame, app: &App) -> HitMap {
         Mode::Asks => draw_asks(f, app, f.area()),
         Mode::IssueDraft => draw_issue_draft(f, app, f.area(), &mut hits),
         Mode::IssueDetail => draw_issue_detail(f, app, f.area()),
+        Mode::RecipePicker => {
+            // Over the draft modal when it was opened from there, so the draft stays in view.
+            if matches!(app.recipe_picker.as_ref().map(|p| &p.target), Some(PickerTarget::Draft)) {
+                draw_issue_draft(f, app, f.area(), &mut crate::hit::HitMap::default());
+            }
+            draw_recipe_picker(f, app, f.area(), &mut hits)
+        }
         Mode::PushConfirm => draw_push_confirm(f, app, f.area(), &mut hits),
         Mode::LandConfirm => draw_land_confirm(f, app, f.area(), &mut hits),
         Mode::Landing => draw_landing(f, app, f.area()),

@@ -145,7 +145,7 @@ pub(super) fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         Mode::PushConfirm | Mode::LandConfirm | Mode::DeleteConfirm | Mode::RebaseConfirm
         | Mode::ResolveConflict | Mode::Landing | Mode::Blocked | Mode::SetupRequired
         | Mode::UnapplyConfirm | Mode::PrModal | Mode::PrRunning | Mode::Asks
-        | Mode::IssueDraft | Mode::IssueDetail => "",
+        | Mode::IssueDraft | Mode::IssueDetail | Mode::RecipePicker => "",
         Mode::Branches if app.branch_preview.is_some() => {
             "  ↑/↓ scroll · a apply into a new lane · esc/← back"
         }
@@ -173,7 +173,7 @@ pub(super) fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         }
         Mode::Help => "  esc close",
         Mode::Normal if app.on_issues() => {
-            "  ←/→ lane · ↑/↓ issue · tab view · n draft · ⏎ open · p promote · ?"
+            "  ←/→ lane · ↑/↓ issue · tab view · n draft · ⏎ open · p promote · r recipe · ?"
         }
         // `tab` only does anything on the unassigned lane, so only there does it get a hint.
         Mode::Normal if app.board.columns.get(app.col).is_some_and(|c| c.kind == ColumnKind::Unassigned) => {

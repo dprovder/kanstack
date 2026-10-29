@@ -13,7 +13,7 @@
 
 use super::*;
 use kanstack_tracker::{Draft, Item, ItemFilter, ItemId, ItemState, Tracker};
-use ratatui::crossterm::event::KeyCode as K;
+use ratatui::crossterm::event::{KeyCode as K, KeyModifiers};
 
 /// What `tab` on the unassigned lane cycles through, in this order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -65,6 +65,7 @@ pub enum DraftRow {
 enum WriteDone {
     Created(Result<ItemId>),
     Promoted(ItemId, Result<()>),
+    RecipeSet(ItemId, String, Result<()>),
 }
 
 /// How often the list is refetched while the issues view is showing.
@@ -313,6 +314,10 @@ impl App {
                 Ok(WriteDone::Promoted(id, Err(e))) => {
                     Some(Err(format!("could not promote {}: {e:#}", item_label(&id))))
                 }
+                Ok(WriteDone::RecipeSet(id, name, Ok(()))) => Some(Ok(format!("{} runs {name} now", item_label(&id)))),
+                Ok(WriteDone::RecipeSet(id, name, Err(e))) => {
+                    Some(Err(format!("could not set {}'s recipe to {name}: {e:#}", item_label(&id))))
+                }
             };
             if let Some(done) = done {
                 self.issues.write = None;
@@ -382,6 +387,7 @@ impl App {
             K::Char('G') => self.issues.sel = self.issues.items.len().saturating_sub(1),
             K::Char('n') => self.begin_issue_draft(),
             K::Char('p') => self.promote_selected_issue(),
+            K::Char('r') => self.pick_recipe_for_selected_issue(),
             K::Enter if self.issues.selected().is_none() => self.begin_issue_draft(),
             K::Enter => self.open_issue_detail(),
             // Every one of these acts on a file card, and none is on screen to act on.
@@ -443,6 +449,13 @@ impl App {
                 self.notify("draft discarded", Notice::Info);
             }
             K::Enter => self.confirm_issue_draft(),
+            // The recipe is picked from the catalog, never typed: `tab` (the key that got
+            // here) or typing on its row opens the picker, and backspace clears it.
+            K::Tab if row == DraftRow::Recipe => self.pick_recipe_for_draft(None),
+            K::Char(c) if row == DraftRow::Recipe && !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.pick_recipe_for_draft(Some(c))
+            }
+            K::Backspace | K::Delete if row == DraftRow::Recipe => self.issues.draft_recipe.clear(),
             K::Down | K::Tab => {
                 self.issues.draft_row = match row {
                     DraftRow::Title => DraftRow::Body,
@@ -476,7 +489,11 @@ impl App {
                 self.issues.draft_title_missing = false;
             }
             DraftRow::Body => self.issues.draft_body.paste(text, true),
-            DraftRow::Recipe => self.issues.draft_recipe.paste(text, false),
+            // Picked, not typed: a paste there is the picker's query.
+            DraftRow::Recipe => {
+                self.pick_recipe_for_draft(None);
+                self.paste_recipe_picker(text);
+            }
         }
     }
 
@@ -501,6 +518,15 @@ impl App {
             self.mode = Mode::Normal;
             self.notify("saving the issue…", Notice::Info);
         }
+    }
+
+    /// Sets `id`'s recipe to `name` on a background thread (see [`Tracker::set_recipe`]).
+    /// `false` when it couldn't start, having said why.
+    pub(super) fn begin_set_recipe(&mut self, id: ItemId, name: String) -> bool {
+        self.begin_issues_write(move |tracker| {
+            let result = tracker.and_then(|t| t.set_recipe(&id, Some(&name)));
+            WriteDone::RecipeSet(id, name, result)
+        })
     }
 
     /// `p`: moves the selected proposal to `backlog`, where the queue picks it up. Anything
@@ -703,6 +729,11 @@ mod tests {
     fn a_draft_is_created_in_backlog_and_selected_once_listed() {
         let dir = scratch("draft");
         let mut app = local_app(&dir);
+        // A repository with one recipe, for the recipe field's picker.
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::create_dir_all(dir.join(".kanstack/recipes")).unwrap();
+        std::fs::write(dir.join(".kanstack/recipes/bugfix.md"), "---\ndescription: Fix a bug\n---\n").unwrap();
+        app.repo = Some(dir.clone());
         key(&mut app, KeyCode::Tab);
         key(&mut app, KeyCode::Tab);
         wait_until(&mut app, |app| app.issues.loaded);
@@ -718,7 +749,11 @@ mod tests {
         key(&mut app, KeyCode::Down);
         app.on_paste("Retries race the debounce.\nSee #41.");
         key(&mut app, KeyCode::Down);
+        // Typing on the recipe row filters the picker rather than the field; ⏎ picks.
         type_text(&mut app, "bugfix");
+        assert_eq!(app.mode, Mode::RecipePicker);
+        key(&mut app, KeyCode::Enter);
+        assert_eq!((app.mode, app.issues.draft_recipe.as_str()), (Mode::IssueDraft, "bugfix"));
         key(&mut app, KeyCode::Enter);
         assert_eq!(app.mode, Mode::Normal);
         wait_until(&mut app, |app| !app.issues.writing());

@@ -37,6 +37,7 @@ mod delete;
 mod diff;
 mod drawer;
 mod issues;
+mod recipe_picker;
 mod moving;
 mod pr;
 mod push_land;
@@ -52,6 +53,7 @@ mod undo;
 pub use branch_modal::{BranchModalRow, BranchUi};
 pub use drawer::BranchPreview;
 pub use issues::{item_branch_prefix, item_label, DraftRow, Issues, OpenTracker, UnassignedView};
+pub use recipe_picker::{PickerTarget, RecipeEntry, RecipePicker};
 pub use pr::{PendingPr, PrModalRow};
 pub use push_land::PendingLand;
 pub use resolve::ResolveView;
@@ -143,6 +145,9 @@ pub enum Mode {
     IssueDraft,
     /// Reading one issue's body and reports (`⏎` in the issues view), scrollable.
     IssueDetail,
+    /// Choosing a recipe from the catalog: `r` on an issue, or the draft modal's recipe
+    /// field — see `app::recipe_picker`.
+    RecipePicker,
     /// The workspace is broken in the one way that stops `but` answering anything at all
     /// (see [`crate::but::is_workspace_block`]). Every key is swallowed except the two
     /// recoveries and quit — the board behind this is a snapshot of a repository that has
@@ -331,6 +336,9 @@ pub struct App {
     pub unassigned_grouped_by_folder: bool,
     /// The issues view's list, cursor, draft and in-flight tracker calls. See `app::issues`.
     pub issues: Issues,
+    /// The recipe picker while `Mode::RecipePicker` is up, holding the catalog it read on
+    /// opening.
+    pub recipe_picker: Option<RecipePicker>,
     /// The terminal's width as of the last frame drawn, kept here (not just in `ui`) so
     /// `Shift+←/→` paging knows how many lanes are actually on screen. `ui::draw` never
     /// mutates `App` — this is set from `main`'s event loop instead, right after each
@@ -551,6 +559,7 @@ impl App {
             unassigned_view: UnassignedView::Flat,
             unassigned_grouped_by_folder: false,
             issues: Issues::new(Some(open_tracker)),
+            recipe_picker: None,
             terminal_width: 80,
             selected: HashSet::new(),
             split_poll: None,
@@ -624,6 +633,7 @@ impl App {
             unassigned_view: UnassignedView::Flat,
             unassigned_grouped_by_folder: false,
             issues: Issues::new(None),
+            recipe_picker: None,
             terminal_width: 80,
             selected: HashSet::new(),
             split_poll: None,
@@ -1164,6 +1174,7 @@ impl App {
             Mode::Branch if self.branch_modal_row == BranchModalRow::Harness => self.harness_input.paste(text, false),
             Mode::Asks if self.ask_answering.is_some() => self.ask_answer_input.paste(text, false),
             Mode::IssueDraft => self.paste_issue_draft(text),
+            Mode::RecipePicker => self.paste_recipe_picker(text),
             Mode::PrModal => match self.pr_modal_row {
                 PrModalRow::Title => self.pr_title_input.paste(text, false),
                 PrModalRow::Message => self.pr_message_input.paste(text, true),
@@ -1340,6 +1351,7 @@ impl App {
             Mode::Asks => return self.handle_key_asks(key),
             Mode::IssueDraft => return self.handle_key_issue_draft(key),
             Mode::IssueDetail => return self.handle_key_issue_detail(key),
+            Mode::RecipePicker => return self.handle_key_recipe_picker(key),
             // Help swallows everything except the keys that dismiss it. Small enough (and
             // general enough — it isn't really "a feature") to leave right here rather
             // than in a file of its own.
