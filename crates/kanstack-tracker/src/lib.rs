@@ -140,8 +140,8 @@ pub trait Tracker: Sync {
     }
 
     /// Whether this tracker is usable for `repo`: its CLI is installed and authenticated,
-    /// and (for auto-detection) the repo's remote points at it. [`select`] takes the first
-    /// tracker in [`KNOWN`] that says yes, which is why `local` is last and always does.
+    /// and the repo's remote points at it. Only a suggestion, for a setup wizard to offer:
+    /// [`select`] never calls it, so a tracker is used only when `KANSTACK_TRACKER` names it.
     fn detect(&self, repo: &Path) -> bool;
 
     /// The items matching `filter`, oldest first.
@@ -160,39 +160,36 @@ pub trait Tracker: Sync {
 }
 
 /// Opens one tracker for the repository at a path. Must not touch the tracker itself (no
-/// network, no files written): [`select`] opens each candidate just to ask its name.
+/// network, no files written): [`select`] opens each candidate just to ask its name, and a
+/// setup wizard opens each to ask [`Tracker::detect`].
 pub type Open = fn(&Path) -> Result<Box<dyn Tracker>>;
 
-/// Every tracker kanstack knows, in the order auto-detection tries them, as the multiplexer
-/// is discovered: remote backends first, each checking the repo's remote, then `local`, the
-/// fallback that always accepts.
+/// Every tracker kanstack knows: what `KANSTACK_TRACKER` can name, and what a setup wizard
+/// offers. Remote backends go ahead of `local`, so a wizard asking each to
+/// [`Tracker::detect`] in turn suggests a remote tracker the repo is on before the fallback.
 pub const KNOWN: &[Open] = &[github::open, local::open];
 
-/// The tracker for `repo`: the one `KANSTACK_TRACKER` names if it's set, else the first in
-/// [`KNOWN`] whose [`Tracker::detect`] accepts the repo, which is `local` when nothing else
-/// does. An explicit choice isn't checked with `detect`: a tracker that isn't set up should
-/// fail on first use with its own CLI's error, not be silently swapped for another one.
+/// The tracker for `repo`: the one `KANSTACK_TRACKER` names, or `local` when it's unset or
+/// blank. Never detected: a repo on GitHub keeps its queue in `local` until someone opts in,
+/// so kanstack doesn't start reading and writing a team's real issues on its own. Nor is an
+/// explicit choice checked with `detect`: a tracker that isn't set up should fail on first
+/// use with its own CLI's error, not be silently swapped for another one.
 pub fn select(repo: &Path) -> Result<Box<dyn Tracker>> {
     select_named(repo, std::env::var("KANSTACK_TRACKER").ok().as_deref())
 }
 
 /// [`select`], with the `KANSTACK_TRACKER` value passed in. Blank counts as unset.
 fn select_named(repo: &Path, name: Option<&str>) -> Result<Box<dyn Tracker>> {
-    let name = name.map(str::trim).filter(|name| !name.is_empty());
+    let name = name.map(str::trim).filter(|name| !name.is_empty()).unwrap_or("local");
     let mut ids = Vec::new();
     for open in KNOWN {
         let tracker = open(repo)?;
-        match name {
-            Some(name) if tracker.id() == name || tracker.aliases().contains(&name) => return Ok(tracker),
-            Some(_) => ids.push(tracker.id()),
-            None if tracker.detect(repo) => return Ok(tracker),
-            None => {}
+        if tracker.id() == name || tracker.aliases().contains(&name) {
+            return Ok(tracker);
         }
+        ids.push(tracker.id());
     }
-    match name {
-        Some(name) => bail!("KANSTACK_TRACKER is {name:?}, which isn't a known tracker (known: {})", ids.join(", ")),
-        None => bail!("no tracker is usable for {}", repo.display()),
-    }
+    bail!("KANSTACK_TRACKER is {name:?}, which isn't a known tracker (known: {})", ids.join(", "))
 }
 
 #[cfg(test)]
@@ -209,7 +206,7 @@ mod tests {
     }
 
     #[test]
-    fn select_falls_back_to_local_when_unset_or_blank() {
+    fn select_is_local_when_unset_or_blank() {
         let repo = tempfile::tempdir().unwrap();
         assert_eq!(select_named(repo.path(), None).unwrap().id(), "local");
         assert_eq!(select_named(repo.path(), Some("  ")).unwrap().id(), "local");
@@ -223,22 +220,25 @@ mod tests {
         assert!(err.contains("\"jira\"") && err.contains("known: github, local"), "{err}");
     }
 
-    /// Unset, `github` goes ahead of `local` whenever it detects; named, it wins even where it
-    /// wouldn't. The only test that sets `KANSTACK_GH_BIN`, which no other test's outcome
-    /// depends on: theirs run in repos with no origin, so `gh` is never asked.
+    /// A repo that `github` detects still gets `local` unless `github` is named, and naming it
+    /// doesn't run `detect` either. The only test that sets `KANSTACK_GH_BIN`: it points any
+    /// `gh` that select wrongly runs at the stand-in, never the real one, and its log shows
+    /// none ran.
     #[test]
-    fn select_tries_github_before_local() {
+    fn select_uses_github_only_when_named() {
         let fake = github::fake::Fake::new();
         std::env::set_var("KANSTACK_GH_BIN", fake.gh());
-        let detected = select_named(&fake.repo(), None).map(|tracker| tracker.id());
-        fake.set_authed(false);
-        let unauthed = select_named(&fake.repo(), None).map(|tracker| tracker.id());
+        let detects = github::open(&fake.repo()).unwrap().detect(&fake.repo());
+        let before = fake.log().len();
+        let unset = select_named(&fake.repo(), None).map(|tracker| tracker.id());
+        let blank = select_named(&fake.repo(), Some(" ")).map(|tracker| tracker.id());
         let named = select_named(&fake.repo(), Some("github")).map(|tracker| tracker.id());
         std::env::remove_var("KANSTACK_GH_BIN");
-        assert_eq!(detected.unwrap(), "github");
-        assert_eq!(unauthed.unwrap(), "local");
+        assert!(detects, "the fake repo is one github detects");
+        assert_eq!(unset.unwrap(), "local");
+        assert_eq!(blank.unwrap(), "local");
         assert_eq!(named.unwrap(), "github");
-        assert_eq!(fake.log().matches("auth status").count(), 2, "an explicit choice isn't detected");
+        assert_eq!(fake.log().len(), before, "select ran gh:\n{}", fake.log());
     }
 
     /// The only test here that sets `KANSTACK_TRACKER`, so it can't race another.

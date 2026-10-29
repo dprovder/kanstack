@@ -7,8 +7,9 @@
 //!
 //! - **Ids** are issue numbers: `44`, linked as "Closes #44".
 //! - **States** are labels named `kanstack:<state>`, created the first time each is needed.
-//!   `done` also closes the issue, and leaving `done` reopens it. An issue with no
-//!   `kanstack:` label is `backlog` while open, and a closed issue is `done` whatever its
+//!   `done` also closes the issue, and leaving `done` reopens it. An open issue with no
+//!   `kanstack:` label is `proposed`, so the queue never pulls an issue someone filed until a
+//!   person promotes it, which adds `kanstack:backlog`. A closed issue is `done` whatever its
 //!   labels say: a person closing an issue on GitHub means it's finished (or dropped), and the
 //!   queue mustn't start it again because a stale `kanstack:backlog` label is still on it.
 //! - **Recipe and source** ride at the end of the body as `kanstack-recipe: <name>` and
@@ -91,7 +92,7 @@ impl Issue {
         if self.closed() {
             return ItemState::Done;
         }
-        self.state_labels().max_by_key(|state| ItemState::ALL.iter().position(|s| s == state)).unwrap_or(ItemState::Backlog)
+        self.state_labels().max_by_key(|state| ItemState::ALL.iter().position(|s| s == state)).unwrap_or(ItemState::Proposed)
     }
 
     fn into_item(self) -> Item {
@@ -795,16 +796,23 @@ mod tests {
     }
 
     #[test]
-    fn unlabeled_issues_are_backlog_when_open_and_done_when_closed() {
+    fn unlabeled_issues_are_proposed_when_open_and_done_when_closed() {
         let fake = Fake::new();
         let tracker = tracker(&fake);
         fake.put_issue(1, "open, by a person", "Body", true, &["bug"]);
         fake.put_issue(2, "closed, by a person", "", false, &[]);
         let items = tracker.list(&ItemFilter::default()).unwrap();
         let states: Vec<_> = items.iter().map(|item| (item.id.0.as_str(), item.state, item.recipe.clone())).collect();
-        assert_eq!(states, [("1", ItemState::Backlog, None), ("2", ItemState::Done, None)]);
+        assert_eq!(states, [("1", ItemState::Proposed, None), ("2", ItemState::Done, None)]);
         assert_eq!(items[0].body, "Body\n");
         assert!(fake.labels().is_empty(), "reading creates no labels");
+
+        // The queue doesn't see it until it's promoted, which labels it.
+        assert!(tracker.list(&ItemFilter::state(ItemState::Backlog)).unwrap().is_empty());
+        tracker.set_state(&id(1), ItemState::Backlog).unwrap();
+        assert_eq!(fake.issue_file(1, "labels"), "bug\nkanstack:backlog\n");
+        let queue = tracker.list(&ItemFilter::state(ItemState::Backlog)).unwrap();
+        assert_eq!(queue.iter().map(|item| item.id.0.as_str()).collect::<Vec<_>>(), ["1"]);
     }
 
     #[test]
