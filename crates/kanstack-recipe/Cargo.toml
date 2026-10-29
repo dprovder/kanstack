@@ -16,6 +16,8 @@ path = "src/main.rs"
 [dependencies]
 # flock(2) for the one-orchestrator-per-repo lock (src/lock.rs); kanstack already depends on it.
 libc = "0.2"
+# The queue: work items live behind kanstack-tracker's Tracker trait (local backend today).
+kanstack-tracker = { path = "../kanstack-tracker" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"

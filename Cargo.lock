@@ -653,6 +653,7 @@ dependencies = [
 name = "kanstack-recipe"
 version = "0.1.0"
 dependencies = [
+ "kanstack-tracker",
  "libc",
  "serde",
  "serde_json",

@@ -3,9 +3,11 @@
 //! See the crate's README for the recipe format and design choices.
 
 pub mod graph;
+pub mod items;
 pub mod kanstack;
 pub mod lock;
 pub mod recipe;
 pub mod resume;
 pub mod run;
+pub mod serve;
 pub mod state;
