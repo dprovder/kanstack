@@ -42,7 +42,7 @@ const REPORTS_HEADING: &str = "## Reports";
 /// Every write is atomic (a temp file renamed over the item), so a reader never sees half a
 /// file. Atomic isn't enough for a read-modify-write, though: two steps of one run
 /// commenting on the same item at once would each rewrite the file they read, and the last
-/// rename would drop the other's report. So [`Tracker::set_state`] and [`Tracker::comment`]
+/// rename would drop the other's report. So [`Tracker::set_state`], [`Tracker::set_recipe`] and [`Tracker::comment`]
 /// hold the item's [`ItemLock`] from read to rename. Ids, the one thing two creators would
 /// otherwise race on, are claimed exclusively instead (see [`LocalTracker::claim_id`]).
 pub struct LocalTracker {
@@ -146,6 +146,35 @@ impl LocalTracker {
         Ok(ItemLock(file))
     }
 
+    /// Sets front-matter `key` to `value` under `id`'s lock, or removes it for `None`. The
+    /// first `key:` line is replaced in place and any repeats dropped; a missing one goes
+    /// after the `after:` line, or last. Every other line, and the body, is left as it was.
+    fn set_front_matter(&self, id: &ItemId, key: &str, value: Option<&str>, after: Option<&str>) -> Result<()> {
+        let _lock = self.lock(id)?;
+        let contents = self.read(id)?;
+        let (front, rest) = split(&contents).with_context(|| format!("item {id}"))?;
+        let new_line = value.map(|value| format!("{key}: {value}"));
+        let mut lines: Vec<String> = Vec::new();
+        let mut placed = false;
+        for line in front.lines() {
+            if key_value(line).is_some_and(|(k, _)| k == key) {
+                if !placed {
+                    lines.extend(new_line.clone());
+                    placed = true;
+                }
+                continue;
+            }
+            lines.push(line.to_string());
+        }
+        if let (false, Some(new_line)) = (placed, new_line) {
+            let at = after
+                .and_then(|after| lines.iter().position(|line| key_value(line).is_some_and(|(k, _)| k == after)))
+                .map_or(lines.len(), |i| i + 1);
+            lines.insert(at, new_line);
+        }
+        self.write(id, &format!("---\n{}\n---\n{rest}", lines.join("\n")))
+    }
+
     fn read(&self, id: &ItemId) -> Result<String> {
         let path = self.path(id)?;
         std::fs::read_to_string(&path).with_context(|| format!("reading item {id} ({})", path.display()))
@@ -230,23 +259,14 @@ impl Tracker for LocalTracker {
     /// Rewrites the `state:` line and nothing else: the body, and any front-matter line
     /// kanstack doesn't know (one a person added by hand), come back byte for byte.
     fn set_state(&self, id: &ItemId, state: ItemState) -> Result<()> {
-        let _lock = self.lock(id)?;
-        let contents = self.read(id)?;
-        let (front, rest) = split(&contents).with_context(|| format!("item {id}"))?;
-        let mut lines: Vec<String> = Vec::new();
-        let mut replaced = false;
-        for line in front.lines() {
-            if key_value(line).is_some_and(|(key, _)| key == "state") {
-                lines.push(format!("state: {state}"));
-                replaced = true;
-            } else {
-                lines.push(line.to_string());
-            }
-        }
-        if !replaced {
-            lines.push(format!("state: {state}"));
-        }
-        self.write(id, &format!("---\n{}\n---\n{rest}", lines.join("\n")))
+        self.set_front_matter(id, "state", Some(state.as_str()), None)
+    }
+
+    /// Rewrites the `recipe:` line, adding it under `title:` when there's none, or drops it
+    /// for `None`. Like [`Self::set_state`], nothing else in the file changes.
+    fn set_recipe(&self, id: &ItemId, recipe: Option<&str>) -> Result<()> {
+        let recipe = recipe.map(one_line).filter(|r| !r.is_empty());
+        self.set_front_matter(id, "recipe", recipe.as_deref(), Some("title"))
     }
 
     /// Appends `body` at the end of the file, under a `## Reports` heading that's added the
@@ -454,6 +474,45 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "---\nid: 1\ntitle: T\nowner: me\nstate: running\n---\n\nKeep me.\n---\nAnd me.\n"
         );
+    }
+
+    #[test]
+    fn set_recipe_rewrites_adds_and_clears_only_the_recipe_line() {
+        let (_dir, tracker) = tracker();
+        let id = tracker.create(&Draft { body: "Keep me.\nrecipe: not front matter".to_string(), ..draft("T", ItemState::Backlog) }).unwrap();
+        let path = tracker.dir().join("1.md");
+        let contents = std::fs::read_to_string(&path).unwrap().replacen("title: T\n", "title: T\nowner: me\n", 1);
+        std::fs::write(&path, contents).unwrap();
+        let file = |recipe: &str| format!("---\nid: 1\ntitle: T\n{recipe}owner: me\nstate: backlog\n---\n\nKeep me.\nrecipe: not front matter\n");
+
+        tracker.set_recipe(&id, Some("bugfix/small")).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), file("recipe: bugfix/small\n"), "added under the title");
+        assert_eq!(tracker.get(&id).unwrap().recipe.as_deref(), Some("bugfix/small"));
+
+        tracker.set_recipe(&id, Some("land-feature")).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), file("recipe: land-feature\n"), "replaced in place");
+
+        tracker.set_recipe(&id, None).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), file(""));
+        let item = tracker.get(&id).unwrap();
+        assert_eq!((item.recipe, item.body.as_str()), (None, "Keep me.\nrecipe: not front matter\n"));
+
+        assert!(tracker.set_recipe(&ItemId("9".to_string()), Some("x")).is_err(), "no such item");
+    }
+
+    /// The recipe is set under the item lock, so it doesn't lose a report written meanwhile.
+    #[test]
+    fn set_recipe_and_comments_at_once_both_land() {
+        let (_dir, tracker) = tracker();
+        let id = tracker.create(&draft("T", ItemState::Backlog)).unwrap();
+        std::thread::scope(|scope| {
+            let (t, i) = (&tracker, &id);
+            scope.spawn(move || (0..20).for_each(|n| t.comment(i, &format!("report {n}")).unwrap()));
+            scope.spawn(move || (0..20).for_each(|n| t.set_recipe(i, Some(&format!("r{n}"))).unwrap()));
+        });
+        let item = tracker.get(&id).unwrap();
+        assert_eq!(item.recipe.as_deref(), Some("r19"));
+        assert!((0..20).all(|n| item.body.contains(&format!("report {n}\n"))), "{}", item.body);
     }
 
     #[test]

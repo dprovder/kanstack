@@ -150,6 +150,10 @@ pub trait Tracker: Sync {
     fn create(&self, draft: &Draft) -> Result<ItemId>;
     fn set_state(&self, id: &ItemId, state: ItemState) -> Result<()>;
 
+    /// Sets which recipe the item runs, or clears it with `None`, leaving everything else
+    /// about the item (its body included) as it was.
+    fn set_recipe(&self, id: &ItemId, recipe: Option<&str>) -> Result<()>;
+
     /// Appends a step's report to the item, as a comment on remote trackers.
     fn comment(&self, id: &ItemId, body: &str) -> Result<()>;
 

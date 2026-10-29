@@ -20,9 +20,9 @@
 //! every unfinished run, never re-runs a done step, posts each step once (at least once: a crash
 //! between posting and saving posts it again), and settles items whose run ended just before.
 //!
-//! Recipes are found by name: an item's `recipe` is a path when it contains `/` or ends in
-//! `.md` (relative to the repository), else `<name>.md` in `<repo>/.kanstack/recipes/`, or in
-//! the directories `KANSTACK_RECIPE_PATH` lists (colon-separated) when it's set.
+//! Recipes are found by name with [`catalog::resolve`]: `<name>.md` in `<repo>/.kanstack/recipes/`,
+//! then in the directories `KANSTACK_RECIPE_PATH` lists (colon-separated), or a path relative to
+//! the repository. `recipes` lists the same names.
 
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -34,6 +34,7 @@ use std::thread;
 use kanstack_tracker::{Item, ItemFilter, ItemId, ItemState, Tracker};
 use serde::Serialize;
 
+use crate::catalog;
 use crate::kanstack::KanstackClient;
 use crate::lock::OrchestratorLock;
 use crate::recipe;
@@ -49,8 +50,8 @@ pub struct ServeOptions {
     pub max: usize,
     /// The retry budget for steps whose recipe sets none (`KANSTACK_RETRIES`).
     pub retries: u32,
-    /// `KANSTACK_RECIPE_PATH`: where recipes are looked up by name instead of
-    /// `<repo>/.kanstack/recipes/`.
+    /// `KANSTACK_RECIPE_PATH`: where recipes are looked up by name after
+    /// `<repo>/.kanstack/recipes/` (see [`catalog::recipe_dirs`]).
     pub recipe_path: Option<String>,
     pub run: RunOptions,
 }
@@ -291,7 +292,7 @@ impl<'a> Serve<'a> {
     /// be used, which fails the item; `Ok(false)` when the run's state couldn't be saved,
     /// which is the orchestrator's problem, not the item's, so it stays in the backlog.
     fn start(&mut self, item: &Item, name: &str, events: &mut Vec<Event>) -> Result<bool, String> {
-        let path = resolve_recipe(&self.repo, name, self.opts.recipe_path.as_deref())?;
+        let path = catalog::resolve(&self.repo, name, self.opts.recipe_path.as_deref())?;
         let source = fs::read_to_string(&path).map_err(|e| format!("could not read recipe {}: {e}", path.display()))?;
         let parsed = recipe::parse(&source).map_err(|e| format!("recipe {}: {e}", path.display()))?;
         let budgets = recipe::parse_retries(&source).map_err(|e| format!("recipe {}: {e}", path.display()))?;
@@ -440,25 +441,6 @@ pub fn branch_prefix(id: &ItemId) -> String {
     format!("item-{}-", id.trim_matches('-'))
 }
 
-/// Finds the recipe an item names (see the module doc). `search_path` is
-/// `KANSTACK_RECIPE_PATH`'s value; blank counts as unset.
-pub fn resolve_recipe(repo: &Path, name: &str, search_path: Option<&str>) -> Result<PathBuf, String> {
-    let name = name.trim();
-    if name.contains('/') || name.ends_with(".md") {
-        let path = repo.join(name);
-        return if path.is_file() { Ok(path) } else { Err(format!("recipe file {} doesn't exist", path.display())) };
-    }
-    let dirs: Vec<PathBuf> = match search_path.map(str::trim).filter(|p| !p.is_empty()) {
-        Some(paths) => paths.split(':').filter(|d| !d.is_empty()).map(|d| repo.join(d)).collect(),
-        None => vec![repo.join(".kanstack").join("recipes")],
-    };
-    if let Some(path) = dirs.iter().map(|dir| dir.join(format!("{name}.md"))).find(|p| p.is_file()) {
-        return Ok(path);
-    }
-    let searched = dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(", ");
-    Err(format!("no recipe named \"{name}\" ({name}.md isn't in {searched})"))
-}
-
 /// One `--json` line: an [`Event`], versioned.
 #[derive(Serialize)]
 struct JsonLine<'e> {
@@ -572,29 +554,6 @@ pub fn command(args: &[String]) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn resolves_paths_names_and_the_search_path() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = tmp.path();
-        fs::create_dir_all(repo.join(".kanstack/recipes")).unwrap();
-        fs::create_dir_all(repo.join("elsewhere")).unwrap();
-        fs::create_dir_all(repo.join("more")).unwrap();
-        fs::write(repo.join(".kanstack/recipes/land.md"), "").unwrap();
-        fs::write(repo.join("more/land.md"), "").unwrap();
-        fs::write(repo.join("elsewhere/odd.md"), "").unwrap();
-
-        assert_eq!(resolve_recipe(repo, "land", None).unwrap(), repo.join(".kanstack/recipes/land.md"));
-        assert_eq!(resolve_recipe(repo, " land ", Some("")).unwrap(), repo.join(".kanstack/recipes/land.md"));
-        assert_eq!(resolve_recipe(repo, "land", Some("elsewhere:more")).unwrap(), repo.join("more/land.md"));
-        assert_eq!(resolve_recipe(repo, "elsewhere/odd.md", None).unwrap(), repo.join("elsewhere/odd.md"));
-        assert_eq!(resolve_recipe(repo, "odd.md", Some("elsewhere")).unwrap_err(), format!("recipe file {} doesn't exist", repo.join("odd.md").display()));
-        let abs = repo.join("more/land.md");
-        assert_eq!(resolve_recipe(repo, abs.to_str().unwrap(), None).unwrap(), abs);
-
-        let err = resolve_recipe(repo, "odd", Some("more")).unwrap_err();
-        assert!(err.contains("no recipe named \"odd\"") && err.contains("more"), "{err}");
-    }
 
     #[test]
     fn branch_prefixes_are_safe_branch_names() {

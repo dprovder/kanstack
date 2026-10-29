@@ -144,6 +144,11 @@ pub struct Recipe {
     /// The recipe's `aggregate:` step, if it names one: it runs last, after every other step,
     /// and its prompt carries their outcomes (see [`crate::aggregate`]).
     pub aggregate: Option<String>,
+    /// One line saying what the recipe is for, shown by `recipes` and kanstack's recipe
+    /// picker. Never part of a prompt.
+    pub description: Option<String>,
+    /// Free words to find the recipe by, like `description`.
+    pub tags: Vec<String>,
 }
 
 impl Recipe {
@@ -198,6 +203,8 @@ pub enum RecipeError {
     UnknownAggregate(String),
     /// The aggregate step runs after every other step, so none can wait for or run on it.
     AggregateReferenced { step: String, aggregate: String, field: &'static str },
+    /// `description:` is shown on one line wherever recipes are listed.
+    MultiLineDescription,
 }
 
 impl fmt::Display for RecipeError {
@@ -265,6 +272,9 @@ impl fmt::Display for RecipeError {
                 f,
                 "step \"{step}\" names the aggregate step \"{aggregate}\" in its `{field}`, but the aggregate step runs after every other step"
             ),
+            RecipeError::MultiLineDescription => {
+                write!(f, "`description` spans several lines; keep it to one, and put the rest in the recipe's body")
+            }
         }
     }
 }
@@ -276,6 +286,9 @@ struct RawFrontMatter {
     version: u64,
     retries: Option<u32>,
     aggregate: Option<String>,
+    description: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
     #[serde(default)]
     steps: BTreeMap<String, RawStep>,
 }
@@ -327,6 +340,37 @@ pub fn parse_retries(input: &str) -> Result<RetryBudgets, RecipeError> {
     })
 }
 
+/// What lists a recipe (`recipes`, kanstack's picker): its `description:` and `tags:` and how
+/// many steps it declares, read from the front matter without validating the steps, so a
+/// recipe that doesn't pass [`parse`] can still be listed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Meta {
+    pub description: Option<String>,
+    pub tags: Vec<String>,
+    pub steps: usize,
+}
+
+pub fn parse_meta(input: &str) -> Result<Meta, RecipeError> {
+    let (yaml, _) = split_front_matter(input)?;
+    let raw: RawFrontMatter = serde_yaml::from_str(yaml)
+        .map_err(|e| RecipeError::Malformed(format!("invalid YAML front matter: {e}")))?;
+    Ok(Meta { description: description(raw.description.as_deref())?, tags: tags(&raw.tags), steps: raw.steps.len() })
+}
+
+/// `description:` trimmed, `None` when blank. A folded YAML scalar (`>`) ends in a newline,
+/// which the trim forgives; a line break inside it is an error.
+fn description(raw: Option<&str>) -> Result<Option<String>, RecipeError> {
+    let Some(text) = raw.map(str::trim).filter(|text| !text.is_empty()) else { return Ok(None) };
+    if text.contains(['\n', '\r']) {
+        return Err(RecipeError::MultiLineDescription);
+    }
+    Ok(Some(text.to_string()))
+}
+
+fn tags(raw: &[String]) -> Vec<String> {
+    raw.iter().map(|tag| tag.trim()).filter(|tag| !tag.is_empty()).map(String::from).collect()
+}
+
 pub fn parse(input: &str) -> Result<Recipe, RecipeError> {
     let (yaml, body) = split_front_matter(input)?;
     let raw: RawFrontMatter = serde_yaml::from_str(yaml)
@@ -367,6 +411,8 @@ fn validate(raw: RawFrontMatter, body: &str) -> Result<Recipe, RecipeError> {
     if raw.steps.is_empty() {
         return Err(RecipeError::NoSteps);
     }
+    let description = description(raw.description.as_deref())?;
+    let tags = tags(&raw.tags);
     if let Some(aggregate) = &raw.aggregate {
         if !raw.steps.contains_key(aggregate) {
             return Err(RecipeError::UnknownAggregate(aggregate.clone()));
@@ -496,6 +542,8 @@ fn validate(raw: RawFrontMatter, body: &str) -> Result<Recipe, RecipeError> {
         steps,
         context: body.to_string(),
         aggregate: raw.aggregate,
+        description,
+        tags,
     };
     detect_continue_agent_mismatch(&recipe)?;
     Ok(recipe)
@@ -901,6 +949,23 @@ mod tests {
         // A stack step's branch is its own, so continuing on it meets the stack step's agent.
         parse("---\nversion: 1\nsteps:\n  implement:\n    agent: codex\n    prompt: I\n  review:\n    agent: claude\n    needs: [implement]\n    on: implement\n    spawn: stack\n    prompt: R\n  fix:\n    agent: claude\n    needs: [review]\n    on: review\n    spawn: continue\n    prompt: F\n---\n")
             .expect("fix continues review's claude pane on implement-review");
+    }
+
+    #[test]
+    fn reads_description_and_tags_and_rejects_a_multi_line_description() {
+        let recipe = parse("---\nversion: 1\ndescription: >\n  Fix a small bug\ntags: [bug, \" quick \"]\nsteps:\n  a:\n    agent: codex\n    prompt: A\n---\n").unwrap();
+        assert_eq!((recipe.description.as_deref(), recipe.tags), (Some("Fix a small bug"), vec!["bug".to_string(), "quick".to_string()]));
+
+        let bare = parse("---\nversion: 1\nsteps:\n  a:\n    agent: codex\n    prompt: A\n---\n").unwrap();
+        assert_eq!((bare.description, bare.tags), (None, Vec::new()));
+
+        let err = parse("---\nversion: 1\ndescription: |\n  One\n  Two\nsteps:\n  a:\n    agent: codex\n    prompt: A\n---\n").unwrap_err();
+        assert!(matches!(err, RecipeError::MultiLineDescription), "{err}");
+        assert!(err.to_string().contains("keep it to one"), "{err}");
+        assert!(parse_meta("---\nversion: 1\ndescription: \"a\\nb\"\n---\n").is_err());
+
+        let meta = parse_meta("---\nversion: 1\ndescription: Listed anyway\nsteps:\n  a: {}\n  b: {}\n---\n").unwrap();
+        assert_eq!(meta, Meta { description: Some("Listed anyway".to_string()), tags: Vec::new(), steps: 2 });
     }
 
     #[test]

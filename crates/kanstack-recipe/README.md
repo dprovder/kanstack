@@ -32,7 +32,8 @@ kanstack-recipe run   path/to/recipe.md [--kanstack-bin <path>]   # execute the 
 kanstack-recipe check path/to/recipe.md [--kanstack-bin <path>]   # parse + validate only, spawns nothing
 kanstack-recipe resume [<run-id>] [--force] [--kanstack-bin <path>]  # pick runs back up (default: every unfinished one)
 kanstack-recipe runs [--json]                                     # list runs and their steps' statuses
-kanstack-recipe items <add|list|show|promote|propose> ... [--json] # the factory's queue (see "The factory queue")
+kanstack-recipe recipes [--json]                                  # the recipe catalog: every recipe serve can find by name
+kanstack-recipe items <add|list|show|promote|propose|set-recipe> ... [--json] # the factory's queue (see "The factory queue")
 kanstack-recipe serve [--max <N>] [--once] [--json] [--kanstack-bin <path>]  # pull loop over the queue
 kanstack-recipe land <item-id> [--json] [--keep-panes] [--kanstack-bin <path>] [--but-bin <path>]  # land a reviewed item
 ```
@@ -133,6 +134,8 @@ When you're finished, report what you did by running: kanstack note <branch> "<r
 | `verify` | no | list of shell commands, run from the directory the runner itself was invoked in once the step's workstream goes idle. **All** must exit `0` for the step to count as complete. A nonzero exit fails the step (and the whole recipe) unless it has retries left, in which case the failing command and the tail of its output go back into the same pane and the step continues. |
 | `aggregate` | no | **recipe-level**, not per step: names the step that closes the run by reviewing every other step's outcome and proposing follow-ups (see "The aggregate step"). |
 | `land`, `factory` | no | **recipe-level**: override `KANSTACK_LAND` (`direct` or `pr`) and `KANSTACK_FACTORY` (`light`; `dark` isn't built yet) for this recipe's items. |
+| `description` | no | **recipe-level**: one line saying what the recipe is for, listed by `recipes` and kanstack's recipe picker. Never part of a prompt. `check` rejects one that spans several lines. |
+| `tags` | no | **recipe-level**: a list of words to find the recipe by in `recipes` and the picker. |
 | `retries` | no | how many times a failed step is retried before it fails, overriding `KANSTACK_RETRIES`. Also allowed at the top of the front matter, as the default for every step. Resolved when a run starts and kept in run state. |
 
 No other fields exist in v1 (no `timeout`, `priority`, roles, conditions, or anything
@@ -304,7 +307,7 @@ step that `needs` or is `on` itself, a cycle in `needs`, a placement cycle throu
 target not reachable (directly or transitively) through the step's own `needs`, an unknown
 `spawn` mode (including `share`) or `done_when`, `spawn: continue`, `handoff` or `stack` without
 an `on`, `spawn: advisory` with one, `spawn: continue` with an agent other than the one on the
-branch by then, and malformed YAML front matter.
+branch by then, a multi-line `description`, and malformed YAML front matter.
 
 ## The factory queue
 
@@ -350,10 +353,28 @@ Run state links each run to its `item` and records its `branch_prefix`, which st
 `reported` and whether the item has been `settled`; each step also records `retries`,
 `retry_budget` and any pending `retry`, which `runs` shows as `retried 1/2`.
 
-An item's `recipe` is a path when it contains `/` or ends in `.md`; otherwise it's looked up as
-`<name>.md` in `<repo>/.kanstack/recipes/`, or in the colon-separated directories of
-`KANSTACK_RECIPE_PATH`. An item whose recipe can't be found or parsed goes to `failed`, with the
-reason as a comment. Each item's branches are prefixed `item-<id>-`, so two items running one
+**Recipes by name.** An item's `recipe` is usually a name from the catalog. A recipe's name is
+its path below its recipe directory, minus `.md`, so `.kanstack/recipes/bugfix/small.md` is
+`bugfix/small`. The directories are `<repo>/.kanstack/recipes/`, then each of
+`KANSTACK_RECIPE_PATH`'s colon-separated entries (relative ones from the repository root), in
+that order, and when two hold the same name the first one's wins. `recipes` lists the catalog:
+
+```sh
+kanstack-recipe recipes          # name, step count, description, [tags], and the file
+kanstack-recipe recipes --json   # {"schema":1,"recipes":[{"name","description","tags","steps","path","error"?}]}
+```
+
+A recipe that `check` would reject is still listed, with its `error`. `serve` resolves names
+with the same function `recipes` lists with, so every listed name is one it can start. A
+`recipe` ending in `.md`, absolute, or starting with `./` or holding `..` is a path from the
+repository instead, as is a name with a `/` that's in no recipe directory. An item whose recipe
+can't be found or parsed goes to `failed`, with the reason as a comment.
+
+**Setting a recipe later.** `items set-recipe <id> <name>` names an item's recipe after it was
+drafted, and `--clear` removes it. A name that isn't in the catalog is refused unless `--force`
+(say, for a path). The local tracker rewrites the item's `recipe:` line under its lock; GitHub
+rewrites the trailing `kanstack-recipe:` line of the issue body and leaves the rest of the body
+alone. In kanstack's TUI, `r` on an issue does the same through a picker over the catalog. Each item's branches are prefixed `item-<id>-`, so two items running one
 recipe never share a lane.
 
 **What the agents are told.** Every prompt an item's run sends — each step's first launch, a

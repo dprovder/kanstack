@@ -616,6 +616,9 @@ mod tests {
         fn set_state(&self, _id: &ItemId, _state: ItemState) -> Result<()> {
             unimplemented!()
         }
+        fn set_recipe(&self, _id: &ItemId, _recipe: Option<&str>) -> Result<()> {
+            unimplemented!()
+        }
         fn comment(&self, _id: &ItemId, _body: &str) -> Result<()> {
             unimplemented!()
         }

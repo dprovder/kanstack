@@ -1,5 +1,6 @@
-//! The `items` subcommands: add, list, show, promote and propose work items in the queue,
-//! through whichever tracker `kanstack_tracker::select` picks for the repository. The queue
+//! The `items` subcommands: add, list, show, promote and propose work items in the queue, and
+//! set-recipe to name (or clear) the recipe `serve` runs for one, through whichever tracker
+//! `kanstack_tracker::select` picks for the repository. The queue
 //! itself lives behind the tracker; nothing here keeps state of its own.
 //!
 //! Exit codes match `main.rs`: 0 success, 2 a usage error (caught before the tracker is
@@ -11,6 +12,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use kanstack_tracker::{Draft, Item, ItemFilter, ItemId, ItemState, Tracker};
+
+use crate::catalog;
 
 /// Versions every `items --json` document, independently of `runs --json`.
 const SCHEMA: u32 = 1;
@@ -92,6 +95,8 @@ enum Sub {
     Promote(ItemId),
     /// The draft already has `from` and `state: proposed` set.
     Propose(Draft),
+    /// `None` clears it. `force` skips the catalog check.
+    SetRecipe { id: ItemId, recipe: Option<String>, force: bool },
 }
 
 /// Every flag any subcommand takes, gathered in one pass. Each subcommand names the ones it
@@ -217,22 +222,52 @@ fn parse(args: &[String]) -> Result<Parsed, Error> {
             };
             (Sub::Propose(draft), flags.json)
         }
+        "set-recipe" => parse_set_recipe(rest)?,
         other => return Err(Error::Usage(format!("items: unknown subcommand `{other}`"))),
     };
     Ok(Parsed { sub, json })
 }
 
+/// `set-recipe <id> <name> [--force]` or `set-recipe <id> --clear`. Two positionals, so it
+/// doesn't fit [`Flags::gather`].
+fn parse_set_recipe(args: &[String]) -> Result<(Sub, bool), Error> {
+    let usage = |msg: String| Error::Usage(format!("items set-recipe: {msg}"));
+    let (mut positional, mut clear, mut force, mut json) = (Vec::new(), false, false, false);
+    for arg in args {
+        match arg.as_str() {
+            "--clear" => clear = true,
+            "--force" => force = true,
+            "--json" => json = true,
+            other if other.starts_with("--") => return Err(usage(format!("unexpected argument `{other}`"))),
+            other => positional.push(other.to_string()),
+        }
+    }
+    let (id, recipe) = match (positional.as_slice(), clear) {
+        ([], _) => return Err(usage("missing <id>".to_string())),
+        ([id], true) => (id, None),
+        ([_], false) => return Err(usage("missing <name> (or --clear)".to_string())),
+        ([_, _], true) => return Err(usage("give a <name> or --clear, not both".to_string())),
+        ([_, name], false) if name.trim().is_empty() => return Err(usage("<name> is empty; use --clear to clear it".to_string())),
+        ([id, name], false) => (id, Some(name.trim().to_string())),
+        _ => return Err(usage(format!("unexpected argument `{}`", positional[2]))),
+    };
+    if clear && force {
+        return Err(usage("--force only goes with a <name>".to_string()));
+    }
+    Ok((Sub::SetRecipe { id: ItemId(id.clone()), recipe, force }, json))
+}
+
 /// The top level of the work tree the current directory is in.
 fn git_root() -> Result<PathBuf, Error> {
-    let output = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .map_err(|e| failed(format_args!("could not run git: {e}")))?;
+    repo_root("items").map_err(Error::Failed)
+}
+
+/// The top level of the work tree the current directory is in, for `command`, which needs a
+/// git repository.
+pub fn repo_root(command: &str) -> Result<PathBuf, String> {
+    let output = Command::new("git").args(["rev-parse", "--show-toplevel"]).output().map_err(|e| format!("could not run git: {e}"))?;
     if !output.status.success() {
-        return Err(Error::Failed(format!(
-            "items needs a git repository: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
+        return Err(format!("{command} needs a git repository: {}", String::from_utf8_lossy(&output.stderr).trim()));
     }
     Ok(PathBuf::from(String::from_utf8_lossy(&output.stdout).trim_end_matches(['\n', '\r'])))
 }
@@ -253,7 +288,45 @@ fn execute(parsed: &Parsed, repo: &Path, out: &mut dyn Write) -> Result<(), Erro
             tracker.get(from).map_err(|e| failed(format_args!("--from {from}: {e:#}")))?;
             create(tracker, draft, json, out)
         }
+        Sub::SetRecipe { id, recipe, force } => {
+            let search_path = std::env::var("KANSTACK_RECIPE_PATH").ok();
+            set_recipe(tracker, id, recipe.as_deref(), *force, repo, search_path.as_deref(), json, out)
+        }
     }
+}
+
+/// Names `recipe` as the item's, or clears it. A name `serve` couldn't find by name is
+/// refused unless `force`d, since a typo would only surface when `serve` fails the item; a
+/// path is one of those, so it needs `--force` too.
+#[allow(clippy::too_many_arguments)]
+fn set_recipe(
+    tracker: &dyn Tracker,
+    id: &ItemId,
+    recipe: Option<&str>,
+    force: bool,
+    repo: &Path,
+    search_path: Option<&str>,
+    json: bool,
+    out: &mut dyn Write,
+) -> Result<(), Error> {
+    if let (Some(name), false) = (recipe, force) {
+        if !catalog::scan(repo, search_path).iter().any(|entry| entry.name == name) {
+            return Err(Error::Failed(format!(
+                "no recipe named \"{name}\" in the catalog (`kanstack-recipe recipes` lists them); \
+                 pass --force to set it anyway, e.g. for a path"
+            )));
+        }
+    }
+    tracker.set_recipe(id, recipe).map_err(failed)?;
+    if json {
+        let item = tracker.get(id).map_err(failed)?;
+        return emit(out, serde_json::json!({ "schema": SCHEMA, "item": item }));
+    }
+    match recipe {
+        Some(name) => writeln!(out, "✓ item {id}: recipe {name}"),
+        None => writeln!(out, "✓ item {id}: recipe cleared"),
+    }
+    .map_err(failed)
 }
 
 /// `add` and `propose`: the new id alone on a line, so `id=$(kanstack-recipe items add ...)`
@@ -341,4 +414,6 @@ fn print_usage() {
     eprintln!("  kanstack-recipe items show <id> [--json]");
     eprintln!("  kanstack-recipe items promote <id> [--json]");
     eprintln!("  kanstack-recipe items propose --from <id> --title <t> [--body <b> | --body-file <path>] [--recipe <name>] [--json]");
+    eprintln!("  kanstack-recipe items set-recipe <id> <name> [--force] [--json]   (a name from `kanstack-recipe recipes`; --force for any other)");
+    eprintln!("  kanstack-recipe items set-recipe <id> --clear [--json]");
 }

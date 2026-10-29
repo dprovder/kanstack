@@ -3,6 +3,7 @@
 //! See the crate's README for the recipe format and design choices.
 
 pub mod aggregate;
+pub mod catalog;
 pub mod graph;
 pub mod items;
 pub mod kanstack;

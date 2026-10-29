@@ -311,6 +311,20 @@ impl Tracker for GithubTracker {
         }
     }
 
+    /// Rewrites the body's trailing `kanstack-recipe:` line (adding one, or dropping it for
+    /// `None`) and leaves the rest of the body as it was, the `kanstack-from:` line included.
+    /// Nothing is edited when the issue already names that recipe.
+    fn set_recipe(&self, id: &ItemId, recipe: Option<&str>) -> Result<()> {
+        let n = number(id)?;
+        let issue = self.view(n)?;
+        let raw = issue.body.as_deref().unwrap_or_default();
+        let body = with_recipe_line(raw, recipe);
+        if body == raw {
+            return Ok(());
+        }
+        self.gh(&["issue", "edit", &n.to_string(), "--repo", self.slug()?, "--body", &body]).map(drop)
+    }
+
     fn comment(&self, id: &ItemId, body: &str) -> Result<()> {
         self.gh(&["issue", "comment", &number(id)?.to_string(), "--repo", self.slug()?, "--body", body.trim()]).map(drop)
     }
@@ -435,6 +449,52 @@ fn decode_body(raw: &str) -> (String, Option<String>, Option<ItemId>) {
     (body, recipe, from)
 }
 
+/// `raw` with its recipe line set to `recipe`, or removed for `None`. Only the trailing run
+/// of `kanstack-` lines that [`decode_body`] reads is touched: everything before it comes
+/// back byte for byte, line endings included, and the `kanstack-from:` line stays.
+fn with_recipe_line(raw: &str, recipe: Option<&str>) -> String {
+    let lines: Vec<&str> = raw.split_inclusive('\n').collect();
+    let mut start = lines.len();
+    while start > 0 {
+        let line = lines[start - 1].trim();
+        if line.is_empty() || line.starts_with(RECIPE_LINE) || line.starts_with(FROM_LINE) {
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+    let mut trailer: Vec<String> = Vec::new();
+    let recipe = recipe.and_then(|recipe| recipe.split_whitespace().next());
+    let mut placed = false;
+    for line in lines[start..].iter().map(|line| line.trim()).filter(|line| !line.is_empty()) {
+        if line.starts_with(RECIPE_LINE) {
+            if let (false, Some(recipe)) = (placed, recipe) {
+                trailer.push(format!("{RECIPE_LINE} {recipe}"));
+            }
+            placed = true;
+        } else {
+            trailer.push(line.to_string());
+        }
+    }
+    if let (false, Some(recipe)) = (placed, recipe) {
+        trailer.insert(0, format!("{RECIPE_LINE} {recipe}"));
+    }
+    let head: String = lines[..start].concat();
+    if trailer.is_empty() {
+        return head;
+    }
+    let mut body = head;
+    if !body.is_empty() {
+        if !body.ends_with('\n') {
+            body.push('\n');
+        }
+        body.push('\n');
+    }
+    body.push_str(&trailer.join("\n"));
+    body.push('\n');
+    body
+}
+
 /// A stand-in `gh` for tests: issues, labels and comments as files in a temp dir, printed
 /// back as JSON shaped like `gh`'s. Never calls GitHub. Fails like `gh` does where it
 /// matters here: on a `--repo` other than the one it was made for, on adding a label that
@@ -490,12 +550,12 @@ need_labels() { for l in $(each "$1"); do has_label "$l" || { echo "could not ad
 need_issue() { [ -d "$D/issues/$num" ] || { echo "GraphQL: Could not resolve to an issue with the number of $num." >&2; exit 1; }; }
 
 cmd="$1 $2"; shift 2
-num=''; repo=''; title=''; body=''; state=open; add=''; remove=''
+num=''; repo=''; title=''; body=''; body_set=''; state=open; add=''; remove=''
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo) repo=$2; shift 2 ;;
     --title) title=$2; shift 2 ;;
-    --body) body=$2; shift 2 ;;
+    --body) body=$2; body_set=1; shift 2 ;;
     --state) state=$2; shift 2 ;;
     --label|--add-label) add="$add,$2"; shift 2 ;;
     --remove-label) remove="$remove,$2"; shift 2 ;;
@@ -533,7 +593,8 @@ case "$cmd" in
   "issue edit")
     need_issue; need_labels "$add"; i="$D/issues/$num"
     for l in $(each "$remove"); do grep -vxF "$l" "$i/labels" > "$i/labels.tmp"; mv "$i/labels.tmp" "$i/labels"; done
-    for l in $(each "$add"); do grep -qxF "$l" "$i/labels" || printf '%s\n' "$l" >> "$i/labels"; done ;;
+    for l in $(each "$add"); do grep -qxF "$l" "$i/labels" || printf '%s\n' "$l" >> "$i/labels"; done
+    if [ -n "$body_set" ]; then printf '%s.' "$body" > "$i/body"; fi ;;
   "issue close") need_issue; echo CLOSED > "$D/issues/$num/state" ;;
   "issue reopen") need_issue; echo OPEN > "$D/issues/$num/state" ;;
   "issue comment") need_issue; printf '%s\n--\n' "$body" >> "$D/issues/$num/comments" ;;
@@ -868,6 +929,44 @@ mod tests {
         assert_eq!((body.as_str(), recipe.as_deref(), from), ("Fix it.\n", Some("bugfix"), Some(id(12))));
         let (body, recipe, from) = decode_body("kanstack-recipe: a\nmore text\n");
         assert_eq!((body.as_str(), recipe, from), ("kanstack-recipe: a\nmore text\n", None, None));
+    }
+
+    #[test]
+    fn set_recipe_rewrites_only_the_trailing_recipe_line() {
+        let fake = Fake::new();
+        let tracker = tracker(&fake);
+        let body = |b: &str| fake.issue_file(1, "body").replace(b, "<>");
+        fake.put_issue(1, "T", "Fix it.\r\n\r\nkanstack-recipe: quoted, not the trailer\r\nmore\r\n\r\nkanstack-recipe: old\r\nkanstack-from: #3\r\n", true, &[]);
+
+        tracker.set_recipe(&id(1), Some("bugfix/small")).unwrap();
+        let head = "Fix it.\r\n\r\nkanstack-recipe: quoted, not the trailer\r\nmore\r\n";
+        assert_eq!(body(head), "<>\nkanstack-recipe: bugfix/small\nkanstack-from: #3\n", "the person's text, byte for byte");
+        let item = tracker.get(&id(1)).unwrap();
+        assert_eq!((item.recipe.as_deref(), item.from), (Some("bugfix/small"), Some(id(3))));
+
+        tracker.set_recipe(&id(1), None).unwrap();
+        assert_eq!(body(head), "<>\nkanstack-from: #3\n");
+        assert_eq!(tracker.get(&id(1)).unwrap().recipe, None);
+
+        let edits = fake.log().matches("issue edit").count();
+        tracker.set_recipe(&id(1), None).unwrap();
+        assert_eq!(fake.log().matches("issue edit").count(), edits, "no edit when nothing changes");
+
+        fake.put_issue(2, "U", "Just text", true, &["kanstack:backlog"]);
+        tracker.set_recipe(&id(2), Some("land")).unwrap();
+        assert_eq!(fake.issue_file(2, "body"), "Just text\n\nkanstack-recipe: land\n");
+        assert_eq!(fake.issue_file(2, "labels"), "kanstack:backlog\n", "labels untouched");
+
+        fake.put_issue(3, "V", "", true, &[]);
+        tracker.set_recipe(&id(3), Some("land")).unwrap();
+        assert_eq!(fake.issue_file(3, "body"), "kanstack-recipe: land\n");
+    }
+
+    #[test]
+    fn with_recipe_line_keeps_a_body_without_a_trailer() {
+        assert_eq!(with_recipe_line("Text\n\nkanstack-recipe: a\n", None), "Text\n");
+        assert_eq!(with_recipe_line("Text", None), "Text");
+        assert_eq!(with_recipe_line("kanstack-from: #2", Some("r")), "kanstack-recipe: r\nkanstack-from: #2\n");
     }
 
     #[test]

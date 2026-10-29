@@ -233,6 +233,8 @@ mod tests {
             steps,
             context: String::new(),
             aggregate: None,
+            description: None,
+            tags: Vec::new(),
         };
 
         // Must return promptly rather than looping forever.

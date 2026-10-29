@@ -33,6 +33,7 @@ impl Scratch {
         assert!(init.success());
         std::env::set_var("KANSTACK_STATE_PATH", &state);
         std::env::remove_var("KANSTACK_TRACKER");
+        std::env::remove_var("KANSTACK_RECIPE_PATH");
         Scratch { _tmp: tmp, repo, _env: env }
     }
 
@@ -223,6 +224,35 @@ fn propose_creates_a_proposed_item_from_an_existing_one() {
     assert_eq!(s.items(&["propose", "--from", "1"]).0, usage());
     assert_eq!(s.items(&["propose", "--from", "1", "--title", "T", "--state", "backlog"]).0, usage());
     assert_eq!(s.tracker().list(&ItemFilter::default()).unwrap().len(), 3);
+}
+
+#[test]
+fn set_recipe_takes_a_catalog_name_or_force_and_clears() {
+    let s = Scratch::new();
+    let id = s.ok(&["add", "--title", "Fix it"]).trim().to_string();
+    let recipes = s.repo.join(".kanstack/recipes/bugfix");
+    std::fs::create_dir_all(&recipes).unwrap();
+    std::fs::write(recipes.join("small.md"), "---\nversion: 1\nsteps:\n  a:\n    agent: codex\n    prompt: A\n---\n").unwrap();
+    let recipe = || s.tracker().get(&ItemId(id.clone())).unwrap().recipe;
+
+    assert_eq!(s.ok(&["set-recipe", &id, "bugfix/small"]), format!("✓ item {id}: recipe bugfix/small\n"));
+    assert_eq!(recipe().as_deref(), Some("bugfix/small"));
+
+    let (code, out) = s.items(&["set-recipe", &id, "bugfix/smal"]);
+    assert_eq!((code, out.as_str()), (ExitCode::FAILURE, ""), "not in the catalog");
+    assert_eq!(recipe().as_deref(), Some("bugfix/small"), "unchanged");
+
+    let doc = s.json(&["set-recipe", &id, "recipes/odd.md", "--force", "--json"]);
+    assert_eq!(doc["item"]["recipe"], "recipes/odd.md");
+
+    assert_eq!(s.ok(&["set-recipe", &id, "--clear"]), format!("✓ item {id}: recipe cleared\n"));
+    assert_eq!(recipe(), None);
+
+    for bad in [&["set-recipe"][..], &["set-recipe", &id], &["set-recipe", &id, "x", "--clear"], &["set-recipe", &id, "--clear", "--force"], &["set-recipe", &id, "a", "b"], &["set-recipe", &id, " "], &["set-recipe", &id, "x", "--bogus"]] {
+        assert_eq!(s.items(bad).0, usage(), "{bad:?}");
+    }
+    let (code, _) = s.items(&["set-recipe", "99", "bugfix/small"]);
+    assert_eq!(code, ExitCode::FAILURE, "no such item");
 }
 
 #[test]

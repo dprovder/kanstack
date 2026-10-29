@@ -41,6 +41,9 @@ fn main() -> ExitCode {
     if command == "land" {
         return kanstack_recipe::land::command(&args.collect::<Vec<_>>());
     }
+    if command == "recipes" {
+        return list_recipes(&args.collect::<Vec<_>>());
+    }
     if !["run", "check", "resume", "runs"].contains(&command.as_str()) {
         eprintln!("kanstack-recipe: unknown command `{command}`");
         print_usage();
@@ -223,6 +226,37 @@ fn list_runs(args: &Args) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `recipes [--json]`: every recipe `serve` can find by name, for the repository the current
+/// directory is in (see `kanstack_recipe::catalog`).
+fn list_recipes(args: &[String]) -> ExitCode {
+    let mut json = false;
+    for arg in args {
+        match arg.as_str() {
+            "--json" => json = true,
+            other => {
+                eprintln!("kanstack-recipe: recipes: unexpected argument `{other}`");
+                print_usage();
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let repo = match kanstack_recipe::items::repo_root("recipes") {
+        Ok(repo) => repo,
+        Err(e) => {
+            eprintln!("kanstack-recipe: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let search_path = env::var("KANSTACK_RECIPE_PATH").ok();
+    match kanstack_recipe::catalog::command(&repo, search_path.as_deref(), json, &mut std::io::stdout().lock()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("kanstack-recipe: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn store() -> Option<RunStore> {
     let store = RunStore::for_repo(&env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf()));
     if store.is_none() {
@@ -248,7 +282,8 @@ fn print_usage() {
     eprintln!("  kanstack-recipe check <recipe.md> [--kanstack-bin <path>]");
     eprintln!("  kanstack-recipe resume [<run-id>] [--force] [--kanstack-bin <path>]");
     eprintln!("  kanstack-recipe runs [--json]");
-    eprintln!("  kanstack-recipe items <add|list|show|promote|propose> ... [--json]  (items --help for details)");
+    eprintln!("  kanstack-recipe recipes [--json]");
+    eprintln!("  kanstack-recipe items <add|list|show|promote|propose|set-recipe> ... [--json]  (items --help for details)");
     eprintln!("  kanstack-recipe serve [--max <N>] [--once] [--json] [--kanstack-bin <path>]");
     eprintln!("  kanstack-recipe land <item-id> [--json] [--keep-panes] [--kanstack-bin <path>] [--but-bin <path>]");
 }
