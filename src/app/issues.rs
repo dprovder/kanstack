@@ -511,6 +511,16 @@ impl App {
             self.notify("pick a proposal to promote", Notice::Info);
             return;
         };
+        // A backlog item is already queued, so say that (and why it might still sit there)
+        // rather than refusing as if `p` were the wrong move for something running.
+        if item.state == ItemState::Backlog {
+            let msg = match item.recipe {
+                Some(_) => format!("{} is already in the backlog", item_label(&item.id)),
+                None => format!("{} is already in the backlog, but has no recipe, so serve won't pick it up", item_label(&item.id)),
+            };
+            self.notify(msg, Notice::Info);
+            return;
+        }
         if item.state != ItemState::Proposed {
             let msg = format!("only a proposal can be promoted — {} is {}", item_label(&item.id), item.state);
             self.notify(msg, Notice::Info);
@@ -734,7 +744,11 @@ mod tests {
 
         key(&mut app, KeyCode::Char('p'));
         assert!(!app.issues.writing(), "a backlog item isn't promoted");
-        assert!(app.message.as_ref().is_some_and(|(m, _)| m.contains("only a proposal") && m.contains("#1 is backlog")));
+        assert!(
+            app.message.as_ref().is_some_and(|(m, _)| m.contains("#1 is already in the backlog") && m.contains("no recipe")),
+            "{:?}",
+            app.message
+        );
 
         key(&mut app, KeyCode::Down);
         key(&mut app, KeyCode::Char('p'));
