@@ -334,8 +334,15 @@ one `{"schema": 1, ...}` document. Only a proposed item can be promoted.
   branch range, or why it failed);
 - sets an item to `review` when its run completes and `failed` when it fails.
 
-`--once` runs a single tick and exits, for tests and cron. `--json` prints one JSON line per item
-event on stdout and keeps progress on stderr. Items wait in `review`; landing them is a later step.
+Without `--once`, `serve` runs until it's killed; `--once` runs a single tick and exits, for tests
+and cron. `--json` prints one line per item event on stdout and keeps progress on stderr:
+`{"schema":1,"kind":"started|retried|review|failed","item":…,"run":…,"step":…,"reason":…}`.
+A backlog item with no `recipe` is never pulled, and items wait in `review`; landing them is a
+later step. On restart `serve` resumes its unfinished runs, posting each step's comment once,
+except a run whose recipe file has changed since it started, which waits for `resume --force`.
+Run state links each run to its `item` and records its `branch_prefix`, which steps were
+`reported` and whether the item has been `settled`; each step also records `retries`,
+`retry_budget` and any pending `retry`, which `runs` shows as `retried 1/2`.
 
 An item's `recipe` is a path when it contains `/` or ends in `.md`; otherwise it's looked up as
 `<name>.md` in `<repo>/.kanstack/recipes/`, or in the colon-separated directories of

@@ -207,10 +207,11 @@ fn list_runs(args: &Args) -> ExitCode {
         println!("{}  {}  {}", run.id, run.status.as_str(), run.recipe);
         for (step_id, rec) in &run.steps {
             println!(
-                "  {:<15} {:<10} attempt {}{}{}",
+                "  {:<15} {:<10} attempt {}{}{}{}",
                 step_id,
                 rec.status.as_str(),
                 rec.attempt,
+                rec.retry_label().map(|r| format!("  {r}")).unwrap_or_default(),
                 rec.waiting_on.map(|w| format!("  waiting on {}", w.waiting_label())).unwrap_or_default(),
                 rec.last_error.as_deref().map(|e| format!("  {e}")).unwrap_or_default()
             );
