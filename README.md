@@ -195,7 +195,7 @@ repo is thrown away when you're done. `esc` or `q` leaves any time.
 | `d` | delete this lane — asks first |
 | `r` | rebase onto the updated target — shows what will happen |
 | `f` | resolve conflicts on this lane — `o`/`t` take ours/theirs per file, `A` hands the branch's conflicts to the lane's coding agent as a task |
-| `tab` | on the unassigned lane: group its cards by folder, or back to a flat list |
+| `tab` | on the unassigned lane: cycle its view — flat, grouped by folder, or the issues view (below) |
 | `⏎` | open the diff beside the board — `←` goes back, `m` commits or amends one hunk |
 | `b` | new branch — stacks on the selected lane, `tab` for a parallel lane; `shift-tab` opens a harness split (`cmux`, `tmux` as a fallback, `orca`, or `ghostty`) — on by default for a parallel lane, off by default while stacking, groups with the base's pane if it already has one; also offers an optional harness override (cycle with `←`/`→` through what's on `PATH`, or type any other), model name and reasoning-effort hint for the harness pane, the same fields `kanstack spawn --agent`/`--model`/`--effort` take (`--advisory` is CLI-only — a branch created here is presumed to make real changes); asks for an optional initial message before creating anything, so `esc` cancels the whole branch |
 | `t` | send a task to this lane's split pane — spawns one first if it isn't open yet |
@@ -207,6 +207,15 @@ repo is thrown away when you're done. `esc` or `q` leaves any time.
 | `z` / `Z` | undo / redo the last operation — fires immediately, no confirm |
 | `?` | help |
 | `q` | quit |
+
+**The issues view** turns the unassigned lane into the work-item queue that
+[`kanstack-recipe`](crates/kanstack-recipe) runs from: whichever tracker `KANSTACK_TRACKER` names
+(`local` by default, `github` when set). Each item shows its state — `◌` proposed, `○` backlog,
+`●` running, `◆` review, `✓` done, `✗` failed — its id and title, then its recipe (or `from #N`
+for a proposal) and how many lanes it's running on. A running item's lanes are the ones whose
+branch starts `item-<id>-`, and selecting the item marks them in their headers. In this view `n`
+drafts an issue into the backlog, `p` promotes a proposal to the backlog, and `⏎` opens an item's
+body and reports. The list refreshes in the background, so a slow tracker never blocks the board.
 
 Nothing is ever "staged" ahead of a commit — GitButler 0.22 dropped that step entirely, so
 dropping a card onto a lane commits or amends it there immediately, and the footer spells
