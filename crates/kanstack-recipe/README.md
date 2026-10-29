@@ -32,6 +32,8 @@ kanstack-recipe run   path/to/recipe.md [--kanstack-bin <path>]   # execute the 
 kanstack-recipe check path/to/recipe.md [--kanstack-bin <path>]   # parse + validate only, spawns nothing
 kanstack-recipe resume [<run-id>] [--force] [--kanstack-bin <path>]  # pick runs back up (default: every unfinished one)
 kanstack-recipe runs [--json]                                     # list runs and their steps' statuses
+kanstack-recipe items <add|list|show|promote|propose> ... [--json] # the factory's queue (see "The factory queue")
+kanstack-recipe serve [--max <N>] [--once] [--json] [--kanstack-bin <path>]  # pull loop over the queue
 ```
 
 `--kanstack-bin` overrides where the `kanstack` binary is found (default: looked up on `$PATH`).
@@ -127,9 +129,10 @@ When you're finished, report what you did by running: kanstack note <branch> "<r
 | `spawn` | no | how the step's agent reaches its branch: `continue`, `handoff`, `stack` or `advisory` (see "Spawn modes"). Left out, an `on` step continues in the branch's pane when its agent is the branch's current one and hands off when it isn't, and a step with no `on` spawns its own branch. |
 | `done_when` | no | what, besides an idle lane, finishes the step: `commits`, `note` or `either` (see "Completion model"). Defaults to `note` for an advisory step and `commits` otherwise. |
 | `owns` | no | glob list, advisory only — for prompt context and collision-awareness. Not enforced by this runner or by kanstack; no new locking mechanism is built around it. |
-| `verify` | no | list of shell commands, run from the directory the runner itself was invoked in once the step's workstream goes idle. **All** must exit `0` for the step to count as complete; any nonzero exit fails the step (and the whole recipe). Run once each, no retries. |
+| `verify` | no | list of shell commands, run from the directory the runner itself was invoked in once the step's workstream goes idle. **All** must exit `0` for the step to count as complete. A nonzero exit fails the step (and the whole recipe) unless it has retries left, in which case the failing command and the tail of its output go back into the same pane and the step continues. |
+| `retries` | no | how many times a failed step is retried before it fails, overriding `KANSTACK_RETRIES`. Also allowed at the top of the front matter, as the default for every step. Resolved when a run starts and kept in run state. |
 
-No other fields exist in v1 (no `retry`, `timeout`, `priority`, roles, conditions, or anything
+No other fields exist in v1 (no `timeout`, `priority`, roles, conditions, or anything
 else) — see the design notes in the main repository for why.
 
 ### Spawn modes
@@ -300,6 +303,55 @@ target not reachable (directly or transitively) through the step's own `needs`, 
 an `on`, `spawn: advisory` with one, `spawn: continue` with an agent other than the one on the
 branch by then, and malformed YAML front matter.
 
+## The factory queue
+
+`items` and `serve` turn the runner into the minimal software factory: work goes into a queue,
+`serve` pulls it into recipe runs, and each item's state follows its run.
+
+**Items** live behind kanstack-tracker's `Tracker` trait, chosen with `KANSTACK_TRACKER` (only
+`local` exists today: one markdown file per item in kanstack's per-repo state directory, never
+in the worktree). An item has a title, a body, an optional recipe, a state — `proposed`,
+`backlog`, `running`, `failed`, `review` or `done` — and, for a proposal, the item it came from.
+
+```sh
+kanstack-recipe items add --title "Land from the board" --recipe land-feature   # prints the new id
+kanstack-recipe items list [--state backlog]
+kanstack-recipe items show 44
+kanstack-recipe items propose --from 44 --title "Dedupe the timeout constant"   # a proposed follow-up
+kanstack-recipe items promote 45                                                # proposed → backlog
+```
+
+`--body <text>` or `--body-file <path>` sets the body, and every subcommand takes `--json` for
+one `{"schema": 1, ...}` document. Only a proposed item can be promoted.
+
+**`serve`** takes the orchestrator lock, resumes every unfinished run, then loops. Each tick it:
+
+- starts a run for the oldest backlog item that names a recipe while fewer than `--max` runs
+  (default 1) are unfinished, and sets the item `running`. The run is saved first, so an item is
+  never running without one;
+- advances every unfinished run by one tick, with one `status --json` read shared by all;
+- posts each finished step and each retry to its item as a comment (the step's report, its
+  branch range, or why it failed);
+- sets an item to `review` when its run completes and `failed` when it fails.
+
+`--once` runs a single tick and exits, for tests and cron. `--json` prints one JSON line per item
+event on stdout and keeps progress on stderr. Items wait in `review`; landing them is a later step.
+
+An item's `recipe` is a path when it contains `/` or ends in `.md`; otherwise it's looked up as
+`<name>.md` in `<repo>/.kanstack/recipes/`, or in the colon-separated directories of
+`KANSTACK_RECIPE_PATH`. An item whose recipe can't be found or parsed goes to `failed`, with the
+reason as a comment. Each item's branches are prefixed `item-<id>-`, so two items running one
+recipe never share a lane.
+
+**Retries.** `serve` retries a failed step up to `KANSTACK_RETRIES` times (default 2; a plain
+`run` defaults to 0), overridable with `retries:`. A failed verify goes back into the same pane
+with the failing command and the tail of its output, so the agent fixes forward; a dead, pane-less
+or gone lane is stopped and respawned with the same agent on the same branch, with its prompt plus
+a note about what happened. The pending retry is persisted, so a crash in between retries the same
+way. Transport errors from `spawn`/`send` (`multiplexer_unavailable`, `but_failed`,
+`delivery_failed` and the like) back off and retry without using the budget, up to 5 in a row.
+Out of budget, the step fails and so does its item.
+
 ## What this crate does not do
 
 No DAG scheduling, recipe parsing, or workflow state lives inside kanstack itself — that stays
@@ -308,9 +360,10 @@ entirely in this crate, which (as of v1):
 - persists only its own run state (see "Durable runs"), never kanstack's or the tracker's, and
   never as the source of truth for a lane — a resumed step always asks kanstack about its lane
   first;
-- counts attempts but never retries one, and has no timeout or conditional-branching logic;
+- retries a failed step only within its budget, and has no timeout or conditional-branching logic;
 - does not build a new file-locking system around `owns` — that stays advisory metadata;
-- does not talk to any provider SDK, MCP server, or run as a daemon/network service.
+- does not talk to any provider SDK or MCP server. `serve` is a foreground loop, not a
+  daemon or network service.
 
 Anything beyond this is out of scope for v1 by design — see the main repository's design notes
 for the full non-goals list.
