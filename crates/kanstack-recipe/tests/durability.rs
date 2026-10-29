@@ -9,7 +9,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
-use common::{calls_log, fast_opts, git, init_repo, lane_status, tip, write_fake_kanstack};
+use common::{acquire_lock, calls_log, fast_opts, git, init_repo, lane_status, tip, write_fake_kanstack};
 
 use kanstack_recipe::kanstack::KanstackClient;
 use kanstack_recipe::lock::{LockError, OrchestratorLock};
@@ -281,18 +281,7 @@ fn a_second_orchestrator_is_refused_the_lock() {
     let held = OrchestratorLock::try_acquire(&store).unwrap();
     assert!(matches!(OrchestratorLock::try_acquire(&store), Err(LockError::Held(_))));
     drop(held);
-    // Another test's thread can fork a child while the lock is held here, and that child
-    // shares the locked file until its exec closes it (the fd is close-on-exec), so allow
-    // that moment to pass.
-    let mut reacquired = OrchestratorLock::try_acquire(&store);
-    for _ in 0..100 {
-        if reacquired.is_ok() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        reacquired = OrchestratorLock::try_acquire(&store);
-    }
-    reacquired.expect("dropping the holder releases the lock");
+    acquire_lock(&store); // dropping the holder releases the lock
 }
 
 #[test]

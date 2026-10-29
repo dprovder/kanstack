@@ -14,7 +14,7 @@ use std::process::{Command, ExitCode, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use common::{actions, calls_log, fast_opts, init_repo, write_fake_kanstack};
+use common::{acquire_lock, actions, calls_log, fast_opts, init_repo, write_fake_kanstack};
 
 use kanstack_recipe::kanstack::KanstackClient;
 use kanstack_recipe::lock::OrchestratorLock;
@@ -84,7 +84,7 @@ impl Factory {
     }
 
     fn lock(&self) -> OrchestratorLock {
-        OrchestratorLock::try_acquire(&self.store).unwrap()
+        acquire_lock(&self.store)
     }
 
     /// The one run for `item`.

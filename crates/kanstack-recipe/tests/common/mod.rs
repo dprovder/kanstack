@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use kanstack_recipe::lock::OrchestratorLock;
 use kanstack_recipe::run::RunOptions;
+use kanstack_recipe::state::RunStore;
 
 /// Writes an executable fake `kanstack` into `dir`. Every knob is a file next to it:
 ///
@@ -31,10 +33,14 @@ use kanstack_recipe::run::RunOptions;
 ///   copies the file `snapshot_path` names to `snapshot.N.json`. Once N reaches `commit_at`
 ///   (default 1) it lands the queued commits, one on each branch, unless `no_commits` exists;
 ///   once N reaches `note_at` (default 1) it appends a `kind: "note"` event about each queued
-///   branch to `events.jsonl`, if `notes` exists. Then it prints `status.N.json` if the test
+///   branch to `events.jsonl`, if `notes` exists. Once N reaches `rebase_at`, it rebases every
+///   open lane's branch onto a new commit on `main`, as GitButler's restack does (the same
+///   changes as new commits), just once. Then it prints `status.N.json` if the test
 ///   wrote one, else every lane on pane `%7`: `busy` if `busy` lists it, `dead` (just this
 ///   once) if `die_on_status` lists it, else `idle`.
 /// - `events [--since <offset>]` prints `events.jsonl` from that byte offset, as kanstack does.
+///
+/// Every commit it makes adds a file of its own, so each one has a diff, and a patch id.
 pub fn write_fake_kanstack(dir: &Path) -> PathBuf {
     let script_path = dir.join("kanstack");
     let script = r#"#!/bin/sh
@@ -45,14 +51,41 @@ shift
 flat() { printf '%s' "$*" | tr '\n' ' '; }
 g() { git -C "$(cat "$DIR/repo_path")" -c user.name=t -c user.email=t@t -c commit.gpgsign=false "$@"; }
 
+# Prints a new commit on top of $1 with message $2 that adds a file no other commit has.
+new_commit() {
+  n=$(( $(cat "$DIR/commit_count" 2>/dev/null || echo 0) + 1 ))
+  echo "$n" > "$DIR/commit_count"
+  blob=$(printf '%s\n' "$2 ($n)" | g hash-object -w --stdin)
+  tree=$(
+    export GIT_INDEX_FILE="$DIR/index.tmp"
+    g read-tree "$1" && g update-index --add --cacheinfo "100644,$blob,change-$n.txt" && g write-tree
+    rm -f "$DIR/index.tmp"
+  )
+  g commit-tree -p "$1" -m "$2" "$tree"
+}
+
 # The agent's commit on branch $1.
 commit() {
   if [ -f "$DIR/repo_path" ] && [ ! -f "$DIR/no_commits" ]; then
     if tip=$(g rev-parse --verify --quiet "refs/heads/$1"); then
-      new=$(g commit-tree -p "$tip" -m "work on $1" "$tip^{tree}")
-      g update-ref "refs/heads/$1" "$new"
+      g update-ref "refs/heads/$1" "$(new_commit "$tip" "work on $1")"
     fi
   fi
+}
+
+# Moves main on by a commit, then replays each open lane's own commits onto it.
+rebase_lanes() {
+  up=$(new_commit refs/heads/main "upstream")
+  g update-ref refs/heads/main "$up"
+  [ -f "$DIR/lanes" ] || return 0
+  while IFS= read -r b; do
+    onto="$up"
+    for c in $(g rev-list --reverse "$up..refs/heads/$b"); do
+      tree=$(g merge-tree --write-tree --merge-base="$c^" "$onto" "$c")
+      onto=$(g commit-tree -p "$onto" -m "$(g log -1 --format=%B "$c")" "$tree")
+    done
+    g update-ref "refs/heads/$b" "$onto"
+  done < "$DIR/lanes"
 }
 
 # The agent's `kanstack note` about branch $1.
@@ -158,6 +191,10 @@ case "$cmd" in
     fi
     play pending_commits commit "$n" commit_at
     play pending_notes note "$n" note_at
+    if [ -f "$DIR/rebase_at" ] && [ "$n" -ge "$(cat "$DIR/rebase_at")" ]; then
+      rm "$DIR/rebase_at"
+      rebase_lanes < /dev/null
+    fi
     # A lane stopped from outside the run (`kanstack stop` by hand) isn't reported dead: kanstack
     # forgets it, and it's simply absent from every status after.
     if [ -f "$DIR/vanish_on_status" ] && [ -f "$DIR/lanes" ]; then
@@ -226,12 +263,13 @@ pub fn git(repo: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// Makes `repo` a git repository with one commit on `main`, and points the fake in `bin_dir`
-/// at it.
+/// Makes `repo` a git repository with one commit on `main`, which it names as the workspace's
+/// target the way GitButler does, and points the fake in `bin_dir` at it.
 pub fn init_repo(repo: &Path, bin_dir: &Path) {
     fs::create_dir_all(repo).unwrap();
     git(repo, &["init", "-q", "-b", "main"]);
     git(repo, &["commit", "-q", "--allow-empty", "-m", "base"]);
+    git(repo, &["config", "gitbutler.project.targetref", "refs/heads/main"]);
     fs::write(bin_dir.join("repo_path"), repo.to_str().unwrap()).unwrap();
 }
 
@@ -260,6 +298,21 @@ pub fn actions(dir: &Path) -> Vec<String> {
         .filter(|l| *l != "status" && !l.starts_with("events"))
         .map(String::from)
         .collect()
+}
+
+/// `store`'s orchestrator lock, once nothing else holds it. Another test's thread can fork a
+/// child while a lock is held, and that child shares the locked file until its exec closes it
+/// (the fd is close-on-exec), so a lock just dropped can still read as held for a moment.
+pub fn acquire_lock(store: &RunStore) -> OrchestratorLock {
+    let mut lock = OrchestratorLock::try_acquire(store);
+    for _ in 0..100 {
+        if lock.is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+        lock = OrchestratorLock::try_acquire(store);
+    }
+    lock.expect("nothing else holds the orchestrator lock")
 }
 
 pub fn fast_opts() -> RunOptions {

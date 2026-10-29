@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
-use common::{actions, fast_opts, init_repo, write_fake_kanstack};
+use common::{acquire_lock, actions, fast_opts, init_repo, write_fake_kanstack};
 
 use kanstack_recipe::aggregate::{self, runnable_steps};
 use kanstack_recipe::graph::StepState;
@@ -256,7 +256,7 @@ impl Factory {
 
     /// Ticks `serve` until `item` leaves `running`, then returns its state.
     fn serve_until_settled(&self, item: &ItemId, retries: u32) -> ItemState {
-        let lock = OrchestratorLock::try_acquire(&self.store).unwrap();
+        let lock = acquire_lock(&self.store);
         let mut serve = self.serve(&lock, retries);
         for _ in 0..400 {
             serve.tick();

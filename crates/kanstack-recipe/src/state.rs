@@ -112,6 +112,13 @@ pub struct StepRecord {
     /// so a crash in between still retries the same way.
     #[serde(default)]
     pub retry: Option<Retry>,
+    /// The patch id of every commit on the step's branch when it started, from its merge base
+    /// with the workspace's target up to its tip (see `crate::run`'s "Idle is necessary, not
+    /// sufficient"). A rebase gives those commits new ids but keeps their patch ids, so only a
+    /// commit whose patch id isn't here is new work. `null` in a snapshot from before this, or
+    /// when git couldn't say: then the step falls back to comparing its tip with `base`.
+    #[serde(default)]
+    pub base_patches: Option<Vec<String>>,
 }
 
 /// How a failed attempt is retried.
@@ -150,6 +157,7 @@ impl Default for StepRecord {
             retries: 0,
             retry_budget: 0,
             retry: None,
+            base_patches: None,
         }
     }
 }
@@ -395,7 +403,7 @@ fn repo_state(repo: &Path) -> Option<(PathBuf, u64)> {
     Some((dir, fnv1a(repo.to_string_lossy().as_bytes())))
 }
 
-fn fnv1a(bytes: &[u8]) -> u64 {
+pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf29ce484222325, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x100000001b3))
 }
 
@@ -427,6 +435,7 @@ mod tests {
                 retries: 1,
                 retry_budget: 2,
                 retry: Some(Retry::FixForward { message: "`cargo test` exited 101".to_string() }),
+                base_patches: Some(vec!["0123abcd".to_string()]),
             },
         );
         run.branch_agents.insert("a".to_string(), "codex".to_string());
@@ -460,6 +469,7 @@ mod tests {
         let run: RunState = serde_json::from_str(raw).unwrap();
         assert_eq!((run.steps["a"].report.clone(), run.steps["a"].waiting_on), (None, None));
         assert_eq!((run.steps["a"].retries, run.steps["a"].retry_label()), (0, None));
+        assert_eq!(run.steps["a"].base_patches, None, "falls back to comparing tips with `base`");
         assert!(run.branch_agents.is_empty() && run.branch_prefix.is_empty() && !run.settled);
     }
 

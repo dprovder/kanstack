@@ -184,7 +184,16 @@ reading chat output or any LLM "judge":
 2. poll `kanstack status --json` until that workstream's `status` is `idle`, and not on the
    first read since launch (see below);
 3. check the step's `done_when`:
-   - `commits`: the branch's tip has moved since the step's `base`, its tip when it started;
+   - `commits`: the branch holds a commit it didn't when the step started. A rebase doesn't
+     count: GitButler restacks branches routinely, which moves a tip without anyone committing.
+     So when a step starts, the runner records the patch id (`git patch-id --stable`) of every
+     commit from the branch's merge base with the workspace's target up to its tip
+     (`base_patches`), and the step counts as committed only once that range holds a commit
+     whose patch id isn't among them. The target is git's `gitbutler.project.targetref`
+     (GitButler sets it), else `refs/remotes/origin/HEAD`. A commit with no diff (empty, or a
+     merge) is identified by its author, author date and message instead, which a rebase keeps
+     too. With no target to find, and for runs recorded before patch ids were, it falls back to
+     the branch's tip having moved from `base`, its tip when the step started;
    - `note`: the agent has reported with `kanstack note <branch> "<report>"` since the step
      launched;
    - `either`: one of the two.
@@ -259,7 +268,7 @@ root), mirrored in `src/state.rs`. `state.json` records the recipe's path and ha
 directory `run` was invoked in, each branch's current agent (`branch_agents`), and for each step
 its status (`pending`, `launching`, `running`, `verifying`, `done` or `failed`), `attempt`,
 `branch`, `pane`, `base` and `tip` (its branch's commit when it started and when it finished,
-from git), `started_at`, `last_error`, `notes_from` (the events log's length when it launched),
+from git), `base_patches` (see "Completion model"), `started_at`, `last_error`, `notes_from` (the events log's length when it launched),
 `report` (its agent's note) and `waiting_on` (set while its lane is idle but its `done_when`
 isn't met).
 

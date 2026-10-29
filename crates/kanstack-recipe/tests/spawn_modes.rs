@@ -8,7 +8,7 @@ mod common;
 use std::fs;
 use std::path::PathBuf;
 
-use common::{actions, calls_log, fast_opts, init_repo, tip, write_fake_kanstack};
+use common::{actions, calls_log, fast_opts, git, init_repo, tip, write_fake_kanstack};
 use kanstack_recipe::kanstack::KanstackClient;
 use kanstack_recipe::recipe::{self, DoneWhen, Recipe};
 use kanstack_recipe::run::{resume_run, start_run, RunOutcome};
@@ -297,4 +297,84 @@ fn done_when_either_accepts_a_note_or_commits() {
     assert_eq!((review.status, review.report.as_deref()), (StepStatus::Done, None));
     assert_ne!(review.base, review.tip);
     assert_eq!(lab.status_reads(), 2, "no waiting");
+}
+
+const ONE_COMMITS_STEP: &str = "---\nversion: 1\nsteps:\n  a:\n    agent: codex\n    prompt: Do A\n---\nctx\n";
+
+/// Branch `a` off `main` with one commit of its own on it, as an earlier step would leave it.
+fn branch_with_work(lab: &Lab) -> String {
+    git(&lab.repo, &["checkout", "-q", "-b", "a"]);
+    fs::write(lab.repo.join("earlier.txt"), "earlier work\n").unwrap();
+    git(&lab.repo, &["add", "earlier.txt"]);
+    git(&lab.repo, &["commit", "-q", "-m", "earlier work"]);
+    git(&lab.repo, &["checkout", "-q", "main"]);
+    tip(&lab.repo, "a")
+}
+
+fn contains_commit(lab: &Lab, branch: &str, sha: &str) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(&lab.repo)
+        .args(["merge-base", "--is-ancestor", sha, &format!("refs/heads/{branch}")])
+        .status()
+        .unwrap()
+        .success()
+}
+
+/// GitButler restacks branches routinely, which moves a branch's tip with nothing new on it. A
+/// `commits` step isn't finished by that: it keeps waiting until a commit with a patch id the
+/// branch didn't have when the step started lands.
+#[test]
+fn a_rebase_with_no_new_commit_keeps_a_commits_step_waiting() {
+    let lab = Lab::new();
+    let before = branch_with_work(&lab);
+    lab.knob("rebase_at", "2");
+    lab.knob("commit_at", "4");
+    let (outcome, run) = lab.run(ONE_COMMITS_STEP);
+    assert!(!outcome.failed);
+
+    // Read 2 rebased the branch and was a trusted idle; it didn't count as commits.
+    let a = &lab.snapshot(3).steps["a"];
+    assert_eq!((a.status, a.waiting_on), (StepStatus::Running, Some(DoneWhen::Commits)), "{a:?}");
+    let a = &lab.snapshot(4).steps["a"];
+    assert_eq!((a.status, a.waiting_on), (StepStatus::Running, Some(DoneWhen::Commits)), "still waiting: {a:?}");
+    assert!(!contains_commit(&lab, "a", &before), "the earlier commit was rewritten by the rebase");
+    assert_eq!(lab.status_reads(), 4, "done on the read the real commit landed");
+
+    let a = &run.steps["a"];
+    assert_eq!(a.status, StepStatus::Done);
+    assert_eq!(a.base.as_deref(), Some(before.as_str()));
+    assert_eq!(a.base_patches.as_ref().map(Vec::len), Some(1), "the earlier commit's patch id: {a:?}");
+}
+
+/// A rebase that carries a real new commit along with the old ones finishes the step on the
+/// read it happens.
+#[test]
+fn a_rebase_with_a_new_commit_finishes_a_commits_step() {
+    let lab = Lab::new();
+    let before = branch_with_work(&lab);
+    lab.knob("rebase_at", "2");
+    lab.knob("commit_at", "2");
+    let (outcome, run) = lab.run(ONE_COMMITS_STEP);
+    assert!(!outcome.failed);
+    assert!(!contains_commit(&lab, "a", &before), "the branch was rebased");
+    assert_eq!(lab.status_reads(), 2, "done on the first trusted idle");
+    assert_eq!(run.steps["a"].status, StepStatus::Done);
+}
+
+/// With no workspace target to take a merge base with (and so no patch ids recorded, as in a
+/// run from before them), a step falls back to its tip having moved from its `base`, which a
+/// rebase alone satisfies.
+#[test]
+fn without_patch_ids_a_step_falls_back_to_comparing_tips() {
+    let lab = Lab::new();
+    git(&lab.repo, &["config", "--unset", "gitbutler.project.targetref"]);
+    branch_with_work(&lab);
+    lab.knob("rebase_at", "2");
+    lab.knob("no_commits", "");
+    let (outcome, run) = lab.run(ONE_COMMITS_STEP);
+    assert!(!outcome.failed);
+    assert_eq!(lab.status_reads(), 2);
+    let a = &run.steps["a"];
+    assert_eq!((a.status, a.base_patches.clone()), (StepStatus::Done, None));
 }

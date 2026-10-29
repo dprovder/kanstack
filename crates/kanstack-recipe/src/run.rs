@@ -11,9 +11,18 @@
 //! two runs of one recipe never meet on a lane.
 //!
 //! **Idle is necessary, not sufficient.** A trusted idle only ends a step once its `done_when`
-//! holds: its branch tip moved since its `base` (`commits`), or a `kanstack note` about its
-//! branch arrived in the events log after it launched (`note`), or either. Until then the step
-//! keeps polling with `waiting_on` set, so `runs` shows why it isn't done.
+//! holds: its branch holds a commit it didn't when the step started (`commits`), or a
+//! `kanstack note` about its branch arrived in the events log after it launched (`note`), or
+//! either. Until then the step keeps polling with `waiting_on` set, so `runs` shows why it
+//! isn't done.
+//!
+//! **A rebase isn't new work.** GitButler restacks branches routinely, which moves a branch's
+//! tip without anyone committing, so "the tip moved since the step's `base`" would pass a step
+//! that did nothing. Instead, a step records the patch id (`git patch-id --stable`) of every
+//! commit from its branch's merge base with the workspace's target up to its tip when it starts
+//! ([`StepRecord::base_patches`]), and counts as committed only once that range holds a commit
+//! whose patch id isn't among them. A run recorded before this, with no patch ids, still
+//! compares tips.
 //!
 //! Failure policy: a step whose `verify` commands don't all exit 0, or whose pane dies, is
 //! retried while it has budget left ([`StepRecord::retry_budget`], 0 unless the run was given
@@ -73,7 +82,7 @@ use crate::aggregate::{self, runnable_steps};
 use crate::graph::{resolve_workstream, StepState};
 use crate::kanstack::{KanstackClient, KanstackError, WorkstreamStatus};
 use crate::recipe::{Recipe, SpawnMode, Step};
-use crate::state::{now_secs, Retry, RunState, RunStatus, RunStore, StepRecord, StepStatus};
+use crate::state::{fnv1a, now_secs, Retry, RunState, RunStatus, RunStore, StepRecord, StepStatus};
 
 /// How many consecutive `status --json` failures in a row are tolerated as transient before
 /// every currently-running step is failed. See the module doc.
@@ -453,7 +462,11 @@ impl<'a> Driver<'a> {
         // Record before acting: a launch that couldn't be recorded never happens, and one that
         // was recorded has used up its attempt even if this process dies mid-spawn. A retry
         // keeps the step's base, so the commits its earlier attempts made still count.
-        let base = if retry.is_none() { branch_tip(&run.workdir, branch) } else { run.steps[step_id].base.clone() };
+        let (base, base_patches) = if retry.is_none() {
+            (branch_tip(&run.workdir, branch), branch_patch_ids(&run.workdir, branch))
+        } else {
+            (run.steps[step_id].base.clone(), run.steps[step_id].base_patches.clone())
+        };
         let previous_agent = run.branch_agents.insert(branch.to_string(), step.agent.clone());
         let rec = record(run, step_id);
         rec.status = StepStatus::Launching;
@@ -461,6 +474,7 @@ impl<'a> Driver<'a> {
         rec.branch = Some(branch.to_string());
         rec.pane = None;
         rec.base = base;
+        rec.base_patches = base_patches;
         rec.tip = None;
         rec.started_at = Some(now_secs());
         rec.waiting_on = None;
@@ -487,10 +501,15 @@ impl<'a> Driver<'a> {
                     Some(base) => Some(base.clone()),
                     None => branch_tip(&run.workdir, branch),
                 };
+                let base_patches = match &run.steps[step_id].base_patches {
+                    Some(patches) => Some(patches.clone()),
+                    None => branch_patch_ids(&run.workdir, branch),
+                };
                 let rec = record(run, step_id);
                 rec.status = StepStatus::Running;
                 rec.pane = pane;
                 rec.base = base;
+                rec.base_patches = base_patches;
                 rec.retry = None;
                 self.live.status_reads_since_launch.insert(step_id.to_string(), 0);
                 self.live.backoff.remove(step_id);
@@ -720,10 +739,7 @@ impl<'a> Driver<'a> {
         let rec = &run.steps[step_id];
         let branch = rec.branch.clone().unwrap_or_default();
 
-        // A base of `null` means the branch didn't exist when the step started (or git
-        // couldn't say), so any tip at all is movement.
-        let committed = done_when.allows_commits()
-            && branch_tip(&run.workdir, &branch).is_some_and(|tip| rec.base.as_deref() != Some(tip.as_str()));
+        let committed = done_when.allows_commits() && has_new_commits(&run.workdir, &branch, rec);
         let report = if done_when.allows_note() {
             match self.client.notes_since(rec.notes_from.unwrap_or(0)) {
                 Ok(notes) => notes.into_iter().rfind(|n| n.branch == branch).map(|n| n.text),
@@ -949,6 +965,77 @@ fn branch_tip(workdir: &Path, branch: &str) -> Option<String> {
         .ok()?;
     let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
     (output.status.success() && !sha.is_empty()).then_some(sha)
+}
+
+/// Whether `branch` holds work its step didn't start with: a commit whose patch id isn't in
+/// the step's [`StepRecord::base_patches`], so a rebase alone doesn't count. A step recorded
+/// without patch ids falls back to its tip having moved from `base`, where a `base` of `null`
+/// (the branch didn't exist when the step started, or git couldn't say) makes any tip movement.
+/// A failed read of the patch ids counts as nothing new yet: the next idle read asks again.
+fn has_new_commits(workdir: &Path, branch: &str, rec: &StepRecord) -> bool {
+    match &rec.base_patches {
+        Some(recorded) => branch_patch_ids(workdir, branch).is_some_and(|now| now.iter().any(|id| !recorded.contains(id))),
+        None => branch_tip(workdir, branch).is_some_and(|tip| rec.base.as_deref() != Some(tip.as_str())),
+    }
+}
+
+/// The patch id of every commit on `branch` since its merge base with the workspace's target
+/// ([`workspace_target`]), sorted. A commit with no diff to take a patch id of (an empty or a
+/// merge commit) gets a stand-in id from its author, author date and message instead, which a
+/// rebase keeps too. `None` when the branch doesn't exist, there's no target, or git fails.
+fn branch_patch_ids(workdir: &Path, branch: &str) -> Option<Vec<String>> {
+    let tip = format!("refs/heads/{branch}");
+    let target = workspace_target(workdir)?;
+    let merge_base = git_stdout(workdir, &["merge-base", &target, &tip])?;
+    let range = format!("{}..{tip}", merge_base.trim());
+
+    let log = git_stdout(workdir, &["log", "-p", "--no-color", "--no-ext-diff", "--format=commit %H", &range])?;
+    let patch_ids = git_stdout_with_input(workdir, &["patch-id", "--stable"], log.into_bytes())?;
+    let by_commit: HashMap<&str, &str> = patch_ids.lines().filter_map(|line| line.split_once(' ')).map(|(id, sha)| (sha, id)).collect();
+
+    // One record per commit: its sha, then what identifies it when it has no diff.
+    let commits = git_stdout(workdir, &["log", "--format=%H%x00%an <%ae> %at%x00%B%x1e", &range])?;
+    let mut ids: Vec<String> = commits
+        .split('\x1e')
+        .filter_map(|record| record.trim_start().split_once('\0'))
+        .map(|(sha, identity)| match by_commit.get(sha) {
+            Some(id) => id.to_string(),
+            None => format!("no-diff:{:016x}", fnv1a(identity.as_bytes())),
+        })
+        .collect();
+    ids.sort();
+    Some(ids)
+}
+
+/// The ref GitButler targets in `workdir`'s repository (`gitbutler.project.targetref`, e.g.
+/// `refs/remotes/origin/main`), else `refs/remotes/origin/HEAD`. `None` when neither resolves.
+fn workspace_target(workdir: &Path) -> Option<String> {
+    let configured = git_stdout(workdir, &["config", "--get", "gitbutler.project.targetref"]).map(|s| s.trim().to_string());
+    configured
+        .into_iter()
+        .chain(std::iter::once("refs/remotes/origin/HEAD".to_string()))
+        .find(|target| !target.is_empty() && git_stdout(workdir, &["rev-parse", "--verify", "--quiet", &format!("{target}^{{commit}}")]).is_some())
+}
+
+/// Runs `git <args>` in `workdir` and returns its stdout, or `None` if it fails.
+fn git_stdout(workdir: &Path, args: &[&str]) -> Option<String> {
+    git_stdout_with_input(workdir, args, Vec::new())
+}
+
+/// [`git_stdout`], with `input` on git's stdin, written from a thread of its own so a large
+/// input can't deadlock against git's output.
+fn git_stdout_with_input(workdir: &Path, args: &[&str], input: Vec<u8>) -> Option<String> {
+    use std::io::Write;
+    let mut command = Command::new("git");
+    if !workdir.as_os_str().is_empty() {
+        command.arg("-C").arg(workdir);
+    }
+    let mut child = command.args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+    let mut stdin = child.stdin.take()?;
+    let writer = thread::spawn(move || stdin.write_all(&input));
+    let output = child.wait_with_output().ok()?;
+    let _ = writer.join();
+    output.status.success().then(|| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 #[cfg(test)]
