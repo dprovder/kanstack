@@ -6,9 +6,9 @@ use std::io;
 use std::path::PathBuf;
 
 use crate::kanstack::KanstackClient;
-use crate::recipe::{self, RecipeError};
+use crate::recipe::{self, Recipe, RecipeError};
 use crate::run::{resume_run, RunOptions, RunOutcome};
-use crate::state::{recipe_hash, RunStatus, RunStore};
+use crate::state::{recipe_hash, RunState, RunStatus, RunStore};
 
 #[derive(Debug)]
 pub enum ResumeError {
@@ -43,6 +43,14 @@ impl std::error::Error for ResumeError {}
 /// Resumes the run `run_id` in `store`. With `force`, a changed recipe is resumed anyway and
 /// its new hash recorded, so the next resume doesn't need forcing again.
 pub fn resume(store: &RunStore, client: &KanstackClient, opts: &RunOptions, run_id: &str, force: bool) -> Result<RunOutcome, ResumeError> {
+    let (recipe, mut run) = load_for_resume(store, run_id, force)?;
+    Ok(resume_run(&recipe, client, opts, store, &mut run))
+}
+
+/// Everything [`resume`] checks before it drives the run: the run `run_id` in `store`, still
+/// unfinished, and its recipe, unchanged since it started (or, with `force`, changed and its
+/// new hash saved). `serve` drives what this returns a tick at a time instead.
+pub fn load_for_resume(store: &RunStore, run_id: &str, force: bool) -> Result<(Recipe, RunState), ResumeError> {
     let mut run = store.load(run_id).map_err(ResumeError::State)?;
     if run.status != RunStatus::Running {
         return Err(ResumeError::Finished(run.status));
@@ -59,8 +67,7 @@ pub fn resume(store: &RunStore, client: &KanstackClient, opts: &RunOptions, run_
     }
     let recipe = recipe::parse(&source).map_err(ResumeError::Recipe)?;
     store.save(&run).map_err(ResumeError::State)?;
-
-    Ok(resume_run(&recipe, client, opts, store, &mut run))
+    Ok((recipe, run))
 }
 
 /// The ids of every run not known to be finished, oldest first. A run whose state can't be

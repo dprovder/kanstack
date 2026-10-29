@@ -22,7 +22,9 @@ use kanstack_recipe::run::RunOptions;
 ///   opens a lane (a line in `lanes`) and queues the agent's turn: its commit (a line in
 ///   `pending_commits`) and its note (a line in `pending_notes`).
 ///   `crash_before_spawn`/`crash_after_spawn` are removed and the caller is killed with
-///   `kill -9`, before or after the lane comes up.
+///   `kill -9`, before or after the lane comes up; one that names a branch only fires for it.
+/// - `spawn` and `send` fail in transport (`multiplexer_unavailable`, exit 5) while
+///   `fail_transport_remaining` counts down.
 /// - `send <branch>` queues the agent's turn; `stop <branch>` closes the lane, or fails with
 ///   `unknown_workstream` when there's none.
 /// - The Nth `status` call fails while `status_fail_remaining` counts down. Otherwise it first
@@ -30,7 +32,8 @@ use kanstack_recipe::run::RunOptions;
 ///   (default 1) it lands the queued commits, one on each branch, unless `no_commits` exists;
 ///   once N reaches `note_at` (default 1) it appends a `kind: "note"` event about each queued
 ///   branch to `events.jsonl`, if `notes` exists. Then it prints `status.N.json` if the test
-///   wrote one, else every lane `idle` on pane `%7`.
+///   wrote one, else every lane on pane `%7`: `busy` if `busy` lists it, `dead` (just this
+///   once) if `die_on_status` lists it, else `idle`.
 /// - `events [--since <offset>]` prints `events.jsonl` from that byte offset, as kanstack does.
 pub fn write_fake_kanstack(dir: &Path) -> PathBuf {
     let script_path = dir.join("kanstack");
@@ -72,6 +75,21 @@ queue() {
   echo "$1" >> "$DIR/pending_notes"
 }
 
+# Fails this spawn/send in transport while `fail_transport_remaining` counts down.
+transport() {
+  remaining=$(cat "$DIR/fail_transport_remaining" 2>/dev/null || echo 0)
+  if [ "$remaining" -gt 0 ]; then
+    echo $((remaining - 1)) > "$DIR/fail_transport_remaining"
+    printf '{"schema":1,"ok":false,"command":"%s","error":{"code":"multiplexer_unavailable","message":"forced transport failure for test"}}\n' "$1"
+    exit 5
+  fi
+}
+
+# Whether crash knob $1 is set for branch $2: present, and empty or naming it.
+crash_for() {
+  [ -f "$DIR/$1" ] && { [ ! -s "$DIR/$1" ] || [ "$(cat "$DIR/$1")" = "$2" ]; }
+}
+
 case "$cmd" in
   spawn)
     branch="$1"
@@ -85,11 +103,12 @@ case "$cmd" in
       esac
       shift
     done
+    transport spawn
     if [ "$(cat "$DIR/fail_spawn_branch" 2>/dev/null)" = "$branch" ] || grep -qx "$branch" "$DIR/lanes" 2>/dev/null; then
       printf '{"schema":1,"ok":false,"command":"spawn","error":{"code":"workstream_exists","message":"a lane is already open on %s"}}\n' "$branch"
       exit 4
     fi
-    if [ -f "$DIR/crash_before_spawn" ]; then
+    if crash_for crash_before_spawn "$branch"; then
       rm "$DIR/crash_before_spawn"
       kill -9 "$PPID"
       exit 1
@@ -101,7 +120,7 @@ case "$cmd" in
     fi
     echo "$branch" >> "$DIR/lanes"
     queue "$branch"
-    if [ -f "$DIR/crash_after_spawn" ]; then
+    if crash_for crash_after_spawn "$branch"; then
       rm "$DIR/crash_after_spawn"
       kill -9 "$PPID"
       exit 1
@@ -110,6 +129,7 @@ case "$cmd" in
     ;;
   send)
     echo "send $(flat "$*")" >> "$DIR/calls.log"
+    transport send
     queue "$1"
     printf '{"schema":1,"ok":true,"command":"send","workstream":"%s","result":{"pane":"%%7"}}\n' "$1"
     ;;
@@ -148,7 +168,14 @@ case "$cmd" in
       while IFS= read -r b; do
         if [ "$first" != "1" ]; then printf ','; fi
         first=0
-        printf '{"branch":"%s","pane":"%%7","agent":"codex","item":null,"status":"idle","lane":null}' "$b"
+        st=idle
+        if grep -qx "$b" "$DIR/busy" 2>/dev/null; then st=busy; fi
+        if grep -qx "$b" "$DIR/die_on_status" 2>/dev/null; then
+          st=dead
+          grep -vx "$b" "$DIR/die_on_status" > "$DIR/die_on_status.tmp"
+          mv "$DIR/die_on_status.tmp" "$DIR/die_on_status"
+        fi
+        printf '{"branch":"%s","pane":"%%7","agent":"codex","item":null,"status":"%s","lane":null}' "$b" "$st"
       done < "$DIR/lanes"
     fi
     printf '],"workspace":null,"workspace_blocked":null}\n'
@@ -231,5 +258,6 @@ pub fn actions(dir: &Path) -> Vec<String> {
 pub fn fast_opts() -> RunOptions {
     RunOptions {
         poll_interval: Duration::from_millis(5),
+        ..RunOptions::default()
     }
 }

@@ -11,7 +11,7 @@
 //! on each one: temp file, fsync, rename, fsync the directory ([`write_atomically`]). A reader
 //! therefore only ever sees the old snapshot or the new one, never half of either.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -76,8 +76,8 @@ impl StepStatus {
 /// started and when it finished, read from git; either is `null` when the branch didn't exist
 /// yet (or git couldn't be asked).
 ///
-/// The fields after `last_error` came with `done_when` and default to `null` in a snapshot
-/// written before it.
+/// The fields after `last_error` came with `done_when` and retries, and default to `null` or
+/// `0` in a snapshot written before them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepRecord {
     pub status: StepStatus,
@@ -100,6 +100,37 @@ pub struct StepRecord {
     /// isn't done.
     #[serde(default)]
     pub waiting_on: Option<DoneWhen>,
+    /// How many of `retry_budget` this step has used: failed attempts that were retried.
+    /// Transport errors (a `spawn` or `send` that didn't go through) never count.
+    #[serde(default)]
+    pub retries: u32,
+    /// How many retries the step gets, resolved when the run started (see
+    /// [`crate::recipe::RetryBudgets`]). `0` for a run started without a budget.
+    #[serde(default)]
+    pub retry_budget: u32,
+    /// Set while a retry is decided but not launched yet: how the next launch goes. Persisted
+    /// so a crash in between still retries the same way.
+    #[serde(default)]
+    pub retry: Option<Retry>,
+}
+
+/// How a failed attempt is retried.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Retry {
+    /// `verify` failed: send `message` (the failing command and its output's tail) into the
+    /// step's pane, so the agent fixes forward with its context intact.
+    FixForward { message: String },
+    /// The pane died or was gone: respawn the step's agent on its branch, with its prompt
+    /// followed by `note`.
+    Respawn { note: String },
+}
+
+impl StepRecord {
+    /// `retried 1/2`, once the step has a budget or has used any of it.
+    pub fn retry_label(&self) -> Option<String> {
+        (self.retries > 0 || self.retry_budget > 0).then(|| format!("retried {}/{}", self.retries, self.retry_budget))
+    }
 }
 
 impl Default for StepRecord {
@@ -116,6 +147,9 @@ impl Default for StepRecord {
             notes_from: None,
             report: None,
             waiting_on: None,
+            retries: 0,
+            retry_budget: 0,
+            retry: None,
         }
     }
 }
@@ -144,7 +178,7 @@ impl RunStatus {
 pub struct RunState {
     pub version: u32,
     pub id: String,
-    /// The tracker item this run works on. Always `null` until the tracker is wired in.
+    /// The tracker item this run works on: set by `serve`, `null` for a `run` of a recipe file.
     pub item: Option<String>,
     /// The recipe's name: its file stem.
     pub recipe: String,
@@ -163,6 +197,17 @@ pub struct RunState {
     /// pane when it's the same.
     #[serde(default)]
     pub branch_agents: BTreeMap<String, String>,
+    /// Put in front of every branch the run's steps resolve to, so two items running the same
+    /// recipe never share a lane. `serve` sets it per item; empty for a plain `run`.
+    #[serde(default)]
+    pub branch_prefix: String,
+    /// The steps whose outcome has been posted to the run's item, so a restarted `serve`
+    /// posts each one once.
+    #[serde(default)]
+    pub reported: BTreeSet<String>,
+    /// The run has ended and its item's state has been set to match.
+    #[serde(default)]
+    pub settled: bool,
 }
 
 impl RunState {
@@ -179,6 +224,9 @@ impl RunState {
             status: RunStatus::Running,
             steps: recipe.steps.keys().map(|id| (id.clone(), StepRecord::default())).collect(),
             branch_agents: BTreeMap::new(),
+            branch_prefix: String::new(),
+            reported: BTreeSet::new(),
+            settled: false,
         }
     }
 
@@ -362,6 +410,9 @@ mod tests {
                 notes_from: Some(512),
                 report: Some("added the land endpoint".to_string()),
                 waiting_on: None,
+                retries: 1,
+                retry_budget: 2,
+                retry: Some(Retry::FixForward { message: "`cargo test` exited 101".to_string() }),
             },
         );
         run.branch_agents.insert("a".to_string(), "codex".to_string());
@@ -382,6 +433,8 @@ mod tests {
         let raw = fs::read_to_string(store.state_path("100-land")).unwrap();
         assert!(raw.contains(r#""status": "done""#), "{raw}");
         assert!(raw.contains(r#""status": "pending""#), "{raw}");
+        assert!(raw.contains(r#""kind": "fix_forward""#), "{raw}");
+        assert_eq!(run.steps["a"].retry_label().as_deref(), Some("retried 1/2"));
         assert!(!tmp.path().join("runs/100-land/.state.json.tmp").exists(), "the temp file is renamed away");
     }
 
@@ -392,7 +445,8 @@ mod tests {
             "steps":{"a":{"status":"running","attempt":1,"branch":"a","pane":"%1","base":null,"tip":null,"started_at":1,"last_error":null}}}"#;
         let run: RunState = serde_json::from_str(raw).unwrap();
         assert_eq!((run.steps["a"].report.clone(), run.steps["a"].waiting_on), (None, None));
-        assert!(run.branch_agents.is_empty());
+        assert_eq!((run.steps["a"].retries, run.steps["a"].retry_label()), (0, None));
+        assert!(run.branch_agents.is_empty() && run.branch_prefix.is_empty() && !run.settled);
     }
 
     #[test]

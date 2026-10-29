@@ -261,6 +261,7 @@ impl std::error::Error for RecipeError {}
 #[derive(Debug, Deserialize)]
 struct RawFrontMatter {
     version: u64,
+    retries: Option<u32>,
     #[serde(default)]
     steps: BTreeMap<String, RawStep>,
 }
@@ -280,6 +281,36 @@ struct RawStep {
     verify: Vec<String>,
     spawn: Option<String>,
     done_when: Option<String>,
+    retries: Option<u32>,
+}
+
+/// A recipe's `retries:`, recipe-wide and per step, read by [`parse_retries`]. Held beside
+/// [`Recipe`] rather than in it: a run resolves every step's budget once, when it starts, and
+/// keeps it in its own state (`StepRecord::retry_budget`), so the engine never needs it here.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetryBudgets {
+    pub recipe: Option<u32>,
+    pub steps: BTreeMap<String, u32>,
+}
+
+impl RetryBudgets {
+    /// How many retries `step_id` gets: its own `retries:`, else the recipe's, else `default`
+    /// (which `serve` takes from `KANSTACK_RETRIES`).
+    pub fn budget(&self, step_id: &str, default: u32) -> u32 {
+        self.steps.get(step_id).copied().or(self.recipe).unwrap_or(default)
+    }
+}
+
+/// The `retries:` in `input`'s front matter. Fails exactly when [`parse`] would fail to read
+/// the front matter, so a caller that already parsed the recipe can rely on it.
+pub fn parse_retries(input: &str) -> Result<RetryBudgets, RecipeError> {
+    let (yaml, _) = split_front_matter(input)?;
+    let raw: RawFrontMatter = serde_yaml::from_str(yaml)
+        .map_err(|e| RecipeError::Malformed(format!("invalid YAML front matter: {e}")))?;
+    Ok(RetryBudgets {
+        recipe: raw.retries,
+        steps: raw.steps.into_iter().filter_map(|(id, step)| Some((id, step.retries?))).collect(),
+    })
 }
 
 pub fn parse(input: &str) -> Result<Recipe, RecipeError> {
@@ -606,6 +637,18 @@ mod tests {
         assert_eq!(review.on.as_deref(), Some("implement"));
         assert_eq!(review.owns, vec!["src/**".to_string()]);
         assert_eq!(review.verify, vec!["cargo test".to_string()]);
+    }
+
+    #[test]
+    fn retries_fall_back_from_step_to_recipe_to_the_default() {
+        let source = "---\nversion: 1\nretries: 1\nsteps:\n  a:\n    agent: codex\n    retries: 4\n    prompt: A\n  b:\n    agent: codex\n    prompt: B\n---\n";
+        parse(source).unwrap();
+        let budgets = parse_retries(source).unwrap();
+        assert_eq!((budgets.budget("a", 2), budgets.budget("b", 2)), (4, 1));
+
+        let budgets = parse_retries("---\nversion: 1\nsteps:\n  a:\n    agent: codex\n    prompt: A\n---\n").unwrap();
+        assert_eq!(budgets.budget("a", 2), 2);
+        assert!(parse("---\nversion: 1\nsteps:\n  a:\n    agent: codex\n    retries: -1\n    prompt: A\n---\n").is_err());
     }
 
     #[test]
