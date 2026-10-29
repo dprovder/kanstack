@@ -39,7 +39,7 @@ use crate::lock::OrchestratorLock;
 use crate::recipe;
 use crate::resume::{load_for_resume, unfinished_runs};
 use crate::run::{ActiveRun, RunOptions};
-use crate::state::{recipe_hash, RunState, RunStatus, RunStore, StepRecord, StepStatus};
+use crate::state::{recipe_hash, RunState, RunStatus, RunStore, StepRecord, StepStatus, WorkItem};
 
 /// The retry budget when neither `KANSTACK_RETRIES` nor the recipe sets one.
 pub const DEFAULT_RETRIES: u32 = 2;
@@ -301,6 +301,7 @@ impl<'a> Serve<'a> {
         let mut run = RunState::new(self.store.new_run_id(&stem), &parsed, &path, recipe_hash(&source), self.repo.clone());
         run.item = Some(item.id.0.clone());
         run.branch_prefix = branch_prefix(&item.id);
+        run.work_item = Some(WorkItem { title: item.title.clone(), body: item.body.clone() });
         for (step_id, rec) in &mut run.steps {
             rec.retry_budget = budgets.budget(step_id, self.opts.retries);
         }

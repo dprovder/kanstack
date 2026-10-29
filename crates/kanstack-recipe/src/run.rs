@@ -417,7 +417,7 @@ impl<'a> Driver<'a> {
         let retry = run.steps[step_id].retry.clone();
         let (plan, prompt) = match &retry {
             None => (self.plan_launch(run, step_id, branch), aggregate::launch_prompt(self.recipe, run, step_id, branch)),
-            Some(Retry::FixForward { message }) => (Ok(Launch::Continue), message.clone()),
+            Some(Retry::FixForward { message }) => (Ok(Launch::Continue), aggregate::with_work_item(run, message.clone())),
             Some(Retry::Respawn { note }) => (Ok(Launch::Handoff), format!("{}\n\n{note}", aggregate::launch_prompt(self.recipe, run, step_id, branch))),
         };
 

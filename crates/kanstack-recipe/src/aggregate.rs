@@ -34,12 +34,25 @@ pub fn runnable_steps(recipe: &Recipe, states: &HashMap<String, StepState>) -> V
 }
 
 /// What reaches the harness for `step_id` on `branch`: [`Recipe::launch_prompt`], except for
-/// the aggregate step, whose effective prompt is followed by [`outcomes_block`].
+/// the aggregate step, whose effective prompt is followed by [`outcomes_block`]. Either way,
+/// behind the run's item block when it has one ([`with_work_item`]).
 pub fn launch_prompt(recipe: &Recipe, run: &RunState, step_id: &str, branch: &str) -> String {
-    if recipe.aggregate.as_deref() != Some(step_id) {
-        return recipe.launch_prompt(step_id, branch);
-    }
-    format!("{}\n\n{}", recipe.effective_prompt(step_id), outcomes_block(recipe, run, branch))
+    let prompt = if recipe.aggregate.as_deref() != Some(step_id) {
+        recipe.launch_prompt(step_id, branch)
+    } else {
+        format!("{}\n\n{}", recipe.effective_prompt(step_id), outcomes_block(recipe, run, branch))
+    };
+    with_work_item(run, prompt)
+}
+
+/// `prompt`, preceded by `## Work item #<id>: <title>` and the item's body when the run works
+/// on an item, so the agent knows what the work is. A plain `run` has no item, and its
+/// prompts are left as they are.
+pub fn with_work_item(run: &RunState, prompt: String) -> String {
+    let (Some(id), Some(item)) = (&run.item, &run.work_item) else { return prompt };
+    let body = item.body.trim();
+    let block = if body.is_empty() { format!("## Work item #{id}: {}", item.title) } else { format!("## Work item #{id}: {}\n\n{body}", item.title) };
+    format!("{block}\n\n{prompt}")
 }
 
 /// Every step's outcome but the aggregate's, then what to do with them: propose follow-ups

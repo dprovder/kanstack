@@ -224,6 +224,79 @@ fn a_step_out_of_retries_fails_its_item_and_leaves_the_others_alone() {
     assert!(body.contains("### a: failed (retried 1/1)") && body.contains("out of retries"), "{body}");
 }
 
+/// The `--prompt` a logged `spawn` call carried (newlines flattened to spaces by the stand-in).
+fn spawn_prompt(call: &str) -> &str {
+    let start = call.find(" --prompt ").unwrap_or_else(|| panic!("no --prompt in {call}")) + " --prompt ".len();
+    call[start..].strip_suffix(" --json").unwrap_or(&call[start..])
+}
+
+/// The message a logged `send <branch> <message> --json` call carried.
+fn send_message<'c>(call: &'c str, branch: &str) -> &'c str {
+    let rest = call.strip_prefix(&format!("send {branch} ")).unwrap_or_else(|| panic!("not a send to {branch}: {call}"));
+    rest.strip_suffix(" --json").unwrap_or(rest)
+}
+
+#[test]
+fn every_launch_starts_with_the_work_item_first_launch_and_fix_forward_retry() {
+    let f = Factory::new();
+    f.recipe(
+        "check",
+        "---\nversion: 1\nsteps:\n  a:\n    agent: codex\n    prompt: Do A\n    verify:\n      - \"[ -f fixed ] || { echo 'assertion failed: widget'; touch fixed; exit 1; }\"\n---\nctx\n",
+    );
+    let id = f.item("Widget", Some("check"));
+    let lock = f.lock();
+    let mut serve = f.serve(&lock, 1, 2);
+
+    tick_until(&mut serve, || f.get(&id).state == ItemState::Review);
+
+    let calls = actions(&f.bin_dir);
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    let block = "## Work item #1: Widget  Widget, please.  ";
+    let first = spawn_prompt(&calls[0]);
+    assert!(first.starts_with(&format!("{block}Do A  ## Recipe context")), "first launch: {first}");
+    let retry = send_message(&calls[1], "item-1-a");
+    assert!(retry.starts_with(block) && retry.contains("assertion failed: widget"), "fix-forward retry: {retry}");
+
+    let work_item = f.run_for(&id).work_item.expect("captured when the run started");
+    assert_eq!((work_item.title.as_str(), work_item.body.as_str()), ("Widget", "Widget, please.\n"));
+}
+
+#[test]
+fn a_respawn_carries_the_work_item_as_it_was_when_the_run_started() {
+    let f = Factory::new();
+    f.recipe("one", ONE_STEP);
+    let id = f.item("Fragile", Some("one"));
+    f.knob("die_on_status", "item-1-a\n");
+    let lock = f.lock();
+    let mut serve = f.serve(&lock, 1, 2);
+
+    tick_until(&mut serve, || f.get(&id).state == ItemState::Review);
+
+    let calls = actions(&f.bin_dir);
+    assert_eq!(calls.len(), 3, "{calls:?}");
+    let respawn = spawn_prompt(&calls[2]);
+    assert!(respawn.starts_with("## Work item #1: Fragile  Fragile, please.  Do A"), "{respawn}");
+    assert!(respawn.contains("ended before it was finished"), "{respawn}");
+    // By the respawn the local item's body has the retry comment appended; the run's copy
+    // from when it started is what the agent gets.
+    assert!(f.get(&id).body.contains("### a: retrying"), "{}", f.get(&id).body);
+    assert!(!respawn.contains("retrying"), "the item's later edits stay out: {respawn}");
+}
+
+#[test]
+fn a_plain_run_has_no_work_item_block() {
+    let f = Factory::new();
+    let recipe = kanstack_recipe::recipe::parse(ONE_STEP).unwrap();
+    let path = f.workdir.join("one.md");
+    fs::write(&path, ONE_STEP).unwrap();
+    let mut run = RunState::new("r1", &recipe, &path, String::new(), f.workdir.clone());
+    run.item = Some("1".to_string());
+    assert_eq!(kanstack_recipe::aggregate::launch_prompt(&recipe, &run, "a", "a"), recipe.launch_prompt("a", "a"), "no captured item, no block");
+    run.item = None;
+    run.work_item = Some(kanstack_recipe::state::WorkItem { title: "T".to_string(), body: "B".to_string() });
+    assert_eq!(kanstack_recipe::aggregate::launch_prompt(&recipe, &run, "a", "a"), recipe.launch_prompt("a", "a"), "no item, no block");
+}
+
 #[test]
 fn a_dead_pane_is_respawned_on_the_same_branch() {
     let f = Factory::new();

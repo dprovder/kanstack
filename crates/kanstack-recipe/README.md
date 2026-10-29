@@ -356,6 +356,21 @@ An item's `recipe` is a path when it contains `/` or ends in `.md`; otherwise it
 reason as a comment. Each item's branches are prefixed `item-<id>-`, so two items running one
 recipe never share a lane.
 
+**What the agents are told.** Every prompt an item's run sends — each step's first launch, a
+retry's message, a respawn and the aggregate step's prompt — starts with the item:
+
+```text
+## Work item #<id>: <title>
+
+<body>
+
+<the step's launch prompt>
+```
+
+The title and body are copied into run state (`work_item`) when the run starts, so a resumed
+run tells its agents the same thing even if the issue was edited since. A plain `run` has no
+item, and its prompts are unchanged.
+
 **Retries.** `serve` retries a failed step up to `KANSTACK_RETRIES` times (default 2; a plain
 `run` defaults to 0), overridable with `retries:`. A failed verify goes back into the same pane
 with the failing command and the tail of its output, so the agent fixes forward; a dead, pane-less

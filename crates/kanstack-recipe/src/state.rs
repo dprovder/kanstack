@@ -208,6 +208,19 @@ pub struct RunState {
     /// The run has ended and its item's state has been set to match.
     #[serde(default)]
     pub settled: bool,
+    /// The item's title and body as they were when the run started: every launch prompt
+    /// starts with them (see [`crate::aggregate::with_work_item`]), and a resume uses this
+    /// copy, so editing the issue later doesn't change what the agents are told. `null` for a
+    /// plain `run`, and for a run started before it was recorded.
+    #[serde(default)]
+    pub work_item: Option<WorkItem>,
+}
+
+/// What a run's agents are told about its item: a copy taken when the run started.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkItem {
+    pub title: String,
+    pub body: String,
 }
 
 impl RunState {
@@ -227,6 +240,7 @@ impl RunState {
             branch_prefix: String::new(),
             reported: BTreeSet::new(),
             settled: false,
+            work_item: None,
         }
     }
 

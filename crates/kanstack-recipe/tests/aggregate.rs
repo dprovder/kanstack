@@ -186,6 +186,17 @@ fn other_steps_prompts_are_left_alone() {
     }
 }
 
+#[test]
+fn the_aggregate_prompt_starts_with_the_work_item() {
+    let recipe = recipe();
+    let mut run = finished_run(&recipe, Some("44"));
+    run.work_item = Some(kanstack_recipe::state::WorkItem { title: "Land from the board".to_string(), body: "Add an L key.\n".to_string() });
+    let prompt = launch_prompt(&recipe, &run, "followups", "item-44-followups");
+    let block = "## Work item #44: Land from the board\n\nAdd an L key.\n\n";
+    assert!(prompt.starts_with(&format!("{block}{}", recipe.effective_prompt("followups"))), "{prompt}");
+    assert!(prompt.contains("## How the run went"), "{prompt}");
+}
+
 /// A scratch factory, like `tests/serve.rs`'s: the stand-in kanstack, a git repository with
 /// recipes in `.kanstack/recipes/`, a local tracker and a run store.
 struct Factory {
@@ -261,9 +272,9 @@ fn serve_spawns_the_aggregate_last_as_advisory_with_the_runs_outcomes() {
 
     let calls = actions(&f.bin_dir);
     assert_eq!(calls.len(), 2, "{calls:?}");
-    assert!(calls[0].starts_with("spawn item-1-implement --agent codex --prompt Implement"), "{calls:?}");
+    assert!(calls[0].starts_with("spawn item-1-implement --agent codex --prompt ## Work item #1: Widget  Widget, please.  Implement"), "{calls:?}");
     let last = &calls[1];
-    assert!(last.starts_with("spawn item-1-followups --agent claude --advisory --prompt Propose follow-ups."), "{last}");
+    assert!(last.starts_with("spawn item-1-followups --agent claude --advisory --prompt ## Work item #1: Widget  Widget, please.  Propose follow-ups."), "{last}");
     assert!(last.contains("### implement: done"), "{last}");
     assert!(last.contains("Its report:  report from item-1-implement"), "{last}");
     assert!(last.contains("Commits `") && last.contains("` on `item-1-implement`."), "{last}");
