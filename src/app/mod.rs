@@ -36,6 +36,7 @@ mod commit;
 mod delete;
 mod diff;
 mod drawer;
+mod issues;
 mod moving;
 mod pr;
 mod push_land;
@@ -50,6 +51,7 @@ mod undo;
 // file — `ui`, `snapshot`, `tutorial` and the integration tests all reach them that way.
 pub use branch_modal::{BranchModalRow, BranchUi};
 pub use drawer::BranchPreview;
+pub use issues::{item_branch_prefix, item_label, DraftRow, Issues, OpenTracker, UnassignedView};
 pub use pr::{PendingPr, PrModalRow};
 pub use push_land::PendingLand;
 pub use resolve::ResolveView;
@@ -136,6 +138,11 @@ pub enum Mode {
     /// `app::asks`. Jumping to a lane or answering its ask inline both happen from here;
     /// nothing on the board is interpreted or acted on beyond that one `answer`.
     Asks,
+    /// Drafting a new issue for the tracker (`n` in the issues view): title, body, recipe.
+    /// Nothing reaches the tracker until it's saved — see `app::issues`.
+    IssueDraft,
+    /// Reading one issue's body and reports (`⏎` in the issues view), scrollable.
+    IssueDetail,
     /// The workspace is broken in the one way that stops `but` answering anything at all
     /// (see [`crate::but::is_workspace_block`]). Every key is swallowed except the two
     /// recoveries and quit — the board behind this is a snapshot of a repository that has
@@ -312,11 +319,18 @@ pub struct App {
     /// A watcher-driven refresh running on a background thread, so a file save elsewhere
     /// never blocks navigation while it's picked up. See `begin_background_refresh`.
     background_refresh: Option<PendingRefresh>,
-    /// Whether the unassigned lane's cards are grouped by directory. GitHub issue #6: a
-    /// flat list of loose files stops being navigable by eye once there are a lot of them.
-    /// Toggled with `tab` while that lane is selected; reapplied in `clamp` so it survives
-    /// every refresh rather than resetting the moment the board rebuilds.
+    /// Which view the unassigned lane shows: its files flat, its files by folder, or the
+    /// tracker's issues. Cycled with `tab` while that lane is selected — see
+    /// `App::cycle_unassigned_view`.
+    pub unassigned_view: UnassignedView,
+    /// Whether the unassigned lane's cards are grouped by directory (GitHub issue #6: a flat
+    /// list of loose files stops being navigable by eye once there are a lot of them).
+    /// Always `unassigned_view == Folders`, set only through `set_unassigned_view`; kept as
+    /// its own field because `clamp` reapplies it after every refresh, and the live tests
+    /// read it.
     pub unassigned_grouped_by_folder: bool,
+    /// The issues view's list, cursor, draft and in-flight tracker calls. See `app::issues`.
+    pub issues: Issues,
     /// The terminal's width as of the last frame drawn, kept here (not just in `ui`) so
     /// `Shift+←/→` paging knows how many lanes are actually on screen. `ui::draw` never
     /// mutates `App` — this is set from `main`'s event loop instead, right after each
@@ -474,6 +488,8 @@ impl App {
             ));
         }
         let repo = Some(but.cwd().to_path_buf());
+        let tracker_repo = but.cwd().to_path_buf();
+        let open_tracker: OpenTracker = Arc::new(move || kanstack_tracker::select(&tracker_repo));
         Ok(App {
             but: Some(Arc::new(but)),
             splitter,
@@ -532,7 +548,9 @@ impl App {
             tutorial: None,
             board_generation: 0,
             background_refresh: None,
+            unassigned_view: UnassignedView::Flat,
             unassigned_grouped_by_folder: false,
+            issues: Issues::new(Some(open_tracker)),
             terminal_width: 80,
             selected: HashSet::new(),
             split_poll: None,
@@ -603,7 +621,9 @@ impl App {
             tutorial: None,
             board_generation: 0,
             background_refresh: None,
+            unassigned_view: UnassignedView::Flat,
             unassigned_grouped_by_folder: false,
+            issues: Issues::new(None),
             terminal_width: 80,
             selected: HashSet::new(),
             split_poll: None,
@@ -725,7 +745,7 @@ impl App {
     /// Moves a branch's pane to sit with its new stack siblings when `but status` says it
     /// just joined one — see `Splitter::restack_moved_branches`. Called from `refresh` and
     /// `refresh_quietly`, the two places a fresh `WorkspaceStatus` reflects the world having
-    /// actually changed (not `toggle_unassigned_grouping`, which re-fetches status only to
+    /// actually changed (not `cycle_unassigned_view`, which re-fetches status only to
     /// rebuild the board under an unrelated display preference — moving someone's pane as a
     /// side effect of that would be a surprise, not a service). Best-effort: a multiplexer
     /// that can't be reached or refuses the move is no worse than today's behavior, so this
@@ -896,6 +916,9 @@ impl App {
     /// Non-blocking check on a background refresh started by `begin_background_refresh`.
     /// Call this every tick of the event loop, the same as `poll_land`.
     pub fn poll_background_refresh(&mut self) {
+        // The issues view's tracker calls ride along on this tick rather than taking a line
+        // of their own in `main`'s loop; `poll_issues` never waits either.
+        self.poll_issues();
         let Some(pending) = &self.background_refresh else {
             return;
         };
@@ -1037,52 +1060,6 @@ impl App {
         }
     }
 
-    /// Toggles whether the unassigned lane's cards are grouped by directory (GitHub issue
-    /// #6: a flat list of loose files stops being navigable by eye once there are a lot of
-    /// them). Scoped to that lane on purpose — `tab` does nothing anywhere else in Normal
-    /// mode today, and toggling a view option for a lane you are not looking at would be a
-    /// surprising thing for a key to do.
-    ///
-    /// Re-fetches rather than un-sorting the in-memory board in place: sorting is
-    /// destructive to the original order, so turning grouping back off needs a real source
-    /// of truth to restore from, not just an inverse of `group_unassigned_by_folder`.
-    fn toggle_unassigned_grouping(&mut self) {
-        let on_unassigned = self
-            .board
-            .columns
-            .get(self.col)
-            .is_some_and(|c| c.kind == crate::board::ColumnKind::Unassigned);
-        if !on_unassigned {
-            self.notify(
-                "tab groups the unassigned lane by folder — select it first",
-                Notice::Info,
-            );
-            return;
-        }
-
-        let Some(but) = &self.but else {
-            self.notify("snapshot is read-only", Notice::Info);
-            return;
-        };
-        self.unassigned_grouped_by_folder = !self.unassigned_grouped_by_folder;
-        let grouped = self.unassigned_grouped_by_folder;
-        match but.status() {
-            Ok(s) => {
-                self.board = Self::board_from(but, &mut self.commit_stats, &s);
-                self.clamp();
-                self.notify(
-                    if grouped {
-                        "unassigned grouped by folder"
-                    } else {
-                        "unassigned back to a flat list"
-                    },
-                    Notice::Info,
-                );
-            }
-            Err(e) => self.notify(format!("refresh failed: {e}"), Notice::Error),
-        }
-    }
-
     fn move_column(&mut self, delta: isize) {
         let n = self.column_count();
         if n == 0 {
@@ -1186,6 +1163,7 @@ impl App {
             Mode::Branch if self.branch_modal_row == BranchModalRow::Model => self.model_input.paste(text, false),
             Mode::Branch if self.branch_modal_row == BranchModalRow::Harness => self.harness_input.paste(text, false),
             Mode::Asks if self.ask_answering.is_some() => self.ask_answer_input.paste(text, false),
+            Mode::IssueDraft => self.paste_issue_draft(text),
             Mode::PrModal => match self.pr_modal_row {
                 PrModalRow::Title => self.pr_title_input.paste(text, false),
                 PrModalRow::Message => self.pr_message_input.paste(text, true),
@@ -1360,6 +1338,8 @@ impl App {
             Mode::UnapplyConfirm => return self.handle_key_unapply_confirm(key),
             Mode::Branches => return self.handle_key_branches(key),
             Mode::Asks => return self.handle_key_asks(key),
+            Mode::IssueDraft => return self.handle_key_issue_draft(key),
+            Mode::IssueDetail => return self.handle_key_issue_detail(key),
             // Help swallows everything except the keys that dismiss it. Small enough (and
             // general enough — it isn't really "a feature") to leave right here rather
             // than in a file of its own.
@@ -1373,6 +1353,10 @@ impl App {
         }
 
         self.message = None;
+
+        if self.mode == Mode::Normal && self.on_issues() && self.handle_key_issues_view(key) {
+            return;
+        }
 
         match key.code {
             K::Char('q') if self.mode == Mode::Normal => self.should_quit = true,
@@ -1482,7 +1466,7 @@ impl App {
             K::Char('r') if self.mode == Mode::Normal => self.begin_rebase(),
             K::Char('f') if self.mode == Mode::Normal => self.begin_resolve(),
             K::Char('i') if self.mode == Mode::Normal => self.begin_asks(),
-            K::Tab if self.mode == Mode::Normal => self.toggle_unassigned_grouping(),
+            K::Tab if self.mode == Mode::Normal => self.cycle_unassigned_view(),
             K::Enter if self.mode == Mode::Normal => self.open_diff(),
             K::Enter if self.mode == Mode::Restacking => self.confirm_restack(),
             K::Enter if self.mode == Mode::Moving => self.confirm_move(),

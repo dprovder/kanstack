@@ -29,6 +29,7 @@ mod drawer;
 mod footer;
 mod header;
 mod help;
+mod issues;
 mod pr;
 mod resolve;
 
@@ -44,6 +45,8 @@ use drawer::{draw_branches, draw_unapply_confirm};
 use footer::draw_footer;
 use header::draw_header;
 use help::draw_help;
+use issues::{draw_issue_detail, draw_issue_draft};
+pub(crate) use issues::issue_detail_line_count;
 use pr::{draw_pr_modal, draw_pr_running};
 use resolve::draw_resolve_confirm;
 
@@ -130,6 +133,8 @@ pub fn draw(f: &mut Frame, app: &App) -> HitMap {
     match app.mode {
         Mode::Help => draw_help(f, f.area(), &mut hits),
         Mode::Asks => draw_asks(f, app, f.area()),
+        Mode::IssueDraft => draw_issue_draft(f, app, f.area(), &mut hits),
+        Mode::IssueDetail => draw_issue_detail(f, app, f.area()),
         Mode::PushConfirm => draw_push_confirm(f, app, f.area(), &mut hits),
         Mode::LandConfirm => draw_land_confirm(f, app, f.area(), &mut hits),
         Mode::Landing => draw_landing(f, app, f.area()),

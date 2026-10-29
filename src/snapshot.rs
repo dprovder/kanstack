@@ -1338,4 +1338,178 @@ mod tests {
         assert!(out.contains("answer  the auth ones█"), "{out}");
         assert!(out.contains("⏎ send answer      esc back to the list"), "{out}");
     }
+
+    fn item(id: &str, title: &str, state: kanstack_tracker::ItemState, recipe: Option<&str>, from: Option<&str>) -> kanstack_tracker::Item {
+        kanstack_tracker::Item {
+            id: kanstack_tracker::ItemId(id.into()),
+            title: title.into(),
+            state,
+            recipe: recipe.map(Into::into),
+            from: from.map(|f| kanstack_tracker::ItemId(f.into())),
+            body: String::new(),
+        }
+    }
+
+    /// The fixture board with `feat-auth` renamed `item-44-api`, the way the orchestrator
+    /// names a branch for item 44, and the unassigned lane showing the design doc's issues.
+    fn issues_app() -> App {
+        use kanstack_tracker::ItemState::*;
+        let mut status = crate::but::parse_status(include_str!("../tests/fixtures/status.json")).unwrap();
+        for branch in status.stacks.iter_mut().flat_map(|s| s.branches.iter_mut()) {
+            if branch.name == "feat-auth" {
+                branch.name = "item-44-api".into();
+            }
+        }
+        let mut app = App::from_board(Board::from_status(&status));
+        app.set_unassigned_view(crate::app::UnassignedView::Issues);
+        app.issues.tracker = Some("local");
+        app.issues.loaded = true;
+        app.issues.items = vec![
+            item("44", "Land from the board", Running, Some("land-feature"), None),
+            item("41", "Flaky watch retries", Backlog, None, None),
+            item("42", "Gemini settings cleanup", Backlog, Some("bugfix"), None),
+            item("43", "Codex claim hook", Failed, Some("bugfix"), None),
+            item("45", "Dedupe timeout constant", Proposed, None, Some("38")),
+        ];
+        app
+    }
+
+    /// Each of `tab`'s three positions names itself under the unassigned lane's header, the
+    /// active one bracketed; only the issues view swaps the files for items.
+    #[test]
+    fn the_unassigned_header_marks_which_of_the_three_views_is_active() {
+        let mut status = crate::but::parse_status(include_str!("../tests/fixtures/status.json")).unwrap();
+        status.uncommitted_changes[0].file_path = "src/nested/wip1.txt".into();
+        status.uncommitted_changes[1].file_path = "docs/wip2.txt".into();
+
+        let flat = render_app(&App::from_board(Board::from_status(&status)), 160, 24);
+        assert!(flat.contains("[flat] · folders · issues"), "{flat}");
+        assert!(flat.contains("wip1.txt") && !flat.contains("▸ docs"), "{flat}");
+
+        let mut board = Board::from_status(&status);
+        crate::board::group_unassigned_by_folder(&mut board.columns[0]);
+        let mut folders = App::from_board(board);
+        folders.set_unassigned_view(crate::app::UnassignedView::Folders);
+        let folders = render_app(&folders, 160, 24);
+        assert!(folders.contains("flat · [folders] · issues"), "{folders}");
+        assert!(folders.contains("▸ docs"), "{folders}");
+
+        let issues = render_app(&issues_app(), 160, 24);
+        assert!(issues.contains("flat · folders · [issues] local"), "{issues}");
+        assert!(issues.contains("unassigned · issues  5"), "the header counts items: {issues}");
+        assert!(!issues.contains("wip1.txt"), "files aren't drawn in the issues view: {issues}");
+    }
+
+    /// Two lines per item — glyph, id and title, then state with recipe (or where a proposal
+    /// came from) and how many lanes it runs on — and a draft row after the last.
+    #[test]
+    fn issue_rows_show_glyph_id_title_and_a_state_line() {
+        let out = render_app(&issues_app(), 160, 24);
+        for row in [
+            "● #44 Land from the board",
+            "running · land-feature · 1 lane",
+            "○ #41 Flaky watch retries",
+            "backlog · recipe ?",
+            "○ #42 Gemini settings cleanup",
+            "backlog · bugfix",
+            "✗ #43 Codex claim hook",
+            "failed · bugfix",
+            "◌ #45 Dedupe timeout constant",
+            "proposed · from #38",
+            "+ draft an issue",
+        ] {
+            assert!(out.contains(row), "missing {row:?}:\n{out}");
+        }
+        assert!(out.contains("↑/↓ issue · tab view · n draft · ⏎ open · p promote"), "issue keys in the footer: {out}");
+    }
+
+    #[test]
+    fn issues_still_loading_or_failing_say_so() {
+        let mut app = issues_app();
+        app.issues.items.clear();
+        app.issues.loaded = false;
+        let out = render_app(&app, 160, 24);
+        assert!(out.contains("loading issues…") && out.contains("+ draft an issue"), "{out}");
+
+        app.issues.error = Some("gh: not logged in".into());
+        let out = render_app(&app, 160, 24);
+        assert!(out.contains("✗ gh: not logged in") && !out.contains("loading"), "{out}");
+    }
+
+    /// Selecting a running item tags each lane whose branch is named `item-<id>-…` and
+    /// draws its rule in the accent hue; an item with no lanes highlights nothing.
+    #[test]
+    fn selecting_an_issue_highlights_its_item_lanes() {
+        let app = issues_app();
+        let out = render_app(&app, 160, 24);
+        let header = row_with(&out, "item-44-api");
+        assert_eq!(header.matches("◂ #44").count(), 1, "{out}");
+        let tag = header.find("◂ #44").unwrap();
+        assert!(header.find("item-44-api").unwrap() < tag && tag < header.find("feat-ui").unwrap(), "tag sits on item-44-api's lane: {header}");
+        assert!(out.contains('━'), "{out}");
+
+        let mut app = issues_app();
+        app.issues.sel = 1;
+        let out = render_app(&app, 160, 24);
+        assert!(!out.contains('◂') && !out.contains('━'), "#41 runs nowhere:\n{out}");
+
+        let mut app = issues_app();
+        app.col = 1;
+        let out = render_app(&app, 160, 24);
+        assert!(!out.contains('◂'), "no highlight once the cursor leaves the issue list:\n{out}");
+    }
+
+    #[test]
+    fn the_draft_modal_shows_title_body_and_recipe() {
+        let mut app = issues_app();
+        app.mode = crate::app::Mode::IssueDraft;
+        let out = render_app(&app, 160, 30);
+        assert!(out.contains("draft an issue — local, in backlog"), "{out}");
+        assert!(out.contains("▸ title    █ required"), "{out}");
+        assert!(out.contains("body     (optional)") && out.contains("recipe   optional"), "{out}");
+        assert!(out.contains("⏎ save to backlog      esc discard"), "{out}");
+
+        app.issues.draft_title.set("Retry the watch");
+        app.issues.draft_body.set("It races.\nTwice.");
+        app.issues.draft_recipe.set("bugfix");
+        app.issues.draft_row = crate::app::DraftRow::Body;
+        let out = render_app(&app, 160, 30);
+        assert!(out.contains("  title    Retry the watch"), "{out}");
+        assert!(out.contains("▸ body     It races.") && out.contains("Twice.█"), "{out}");
+        assert!(out.contains("recipe   bugfix"), "{out}");
+
+        app.issues.draft_title.clear();
+        app.issues.draft_title_missing = true;
+        let out = render_app(&app, 160, 30);
+        assert!(out.contains("required — type a title"), "{out}");
+    }
+
+    /// `p` on anything but a proposal says why in the footer rather than doing nothing.
+    #[test]
+    fn promoting_anything_but_a_proposal_is_refused_with_a_notice() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent};
+        let mut app = issues_app();
+        app.on_key(KeyEvent::from(KeyCode::Char('p')));
+        let out = render_app(&app, 160, 24);
+        assert!(out.contains("only a proposal can be promoted — #44 is running"), "{out}");
+        assert_eq!(app.issues.items[0].state, kanstack_tracker::ItemState::Running);
+    }
+
+    #[test]
+    fn the_detail_view_shows_the_body_and_reports_and_scrolls() {
+        let mut app = issues_app();
+        app.issues.items[0].body =
+            format!("Add an L key.\n\n## Reports\n\n{}", (1..=40).map(|n| format!("report {n}")).collect::<Vec<_>>().join("\n"));
+        app.issues.detail = Some(kanstack_tracker::ItemId("44".into()));
+        app.mode = crate::app::Mode::IssueDetail;
+        let out = render_app(&app, 120, 30);
+        assert!(out.contains("● #44 Land from the board") && out.contains("running · land-feature · 1 lane"), "{out}");
+        assert!(out.contains("Add an L key.") && out.contains("## Reports"), "{out}");
+        assert!(!out.contains("report 40") && out.contains("↓ report"), "more below, and it says so:\n{out}");
+
+        app.issues.detail_scroll = 100;
+        let out = render_app(&app, 120, 30);
+        assert!(out.contains("report 40") && !out.contains("Add an L key."), "scrolled to the end:\n{out}");
+        assert!(out.contains("● #44 Land from the board"), "the title stays pinned:\n{out}");
+    }
 }

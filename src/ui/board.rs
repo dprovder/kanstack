@@ -164,8 +164,21 @@ pub(super) fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect, hits
     // `position/total` readout like "10/10" can run longer than that — reserve exactly as
     // much as this lane's label actually needs so the title truncates first instead of the
     // count getting clipped.
-    let count_label = lane_count_label(app, idx, col);
+    // The issues view swaps the lane's files for the tracker's items, so its name and count
+    // describe those instead.
+    let issues_view = col.kind == ColumnKind::Unassigned && app.showing_issues();
+    let (title, count_label) = if issues_view {
+        (format!("{} · issues", col.title), app.issues.items.len().to_string())
+    } else {
+        (col.title.clone(), lane_count_label(app, idx, col))
+    };
     let count_budget = 4 + count_label.chars().count();
+    // A lane the selected issue is running on (a branch named `item-<id>-…`) carries that
+    // issue's id and an accent rule, so its lanes stand out across the board.
+    let item_tag = app
+        .highlighted_item()
+        .filter(|item| app.item_lanes(&item.id).contains(&idx))
+        .map(|item| crate::app::item_label(&item.id));
     let mut header = Line::from(vec![
         if is_drawer_door {
             Span::styled("‹ ", theme::tone(crate::board::Tone::Accent))
@@ -173,7 +186,7 @@ pub(super) fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect, hits
             Span::styled("● ", theme::status_dot(col.state))
         },
         Span::styled(
-            truncate(&col.title, inner_w.saturating_sub(count_budget)),
+            truncate(&title, inner_w.saturating_sub(count_budget)),
             theme::title(is_current || hovered),
         ),
         Span::styled(format!("  {count_label}"), theme::faint()),
@@ -193,6 +206,9 @@ pub(super) fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect, hits
         header.push_span(Span::raw(if col.pane_status.is_some() { " " } else { "  " }));
         header.push_span(Span::styled(glyph, theme::tone(tone)));
     }
+    if let Some(tag) = &item_tag {
+        header.push_span(Span::styled(format!("  ◂ {tag}"), theme::tone(crate::board::Tone::Accent)));
+    }
     if header_is_target || is_current {
         header = header.style(theme::selected_bg());
     }
@@ -205,13 +221,22 @@ pub(super) fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect, hits
     // are and what the top of the stack was.
     let mut fixed_lines = vec![header];
 
-    // A rule under the header, brighter on the active lane.
-    let rule_style = if is_current {
-        theme::muted()
+    // A rule under the header, brighter on the active lane, and heavy in the accent hue on a
+    // lane the selected issue is running on.
+    if item_tag.is_some() {
+        fixed_lines.push(Line::styled("━".repeat(inner_w), theme::tone(crate::board::Tone::Accent)));
     } else {
-        theme::faint()
-    };
-    fixed_lines.push(Line::styled("─".repeat(inner_w), rule_style));
+        let rule_style = if is_current {
+            theme::muted()
+        } else {
+            theme::faint()
+        };
+        fixed_lines.push(Line::styled("─".repeat(inner_w), rule_style));
+    }
+    // Under the rule rather than above it, so every lane's rule stays on one row.
+    if col.kind == ColumnKind::Unassigned {
+        fixed_lines.push(issues::view_switch_line(app, inner_w));
+    }
 
     if !col.badges.is_empty() {
         let spans: Vec<Span> = col
@@ -272,7 +297,14 @@ pub(super) fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect, hits
         }
     }
 
-    for (ci, card) in col.cards.iter().enumerate() {
+    if issues_view {
+        let (issue_lines, start, len) = issues::issue_rows(app, is_current, inner_w);
+        lines = issue_lines;
+        (sel_start, sel_len) = (start, len);
+    }
+    let cards: &[Card] = if issues_view { &[] } else { &col.cards };
+
+    for (ci, card) in cards.iter().enumerate() {
         if let Some(group) = card.group.as_deref() {
             if last_group != Some(group) {
                 if col.kind == ColumnKind::Unassigned {
@@ -326,7 +358,9 @@ pub(super) fn draw_column(f: &mut Frame, app: &App, idx: usize, area: Rect, hits
     // Otherwise: a branch lane already carries an "empty" status badge, so a placeholder
     // underneath it just says the same thing twice. Only the backlog lane, which has no
     // badges of its own, needs one.
-    if col.cards.is_empty() && col.advisory {
+    if issues_view {
+        // Its body is the item list, filled in above.
+    } else if col.cards.is_empty() && col.advisory {
         lines.extend(advisory_body(col, inner_w));
     } else if col.cards.is_empty() && col.badges.is_empty() {
         lines.push(Line::styled("  empty", theme::faint()));
