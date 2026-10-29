@@ -161,25 +161,26 @@ impl Recipe {
         format!("{}\n\n## Recipe context\n\n{}", step.prompt, self.context)
     }
 
-    /// What actually reaches the harness on `branch`: the effective prompt, plus one line
-    /// asking for a `kanstack note` report when the step's `done_when` accepts one. `kanstack`
+    /// What actually reaches the harness on `branch`: the effective prompt, plus the lines
+    /// asking for a `kanstack note` report. Every step is asked, whatever its `done_when`: the
+    /// note is the step's report, while `done_when` only decides when it's finished. `kanstack`
     /// is the binary the run drives lanes with (see [`report_instruction`]).
     pub fn launch_prompt(&self, step_id: &str, branch: &str, kanstack: &Path) -> String {
-        let prompt = self.effective_prompt(step_id);
-        if self.steps[step_id].done_when.allows_note() {
-            format!("{prompt}\n\n{}", report_instruction(kanstack, branch))
-        } else {
-            prompt
-        }
+        format!("{}\n\n{}", self.effective_prompt(step_id), report_instruction(kanstack, branch))
     }
 }
 
-/// The line appended to a prompt whose step can finish on a note. It names `kanstack` by the
-/// path the run was given rather than as a bare `kanstack`, so the note goes through the build
-/// that reads it back, not whichever one is first on the agent's `PATH` (which may be too old
-/// to have `note` at all).
+/// The lines appended to every step's prompt, asking for a report worth reading rather than a
+/// one-liner. It names `kanstack` by the path the run was given rather than as a bare
+/// `kanstack`, so the note goes through the build that reads it back, not whichever one is
+/// first on the agent's `PATH` (which may be too old to have `note` at all).
 pub fn report_instruction(kanstack: &Path, branch: &str) -> String {
-    format!("When you're finished, report what you did by running: {} note {branch} \"<report>\"", shell_word(kanstack))
+    format!(
+        "When you're finished, report back by running: {} note {branch} \"<report>\"\n\
+         Make it a real report, not a one-liner: what changed; what you verified, and how; what you didn't do or \
+         couldn't confirm; caveats; and follow-ups worth proposing.",
+        shell_word(kanstack)
+    )
 }
 
 /// `path` as one shell word: as it is when it's made only of characters no shell treats
@@ -1128,21 +1129,23 @@ mod tests {
     }
 
     #[test]
-    fn launch_prompt_asks_for_a_note_only_when_done_when_accepts_one() {
+    fn launch_prompt_asks_every_step_for_a_report_whatever_its_done_when() {
         let recipe = parse(
             "---\nversion: 1\nsteps:\n  a:\n    agent: codex\n    prompt: A\n  b:\n    agent: codex\n    done_when: note\n    prompt: B\n  c:\n    agent: codex\n    done_when: either\n    prompt: C\n---\nctx\n",
         )
         .unwrap();
         let kanstack = Path::new("/opt/dev/kanstack");
-        assert_eq!(recipe.launch_prompt("a", "a", kanstack), recipe.effective_prompt("a"));
         assert_eq!(
-            recipe.launch_prompt("b", "b", kanstack),
-            "B\n\n## Recipe context\n\nctx\n\nWhen you're finished, report what you did by running: /opt/dev/kanstack note b \"<report>\""
+            recipe.launch_prompt("a", "a", kanstack),
+            "A\n\n## Recipe context\n\nctx\n\nWhen you're finished, report back by running: /opt/dev/kanstack note a \"<report>\"\n\
+             Make it a real report, not a one-liner: what changed; what you verified, and how; what you didn't do or \
+             couldn't confirm; caveats; and follow-ups worth proposing."
         );
-        assert!(recipe.launch_prompt("c", "lane-c", kanstack).ends_with("/opt/dev/kanstack note lane-c \"<report>\""));
+        assert!(recipe.launch_prompt("b", "b", kanstack).contains("/opt/dev/kanstack note b \"<report>\"\n"));
+        assert!(recipe.launch_prompt("c", "lane-c", kanstack).contains("/opt/dev/kanstack note lane-c \"<report>\"\n"));
         assert!(recipe
             .launch_prompt("c", "lane-c", Path::new("/My Tools/kanstack"))
-            .ends_with("'/My Tools/kanstack' note lane-c \"<report>\""));
+            .contains("'/My Tools/kanstack' note lane-c \"<report>\"\n"));
     }
 
     #[test]

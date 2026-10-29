@@ -115,11 +115,12 @@ deterministic template — no conditional templating of any kind:
 ```
 
 That combined text is what reaches the harness, via `kanstack spawn --prompt` or
-`kanstack send`. When the step's `done_when` accepts a note, one more line is appended, asking
-the agent to report back (see "Completion model"):
+`kanstack send`. Two more lines are appended to every step's prompt, whatever its
+`done_when`, asking the agent to report back (see "Completion model"):
 
 ```text
-When you're finished, report what you did by running: /abs/path/to/kanstack note <branch> "<report>"
+When you're finished, report back by running: /abs/path/to/kanstack note <branch> "<report>"
+Make it a real report, not a one-liner: what changed; what you verified, and how; what you didn't do or couldn't confirm; caveats; and follow-ups worth proposing.
 ```
 
 The path is the run's own `kanstack` (`--kanstack-bin`, else `kanstack` on `$PATH`, made
@@ -207,18 +208,28 @@ reading chat output or any LLM "judge":
    `done`.
 
 A step that may legitimately change nothing, like a review, should say `done_when: either`.
-When `done_when` accepts a note, the step's prompt asks the agent for one, and the note's text
-is stored in the step's state as its `report`. Notes are read back through
-`kanstack events --since <offset>` (kind `"note"`, matching the step's branch); `<offset>` is
-the events log's length when the step launched, so a note from before then doesn't count. If
-several arrive, the last one is the report.
+
+Every step's prompt asks the agent for a note, whatever its `done_when`, and the note's text is
+stored in the step's state as its `report`; `serve` posts it to the item, and the aggregate step
+reads it. Notes are read back through `kanstack events --since <offset>` (kind `"note"`,
+matching the step's branch) on each trusted idle read, and once more after `verify` passes;
+`<offset>` (`notes_from`) is the events log's length when the step launched, so a note from
+before then doesn't count. If several arrive, the last one is the report.
+
+`done_when` alone decides when a step is finished: a note never finishes a `commits` step. A
+step that meets its `done_when` on commits with no note yet gets a short grace instead of
+finishing at once: up to two more trusted idle reads (`RunOptions::note_grace_reads`, about two
+poll intervals) for the note to land, then it finishes without one. The grace isn't persisted,
+so a resumed run starts it afresh, and a lane that dies or times out during it finishes the
+step on its commits rather than retrying it. A note that lands after the step settled is not
+recorded; the item's comment says "No report." then.
 
 ### Design choices this runner makes (and why)
 
 **Polling `status --json`, not `events`.** kanstack offers both a poll (`status --json`) and a
 push-ish cue to re-poll (`events --json`, an append-only JSONL log). This runner polls
 `status --json` directly on a fixed interval, and only reads `events` for the notes that
-`done_when` looks for, once a step's lane is trusted idle. It's a short-lived process, not a daemon, so there
+make up each step's report, once its lane is trusted idle. It's a short-lived process, not a daemon, so there
 is no gain from a separate always-on log tail, and polling keeps the implementation to one
 straightforward loop instead of two coordinated ones (a blocking `events --follow` reader feeding
 a separate scheduling loop). `events --json` remains a reasonable choice for a longer-lived
@@ -294,8 +305,8 @@ root), mirrored in `src/state.rs`. `state.json` records the recipe's path and ha
 directory `run` was invoked in, each branch's current agent (`branch_agents`), and for each step
 its status (`pending`, `launching`, `running`, `verifying`, `done` or `failed`), `attempt`,
 `branch`, `pane`, `base` and `tip` (its branch's commit when it started and when it finished,
-from git), `base_patches` (see "Completion model"), `timeout_secs` (see "Timeouts"), `started_at`, `last_error`, `notes_from` (the events log's length when it launched),
-`report` (its agent's note) and `waiting_on` (set while its lane is idle but its `done_when`
+from git), `base_patches` (see "Completion model"), `timeout_secs` (see "Timeouts"), `started_at`, `last_error`, `notes_from` (the events log's length when it launched, for every step),
+`report` (its agent's last note, whatever its `done_when`) and `waiting_on` (set while its lane is idle but its `done_when`
 isn't met).
 
 **Snapshots, not a journal.** Transitions are minutes apart, so the whole `state.json` is
@@ -484,7 +495,9 @@ Its prompt gains a "How the run went" section: each other step's status, retries
 stored report, and why it failed or never ran. Under `serve`, it's then asked to check
 `kanstack-recipe items list --json`, propose each follow-up worth doing with `kanstack-recipe
 items propose --from <item>` (it does its own deduplication against what's listed), and finish
-with `kanstack note`. In a plain `run` with no item, it's asked for a summary note instead.
+with a `kanstack note` saying what it proposed and why, what it left out and why, and what it
+couldn't confirm. In a plain `run` with no item, it's asked for a summary note instead, with the
+same ask as every other step's report.
 Both binaries are named by absolute path in the prompt: `kanstack` as the run resolved it, and
 `kanstack-recipe` as the very executable running the step, so the proposals reach the same
 queue this `serve` pulls from.

@@ -89,11 +89,14 @@ pub struct StepRecord {
     /// Seconds since the Unix epoch, when the current attempt was recorded as `launching`.
     pub started_at: Option<u64>,
     pub last_error: Option<String>,
-    /// The events log's length when the current attempt launched: only notes past it are
-    /// this attempt's report. `null` for a step whose `done_when` doesn't accept a note.
+    /// The events log's length when the step's first attempt launched: only notes past it
+    /// are its report. Recorded for every step, whatever its `done_when`; `null` only in a
+    /// snapshot from before that, for a step whose `done_when` didn't accept a note.
     #[serde(default)]
     pub notes_from: Option<u64>,
-    /// The text of the agent's `kanstack note` report, once one arrived.
+    /// The text of the agent's last `kanstack note` about the step's branch, once one arrived
+    /// before the step settled (see `crate::run`'s "Every step is asked for a report"). For a
+    /// `commits` step it's only the report: it never finishes the step.
     #[serde(default)]
     pub report: Option<String>,
     /// Set while the step's lane is trusted idle but its `done_when` isn't met yet: why it

@@ -110,13 +110,17 @@ pub fn outcomes_block(recipe: &Recipe, run: &RunState, branch: &str, kanstack: &
              that's already there.\n\
              2. Then, for each follow-up worth doing, run `{recipe} items propose --from {item} --title \"<title>\" \
              --body \"<what to do and why>\"` once. If nothing is worth doing, propose nothing.\n\
-             3. When you're finished, report what you proposed by running: {kanstack} note {branch} \"<report>\"\n",
+             3. When you're finished, report back by running: {kanstack} note {branch} \"<report>\"\n\
+             Make it a real report, not a one-liner: what you proposed and why; what you left out, and why (already \
+             queued, not worth doing); what you couldn't confirm from the reports above; and caveats.\n",
             recipe = shell_word(&recipe_bin()),
         )),
         None => block.push_str(&format!(
             "\n## Summary\n\n\
              This run isn't working on a queue item, so don't propose follow-ups. When you're finished, report a summary \
-             of the run, and anything worth following up on, by running: {kanstack} note {branch} \"<summary>\"\n"
+             of the run by running: {kanstack} note {branch} \"<summary>\"\n\
+             Make it a real report, not a one-liner: what changed; what was verified, and how; what wasn't done or \
+             couldn't be confirmed; caveats; and follow-ups worth proposing.\n"
         )),
     }
     block

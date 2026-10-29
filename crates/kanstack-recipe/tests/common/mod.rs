@@ -316,9 +316,18 @@ pub fn acquire_lock(store: &RunStore) -> OrchestratorLock {
     lock.expect("nothing else holds the orchestrator lock")
 }
 
+/// Polls fast, and finishes a step that committed with no note at once rather than after the
+/// report's grace, so tests that count status reads don't count the grace too. The grace's own
+/// tests (`tests/spawn_modes.rs`) use [`graced_opts`].
 pub fn fast_opts() -> RunOptions {
     RunOptions {
         poll_interval: Duration::from_millis(5),
+        note_grace_reads: 0,
         ..RunOptions::default()
     }
+}
+
+/// [`fast_opts`] with the report's default grace.
+pub fn graced_opts() -> RunOptions {
+    RunOptions { note_grace_reads: RunOptions::default().note_grace_reads, ..fast_opts() }
 }

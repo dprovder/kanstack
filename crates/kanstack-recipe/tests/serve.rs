@@ -14,7 +14,7 @@ use std::process::{Command, ExitCode, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use common::{acquire_lock, actions, calls_log, fast_opts, init_repo, write_fake_kanstack};
+use common::{acquire_lock, actions, calls_log, fast_opts, graced_opts, init_repo, write_fake_kanstack};
 
 use kanstack_recipe::kanstack::KanstackClient;
 use kanstack_recipe::lock::OrchestratorLock;
@@ -407,6 +407,27 @@ fn each_steps_report_lands_on_its_item_once() {
     assert!(f.run_for(&id).reported.contains("a"));
 }
 
+/// A `commits` step is asked for a report too, and its note (here one that lands a read after
+/// its commit, during the report's grace) is what's posted, not "No report.".
+#[test]
+fn a_commits_steps_report_lands_on_its_item() {
+    let f = Factory::new();
+    f.recipe("one", ONE_STEP);
+    let id = f.item("One step", Some("one"));
+    f.knob("notes", "");
+    f.knob("note_at", "3");
+    {
+        let lock = f.lock();
+        let opts = ServeOptions { max: 1, retries: 0, recipe_path: None, run: graced_opts() };
+        let mut serve = Serve::new(&f.workdir, &f.tracker, &f.store, &f.client, opts, &lock).unwrap();
+        tick_until(&mut serve, || f.get(&id).state == ItemState::Review);
+    }
+    let note = format!("{} note item-1-a", f.bin_dir.join("kanstack").display());
+    assert!(calls_log(&f.bin_dir).contains(&note), "the commits step is asked to report");
+    let body = f.get(&id).body;
+    assert!(body.contains("report from item-1-a") && !body.contains("No report."), "{body}");
+}
+
 /// `serve` is killed for real, mid-run, by the stand-in's `spawn` of the second step; a second
 /// `serve` reattaches to that step's lane and finishes the item without re-running the first.
 #[test]
@@ -419,6 +440,9 @@ fn a_killed_serve_resumes_without_rerunning_done_steps() {
     let store = RunStore::at(store_root);
     let id = add_item(&tracker, "Two steps", Some("two"));
     f.knob("crash_after_spawn", "item-1-b");
+    // The agents report as their prompts ask, so the resumed step finishes on the one tick
+    // `--once` takes rather than waiting out its report's grace.
+    f.knob("notes", "");
     let bin = f.bin_dir.join("kanstack").to_string_lossy().into_owned();
 
     let output = child(&f.workdir, &state, &["--kanstack-bin", &bin]);

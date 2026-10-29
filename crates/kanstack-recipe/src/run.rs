@@ -16,6 +16,17 @@
 //! either. Until then the step keeps polling with `waiting_on` set, so `runs` shows why it
 //! isn't done.
 //!
+//! **Every step is asked for a report, whatever its `done_when`.** Its prompt ends with a
+//! `kanstack note` instruction, the events log's length is recorded when it launches
+//! ([`StepRecord::notes_from`]), and the last note about its branch since then is stored as its
+//! [`StepRecord::report`] whenever one is seen before the step settles. `done_when` still only
+//! decides when it's finished: a note never finishes a `commits` step. A step that finishes on
+//! commits with no note yet is given a short grace ([`RunOptions::note_grace_reads`] more
+//! trusted idle reads) for the note to land, then finishes without one. The grace is kept in
+//! memory only, so a resume starts it afresh, and a lane that dies or times out during it
+//! finishes the step (its commits are what counted) rather than retrying it. A note that lands
+//! after the step settled isn't recorded.
+//!
 //! **A rebase isn't new work.** GitButler restacks branches routinely, which moves a branch's
 //! tip without anyone committing, so "the tip moved since the step's `base`" would pass a step
 //! that did nothing. Instead, a step records the patch id (`git patch-id --stable`) of every
@@ -113,6 +124,10 @@ const TRANSPORT_ERROR_CODES: &[&str] = &["internal", "multiplexer_unavailable", 
 /// How long a step's attempt may run when neither its recipe nor `KANSTACK_STEP_TIMEOUT` says.
 pub const DEFAULT_STEP_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
+/// How many more trusted idle reads a step that finished on commits waits for its report. See
+/// the module doc's "Every step is asked for a report".
+pub const DEFAULT_NOTE_GRACE_READS: u32 = 2;
+
 pub struct RunOptions {
     pub poll_interval: Duration,
     /// Print progress lines to stderr instead of stdout, which `serve --json` keeps for JSON.
@@ -120,6 +135,9 @@ pub struct RunOptions {
     /// How long an attempt may run when its step has no timeout of its own recorded: a run
     /// started before timeouts, or one whose steps' timeouts weren't resolved.
     pub step_timeout: Duration,
+    /// How many more trusted idle reads a step that finished on commits waits for its note
+    /// before it finishes without one. `0` finishes it at once.
+    pub note_grace_reads: u32,
 }
 
 impl Default for RunOptions {
@@ -128,6 +146,7 @@ impl Default for RunOptions {
             poll_interval: Duration::from_millis(1500),
             progress_to_stderr: false,
             step_timeout: DEFAULT_STEP_TIMEOUT,
+            note_grace_reads: DEFAULT_NOTE_GRACE_READS,
         }
     }
 }
@@ -189,6 +208,9 @@ struct Live {
     broken: bool,
     // step id -> transport errors in a row, and when its launch may be tried again.
     backoff: HashMap<String, (u32, Instant)>,
+    // step id -> trusted idle reads taken since it finished on commits with no note yet: its
+    // report's grace (see the module doc).
+    note_grace: HashMap<String, u32>,
 }
 
 /// One persisted run, driven a tick at a time by its caller (see the module doc's "One tick
@@ -481,7 +503,7 @@ impl<'a> Driver<'a> {
 
         // Read before the launch, so the agent's note can't land ahead of where this attempt's
         // notes are read from. A retry keeps reading from where the step's first attempt did.
-        let notes_from = (retry.is_none() && step.done_when.allows_note()).then(|| self.client.events_end());
+        let notes_from = retry.is_none().then(|| self.client.events_end());
 
         // Record before acting: a launch that couldn't be recorded never happens, and one that
         // was recorded has used up its attempt even if this process dies mid-spawn. A retry
@@ -622,6 +644,10 @@ impl<'a> Driver<'a> {
                         Some("idle") => {
                             // First read since launch — too early to trust: the harness may
                             // not have started the turn we just sent it yet. Keep polling.
+                        }
+                        Some("dead" | "no-pane") | None if reads >= 2 && self.live.note_grace.contains_key(step_id) => {
+                            self.say(run, format_args!("… {step_id:<15} lane gone while waiting on its report, finishing on its commits"));
+                            self.finish_step(run, step_id);
                         }
                         Some(status @ ("dead" | "no-pane")) => {
                             let error = format!(
@@ -769,6 +795,11 @@ impl<'a> Driver<'a> {
         if !overdue {
             return;
         }
+        if self.live.note_grace.contains_key(step_id) {
+            self.say(run, format_args!("… {step_id:<15} timed out waiting on its report, finishing on its commits"));
+            self.finish_step(run, step_id);
+            return;
+        }
         let branch = rec.branch.as_deref().unwrap_or_default();
         let limit = format_duration(Duration::from_secs(limit));
         let error = match (lane, rec.waiting_on) {
@@ -785,38 +816,61 @@ impl<'a> Driver<'a> {
         self.retry_or_fail(run, step_id, error, timeout_note);
     }
 
-    /// A step's lane is trusted idle. If its `done_when` is met, store the agent's report (if
-    /// any) and finish it; if not, record what it's waiting on and keep polling. A failed read
-    /// of the events log counts as no note yet, and is retried on the next idle read.
+    /// A step's lane is trusted idle. Store the agent's latest note as its report, if one
+    /// arrived. If its `done_when` is met, finish it, after the report's grace when it finished
+    /// on commits with no note yet; if not, record what it's waiting on and keep polling. A
+    /// failed read of the events log counts as no note yet, and is retried on the next idle read.
     fn on_trusted_idle(&mut self, run: &mut RunState, step_id: &str) {
         let done_when = self.recipe.steps[step_id].done_when;
         let rec = &run.steps[step_id];
         let branch = rec.branch.clone().unwrap_or_default();
 
         let committed = done_when.allows_commits() && has_new_commits(&run.workdir, &branch, rec);
-        let report = if done_when.allows_note() {
-            match self.client.notes_since(rec.notes_from.unwrap_or(0)) {
-                Ok(notes) => notes.into_iter().rfind(|n| n.branch == branch).map(|n| n.text),
-                Err(e) => {
-                    self.warn(run, format_args!("! {step_id:<15} could not read kanstack's events log, retrying: {e}"));
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        let note = self.latest_note(run, step_id);
+        let new_note = note.is_some() && note != run.steps[step_id].report;
+        if new_note {
+            record(run, step_id).report = note;
+        }
+        let reported = run.steps[step_id].report.is_some();
 
-        if committed || report.is_some() {
-            let rec = record(run, step_id);
-            rec.waiting_on = None;
-            if report.is_some() {
-                rec.report = report;
+        if committed && !reported {
+            let graced = self.live.note_grace.entry(step_id.to_string()).or_insert(0);
+            *graced += 1;
+            if *graced <= self.opts.note_grace_reads {
+                if *graced == 1 {
+                    self.say(run, format_args!("… {step_id:<15} committed, waiting briefly on its report"));
+                    record(run, step_id).waiting_on = None;
+                    self.persist(run);
+                }
+                return;
             }
+        }
+
+        if committed || (done_when.allows_note() && reported) {
+            record(run, step_id).waiting_on = None;
             self.finish_step(run, step_id);
         } else if run.steps[step_id].waiting_on != Some(done_when) {
             self.say(run, format_args!("… {step_id:<15} idle, waiting on {}", done_when.waiting_label()));
             record(run, step_id).waiting_on = Some(done_when);
             self.persist(run);
+        } else if new_note {
+            self.persist(run);
+        }
+    }
+
+    /// The text of the last note about `step_id`'s branch since its attempt launched. A step
+    /// recorded before every step's notes were read (no `notes_from`) is only read when its
+    /// `done_when` accepts a note, from the start of the log, as it was then.
+    fn latest_note(&self, run: &RunState, step_id: &str) -> Option<String> {
+        let rec = &run.steps[step_id];
+        let from = rec.notes_from.or(self.recipe.steps[step_id].done_when.allows_note().then_some(0))?;
+        let branch = rec.branch.as_deref().unwrap_or_default();
+        match self.client.notes_since(from) {
+            Ok(notes) => notes.into_iter().rfind(|n| n.branch == branch).map(|n| n.text),
+            Err(e) => {
+                self.warn(run, format_args!("! {step_id:<15} could not read kanstack's events log, retrying: {e}"));
+                None
+            }
         }
     }
 
@@ -824,6 +878,7 @@ impl<'a> Driver<'a> {
     /// any) and mark it `done`, or retry or fail it. No `verify` at all means it's done now.
     fn finish_step(&mut self, run: &mut RunState, step_id: &str) {
         self.live.status_reads_since_launch.remove(step_id);
+        self.live.note_grace.remove(step_id);
         let step = &self.recipe.steps[step_id];
         if step.verify.is_empty() {
             self.say(run, format_args!("✓ {step_id:<15} complete"));
@@ -858,6 +913,10 @@ impl<'a> Driver<'a> {
         }
 
         self.say(run, format_args!("✓ {step_id:<15} verified  {}", step.verify.join(" && ")));
+        // A note can land while `verify` runs.
+        if let Some(note) = self.latest_note(run, step_id) {
+            record(run, step_id).report = Some(note);
+        }
         self.complete(run, step_id);
     }
 
@@ -876,6 +935,7 @@ impl<'a> Driver<'a> {
             return;
         }
         self.live.status_reads_since_launch.remove(step_id);
+        self.live.note_grace.remove(step_id);
         let tip = run.steps[step_id].branch.as_deref().and_then(|b| branch_tip(&run.workdir, b));
         let rec = record(run, step_id);
         rec.retries += 1;
@@ -902,6 +962,7 @@ impl<'a> Driver<'a> {
     /// was retried.
     fn settle(&mut self, run: &mut RunState, step_id: &str, status: StepStatus, error: Option<String>) {
         self.live.status_reads_since_launch.remove(step_id);
+        self.live.note_grace.remove(step_id);
         let tip = run.steps[step_id].branch.as_deref().and_then(|b| branch_tip(&run.workdir, b));
         let rec = record(run, step_id);
         rec.status = status;

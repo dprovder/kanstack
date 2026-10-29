@@ -172,6 +172,7 @@ fn the_block_lists_each_steps_report_commit_range_or_failure_and_asks_for_propos
     let note = follow_ups.find(&format!("by running: {KANSTACK} note item-44-followups \"<report>\"")).expect(follow_ups);
     assert!(list < propose && propose < note, "list, then propose, then note: {follow_ups}");
     assert!(follow_ups.contains("don't propose anything that's already there"), "{follow_ups}");
+    assert!(follow_ups.contains("Make it a real report, not a one-liner: what you proposed and why;"), "{follow_ups}");
     assert_eq!(prompt.matches("kanstack note").count(), 1, "one report instruction, not two: {prompt}");
 }
 
@@ -185,7 +186,11 @@ fn without_an_item_the_block_keeps_the_outcomes_and_asks_for_a_summary() {
     assert_eq!(&prompt[..outcomes_end], &with_item[..outcomes_end], "the same outcomes");
     let rest = &prompt[outcomes_end..];
     assert!(rest.starts_with("\n## Summary\n\nThis run isn't working on a queue item, so don't propose follow-ups."), "{rest}");
-    assert!(rest.ends_with(&format!("by running: {KANSTACK} note followups \"<summary>\"\n")), "{rest}");
+    assert!(rest.contains(&format!("by running: {KANSTACK} note followups \"<summary>\"\n")), "{rest}");
+    assert!(
+        rest.ends_with("what wasn't done or couldn't be confirmed; caveats; and follow-ups worth proposing.\n"),
+        "the same real-report ask as every other step: {rest}"
+    );
     assert!(!prompt.contains("items propose") && !prompt.contains("items list"), "{prompt}");
 }
 

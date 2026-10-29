@@ -8,10 +8,10 @@ mod common;
 use std::fs;
 use std::path::PathBuf;
 
-use common::{actions, calls_log, fast_opts, git, init_repo, tip, write_fake_kanstack};
+use common::{actions, calls_log, fast_opts, git, graced_opts, init_repo, tip, write_fake_kanstack};
 use kanstack_recipe::kanstack::KanstackClient;
 use kanstack_recipe::recipe::{self, DoneWhen, Recipe};
-use kanstack_recipe::run::{resume_run, start_run, RunOutcome};
+use kanstack_recipe::run::{resume_run, start_run, RunOptions, RunOutcome};
 use kanstack_recipe::state::{RunState, RunStore, StepRecord, StepStatus};
 
 struct Lab {
@@ -50,10 +50,15 @@ impl Lab {
 
     /// Runs `source` from scratch, persisted, with the fake copying each snapshot it sees.
     fn run(&self, source: &str) -> (RunOutcome, RunState) {
+        self.run_with(source, &fast_opts())
+    }
+
+    /// [`Lab::run`] with `opts`.
+    fn run_with(&self, source: &str, opts: &RunOptions) -> (RunOutcome, RunState) {
         let recipe = recipe::parse(source).unwrap();
         let mut run = self.new_run(&recipe);
         self.knob("snapshot_path", self.store.state_path(&run.id).to_str().unwrap());
-        let outcome = start_run(&recipe, &self.client(), &fast_opts(), &self.store, &mut run);
+        let outcome = start_run(&recipe, &self.client(), opts, &self.store, &mut run);
         (outcome, self.store.load(&run.id).unwrap())
     }
 
@@ -246,8 +251,75 @@ fn done_when_commits_waits_for_the_branch_tip_to_move() {
     assert_eq!(lab.status_reads(), 4, "done on the read the commit landed");
     let a = &run.steps["a"];
     assert_eq!((a.status, a.waiting_on, a.report.as_deref()), (StepStatus::Done, None, None));
-    assert!(!calls_log(&lab.bin_dir).contains("kanstack note"), "a commits step isn't asked for a note");
-    assert!(!calls_log(&lab.bin_dir).contains("events"), "nor are notes read for it");
+    assert!(actions(&lab.bin_dir)[0].contains(&format!("{} note a \"<report>\"", lab.kanstack_bin().display())), "a commits step is asked for a report too");
+    assert!(a.notes_from.is_some(), "and its notes are read from its launch");
+}
+
+const COMMITS_STEP: &str = "---\nversion: 1\nsteps:\n  a:\n    agent: codex\n    prompt: Do A\n---\nctx\n";
+
+/// A `commits` step that committed with no note yet waits out the report's grace: a note that
+/// lands during it is the step's report.
+#[test]
+fn a_commits_step_picks_up_a_note_that_lands_during_its_grace() {
+    let lab = Lab::new();
+    lab.knob("notes", "");
+    lab.knob("note_at", "3");
+    let (outcome, run) = lab.run_with(COMMITS_STEP, &graced_opts());
+    assert!(!outcome.failed);
+
+    // Read 2 is the first trusted idle: the commit is there, the note isn't yet.
+    let a = &lab.snapshot(3).steps["a"];
+    assert_eq!((a.status, a.waiting_on, a.report.as_deref()), (StepStatus::Running, None, None), "{a:?}");
+    assert_eq!(lab.status_reads(), 3, "done on the read the note landed");
+    let a = &run.steps["a"];
+    assert_eq!((a.status, a.report.as_deref()), (StepStatus::Done, Some("report from a")));
+    assert_ne!(a.base, a.tip);
+}
+
+/// The grace is bounded: with no note at all, the step finishes on its commits after
+/// `note_grace_reads` more trusted idle reads, with no report.
+#[test]
+fn a_commits_step_with_no_note_finishes_after_its_grace() {
+    let lab = Lab::new();
+    let (outcome, run) = lab.run_with(COMMITS_STEP, &graced_opts());
+    assert!(!outcome.failed);
+    let grace = RunOptions::default().note_grace_reads as usize;
+    assert_eq!(lab.status_reads(), 2 + grace, "the first trusted idle, then the grace");
+    let a = &run.steps["a"];
+    assert_eq!((a.status, a.report.as_deref(), a.retries), (StepStatus::Done, None, 0));
+}
+
+/// `done_when` still decides completion: a note alone doesn't finish a `commits` step, but it's
+/// kept as the report, and the step finishes on the read its commit lands with no grace.
+#[test]
+fn a_note_alone_doesnt_finish_a_commits_step_but_is_its_report() {
+    let lab = Lab::new();
+    lab.knob("notes", "");
+    lab.knob("commit_at", "4");
+    let (outcome, run) = lab.run_with(COMMITS_STEP, &graced_opts());
+    assert!(!outcome.failed);
+
+    let a = &lab.snapshot(3).steps["a"];
+    assert_eq!((a.status, a.waiting_on, a.report.as_deref()), (StepStatus::Running, Some(DoneWhen::Commits), Some("report from a")), "{a:?}");
+    assert_eq!(lab.status_reads(), 4, "done on the read the commit landed");
+    assert_eq!((run.steps["a"].status, run.steps["a"].report.as_deref()), (StepStatus::Done, Some("report from a")));
+}
+
+/// A lane that dies while its step waits on a report doesn't undo the commits it finished on:
+/// the step is done, not respawned.
+#[test]
+fn a_lane_that_dies_during_the_grace_still_finishes_its_step() {
+    let lab = Lab::new();
+    lab.knob(
+        "status.3.json",
+        "{\"schema\":1,\"workstreams\":[{\"branch\":\"a\",\"pane\":\"%7\",\"agent\":\"codex\",\"item\":null,\"status\":\"dead\",\"lane\":null}],\"workspace\":null,\"workspace_blocked\":null}\n",
+    );
+    let (outcome, run) = lab.run_with(COMMITS_STEP, &graced_opts());
+    assert!(!outcome.failed);
+    assert_eq!(lab.status_reads(), 3);
+    let a = &run.steps["a"];
+    assert_eq!((a.status, a.attempt, a.retries, a.report.as_deref()), (StepStatus::Done, 1, 0, None));
+    assert_eq!(actions(&lab.bin_dir).len(), 1, "no respawn");
 }
 
 /// `note`: commits alone don't finish it, and a note from before the step launched doesn't
