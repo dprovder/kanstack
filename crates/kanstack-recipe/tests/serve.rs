@@ -321,6 +321,24 @@ fn a_dead_pane_is_respawned_on_the_same_branch() {
 }
 
 #[test]
+fn a_lane_stopped_from_outside_is_respawned_on_the_same_branch() {
+    let f = Factory::new();
+    f.recipe("one", ONE_STEP);
+    let id = f.item("Stopped by hand", Some("one"));
+    f.knob("vanish_on_status", "item-1-a\n");
+    let lock = f.lock();
+    let mut serve = f.serve(&lock, 1, 2);
+
+    tick_until(&mut serve, || f.get(&id).state == ItemState::Review);
+
+    let calls = actions(&f.bin_dir);
+    assert_eq!(calls.iter().filter(|c| c.starts_with("spawn item-1-a ")).count(), 2, "respawned once: {calls:?}");
+    let a = &f.run_for(&id).steps["a"];
+    assert_eq!((a.status, a.retries, a.attempt), (StepStatus::Done, 1, 2), "{a:?}");
+    assert!(a.last_error.as_deref().unwrap_or_default().contains("disappeared"), "{a:?}");
+}
+
+#[test]
 fn transport_errors_retry_without_using_up_the_budget() {
     let f = Factory::new();
     f.recipe("one", ONE_STEP);

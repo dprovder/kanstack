@@ -585,7 +585,16 @@ impl<'a> Driver<'a> {
                             self.warn(run, format_args!("✗ {step_id:<15} failed    {error}"));
                             self.retry_or_fail(run, step_id, error, respawn_note);
                         }
-                        _ => {} // busy, waiting, unknown, or not yet reported — keep polling
+                        // Absent: `kanstack stop` (or a prune) forgets a lane rather than
+                        // reporting it dead, so this is the same as dead, not "not yet reported".
+                        // `spawn` registers the lane before it returns, so after the first read
+                        // nothing is still on its way. Waiting on it would hang the run forever.
+                        None if reads >= 2 => {
+                            let error = format!("workstream \"{branch}\" disappeared before finishing (stopped or pruned)");
+                            self.warn(run, format_args!("✗ {step_id:<15} failed    {error}"));
+                            self.retry_or_fail(run, step_id, error, respawn_note);
+                        }
+                        _ => {} // busy, waiting, unknown, or the first read since launch — keep polling
                     }
                     if self.live.broken {
                         return;

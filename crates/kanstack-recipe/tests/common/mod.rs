@@ -158,6 +158,13 @@ case "$cmd" in
     fi
     play pending_commits commit "$n" commit_at
     play pending_notes note "$n" note_at
+    # A lane stopped from outside the run (`kanstack stop` by hand) isn't reported dead: kanstack
+    # forgets it, and it's simply absent from every status after.
+    if [ -f "$DIR/vanish_on_status" ] && [ -f "$DIR/lanes" ]; then
+      grep -vxf "$DIR/vanish_on_status" "$DIR/lanes" > "$DIR/lanes.tmp"
+      mv "$DIR/lanes.tmp" "$DIR/lanes"
+      rm "$DIR/vanish_on_status"
+    fi
     if [ -f "$DIR/status.$n.json" ]; then
       cat "$DIR/status.$n.json"
       exit 0
