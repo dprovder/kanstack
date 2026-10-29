@@ -4,13 +4,40 @@
 //! kanstack's own Rust crate or reaches into its internals, only its documented `--json`
 //! envelopes (see the repository's README, "Driving panes from a script or an agent").
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::recipe::{SpawnMode, Step};
+
+/// The `kanstack` binary a command runs, as an absolute path: `given` (`--kanstack-bin`), else
+/// whatever `kanstack` resolves to on `PATH`. Resolved once at startup, so the binary the runner
+/// calls and the one its prompts tell agents to call are the same file, whatever an agent's
+/// own `PATH` holds. A bare name not found on `PATH` is kept as it is, to fail as before.
+pub fn resolve_bin(given: Option<PathBuf>) -> PathBuf {
+    resolve_bin_on(given, std::env::var_os("PATH").as_deref())
+}
+
+/// [`resolve_bin`] against `path`, a `PATH` value.
+fn resolve_bin_on(given: Option<PathBuf>, path: Option<&std::ffi::OsStr>) -> PathBuf {
+    let bin = given.unwrap_or_else(|| PathBuf::from("kanstack"));
+    if bin.components().count() > 1 || bin.is_absolute() {
+        return std::path::absolute(&bin).unwrap_or(bin);
+    }
+    path.into_iter()
+        .flat_map(std::env::split_paths)
+        .map(|dir| dir.join(&bin))
+        .find(|candidate| is_executable(candidate))
+        .map(|found| std::path::absolute(&found).unwrap_or(found))
+        .unwrap_or(bin)
+}
+
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
 
 #[derive(Debug)]
 pub struct KanstackError {
@@ -121,6 +148,11 @@ pub struct KanstackClient {
 impl KanstackClient {
     pub fn new(bin: impl Into<PathBuf>) -> Self {
         KanstackClient { bin: bin.into() }
+    }
+
+    /// The `kanstack` this client runs, which prompts name too (see [`resolve_bin`]).
+    pub fn bin(&self) -> &Path {
+        &self.bin
     }
 
     /// Runs `kanstack <args>`, parses stdout as the shared `--json` envelope, and turns
@@ -274,6 +306,27 @@ mod tests {
             spawn: None,
             done_when: crate::recipe::DoneWhen::Commits,
         }
+    }
+
+    #[test]
+    fn the_kanstack_binary_is_resolved_to_an_absolute_path_once() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let (empty, bin) = (tmp.path().join("empty"), tmp.path().join("bin"));
+        for dir in [&empty, &bin] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(empty.join("kanstack"), "not executable").unwrap();
+        let exe = bin.join("kanstack");
+        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::join_paths([&empty, &bin]).unwrap();
+
+        assert_eq!(resolve_bin_on(None, Some(&path)), exe, "the first executable `kanstack` on PATH");
+        assert_eq!(resolve_bin_on(Some(PathBuf::from("/k/kanstack")), Some(&path)), PathBuf::from("/k/kanstack"));
+        let relative = resolve_bin_on(Some(PathBuf::from("target/debug/kanstack")), Some(&path));
+        assert_eq!(relative, std::env::current_dir().unwrap().join("target/debug/kanstack"));
+        assert_eq!(resolve_bin_on(None, Some(std::ffi::OsStr::new(""))), PathBuf::from("kanstack"), "not found: left to fail as before");
     }
 
     #[test]

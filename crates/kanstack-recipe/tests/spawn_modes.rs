@@ -32,8 +32,12 @@ impl Lab {
         Lab { _tmp: tmp, bin_dir, repo, store: RunStore::at(root.join("state")) }
     }
 
+    fn kanstack_bin(&self) -> PathBuf {
+        self.bin_dir.join("kanstack")
+    }
+
     fn client(&self) -> KanstackClient {
-        KanstackClient::new(self.bin_dir.join("kanstack"))
+        KanstackClient::new(self.kanstack_bin())
     }
 
     fn knob(&self, name: &str, value: &str) {
@@ -137,7 +141,7 @@ fn advisory_spawns_its_own_branch_and_finishes_on_a_note() {
     let (outcome, run) = lab.run("---\nversion: 1\nsteps:\n  survey:\n    agent: claude\n    spawn: advisory\n    prompt: Survey\n---\nctx\n");
     assert!(!outcome.failed);
     assert_actions(&lab, &["spawn survey --agent claude --advisory --prompt Survey"]);
-    assert!(actions(&lab.bin_dir)[0].contains("kanstack note survey \"<report>\""), "the prompt asks for the note");
+    assert!(actions(&lab.bin_dir)[0].contains(&format!("{} note survey \"<report>\"", lab.kanstack_bin().display())), "the prompt asks for the note");
     let survey = &run.steps["survey"];
     assert_eq!((survey.status, survey.report.as_deref()), (StepStatus::Done, Some("report from survey")));
 }
@@ -268,7 +272,7 @@ fn done_when_note_waits_for_a_note_written_after_launch() {
     let a = &run.steps["a"];
     assert_eq!((a.status, a.report.as_deref()), (StepStatus::Done, Some("report from a")));
     assert!(a.notes_from.unwrap() > 0, "notes are read from past the stale one");
-    assert!(actions(&lab.bin_dir)[0].contains("kanstack note a \"<report>\""), "the prompt asks for the note");
+    assert!(actions(&lab.bin_dir)[0].contains(&format!("{} note a \"<report>\"", lab.kanstack_bin().display())), "the prompt asks for the note");
 }
 
 /// `either`: a note with no commits finishes it, and so do commits with no note.
@@ -284,7 +288,7 @@ fn done_when_either_accepts_a_note_or_commits() {
     let review = &run.steps["review"];
     assert_eq!((review.status, review.report.as_deref()), (StepStatus::Done, Some("report from review")));
     assert_eq!(review.base, review.tip, "no commits");
-    assert!(actions(&lab.bin_dir)[0].contains("kanstack note review \"<report>\""));
+    assert!(actions(&lab.bin_dir)[0].contains(&format!("{} note review \"<report>\"", lab.kanstack_bin().display())));
 
     let lab = Lab::new();
     let (outcome, run) = lab.run(source);

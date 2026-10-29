@@ -2,7 +2,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use kanstack_recipe::kanstack::KanstackClient;
+use kanstack_recipe::kanstack::{self, KanstackClient};
 use kanstack_recipe::lock::OrchestratorLock;
 use kanstack_recipe::recipe;
 use kanstack_recipe::resume::{resume, unfinished_runs};
@@ -77,7 +77,7 @@ fn main() -> ExitCode {
         }
     }
 
-    let client = KanstackClient::new(parsed.kanstack_bin.clone().unwrap_or_else(|| PathBuf::from("kanstack")));
+    let client = KanstackClient::new(kanstack::resolve_bin(parsed.kanstack_bin.clone()));
     match command.as_str() {
         "run" | "check" => run_or_check(&command, &parsed, &client),
         "resume" => resume_runs(&parsed, &client),

@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -160,20 +161,37 @@ impl Recipe {
     }
 
     /// What actually reaches the harness on `branch`: the effective prompt, plus one line
-    /// asking for a `kanstack note` report when the step's `done_when` accepts one.
-    pub fn launch_prompt(&self, step_id: &str, branch: &str) -> String {
+    /// asking for a `kanstack note` report when the step's `done_when` accepts one. `kanstack`
+    /// is the binary the run drives lanes with (see [`report_instruction`]).
+    pub fn launch_prompt(&self, step_id: &str, branch: &str, kanstack: &Path) -> String {
         let prompt = self.effective_prompt(step_id);
         if self.steps[step_id].done_when.allows_note() {
-            format!("{prompt}\n\n{}", report_instruction(branch))
+            format!("{prompt}\n\n{}", report_instruction(kanstack, branch))
         } else {
             prompt
         }
     }
 }
 
-/// The line appended to a prompt whose step can finish on a note.
-pub fn report_instruction(branch: &str) -> String {
-    format!("When you're finished, report what you did by running: kanstack note {branch} \"<report>\"")
+/// The line appended to a prompt whose step can finish on a note. It names `kanstack` by the
+/// path the run was given rather than as a bare `kanstack`, so the note goes through the build
+/// that reads it back, not whichever one is first on the agent's `PATH` (which may be too old
+/// to have `note` at all).
+pub fn report_instruction(kanstack: &Path, branch: &str) -> String {
+    format!("When you're finished, report what you did by running: {} note {branch} \"<report>\"", shell_word(kanstack))
+}
+
+/// `path` as one shell word: as it is when it's made only of characters no shell treats
+/// specially, single-quoted otherwise. For commands written into prompts, so the common case
+/// stays readable.
+pub fn shell_word(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    let plain = !text.is_empty() && text.chars().all(|c| c.is_ascii_alphanumeric() || "/._-+,:@%".contains(c));
+    if plain {
+        text.into_owned()
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
 }
 
 #[derive(Debug)]
@@ -974,11 +992,21 @@ mod tests {
             "---\nversion: 1\nsteps:\n  a:\n    agent: codex\n    prompt: A\n  b:\n    agent: codex\n    done_when: note\n    prompt: B\n  c:\n    agent: codex\n    done_when: either\n    prompt: C\n---\nctx\n",
         )
         .unwrap();
-        assert_eq!(recipe.launch_prompt("a", "a"), recipe.effective_prompt("a"));
+        let kanstack = Path::new("/opt/dev/kanstack");
+        assert_eq!(recipe.launch_prompt("a", "a", kanstack), recipe.effective_prompt("a"));
         assert_eq!(
-            recipe.launch_prompt("b", "b"),
-            "B\n\n## Recipe context\n\nctx\n\nWhen you're finished, report what you did by running: kanstack note b \"<report>\""
+            recipe.launch_prompt("b", "b", kanstack),
+            "B\n\n## Recipe context\n\nctx\n\nWhen you're finished, report what you did by running: /opt/dev/kanstack note b \"<report>\""
         );
-        assert!(recipe.launch_prompt("c", "lane-c").ends_with("kanstack note lane-c \"<report>\""));
+        assert!(recipe.launch_prompt("c", "lane-c", kanstack).ends_with("/opt/dev/kanstack note lane-c \"<report>\""));
+        assert!(recipe
+            .launch_prompt("c", "lane-c", Path::new("/My Tools/kanstack"))
+            .ends_with("'/My Tools/kanstack' note lane-c \"<report>\""));
+    }
+
+    #[test]
+    fn shell_word_quotes_only_what_needs_it() {
+        assert_eq!(shell_word(Path::new("/usr/local/bin/kanstack")), "/usr/local/bin/kanstack");
+        assert_eq!(shell_word(Path::new("/a b/it's")), "'/a b/it'\\''s'");
     }
 }

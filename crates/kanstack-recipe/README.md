@@ -39,6 +39,10 @@ kanstack-recipe land <item-id> [--json] [--keep-panes] [--kanstack-bin <path>] [
 ```
 
 `--kanstack-bin` overrides where the `kanstack` binary is found (default: looked up on `$PATH`).
+Either way it's resolved to an absolute path once, at startup, and that path is the one the
+runner calls and the one its prompts tell agents to call (see "Recipe context" below), so an
+agent whose own `PATH` has an older `kanstack` first still reports through the same build the
+runner reads reports from.
 Every `run` is a durable run with its own id, printed when it starts (see "Durable runs" below).
 There is no TUI and no interactive mode; progress prints to stdout as steps launch and finish,
 roughly:
@@ -115,8 +119,11 @@ That combined text is what reaches the harness, via `kanstack spawn --prompt` or
 the agent to report back (see "Completion model"):
 
 ```text
-When you're finished, report what you did by running: kanstack note <branch> "<report>"
+When you're finished, report what you did by running: /abs/path/to/kanstack note <branch> "<report>"
 ```
+
+The path is the run's own `kanstack` (`--kanstack-bin`, else `kanstack` on `$PATH`, made
+absolute), single-quoted if it has a space or anything else a shell would read.
 
 ### Fields
 
@@ -443,6 +450,9 @@ stored report, and why it failed or never ran. Under `serve`, it's then asked to
 `kanstack-recipe items list --json`, propose each follow-up worth doing with `kanstack-recipe
 items propose --from <item>` (it does its own deduplication against what's listed), and finish
 with `kanstack note`. In a plain `run` with no item, it's asked for a summary note instead.
+Both binaries are named by absolute path in the prompt: `kanstack` as the run resolved it, and
+`kanstack-recipe` as the very executable running the step, so the proposals reach the same
+queue this `serve` pulls from.
 Proposals arrive as `proposed` and wait for `items promote`.
 
 ## What this crate does not do

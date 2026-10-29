@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use common::{actions, fast_opts, init_repo, write_fake_kanstack};
 
-use kanstack_recipe::aggregate::{launch_prompt, runnable_steps};
+use kanstack_recipe::aggregate::{self, runnable_steps};
 use kanstack_recipe::graph::StepState;
 use kanstack_recipe::kanstack::KanstackClient;
 use kanstack_recipe::lock::OrchestratorLock;
@@ -26,6 +26,18 @@ const RECIPE: &str = "---\nversion: 1\naggregate: followups\nsteps:\n  implement
 
 fn recipe() -> Recipe {
     parse(RECIPE).unwrap()
+}
+
+/// The `kanstack` the prompts in these tests are built for.
+const KANSTACK: &str = "/opt/dev/kanstack";
+
+fn launch_prompt(recipe: &Recipe, run: &RunState, step_id: &str, branch: &str) -> String {
+    aggregate::launch_prompt(recipe, run, step_id, branch, Path::new(KANSTACK))
+}
+
+/// `kanstack-recipe` as the aggregate step is told to run it: this test binary, here.
+fn recipe_bin() -> String {
+    aggregate::recipe_bin().display().to_string()
 }
 
 #[test]
@@ -153,11 +165,11 @@ fn the_block_lists_each_steps_report_commit_range_or_failure_and_asks_for_propos
 
     let follow_ups = &block[expected_outcomes.len()..];
     assert!(follow_ups.starts_with("\n## Follow-ups\n\nThis run works on item 44."), "{follow_ups}");
-    let list = follow_ups.find("kanstack-recipe items list --json").expect(follow_ups);
+    let list = follow_ups.find(&format!("`{} items list --json`", recipe_bin())).expect(follow_ups);
     let propose = follow_ups
-        .find("kanstack-recipe items propose --from 44 --title \"<title>\" --body \"<what to do and why>\"")
+        .find(&format!("`{} items propose --from 44 --title \"<title>\" --body \"<what to do and why>\"`", recipe_bin()))
         .expect(follow_ups);
-    let note = follow_ups.find("kanstack note item-44-followups \"<report>\"").expect(follow_ups);
+    let note = follow_ups.find(&format!("by running: {KANSTACK} note item-44-followups \"<report>\"")).expect(follow_ups);
     assert!(list < propose && propose < note, "list, then propose, then note: {follow_ups}");
     assert!(follow_ups.contains("don't propose anything that's already there"), "{follow_ups}");
     assert_eq!(prompt.matches("kanstack note").count(), 1, "one report instruction, not two: {prompt}");
@@ -173,7 +185,7 @@ fn without_an_item_the_block_keeps_the_outcomes_and_asks_for_a_summary() {
     assert_eq!(&prompt[..outcomes_end], &with_item[..outcomes_end], "the same outcomes");
     let rest = &prompt[outcomes_end..];
     assert!(rest.starts_with("\n## Summary\n\nThis run isn't working on a queue item, so don't propose follow-ups."), "{rest}");
-    assert!(rest.ends_with("by running: kanstack note followups \"<summary>\"\n"), "{rest}");
+    assert!(rest.ends_with(&format!("by running: {KANSTACK} note followups \"<summary>\"\n")), "{rest}");
     assert!(!prompt.contains("items propose") && !prompt.contains("items list"), "{prompt}");
 }
 
@@ -182,7 +194,7 @@ fn other_steps_prompts_are_left_alone() {
     let recipe = recipe();
     let run = finished_run(&recipe, Some("44"));
     for id in ["implement", "review", "docs"] {
-        assert_eq!(launch_prompt(&recipe, &run, id, id), recipe.launch_prompt(id, id));
+        assert_eq!(launch_prompt(&recipe, &run, id, id), recipe.launch_prompt(id, id, Path::new(KANSTACK)));
     }
 }
 
@@ -278,8 +290,9 @@ fn serve_spawns_the_aggregate_last_as_advisory_with_the_runs_outcomes() {
     assert!(last.contains("### implement: done"), "{last}");
     assert!(last.contains("Its report:  report from item-1-implement"), "{last}");
     assert!(last.contains("Commits `") && last.contains("` on `item-1-implement`."), "{last}");
-    assert!(last.contains("kanstack-recipe items propose --from 1 --title"), "{last}");
-    assert!(last.contains("kanstack note item-1-followups \"<report>\""), "{last}");
+    assert!(last.contains(&format!("{} items propose --from 1 --title", recipe_bin())), "{last}");
+    let kanstack = f.bin_dir.join("kanstack");
+    assert!(last.contains(&format!("{} note item-1-followups \"<report>\"", kanstack.display())), "{last}");
 
     let body = f.tracker.get(&id).unwrap().body;
     assert!(body.contains("### followups: done") && body.contains("report from item-1-followups"), "{body}");

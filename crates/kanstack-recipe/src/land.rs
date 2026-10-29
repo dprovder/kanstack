@@ -706,7 +706,7 @@ pub fn command(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let kanstack = KanstackClient::new(flags.kanstack_bin);
+    let kanstack = KanstackClient::new(crate::kanstack::resolve_bin(Some(flags.kanstack_bin)));
     let but = But::new(flags.but_bin);
     let lander = Lander { repo: &repo, tracker: tracker.as_ref(), store: &store, kanstack: &kanstack, but: &but };
     let opts = LandOptions { json: flags.json, keep_panes: flags.keep_panes, land, factory };

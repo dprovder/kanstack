@@ -517,7 +517,7 @@ pub fn command(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let client = KanstackClient::new(flags.kanstack_bin);
+    let client = KanstackClient::new(crate::kanstack::resolve_bin(Some(flags.kanstack_bin)));
     let opts = ServeOptions {
         max: flags.max,
         retries,

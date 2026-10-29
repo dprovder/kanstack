@@ -15,9 +15,10 @@
 //!   item to propose for, so it's asked for a summary note instead.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use crate::graph::{self, StepState};
-use crate::recipe::Recipe;
+use crate::recipe::{shell_word, Recipe};
 use crate::state::{RunState, StepRecord, StepStatus};
 
 /// [`graph::runnable_steps`], plus the recipe's aggregate step once no other step is in flight
@@ -35,12 +36,13 @@ pub fn runnable_steps(recipe: &Recipe, states: &HashMap<String, StepState>) -> V
 
 /// What reaches the harness for `step_id` on `branch`: [`Recipe::launch_prompt`], except for
 /// the aggregate step, whose effective prompt is followed by [`outcomes_block`]. Either way,
-/// behind the run's item block when it has one ([`with_work_item`]).
-pub fn launch_prompt(recipe: &Recipe, run: &RunState, step_id: &str, branch: &str) -> String {
+/// behind the run's item block when it has one ([`with_work_item`]). `kanstack` is the binary
+/// the run drives lanes with, named in the prompt's report instruction.
+pub fn launch_prompt(recipe: &Recipe, run: &RunState, step_id: &str, branch: &str, kanstack: &Path) -> String {
     let prompt = if recipe.aggregate.as_deref() != Some(step_id) {
-        recipe.launch_prompt(step_id, branch)
+        recipe.launch_prompt(step_id, branch, kanstack)
     } else {
-        format!("{}\n\n{}", recipe.effective_prompt(step_id), outcomes_block(recipe, run, branch))
+        format!("{}\n\n{}", recipe.effective_prompt(step_id), outcomes_block(recipe, run, branch, kanstack))
     };
     with_work_item(run, prompt)
 }
@@ -55,10 +57,19 @@ pub fn with_work_item(run: &RunState, prompt: String) -> String {
     format!("{block}\n\n{prompt}")
 }
 
+/// The `kanstack-recipe` the aggregate step is told to run: this very executable, so its
+/// `items` commands reach the same queue this run serves, whatever is first on the agent's
+/// `PATH`.
+pub fn recipe_bin() -> PathBuf {
+    std::env::current_exe().unwrap_or_else(|_| PathBuf::from("kanstack-recipe"))
+}
+
 /// Every step's outcome but the aggregate's, then what to do with them: propose follow-ups
 /// for the run's item and report with `kanstack note <branch>`, or, with no item, just report
-/// a summary.
-pub fn outcomes_block(recipe: &Recipe, run: &RunState, branch: &str) -> String {
+/// a summary. Both binaries are named by path: `kanstack` as given, `kanstack-recipe` as
+/// [`recipe_bin`].
+pub fn outcomes_block(recipe: &Recipe, run: &RunState, branch: &str, kanstack: &Path) -> String {
+    let kanstack = shell_word(kanstack);
     let mut block = String::from("## How the run went\n\nEvery other step of this run has finished. Here is what each one left.\n");
     for (id, step) in &recipe.steps {
         if recipe.aggregate.as_deref() == Some(id.as_str()) {
@@ -95,16 +106,17 @@ pub fn outcomes_block(recipe: &Recipe, run: &RunState, branch: &str) -> String {
         Some(item) => block.push_str(&format!(
             "\n## Follow-ups\n\n\
              This run works on item {item}. Turn anything it left undone, or turned up, into proposed follow-ups for it:\n\n\
-             1. First run `kanstack-recipe items list --json` to see what's already queued, and don't propose anything \
+             1. First run `{recipe} items list --json` to see what's already queued, and don't propose anything \
              that's already there.\n\
-             2. Then, for each follow-up worth doing, run `kanstack-recipe items propose --from {item} --title \"<title>\" \
+             2. Then, for each follow-up worth doing, run `{recipe} items propose --from {item} --title \"<title>\" \
              --body \"<what to do and why>\"` once. If nothing is worth doing, propose nothing.\n\
-             3. When you're finished, report what you proposed by running: kanstack note {branch} \"<report>\"\n"
+             3. When you're finished, report what you proposed by running: {kanstack} note {branch} \"<report>\"\n",
+            recipe = shell_word(&recipe_bin()),
         )),
         None => block.push_str(&format!(
             "\n## Summary\n\n\
              This run isn't working on a queue item, so don't propose follow-ups. When you're finished, report a summary \
-             of the run, and anything worth following up on, by running: kanstack note {branch} \"<summary>\"\n"
+             of the run, and anything worth following up on, by running: {kanstack} note {branch} \"<summary>\"\n"
         )),
     }
     block

@@ -291,10 +291,10 @@ fn a_plain_run_has_no_work_item_block() {
     fs::write(&path, ONE_STEP).unwrap();
     let mut run = RunState::new("r1", &recipe, &path, String::new(), f.workdir.clone());
     run.item = Some("1".to_string());
-    assert_eq!(kanstack_recipe::aggregate::launch_prompt(&recipe, &run, "a", "a"), recipe.launch_prompt("a", "a"), "no captured item, no block");
+    assert_eq!(kanstack_recipe::aggregate::launch_prompt(&recipe, &run, "a", "a", Path::new("/k")), recipe.launch_prompt("a", "a", Path::new("/k")), "no captured item, no block");
     run.item = None;
     run.work_item = Some(kanstack_recipe::state::WorkItem { title: "T".to_string(), body: "B".to_string() });
-    assert_eq!(kanstack_recipe::aggregate::launch_prompt(&recipe, &run, "a", "a"), recipe.launch_prompt("a", "a"), "no item, no block");
+    assert_eq!(kanstack_recipe::aggregate::launch_prompt(&recipe, &run, "a", "a", Path::new("/k")), recipe.launch_prompt("a", "a", Path::new("/k")), "no item, no block");
 }
 
 #[test]
@@ -393,7 +393,8 @@ fn each_steps_report_lands_on_its_item_once() {
         tick_until(&mut serve, || f.get(&id).state == ItemState::Review);
         serve.tick();
     }
-    assert!(calls_log(&f.bin_dir).contains("kanstack note item-1-a"), "the agent is asked to report on its own branch");
+    let note = format!("{} note item-1-a", f.bin_dir.join("kanstack").display());
+    assert!(calls_log(&f.bin_dir).contains(&note), "the agent is asked to report on its own branch, through the run's kanstack");
 
     // A later serve doesn't post it again.
     let lock = f.lock();
