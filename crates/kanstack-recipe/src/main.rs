@@ -31,6 +31,10 @@ fn main() -> ExitCode {
         print_usage();
         return ExitCode::SUCCESS;
     }
+    // `items` has subcommands and flags of its own, so it parses the rest itself.
+    if command == "items" {
+        return kanstack_recipe::items::command(&args.collect::<Vec<_>>());
+    }
     if !["run", "check", "resume", "runs"].contains(&command.as_str()) {
         eprintln!("kanstack-recipe: unknown command `{command}`");
         print_usage();
@@ -237,4 +241,5 @@ fn print_usage() {
     eprintln!("  kanstack-recipe check <recipe.md> [--kanstack-bin <path>]");
     eprintln!("  kanstack-recipe resume [<run-id>] [--force] [--kanstack-bin <path>]");
     eprintln!("  kanstack-recipe runs [--json]");
+    eprintln!("  kanstack-recipe items <add|list|show|promote|propose> ... [--json]  (items --help for details)");
 }
