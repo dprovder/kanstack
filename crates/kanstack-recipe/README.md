@@ -34,6 +34,7 @@ kanstack-recipe resume [<run-id>] [--force] [--kanstack-bin <path>]  # pick runs
 kanstack-recipe runs [--json]                                     # list runs and their steps' statuses
 kanstack-recipe items <add|list|show|promote|propose> ... [--json] # the factory's queue (see "The factory queue")
 kanstack-recipe serve [--max <N>] [--once] [--json] [--kanstack-bin <path>]  # pull loop over the queue
+kanstack-recipe land <item-id> [--json] [--keep-panes] [--kanstack-bin <path>] [--but-bin <path>]  # land a reviewed item
 ```
 
 `--kanstack-bin` overrides where the `kanstack` binary is found (default: looked up on `$PATH`).
@@ -130,6 +131,8 @@ When you're finished, report what you did by running: kanstack note <branch> "<r
 | `done_when` | no | what, besides an idle lane, finishes the step: `commits`, `note` or `either` (see "Completion model"). Defaults to `note` for an advisory step and `commits` otherwise. |
 | `owns` | no | glob list, advisory only — for prompt context and collision-awareness. Not enforced by this runner or by kanstack; no new locking mechanism is built around it. |
 | `verify` | no | list of shell commands, run from the directory the runner itself was invoked in once the step's workstream goes idle. **All** must exit `0` for the step to count as complete. A nonzero exit fails the step (and the whole recipe) unless it has retries left, in which case the failing command and the tail of its output go back into the same pane and the step continues. |
+| `aggregate` | no | **recipe-level**, not per step: names the step that closes the run by reviewing every other step's outcome and proposing follow-ups (see "The aggregate step"). |
+| `land`, `factory` | no | **recipe-level**: override `KANSTACK_LAND` (`direct` or `pr`) and `KANSTACK_FACTORY` (`light`; `dark` isn't built yet) for this recipe's items. |
 | `retries` | no | how many times a failed step is retried before it fails, overriding `KANSTACK_RETRIES`. Also allowed at the top of the front matter, as the default for every step. Resolved when a run starts and kept in run state. |
 
 No other fields exist in v1 (no `timeout`, `priority`, roles, conditions, or anything
@@ -308,9 +311,13 @@ branch by then, and malformed YAML front matter.
 `items` and `serve` turn the runner into the minimal software factory: work goes into a queue,
 `serve` pulls it into recipe runs, and each item's state follows its run.
 
-**Items** live behind kanstack-tracker's `Tracker` trait, chosen with `KANSTACK_TRACKER` (only
-`local` exists today: one markdown file per item in kanstack's per-repo state directory, never
-in the worktree). An item has a title, a body, an optional recipe, a state — `proposed`,
+**Items** live behind kanstack-tracker's `Tracker` trait. `KANSTACK_TRACKER` picks one
+explicitly: `local` (one markdown file per item in kanstack's per-repo state directory, never in
+the worktree) or `github` (issues through the `gh` CLI, states as `kanstack:<state>` labels, a
+closed issue reads as `done`; `KANSTACK_GH_BIN` substitutes the `gh` binary). Unset, it picks
+`github` when the repository's origin is on github.com and `gh` is logged in, else `local` —
+so in such a repository `items`, `serve` and `land` work on its real issues. Set
+`KANSTACK_TRACKER=local` to keep them local. An item has a title, a body, an optional recipe, a state — `proposed`,
 `backlog`, `running`, `failed`, `review` or `done` — and, for a proposal, the item it came from.
 
 ```sh
@@ -337,8 +344,7 @@ one `{"schema": 1, ...}` document. Only a proposed item can be promoted.
 Without `--once`, `serve` runs until it's killed; `--once` runs a single tick and exits, for tests
 and cron. `--json` prints one line per item event on stdout and keeps progress on stderr:
 `{"schema":1,"kind":"started|retried|review|failed","item":…,"run":…,"step":…,"reason":…}`.
-A backlog item with no `recipe` is never pulled, and items wait in `review`; landing them is a
-later step. On restart `serve` resumes its unfinished runs, posting each step's comment once,
+A backlog item with no `recipe` is never pulled, and items wait in `review` until `land`. On restart `serve` resumes its unfinished runs, posting each step's comment once,
 except a run whose recipe file has changed since it started, which waits for `resume --force`.
 Run state links each run to its `item` and records its `branch_prefix`, which steps were
 `reported` and whether the item has been `settled`; each step also records `retries`,
@@ -359,6 +365,50 @@ way. Transport errors from `spawn`/`send` (`multiplexer_unavailable`, `but_faile
 `delivery_failed` and the like) back off and retry without using the budget, up to 5 in a row.
 Out of budget, the step fails and so does its item.
 
+**Landing.** `land <item-id>` lands an item that's in `review` and has a completed run; anything
+else exits 1 before touching `but`. Light mode (`KANSTACK_FACTORY` unset or `light`) is the
+default and the only mode built: nothing lands until someone runs `land`, and `serve` never does.
+The item's branches land bottom of the stack first (a `spawn: stack` step's branch sits above its
+target), and a branch with no commits — a review that only reported, say — is skipped.
+
+- `KANSTACK_LAND=direct` (the default): for each branch, `but branch show <b> --check --json` then
+  `but land <b> --yes --json`. The first branch that wouldn't land cleanly stops it, with nothing
+  above it landed, and a comment on the item says where and why; the item stays in `review`.
+  Once everything has landed it comments what landed, sets the item `done`, and stops the item's
+  lanes with `kanstack stop` unless `--keep-panes`.
+- `KANSTACK_LAND=pr`: `but pr new <top> -t --json` for each stack's top branch, a comment with the
+  link, and the item stays in `review` — following the PR to its merge isn't built.
+
+Exit codes are 0, 1 (including a land that stopped partway) and 2 for usage. `--json` prints
+`{"schema":1,"item","run","mode","branches","landed":[{"branch","commits"}],"skipped",
+"stopped_at"?,"prs":[{"branch","url"}],"state","lanes_stopped","lanes_not_stopped"?}`, even when
+a land stops partway.
+
+### The aggregate step
+
+A recipe can close its runs with an aggregate step: `aggregate: <step-id>` at the top of the
+front matter names one of its steps. The factory has no aggregator of its own; the recipe picks
+the agent and prompt.
+
+```yaml
+aggregate: follow-ups
+steps:
+  implement:  { agent: codex,  prompt: Implement the change. }
+  follow-ups: { agent: claude, prompt: Decide what's worth doing next. }
+```
+
+The named step needs every other step and defaults to `done_when: note`, and to `spawn: advisory`
+when it has no `on:`. It runs last, once no other step is running or can still start — even after
+a failure, so it can report what went wrong; the run and its item still fail. It's an error for
+`aggregate:` to name a step that doesn't exist, or for another step to name it in `needs` or `on`.
+
+Its prompt gains a "How the run went" section: each other step's status, retries, commit range,
+stored report, and why it failed or never ran. Under `serve`, it's then asked to check
+`kanstack-recipe items list --json`, propose each follow-up worth doing with `kanstack-recipe
+items propose --from <item>` (it does its own deduplication against what's listed), and finish
+with `kanstack note`. In a plain `run` with no item, it's asked for a summary note instead.
+Proposals arrive as `proposed` and wait for `items promote`.
+
 ## What this crate does not do
 
 No DAG scheduling, recipe parsing, or workflow state lives inside kanstack itself — that stays
@@ -369,6 +419,8 @@ entirely in this crate, which (as of v1):
   first;
 - retries a failed step only within its budget, and has no timeout or conditional-branching logic;
 - does not build a new file-locking system around `owns` — that stays advisory metadata;
+- does not follow a PR to its merge (`KANSTACK_LAND=pr` leaves the item in `review`), and has no
+  dark mode yet;
 - does not talk to any provider SDK or MCP server. `serve` is a foreground loop, not a
   daemon or network service.
 
