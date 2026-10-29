@@ -9,6 +9,7 @@
 //! A leaf crate on purpose: it depends on nothing else in this workspace, so kanstack can use
 //! it without depending on the orchestrator that sits above kanstack.
 
+pub mod github;
 pub mod local;
 
 use std::path::Path;
@@ -16,11 +17,12 @@ use std::path::Path;
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
+pub use github::GithubTracker;
 pub use local::LocalTracker;
 
-/// A tracker's own identifier for an item: `44` locally, `#44` on GitHub, `LIN-123` on
-/// Linear. A string because remote trackers don't all use numbers; only the backend that
-/// handed one out interprets it.
+/// A tracker's own identifier for an item: `44` locally, the issue number `44` on GitHub,
+/// `LIN-123` on Linear. A string because remote trackers don't all use numbers; only the
+/// backend that handed one out interprets it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ItemId(pub String);
@@ -94,7 +96,8 @@ pub struct Item {
     /// Only on proposals: the item whose reports produced this one, so a person promoting it
     /// can see where it came from.
     pub from: Option<ItemId>,
-    /// Everything below the title, reports included. Markdown, uninterpreted.
+    /// Everything below the title, uninterpreted Markdown. Reports are included locally; on
+    /// remote trackers they're comments, and not part of it.
     pub body: String,
 }
 
@@ -160,9 +163,10 @@ pub trait Tracker: Sync {
 /// network, no files written): [`select`] opens each candidate just to ask its name.
 pub type Open = fn(&Path) -> Result<Box<dyn Tracker>>;
 
-/// Every tracker kanstack knows, in the order auto-detection tries them. `local` is last
-/// because it's the fallback: remote backends go ahead of it as they're added.
-pub const KNOWN: &[Open] = &[local::open];
+/// Every tracker kanstack knows, in the order auto-detection tries them, as the multiplexer
+/// is discovered: remote backends first, each checking the repo's remote, then `local`, the
+/// fallback that always accepts.
+pub const KNOWN: &[Open] = &[github::open, local::open];
 
 /// The tracker for `repo`: the one `KANSTACK_TRACKER` names if it's set, else the first in
 /// [`KNOWN`] whose [`Tracker::detect`] accepts the repo, which is `local` when nothing else
@@ -216,10 +220,28 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         assert_eq!(select_named(repo.path(), Some("local")).unwrap().id(), "local");
         let err = select_named(repo.path(), Some("jira")).err().unwrap().to_string();
-        assert!(err.contains("\"jira\"") && err.contains("known: local"), "{err}");
+        assert!(err.contains("\"jira\"") && err.contains("known: github, local"), "{err}");
     }
 
-    /// The only test here that touches the environment, so it can't race another.
+    /// Unset, `github` goes ahead of `local` whenever it detects; named, it wins even where it
+    /// wouldn't. The only test that sets `KANSTACK_GH_BIN`, which no other test's outcome
+    /// depends on: theirs run in repos with no origin, so `gh` is never asked.
+    #[test]
+    fn select_tries_github_before_local() {
+        let fake = github::fake::Fake::new();
+        std::env::set_var("KANSTACK_GH_BIN", fake.gh());
+        let detected = select_named(&fake.repo(), None).map(|tracker| tracker.id());
+        fake.set_authed(false);
+        let unauthed = select_named(&fake.repo(), None).map(|tracker| tracker.id());
+        let named = select_named(&fake.repo(), Some("github")).map(|tracker| tracker.id());
+        std::env::remove_var("KANSTACK_GH_BIN");
+        assert_eq!(detected.unwrap(), "github");
+        assert_eq!(unauthed.unwrap(), "local");
+        assert_eq!(named.unwrap(), "github");
+        assert_eq!(fake.log().matches("auth status").count(), 2, "an explicit choice isn't detected");
+    }
+
+    /// The only test here that sets `KANSTACK_TRACKER`, so it can't race another.
     #[test]
     fn select_reads_kanstack_tracker() {
         let repo = tempfile::tempdir().unwrap();
