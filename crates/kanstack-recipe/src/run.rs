@@ -67,6 +67,14 @@
 //! first (see [`Driver::reconcile`]). A prompt is never sent twice to a lane that still
 //! exists. [`run_recipe`] is the same loop with nothing persisted.
 //!
+//! **Every attempt has a time limit.** A lane can get stuck: an editor left open, a harness
+//! asking a question nobody answers. So a `running` step whose attempt has run longer than its
+//! timeout ([`StepRecord::timeout_secs`], else [`RunOptions::step_timeout`]) counts as a failed
+//! attempt and is retried or failed like a dead pane is, respawned on the same branch. The clock
+//! is the attempt's `started_at`, which is persisted, so a resumed run keeps it. A lane that
+//! reported `waiting` (on a person, at a permission prompt) times out too, and its error says
+//! so. A trusted idle that meets the step's `done_when` on the same read wins over the clock.
+//!
 //! **One tick at a time.** A run advances in ticks: launch whatever is runnable, take one
 //! `status --json` read, apply it to every in-flight step. [`start_run`] and [`resume_run`]
 //! loop those ticks until the run ends; [`ActiveRun`] exposes them one by one, so `serve` can
@@ -81,7 +89,7 @@ use std::time::{Duration, Instant};
 use crate::aggregate::{self, runnable_steps};
 use crate::graph::{resolve_workstream, StepState};
 use crate::kanstack::{KanstackClient, KanstackError, WorkstreamStatus};
-use crate::recipe::{Recipe, SpawnMode, Step};
+use crate::recipe::{format_duration, parse_duration, Recipe, SpawnMode, Step};
 use crate::state::{fnv1a, now_secs, Retry, RunState, RunStatus, RunStore, StepRecord, StepStatus};
 
 /// How many consecutive `status --json` failures in a row are tolerated as transient before
@@ -102,10 +110,16 @@ const VERIFY_TAIL_BYTES: usize = 4000;
 /// run, or printed no JSON) counts too.
 const TRANSPORT_ERROR_CODES: &[&str] = &["internal", "multiplexer_unavailable", "harness_unavailable", "but_failed", "delivery_failed"];
 
+/// How long a step's attempt may run when neither its recipe nor `KANSTACK_STEP_TIMEOUT` says.
+pub const DEFAULT_STEP_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
 pub struct RunOptions {
     pub poll_interval: Duration,
     /// Print progress lines to stderr instead of stdout, which `serve --json` keeps for JSON.
     pub progress_to_stderr: bool,
+    /// How long an attempt may run when its step has no timeout of its own recorded: a run
+    /// started before timeouts, or one whose steps' timeouts weren't resolved.
+    pub step_timeout: Duration,
 }
 
 impl Default for RunOptions {
@@ -113,7 +127,17 @@ impl Default for RunOptions {
         RunOptions {
             poll_interval: Duration::from_millis(1500),
             progress_to_stderr: false,
+            step_timeout: DEFAULT_STEP_TIMEOUT,
         }
+    }
+}
+
+/// `KANSTACK_STEP_TIMEOUT` as a duration (`45m`, `2h`, see [`parse_duration`]), or
+/// [`DEFAULT_STEP_TIMEOUT`] when it's unset or blank. `Err` with a message for anything else.
+pub fn step_timeout_from_env() -> Result<Duration, String> {
+    match std::env::var("KANSTACK_STEP_TIMEOUT").ok().filter(|v| !v.trim().is_empty()) {
+        None => Ok(DEFAULT_STEP_TIMEOUT),
+        Some(v) => parse_duration(&v).ok_or_else(|| format!("KANSTACK_STEP_TIMEOUT must be a duration like 45m or 2h, not `{v}`")),
     }
 }
 
@@ -621,6 +645,10 @@ impl<'a> Driver<'a> {
                     if self.live.broken {
                         return;
                     }
+                    self.time_out_if_overdue(run, step_id, status_by_branch.get(branch.as_str()).copied());
+                    if self.live.broken {
+                        return;
+                    }
                 }
             }
             Err(e) => {
@@ -729,6 +757,32 @@ impl<'a> Driver<'a> {
                 return;
             }
         }
+    }
+
+    /// Fails the attempt of a still-`running` `step_id` that has run past its timeout, to be
+    /// retried or failed like a dead pane's. `lane` is its lane's status on this read, which
+    /// says what it was stuck on.
+    fn time_out_if_overdue(&mut self, run: &mut RunState, step_id: &str, lane: Option<&str>) {
+        let rec = &run.steps[step_id];
+        let limit = rec.timeout_secs.unwrap_or(self.opts.step_timeout.as_secs());
+        let overdue = rec.status == StepStatus::Running && rec.started_at.is_some_and(|started| now_secs().saturating_sub(started) >= limit);
+        if !overdue {
+            return;
+        }
+        let branch = rec.branch.as_deref().unwrap_or_default();
+        let limit = format_duration(Duration::from_secs(limit));
+        let error = match (lane, rec.waiting_on) {
+            (Some("waiting"), _) => format!(
+                "timed out after {limit} waiting on a person: lane \"{branch}\" was stopped at a prompt or question nobody answered"
+            ),
+            (Some("idle"), Some(done_when)) => {
+                format!("timed out after {limit}: lane \"{branch}\" was idle, still waiting on {}", done_when.waiting_label())
+            }
+            (Some(status), _) => format!("timed out after {limit}: lane \"{branch}\" was still {status}"),
+            (None, _) => format!("timed out after {limit}"),
+        };
+        self.warn(run, format_args!("✗ {step_id:<15} failed    {error}"));
+        self.retry_or_fail(run, step_id, error, timeout_note);
     }
 
     /// A step's lane is trusted idle. If its `done_when` is met, store the agent's report (if
@@ -888,6 +942,17 @@ fn respawn_note(_: &StepRecord, error: &str) -> Retry {
         note: format!(
             "Note: an earlier session on this step ended before it was finished ({error}). Whatever it committed is \
              still on this branch, so check `git log` and `git status` and carry on from there."
+        ),
+    }
+}
+
+/// The [`Retry::Respawn`] for a step whose attempt ran past its timeout. The stuck pane is
+/// stopped by the respawn's handoff.
+fn timeout_note(_: &StepRecord, error: &str) -> Retry {
+    Retry::Respawn {
+        note: format!(
+            "Note: an earlier session on this step was stopped because it ran past the step's time limit ({error}). \
+             Whatever it committed is still on this branch, so check `git log` and `git status` and carry on from there."
         ),
     }
 }

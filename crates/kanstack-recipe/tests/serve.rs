@@ -510,3 +510,57 @@ fn serve_child_process() {
         1
     });
 }
+
+/// The run for `item`, once there is one.
+fn maybe_run_for(store: &RunStore, item: &ItemId) -> Option<RunState> {
+    store.run_ids().unwrap().iter().map(|id| store.load(id).unwrap()).find(|run| run.item.as_deref() == Some(item.0.as_str()))
+}
+
+/// A lane stuck busy past its step's `timeout:` is a failed attempt: its pane is stopped and the
+/// step's agent respawned on the same branch, within the retry budget, told why.
+#[test]
+fn a_step_stuck_past_its_timeout_is_respawned_on_its_branch() {
+    let f = Factory::new();
+    f.recipe("slow", "---\nversion: 1\nsteps:\n  a:\n    agent: codex\n    timeout: 2s\n    prompt: Do A\n---\nctx\n");
+    let id = f.item("Slow", Some("slow"));
+    f.knob("busy", "item-1-a\n");
+    f.knob("no_commits", "");
+    let lock = f.lock();
+    let mut serve = f.serve(&lock, 1, 1);
+
+    tick_until(&mut serve, || maybe_run_for(&f.store, &id).is_some_and(|run| run.steps["a"].retries == 1));
+    let a = &f.run_for(&id).steps["a"];
+    assert_eq!((a.status, a.timeout_secs), (StepStatus::Pending, Some(2)), "{a:?}");
+    assert_eq!(a.last_error.as_deref(), Some("timed out after 2s: lane \"item-1-a\" was still busy"));
+    // The respawned agent gets on with it.
+    fs::remove_file(f.bin_dir.join("busy")).unwrap();
+    fs::remove_file(f.bin_dir.join("no_commits")).unwrap();
+    tick_until(&mut serve, || f.get(&id).state == ItemState::Review);
+
+    let calls = actions(&f.bin_dir);
+    assert_eq!(calls.len(), 3, "{calls:?}");
+    assert!(calls[0].starts_with("spawn item-1-a "), "{calls:?}");
+    assert_eq!(calls[1], "stop item-1-a --json", "the stuck pane is stopped: {calls:?}");
+    assert!(calls[2].starts_with("spawn item-1-a ") && calls[2].contains("ran past the step's time limit"), "{calls:?}");
+    let a = &f.run_for(&id).steps["a"];
+    assert_eq!((a.status, a.attempt, a.retries), (StepStatus::Done, 2, 1), "{a:?}");
+}
+
+/// A lane waiting on a person times out too, and its error says that's what it was doing. Out of
+/// budget, the step fails without a respawn.
+#[test]
+fn a_lane_waiting_on_a_person_times_out_and_says_so() {
+    let f = Factory::new();
+    f.recipe("ask", "---\nversion: 1\ntimeout: 1s\nsteps:\n  a:\n    agent: codex\n    prompt: Do A\n---\nctx\n");
+    let id = f.item("Ask", Some("ask"));
+    f.knob("waiting", "item-1-a\n");
+    let lock = f.lock();
+    let mut serve = f.serve(&lock, 1, 0);
+    tick_until(&mut serve, || f.get(&id).state == ItemState::Failed);
+
+    let a = &f.run_for(&id).steps["a"];
+    assert_eq!((a.status, a.timeout_secs), (StepStatus::Failed, Some(1)), "{a:?}");
+    let error = a.last_error.as_deref().unwrap_or_default();
+    assert!(error.starts_with("timed out after 1s waiting on a person: lane \"item-1-a\""), "{error}");
+    assert_eq!(actions(&f.bin_dir).len(), 1, "no respawn without budget: {:?}", actions(&f.bin_dir));
+}

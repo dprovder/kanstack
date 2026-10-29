@@ -119,6 +119,11 @@ pub struct StepRecord {
     /// when git couldn't say: then the step falls back to comparing its tip with `base`.
     #[serde(default)]
     pub base_patches: Option<Vec<String>>,
+    /// How long each attempt may run, counted from its `started_at`, resolved when the run
+    /// started (see [`crate::recipe::StepTimeouts`]). Past it, the attempt counts as failed.
+    /// `null` for a run started before timeouts, which then gets the runner's default.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 /// How a failed attempt is retried.
@@ -158,6 +163,7 @@ impl Default for StepRecord {
             retry_budget: 0,
             retry: None,
             base_patches: None,
+            timeout_secs: None,
         }
     }
 }
@@ -436,6 +442,7 @@ mod tests {
                 retry_budget: 2,
                 retry: Some(Retry::FixForward { message: "`cargo test` exited 101".to_string() }),
                 base_patches: Some(vec!["0123abcd".to_string()]),
+                timeout_secs: Some(2700),
             },
         );
         run.branch_agents.insert("a".to_string(), "codex".to_string());
@@ -470,6 +477,7 @@ mod tests {
         assert_eq!((run.steps["a"].report.clone(), run.steps["a"].waiting_on), (None, None));
         assert_eq!((run.steps["a"].retries, run.steps["a"].retry_label()), (0, None));
         assert_eq!(run.steps["a"].base_patches, None, "falls back to comparing tips with `base`");
+        assert_eq!(run.steps["a"].timeout_secs, None, "gets the runner's default timeout");
         assert!(run.branch_agents.is_empty() && run.branch_prefix.is_empty() && !run.settled);
     }
 

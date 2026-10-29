@@ -36,8 +36,8 @@ use kanstack_recipe::state::RunStore;
 ///   branch to `events.jsonl`, if `notes` exists. Once N reaches `rebase_at`, it rebases every
 ///   open lane's branch onto a new commit on `main`, as GitButler's restack does (the same
 ///   changes as new commits), just once. Then it prints `status.N.json` if the test
-///   wrote one, else every lane on pane `%7`: `busy` if `busy` lists it, `dead` (just this
-///   once) if `die_on_status` lists it, else `idle`.
+///   wrote one, else every lane on pane `%7`: `busy` if `busy` lists it, `waiting` if
+///   `waiting` does, `dead` (just this once) if `die_on_status` lists it, else `idle`.
 /// - `events [--since <offset>]` prints `events.jsonl` from that byte offset, as kanstack does.
 ///
 /// Every commit it makes adds a file of its own, so each one has a diff, and a patch id.
@@ -214,6 +214,7 @@ case "$cmd" in
         first=0
         st=idle
         if grep -qx "$b" "$DIR/busy" 2>/dev/null; then st=busy; fi
+        if grep -qx "$b" "$DIR/waiting" 2>/dev/null; then st=waiting; fi
         if grep -qx "$b" "$DIR/die_on_status" 2>/dev/null; then
           st=dead
           grep -vx "$b" "$DIR/die_on_status" > "$DIR/die_on_status.tmp"

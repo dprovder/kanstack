@@ -39,7 +39,7 @@ use crate::kanstack::KanstackClient;
 use crate::lock::OrchestratorLock;
 use crate::recipe;
 use crate::resume::{load_for_resume, unfinished_runs};
-use crate::run::{ActiveRun, RunOptions};
+use crate::run::{step_timeout_from_env, ActiveRun, RunOptions};
 use crate::state::{recipe_hash, RunState, RunStatus, RunStore, StepRecord, StepStatus, WorkItem};
 
 /// The retry budget when neither `KANSTACK_RETRIES` nor the recipe sets one.
@@ -296,6 +296,7 @@ impl<'a> Serve<'a> {
         let source = fs::read_to_string(&path).map_err(|e| format!("could not read recipe {}: {e}", path.display()))?;
         let parsed = recipe::parse(&source).map_err(|e| format!("recipe {}: {e}", path.display()))?;
         let budgets = recipe::parse_retries(&source).map_err(|e| format!("recipe {}: {e}", path.display()))?;
+        let timeouts = recipe::parse_timeouts(&source).map_err(|e| format!("recipe {}: {e}", path.display()))?;
         let path = path.canonicalize().unwrap_or(path);
 
         let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
@@ -305,6 +306,7 @@ impl<'a> Serve<'a> {
         run.work_item = Some(WorkItem { title: item.title.clone(), body: item.body.clone() });
         for (step_id, rec) in &mut run.steps {
             rec.retry_budget = budgets.budget(step_id, self.opts.retries);
+            rec.timeout_secs = Some(timeouts.timeout(step_id, self.opts.run.step_timeout).as_secs());
         }
         // Saved before the item moves, so an item is never `running` without a run to show for
         // it; a crash in between leaves a run that the next `serve` resumes and the item follows.
@@ -497,6 +499,14 @@ pub fn command(args: &[String]) -> ExitCode {
         },
     };
 
+    let step_timeout = match step_timeout_from_env() {
+        Ok(timeout) => timeout,
+        Err(e) => {
+            eprintln!("kanstack-recipe serve: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let repo = cwd.ancestors().find(|dir| dir.join(".git").exists()).unwrap_or(&cwd).to_path_buf();
     let Some(store) = RunStore::for_repo(&repo) else {
@@ -522,7 +532,7 @@ pub fn command(args: &[String]) -> ExitCode {
         max: flags.max,
         retries,
         recipe_path: env::var("KANSTACK_RECIPE_PATH").ok(),
-        run: RunOptions { progress_to_stderr: flags.json, ..RunOptions::default() },
+        run: RunOptions { progress_to_stderr: flags.json, step_timeout, ..RunOptions::default() },
     };
     let poll_interval = opts.run.poll_interval;
 

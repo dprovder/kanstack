@@ -6,7 +6,7 @@ use kanstack_recipe::kanstack::{self, KanstackClient};
 use kanstack_recipe::lock::OrchestratorLock;
 use kanstack_recipe::recipe;
 use kanstack_recipe::resume::{resume, unfinished_runs};
-use kanstack_recipe::run::{start_run, RunOptions};
+use kanstack_recipe::run::{start_run, step_timeout_from_env, RunOptions};
 use kanstack_recipe::state::{recipe_hash, RunState, RunStore};
 
 /// Every flag any command takes, parsed once. Each command rejects the ones it doesn't use.
@@ -78,14 +78,22 @@ fn main() -> ExitCode {
     }
 
     let client = KanstackClient::new(kanstack::resolve_bin(parsed.kanstack_bin.clone()));
+    let opts = match step_timeout_from_env() {
+        Ok(step_timeout) => RunOptions { step_timeout, ..RunOptions::default() },
+        Err(e) if command == "run" || command == "resume" => {
+            eprintln!("kanstack-recipe: {e}");
+            return ExitCode::from(2);
+        }
+        Err(_) => RunOptions::default(),
+    };
     match command.as_str() {
-        "run" | "check" => run_or_check(&command, &parsed, &client),
-        "resume" => resume_runs(&parsed, &client),
+        "run" | "check" => run_or_check(&command, &parsed, &client, &opts),
+        "resume" => resume_runs(&parsed, &client, &opts),
         _ => list_runs(&parsed),
     }
 }
 
-fn run_or_check(command: &str, args: &Args, client: &KanstackClient) -> ExitCode {
+fn run_or_check(command: &str, args: &Args, client: &KanstackClient, opts: &RunOptions) -> ExitCode {
     let Some(recipe_path) = args.positional.as_deref().map(PathBuf::from) else {
         eprintln!("kanstack-recipe: missing <recipe.md> path");
         print_usage();
@@ -103,7 +111,7 @@ fn run_or_check(command: &str, args: &Args, client: &KanstackClient) -> ExitCode
         }
     };
 
-    let parsed = match recipe::parse(&source) {
+    let (parsed, timeouts) = match recipe::parse(&source).and_then(|r| Ok((r, recipe::parse_timeouts(&source)?))) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("{e}");
@@ -124,9 +132,12 @@ fn run_or_check(command: &str, args: &Args, client: &KanstackClient) -> ExitCode
     let recipe_path = recipe_path.canonicalize().unwrap_or(recipe_path);
     let id = store.new_run_id(&recipe_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
     let mut run = RunState::new(id, &parsed, &recipe_path, recipe_hash(&source), workdir);
+    for (step_id, rec) in &mut run.steps {
+        rec.timeout_secs = Some(timeouts.timeout(step_id, opts.step_timeout).as_secs());
+    }
     println!("→ run {}", run.id);
 
-    let outcome = start_run(&parsed, client, &RunOptions::default(), &store, &mut run);
+    let outcome = start_run(&parsed, client, opts, &store, &mut run);
     if outcome.failed {
         eprintln!("✗ recipe failed (run {})", run.id);
         ExitCode::FAILURE
@@ -139,7 +150,7 @@ fn run_or_check(command: &str, args: &Args, client: &KanstackClient) -> ExitCode
 /// `resume [<run-id>]`: that run, or every unfinished one, one after another. A lane keeps
 /// working in its pane while its run waits its turn, so nothing is lost by the wait — its
 /// finish is only noticed later.
-fn resume_runs(args: &Args, client: &KanstackClient) -> ExitCode {
+fn resume_runs(args: &Args, client: &KanstackClient, opts: &RunOptions) -> ExitCode {
     let Some((store, _lock)) = store_and_lock() else {
         return ExitCode::FAILURE;
     };
@@ -161,7 +172,7 @@ fn resume_runs(args: &Args, client: &KanstackClient) -> ExitCode {
     let mut failed = false;
     for id in &ids {
         println!("↻ run {id}");
-        match resume(&store, client, &RunOptions::default(), id, args.force) {
+        match resume(&store, client, opts, id, args.force) {
             Ok(outcome) if outcome.failed => {
                 eprintln!("✗ run {id} failed");
                 failed = true;

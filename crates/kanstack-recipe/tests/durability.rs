@@ -70,10 +70,16 @@ impl Scratch {
 
     /// Runs the `kanstack-recipe` binary in `workdir`, with its state under `state_path`.
     fn cli(&self, args: &[&str]) -> Output {
+        self.cli_with_env(args, &[])
+    }
+
+    /// [`Scratch::cli`], with `env` set too.
+    fn cli_with_env(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_kanstack-recipe"))
             .args(args)
             .current_dir(&self.workdir)
             .env("KANSTACK_STATE_PATH", &self.state_path)
+            .envs(env.iter().copied())
             .output()
             .unwrap()
     }
@@ -403,4 +409,44 @@ fn resume_judges_a_launching_step_on_an_idle_lane_by_done_when() {
     assert!(a.last_error.as_deref().unwrap_or_default().contains("died"), "{a:?}");
     let calls = calls_log(&s.bin_dir);
     assert!(!calls.contains("spawn ") && !calls.contains("send "), "{calls}");
+}
+
+/// The clock is the attempt's persisted `started_at`, so a resume doesn't restart it: a step
+/// whose time ran out while the orchestrator was down times out on resume's first poll.
+#[test]
+fn resume_keeps_a_steps_clock() {
+    let s = Scratch::new(ONE_STEP);
+    let base = s.lane("a");
+    fs::write(s.bin_dir.join("busy"), "a\n").unwrap();
+    let started = kanstack_recipe::state::now_secs() - 120;
+    let rec = StepRecord { base: Some(base), started_at: Some(started), timeout_secs: Some(60), ..in_flight(StepStatus::Running, 1) };
+    s.saved_run(&[("a", rec)]);
+
+    let outcome = resume(&s.store(), &s.client(), &fast_opts(), "1-land", false).unwrap();
+    assert!(outcome.failed);
+    let a = &s.store().load("1-land").unwrap().steps["a"];
+    assert_eq!((a.status, a.started_at), (StepStatus::Failed, Some(started)), "{a:?}");
+    assert_eq!(a.last_error.as_deref(), Some("timed out after 1m: lane \"a\" was still busy"));
+    let calls = calls_log(&s.bin_dir);
+    assert_eq!(calls.lines().filter(|l| *l == "status").count(), 2, "reconcile's read, then the first poll: {calls}");
+    assert!(!calls.contains("spawn ") && !calls.contains("send "), "{calls}");
+}
+
+/// `run` resolves every step's timeout when it starts: the recipe's, else
+/// `KANSTACK_STEP_TIMEOUT`. A value that isn't a duration is refused up front.
+#[test]
+fn run_takes_its_default_timeout_from_the_environment() {
+    let s = Scratch::new(ONE_STEP);
+    fs::write(s.bin_dir.join("busy"), "a\n").unwrap();
+    let recipe = s.recipe_path.to_str().unwrap();
+
+    let refused = s.cli_with_env(&["run", recipe, "--kanstack-bin", &s.kanstack_bin()], &[("KANSTACK_STEP_TIMEOUT", "soon")]);
+    assert_eq!(refused.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("KANSTACK_STEP_TIMEOUT"), "{refused:?}");
+
+    let output = s.cli_with_env(&["run", recipe, "--kanstack-bin", &s.kanstack_bin()], &[("KANSTACK_STEP_TIMEOUT", "1s")]);
+    assert!(!output.status.success(), "the busy lane never finishes");
+    let a = &s.cli_runs()[0].steps["a"];
+    assert_eq!((a.status, a.timeout_secs), (StepStatus::Failed, Some(1)), "{a:?}");
+    assert_eq!(a.last_error.as_deref(), Some("timed out after 1s: lane \"a\" was still busy"));
 }

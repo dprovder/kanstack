@@ -144,9 +144,10 @@ absolute), single-quoted if it has a space or anything else a shell would read.
 | `description` | no | **recipe-level**: one line saying what the recipe is for, listed by `recipes` and kanstack's recipe picker. Never part of a prompt. `check` rejects one that spans several lines. |
 | `tags` | no | **recipe-level**: a list of words to find the recipe by in `recipes` and the picker. |
 | `retries` | no | how many times a failed step is retried before it fails, overriding `KANSTACK_RETRIES`. Also allowed at the top of the front matter, as the default for every step. Resolved when a run starts and kept in run state. |
+| `timeout` | no | how long one attempt at the step may run before it counts as failed (see "Timeouts"): whole numbers with units, largest first, like `90s`, `45m`, `2h` or `1h30m`. Overrides `KANSTACK_STEP_TIMEOUT` (default `60m`). Also allowed at the top of the front matter, as the default for every step. Resolved when a run starts and kept in run state. |
 
-No other fields exist in v1 (no `timeout`, `priority`, roles, conditions, or anything
-else) — see the design notes in the main repository for why.
+No other fields exist in v1 (no `priority`, roles, conditions, or anything else) — see the
+design notes in the main repository for why.
 
 ### Spawn modes
 
@@ -238,8 +239,33 @@ Reading status is itself a `kanstack` subprocess call and can hiccup independent
 own work (a `but` timeout, a momentary I/O error). One failed poll is logged and retried on the
 next tick; only several in a row (`MAX_CONSECUTIVE_STATUS_FAILURES` in `src/run.rs`, `3` today)
 fail every step that's currently running — enough to tell a real, persistent problem (`kanstack`
-actually unreachable) apart from a blip, without adding a general retry/timeout policy to the
-recipe format itself (still out of scope, per the non-goals above).
+actually unreachable) apart from a blip. A step's own time limit is a separate thing (see
+"Timeouts").
+
+### Timeouts
+
+A lane can get stuck: an editor left open, a harness asking a question nobody answers. So each
+attempt at a step has a time limit, its `timeout:`, else the recipe's, else
+`KANSTACK_STEP_TIMEOUT`, else `60m`. A step still `running` past it counts as a failed
+attempt, the same as a dead pane: with retry budget left, its pane is stopped and its agent
+respawned on the same branch with its prompt and a note saying the earlier session ran out of
+time; out of budget, it fails with the reason. For example:
+
+```text
+timed out after 45m: lane "item-44-implement" was still busy
+timed out after 45m: lane "item-44-implement" was idle, still waiting on commits
+timed out after 45m waiting on a person: lane "item-44-review" was stopped at a prompt or question nobody answered
+```
+
+The last is a lane its harness reported `waiting` (a permission prompt, say): it times out like
+any other, but the error says it was waiting on a person rather than working.
+
+The clock starts when the attempt launches (its `started_at`), and is persisted, so a resume
+keeps it: a step whose time ran out while the orchestrator was down times out on the first poll
+after the resume. A retry starts a fresh clock. A lane that's trusted idle with its `done_when`
+met on the same read finishes rather than timing out. The clock counts whole seconds, so a limit
+can fire up to a second early. A `KANSTACK_STEP_TIMEOUT` that isn't a duration makes `run`,
+`resume` and `serve` exit 2 before doing anything.
 
 **Independent siblings on failure: let them finish, don't stop them.** When a step fails (spawn
 error or a `verify` command exiting nonzero), any *other*, independent step that's already
@@ -268,7 +294,7 @@ root), mirrored in `src/state.rs`. `state.json` records the recipe's path and ha
 directory `run` was invoked in, each branch's current agent (`branch_agents`), and for each step
 its status (`pending`, `launching`, `running`, `verifying`, `done` or `failed`), `attempt`,
 `branch`, `pane`, `base` and `tip` (its branch's commit when it started and when it finished,
-from git), `base_patches` (see "Completion model"), `started_at`, `last_error`, `notes_from` (the events log's length when it launched),
+from git), `base_patches` (see "Completion model"), `timeout_secs` (see "Timeouts"), `started_at`, `last_error`, `notes_from` (the events log's length when it launched),
 `report` (its agent's note) and `waiting_on` (set while its lane is idle but its `done_when`
 isn't met).
 
@@ -411,8 +437,8 @@ item, and its prompts are unchanged.
 **Retries.** `serve` retries a failed step up to `KANSTACK_RETRIES` times (default 2; a plain
 `run` defaults to 0), overridable with `retries:`. A failed verify goes back into the same pane
 with the failing command and the tail of its output, so the agent fixes forward; a dead, pane-less
-or gone lane is stopped and respawned with the same agent on the same branch, with its prompt plus
-a note about what happened. The pending retry is persisted, so a crash in between retries the same
+or gone lane, or one that ran past its timeout (see "Timeouts"), is stopped and respawned with the
+same agent on the same branch, with its prompt plus a note about what happened. The pending retry is persisted, so a crash in between retries the same
 way. Transport errors from `spawn`/`send` (`multiplexer_unavailable`, `but_failed`,
 `delivery_failed` and the like) back off and retry without using the budget, up to 5 in a row.
 Out of budget, the step fails and so does its item.
@@ -472,7 +498,7 @@ entirely in this crate, which (as of v1):
 - persists only its own run state (see "Durable runs"), never kanstack's or the tracker's, and
   never as the source of truth for a lane — a resumed step always asks kanstack about its lane
   first;
-- retries a failed step only within its budget, and has no timeout or conditional-branching logic;
+- retries a failed step only within its budget, and has no conditional-branching logic;
 - does not build a new file-locking system around `owns` — that stays advisory metadata;
 - does not follow a PR to its merge (`KANSTACK_LAND=pr` leaves the item in `review`), and has no
   dark mode yet;

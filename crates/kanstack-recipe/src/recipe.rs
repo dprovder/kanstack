@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -223,6 +224,9 @@ pub enum RecipeError {
     AggregateReferenced { step: String, aggregate: String, field: &'static str },
     /// `description:` is shown on one line wherever recipes are listed.
     MultiLineDescription,
+    /// `timeout:` isn't a duration [`parse_duration`] reads. `step` is `None` for the
+    /// recipe-level one.
+    InvalidTimeout { step: Option<String>, value: String },
 }
 
 impl fmt::Display for RecipeError {
@@ -290,6 +294,13 @@ impl fmt::Display for RecipeError {
                 f,
                 "step \"{step}\" names the aggregate step \"{aggregate}\" in its `{field}`, but the aggregate step runs after every other step"
             ),
+            RecipeError::InvalidTimeout { step, value } => {
+                match step {
+                    Some(step) => write!(f, "step \"{step}\" has invalid timeout \"{value}\"")?,
+                    None => write!(f, "invalid timeout \"{value}\"")?,
+                }
+                write!(f, " (expected a duration like 90s, 45m, 2h or 1h30m)")
+            }
             RecipeError::MultiLineDescription => {
                 write!(f, "`description` spans several lines; keep it to one, and put the rest in the recipe's body")
             }
@@ -303,6 +314,7 @@ impl std::error::Error for RecipeError {}
 struct RawFrontMatter {
     version: u64,
     retries: Option<u32>,
+    timeout: Option<serde_yaml::Value>,
     aggregate: Option<String>,
     description: Option<String>,
     #[serde(default)]
@@ -327,6 +339,7 @@ struct RawStep {
     spawn: Option<String>,
     done_when: Option<String>,
     retries: Option<u32>,
+    timeout: Option<serde_yaml::Value>,
 }
 
 /// A recipe's `retries:`, recipe-wide and per step, read by [`parse_retries`]. Held beside
@@ -356,6 +369,99 @@ pub fn parse_retries(input: &str) -> Result<RetryBudgets, RecipeError> {
         recipe: raw.retries,
         steps: raw.steps.into_iter().filter_map(|(id, step)| Some((id, step.retries?))).collect(),
     })
+}
+
+/// A recipe's `timeout:`, recipe-wide and per step, read by [`parse_timeouts`]. Held beside
+/// [`Recipe`] for the same reason as [`RetryBudgets`]: a run resolves every step's timeout once,
+/// when it starts, and keeps it in its own state (`StepRecord::timeout_secs`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StepTimeouts {
+    pub recipe: Option<Duration>,
+    pub steps: BTreeMap<String, Duration>,
+}
+
+impl StepTimeouts {
+    /// How long `step_id` may run: its own `timeout:`, else the recipe's, else `default`
+    /// (`KANSTACK_STEP_TIMEOUT`, see [`crate::run::step_timeout_from_env`]).
+    pub fn timeout(&self, step_id: &str, default: Duration) -> Duration {
+        self.steps.get(step_id).copied().or(self.recipe).unwrap_or(default)
+    }
+}
+
+/// The `timeout:` in `input`'s front matter. Fails exactly when [`parse`] would fail on one, so
+/// a caller that already parsed the recipe can rely on it.
+pub fn parse_timeouts(input: &str) -> Result<StepTimeouts, RecipeError> {
+    let (yaml, _) = split_front_matter(input)?;
+    let raw: RawFrontMatter = serde_yaml::from_str(yaml)
+        .map_err(|e| RecipeError::Malformed(format!("invalid YAML front matter: {e}")))?;
+    let mut steps = BTreeMap::new();
+    for (id, step) in raw.steps {
+        if let Some(timeout) = timeout(Some(&id), step.timeout.as_ref())? {
+            steps.insert(id, timeout);
+        }
+    }
+    Ok(StepTimeouts { recipe: timeout(None, raw.timeout.as_ref())?, steps })
+}
+
+/// A `timeout:` value as a duration: a string [`parse_duration`] reads. A bare number is
+/// refused rather than guessed at, since it has no unit.
+fn timeout(step: Option<&str>, raw: Option<&serde_yaml::Value>) -> Result<Option<Duration>, RecipeError> {
+    let Some(raw) = raw else { return Ok(None) };
+    let invalid = || RecipeError::InvalidTimeout {
+        step: step.map(String::from),
+        value: match raw {
+            serde_yaml::Value::String(s) => s.clone(),
+            other => serde_yaml::to_string(other).unwrap_or_default().trim().to_string(),
+        },
+    };
+    raw.as_str().and_then(parse_duration).map(Some).ok_or_else(invalid)
+}
+
+/// A duration written as whole numbers with units, largest first: `90s`, `45m`, `2h`, `1h30m`.
+/// `None` for anything else, and for zero.
+pub fn parse_duration(text: &str) -> Option<Duration> {
+    let mut secs: u64 = 0;
+    let mut rest = text.trim();
+    let mut last_unit = u64::MAX;
+    if rest.is_empty() {
+        return None;
+    }
+    while !rest.is_empty() {
+        let digits = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+        if digits == 0 {
+            return None;
+        }
+        let n: u64 = rest[..digits].parse().ok()?;
+        let unit = match rest[digits..].chars().next()? {
+            'h' => 3600,
+            'm' => 60,
+            's' => 1,
+            _ => return None,
+        };
+        if unit >= last_unit {
+            return None;
+        }
+        last_unit = unit;
+        secs = secs.checked_add(n.checked_mul(unit)?)?;
+        rest = &rest[digits + 1..];
+    }
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
+
+/// `duration` the way [`parse_duration`] reads one: `45m`, `2h`, `1h30m`, `90s`.
+pub fn format_duration(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    let (h, m, s) = (secs / 3600, secs % 3600 / 60, secs % 60);
+    let mut out = String::new();
+    for (n, unit) in [(h, 'h'), (m, 'm'), (s, 's')] {
+        if n > 0 {
+            out.push_str(&format!("{n}{unit}"));
+        }
+    }
+    if out.is_empty() {
+        out.push_str("0s");
+    }
+    out
 }
 
 /// What lists a recipe (`recipes`, kanstack's picker): its `description:` and `tags:` and how
@@ -445,6 +551,11 @@ fn validate(raw: RawFrontMatter, body: &str) -> Result<Recipe, RecipeError> {
             };
             return Err(RecipeError::AggregateReferenced { step: id.clone(), aggregate: aggregate.clone(), field });
         }
+    }
+
+    timeout(None, raw.timeout.as_ref())?;
+    for (id, step) in &raw.steps {
+        timeout(Some(id), step.timeout.as_ref())?;
     }
 
     let ids: Vec<String> = raw.steps.keys().cloned().collect();
@@ -758,6 +869,36 @@ mod tests {
         let budgets = parse_retries("---\nversion: 1\nsteps:\n  a:\n    agent: codex\n    prompt: A\n---\n").unwrap();
         assert_eq!(budgets.budget("a", 2), 2);
         assert!(parse("---\nversion: 1\nsteps:\n  a:\n    agent: codex\n    retries: -1\n    prompt: A\n---\n").is_err());
+    }
+
+    #[test]
+    fn durations_read_whole_units_largest_first() {
+        let secs = |s: &str| parse_duration(s).map(|d| d.as_secs());
+        assert_eq!((secs("90s"), secs("45m"), secs("2h"), secs("1h30m"), secs(" 2h5s ")), (Some(90), Some(2700), Some(7200), Some(5400), Some(7205)));
+        for bad in ["", "45", "m", "1.5h", "30m1h", "1h1h", "0m", "45 m", "-1m", "1d"] {
+            assert_eq!(secs(bad), None, "{bad:?}");
+        }
+        for text in ["30s", "1m30s", "45m", "2h", "1h30m", "2h5s"] {
+            assert_eq!(format_duration(parse_duration(text).unwrap()), text);
+        }
+        assert_eq!(format_duration(parse_duration("90s").unwrap()), "1m30s");
+    }
+
+    #[test]
+    fn timeouts_fall_back_from_step_to_recipe_to_the_default() {
+        let source = "---\nversion: 1\ntimeout: 2h\nsteps:\n  a:\n    agent: codex\n    timeout: 45m\n    prompt: A\n  b:\n    agent: codex\n    prompt: B\n---\n";
+        parse(source).unwrap();
+        let timeouts = parse_timeouts(source).unwrap();
+        let default = Duration::from_secs(3600);
+        assert_eq!((timeouts.timeout("a", default).as_secs(), timeouts.timeout("b", default).as_secs()), (2700, 7200));
+        let none = parse_timeouts("---\nversion: 1\nsteps:\n  a:\n    agent: codex\n    prompt: A\n---\n").unwrap();
+        assert_eq!(none.timeout("a", default), default);
+
+        let err = parse("---\nversion: 1\nsteps:\n  a:\n    agent: codex\n    timeout: 45\n    prompt: A\n---\n").unwrap_err();
+        assert!(matches!(&err, RecipeError::InvalidTimeout { step: Some(s), value } if s == "a" && value == "45"), "{err:?}");
+        assert!(err.to_string().contains("like 90s, 45m, 2h"), "{err}");
+        let err = parse("---\nversion: 1\ntimeout: soon\nsteps:\n  a:\n    agent: codex\n    prompt: A\n---\n").unwrap_err();
+        assert!(matches!(&err, RecipeError::InvalidTimeout { step: None, .. }), "{err:?}");
     }
 
     #[test]
