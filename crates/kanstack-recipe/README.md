@@ -311,13 +311,13 @@ branch by then, and malformed YAML front matter.
 `items` and `serve` turn the runner into the minimal software factory: work goes into a queue,
 `serve` pulls it into recipe runs, and each item's state follows its run.
 
-**Items** live behind kanstack-tracker's `Tracker` trait. `KANSTACK_TRACKER` picks one
-explicitly: `local` (one markdown file per item in kanstack's per-repo state directory, never in
-the worktree) or `github` (issues through the `gh` CLI, states as `kanstack:<state>` labels, a
-closed issue reads as `done`; `KANSTACK_GH_BIN` substitutes the `gh` binary). Unset, it picks
-`github` when the repository's origin is on github.com and `gh` is logged in, else `local` —
-so in such a repository `items`, `serve` and `land` work on its real issues. Set
-`KANSTACK_TRACKER=local` to keep them local. An item has a title, a body, an optional recipe, a state — `proposed`,
+**Items** live behind kanstack-tracker's `Tracker` trait. `KANSTACK_TRACKER` picks one,
+and nothing is auto-detected: unset means `local`, one markdown file per item in kanstack's
+per-repo state directory, never in the worktree. `KANSTACK_TRACKER=github` uses the origin
+repository's issues through the `gh` CLI (`KANSTACK_GH_BIN` substitutes the binary): states are
+`kanstack:<state>` labels, a closed issue reads as `done`, and an open issue with no `kanstack:`
+label reads as `proposed`, so `serve` never pulls an issue until someone promotes it, which adds
+`kanstack:backlog`. An item has a title, a body, an optional recipe, a state — `proposed`,
 `backlog`, `running`, `failed`, `review` or `done` — and, for a proposal, the item it came from.
 
 ```sh
