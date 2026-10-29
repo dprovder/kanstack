@@ -14,6 +14,8 @@ anyhow = "1.0"
 # flock(2) for the per-item lock (src/local.rs); kanstack and kanstack-recipe already use it.
 libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }
+# Remote backends parse their CLIs' JSON output (`gh ... --json`).
+serde_json = "1.0"
 
 [dev-dependencies]
 tempfile = "3"

@@ -642,6 +642,7 @@ version = "0.0.3"
 dependencies = [
  "anyhow",
  "ignore",
+ "kanstack-tracker",
  "libc",
  "notify",
  "ratatui",
@@ -668,6 +669,7 @@ dependencies = [
  "anyhow",
  "libc",
  "serde",
+ "serde_json",
  "tempfile",
 ]
 
