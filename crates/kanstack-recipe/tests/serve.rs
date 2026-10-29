@@ -570,6 +570,23 @@ fn a_step_stuck_past_its_timeout_is_respawned_on_its_branch() {
     assert_eq!((a.status, a.attempt, a.retries), (StepStatus::Done, 2, 1), "{a:?}");
 }
 
+/// The clock starts once the launch has gone through: a spawn slower than the step's whole
+/// timeout doesn't time the attempt out on the read right after it.
+#[test]
+fn a_slow_launch_doesnt_count_against_the_steps_timeout() {
+    let f = Factory::new();
+    f.recipe("slow", "---\nversion: 1\nsteps:\n  a:\n    agent: codex\n    timeout: 2s\n    prompt: Do A\n---\nctx\n");
+    let id = f.item("Slow spawn", Some("slow"));
+    f.knob("spawn_delay", "2.5\n");
+    let lock = f.lock();
+    let mut serve = f.serve(&lock, 1, 0);
+    tick_until(&mut serve, || matches!(f.get(&id).state, ItemState::Review | ItemState::Failed));
+
+    let a = &f.run_for(&id).steps["a"];
+    assert_eq!((a.status, a.attempt, a.last_error.clone()), (StepStatus::Done, 1, None), "{a:?}");
+    assert_eq!(f.get(&id).state, ItemState::Review);
+}
+
 /// A lane waiting on a person times out too, and its error says that's what it was doing. Out of
 /// budget, the step fails without a respawn.
 #[test]

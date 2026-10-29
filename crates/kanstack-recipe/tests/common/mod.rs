@@ -25,6 +25,7 @@ use kanstack_recipe::state::RunStore;
 ///   `pending_commits`) and its note (a line in `pending_notes`).
 ///   `crash_before_spawn`/`crash_after_spawn` are removed and the caller is killed with
 ///   `kill -9`, before or after the lane comes up; one that names a branch only fires for it.
+///   A launch takes `spawn_delay`'s seconds, if it exists, as on a loaded machine.
 /// - `spawn` and `send` fail in transport (`multiplexer_unavailable`, exit 5) while
 ///   `fail_transport_remaining` counts down.
 /// - `send <branch>` queues the agent's turn; `stop <branch>` closes the lane, or fails with
@@ -158,6 +159,7 @@ case "$cmd" in
       kill -9 "$PPID"
       exit 1
     fi
+    if [ -f "$DIR/spawn_delay" ]; then sleep "$(cat "$DIR/spawn_delay")"; fi
     printf '{"schema":1,"ok":true,"command":"spawn","workstream":"%s","result":{"created":true,"pane":"%%7","agent":"%s","workspace":null,"model":null,"effort":null,"advisory":false}}\n' "$branch" "$agent"
     ;;
   send)

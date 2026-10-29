@@ -82,7 +82,9 @@
 //! asking a question nobody answers. So a `running` step whose attempt has run longer than its
 //! timeout ([`StepRecord::timeout_secs`], else [`RunOptions::step_timeout`]) counts as a failed
 //! attempt and is retried or failed like a dead pane is, respawned on the same branch. The clock
-//! is the attempt's `started_at`, which is persisted, so a resumed run keeps it. A lane that
+//! starts once the attempt's launch has gone through, so a slow spawn doesn't use it up, and is
+//! persisted as the attempt's `started_at`, so a resumed run keeps it. A resumed run only knows
+//! it to the whole second, so it gives the attempt up to a second more, never less. A lane that
 //! reported `waiting` (on a person, at a permission prompt) times out too, and its error says
 //! so. A trusted idle that meets the step's `done_when` on the same read wins over the clock.
 //!
@@ -211,6 +213,9 @@ struct Live {
     // step id -> trusted idle reads taken since it finished on commits with no note yet: its
     // report's grace (see the module doc).
     note_grace: HashMap<String, u32>,
+    // step id -> when its current attempt's launch went through: its timeout's clock, to more
+    // than the whole second `started_at` keeps. A step reattached by a resume has none.
+    running_since: HashMap<String, Instant>,
 }
 
 /// One persisted run, driven a tick at a time by its caller (see the module doc's "One tick
@@ -557,6 +562,8 @@ impl<'a> Driver<'a> {
                 rec.base = base;
                 rec.base_patches = base_patches;
                 rec.retry = None;
+                rec.started_at = Some(now_secs());
+                self.live.running_since.insert(step_id.to_string(), Instant::now());
                 self.live.status_reads_since_launch.insert(step_id.to_string(), 0);
                 self.live.backoff.remove(step_id);
                 self.persist(run);
@@ -791,7 +798,13 @@ impl<'a> Driver<'a> {
     fn time_out_if_overdue(&mut self, run: &mut RunState, step_id: &str, lane: Option<&str>) {
         let rec = &run.steps[step_id];
         let limit = rec.timeout_secs.unwrap_or(self.opts.step_timeout.as_secs());
-        let overdue = rec.status == StepStatus::Running && rec.started_at.is_some_and(|started| now_secs().saturating_sub(started) >= limit);
+        let overdue = rec.status == StepStatus::Running
+            && match self.live.running_since.get(step_id) {
+                Some(since) => since.elapsed() >= Duration::from_secs(limit),
+                // Reattached: whole seconds either side can make `limit` read as up to a
+                // second shorter than it was, so only time out once it's surely past.
+                None => rec.started_at.is_some_and(|started| now_secs().saturating_sub(started) > limit),
+            };
         if !overdue {
             return;
         }
@@ -879,6 +892,7 @@ impl<'a> Driver<'a> {
     fn finish_step(&mut self, run: &mut RunState, step_id: &str) {
         self.live.status_reads_since_launch.remove(step_id);
         self.live.note_grace.remove(step_id);
+        self.live.running_since.remove(step_id);
         let step = &self.recipe.steps[step_id];
         if step.verify.is_empty() {
             self.say(run, format_args!("✓ {step_id:<15} complete"));
@@ -936,6 +950,7 @@ impl<'a> Driver<'a> {
         }
         self.live.status_reads_since_launch.remove(step_id);
         self.live.note_grace.remove(step_id);
+        self.live.running_since.remove(step_id);
         let tip = run.steps[step_id].branch.as_deref().and_then(|b| branch_tip(&run.workdir, b));
         let rec = record(run, step_id);
         rec.retries += 1;
@@ -963,6 +978,7 @@ impl<'a> Driver<'a> {
     fn settle(&mut self, run: &mut RunState, step_id: &str, status: StepStatus, error: Option<String>) {
         self.live.status_reads_since_launch.remove(step_id);
         self.live.note_grace.remove(step_id);
+        self.live.running_since.remove(step_id);
         let tip = run.steps[step_id].branch.as_deref().and_then(|b| branch_tip(&run.workdir, b));
         let rec = record(run, step_id);
         rec.status = status;

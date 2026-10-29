@@ -86,7 +86,8 @@ pub struct StepRecord {
     pub pane: Option<String>,
     pub base: Option<String>,
     pub tip: Option<String>,
-    /// Seconds since the Unix epoch, when the current attempt was recorded as `launching`.
+    /// Seconds since the Unix epoch, when the current attempt was recorded as `launching`, then
+    /// again once its launch went through: the clock its timeout runs on.
     pub started_at: Option<u64>,
     pub last_error: Option<String>,
     /// The events log's length when the step's first attempt launched: only notes past it
