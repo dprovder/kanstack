@@ -20,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::graph::StepState;
-use crate::recipe::Recipe;
+use crate::recipe::{DoneWhen, Recipe};
 
 /// The `version` written into every `state.json`. Bumped only for a change an older reader
 /// would misread; new optional fields don't need it.
@@ -75,6 +75,9 @@ impl StepStatus {
 /// One step's persisted state. `base` and `tip` are the step's branch's commit when it
 /// started and when it finished, read from git; either is `null` when the branch didn't exist
 /// yet (or git couldn't be asked).
+///
+/// The fields after `last_error` came with `done_when` and default to `null` in a snapshot
+/// written before it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepRecord {
     pub status: StepStatus,
@@ -86,6 +89,17 @@ pub struct StepRecord {
     /// Seconds since the Unix epoch, when the current attempt was recorded as `launching`.
     pub started_at: Option<u64>,
     pub last_error: Option<String>,
+    /// The events log's length when the current attempt launched: only notes past it are
+    /// this attempt's report. `null` for a step whose `done_when` doesn't accept a note.
+    #[serde(default)]
+    pub notes_from: Option<u64>,
+    /// The text of the agent's `kanstack note` report, once one arrived.
+    #[serde(default)]
+    pub report: Option<String>,
+    /// Set while the step's lane is trusted idle but its `done_when` isn't met yet: why it
+    /// isn't done.
+    #[serde(default)]
+    pub waiting_on: Option<DoneWhen>,
 }
 
 impl Default for StepRecord {
@@ -99,6 +113,9 @@ impl Default for StepRecord {
             tip: None,
             started_at: None,
             last_error: None,
+            notes_from: None,
+            report: None,
+            waiting_on: None,
         }
     }
 }
@@ -141,6 +158,11 @@ pub struct RunState {
     pub workdir: PathBuf,
     pub status: RunStatus,
     pub steps: BTreeMap<String, StepRecord>,
+    /// Each branch's current agent: the agent of the step last launched on it. An `on:` step
+    /// with no `spawn:` hands the branch off when its own agent differs, and continues in the
+    /// pane when it's the same.
+    #[serde(default)]
+    pub branch_agents: BTreeMap<String, String>,
 }
 
 impl RunState {
@@ -156,6 +178,7 @@ impl RunState {
             workdir,
             status: RunStatus::Running,
             steps: recipe.steps.keys().map(|id| (id.clone(), StepRecord::default())).collect(),
+            branch_agents: BTreeMap::new(),
         }
     }
 
@@ -336,8 +359,12 @@ mod tests {
                 tip: Some("9c8d7e6".to_string()),
                 started_at: Some(1_761_600_000),
                 last_error: None,
+                notes_from: Some(512),
+                report: Some("added the land endpoint".to_string()),
+                waiting_on: None,
             },
         );
+        run.branch_agents.insert("a".to_string(), "codex".to_string());
         run
     }
 
@@ -356,6 +383,16 @@ mod tests {
         assert!(raw.contains(r#""status": "done""#), "{raw}");
         assert!(raw.contains(r#""status": "pending""#), "{raw}");
         assert!(!tmp.path().join("runs/100-land/.state.json.tmp").exists(), "the temp file is renamed away");
+    }
+
+    /// A snapshot written before `done_when` existed still loads, its new fields empty.
+    #[test]
+    fn loads_a_snapshot_from_before_done_when() {
+        let raw = r#"{"version":1,"id":"1-x","item":null,"recipe":"x","recipe_path":"/r/x.md","recipe_hash":"0","workdir":"/repo","status":"running",
+            "steps":{"a":{"status":"running","attempt":1,"branch":"a","pane":"%1","base":null,"tip":null,"started_at":1,"last_error":null}}}"#;
+        let run: RunState = serde_json::from_str(raw).unwrap();
+        assert_eq!((run.steps["a"].report.clone(), run.steps["a"].waiting_on), (None, None));
+        assert!(run.branch_agents.is_empty());
     }
 
     #[test]

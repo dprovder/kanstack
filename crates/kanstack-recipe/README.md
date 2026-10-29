@@ -2,7 +2,7 @@
 
 The orchestrator for kanstack. It reads a Markdown+YAML recipe describing a DAG of steps, and
 drives them to completion by shelling out to `kanstack`'s public CLI/JSON contract (`spawn`,
-`send`, `status --json`) — nothing else. It never imports kanstack's Rust crate or touches its
+`send`, `stop`, `status --json`, and the notes in `events`) — nothing else. It never imports kanstack's Rust crate or touches its
 internals.
 
 kanstack itself has no workflow engine, no scheduler, and no notion of a "task" or "plan" — see
@@ -44,9 +44,10 @@ roughly:
 → run 1761609600-implement-review-docs
 → implement        running   codex / gpt-5.6 / high
 ✓ implement        complete
-→ review           running   claude / default / high (on implement)
+→ review           running   claude / default / high (handoff on implement)
 ✓ review           verified  cargo test
-→ docs             running   codex / default / low (on implement)
+→ docs             running   codex / default / low (handoff on implement)
+… docs             idle, waiting on commits
 ✓ docs             complete
 ✓ recipe complete
 ```
@@ -73,6 +74,8 @@ steps:
     effort: high
     needs: [implement]
     on: implement
+    spawn: handoff
+    done_when: either
     prompt: Review the implementation and fix any problems.
     verify:
       - cargo test
@@ -104,7 +107,12 @@ deterministic template — no conditional templating of any kind:
 ```
 
 That combined text is what reaches the harness, via `kanstack spawn --prompt` or
-`kanstack send`.
+`kanstack send`. When the step's `done_when` accepts a note, one more line is appended, asking
+the agent to report back (see "Completion model"):
+
+```text
+When you're finished, report what you did by running: kanstack note <branch> "<report>"
+```
 
 ### Fields
 
@@ -115,30 +123,76 @@ That combined text is what reaches the harness, via `kanstack spawn --prompt` or
 | `effort` | no | one of `low`/`medium`/`high`, validated at parse time, forwarded as `--effort <value>`. |
 | `prompt` | yes | this step's own instruction; combined with the recipe's shared context as above. |
 | `needs` | no | list of step ids — **causal** dependency. A step is runnable once every step it `needs` has *completed* (see below). Determines *when* a step runs. |
-| `on` | no | a step id — **placement**. Send this step's prompt to the *same* workstream an earlier step created (`kanstack send`) instead of opening a new one (`kanstack spawn`). Determines *where* a step runs. Must reference an already-declared step; chains are followed to the step that actually owns the workstream. Must also be reachable through the step's own `needs` — directly, or transitively through a chain of `needs` (e.g. `docs: { needs: [review] }` may be `on: implement` if `review` itself `needs: [implement]`) — since placing work on a workstream you never causally wait for was never meaningful: `on` selects placement, `needs` still decides *when*, and the two are validated together, not independently. |
+| `on` | no | a step id — **placement**. Run this step on the branch an earlier step worked on, instead of a branch of its own; `spawn` says how (see "Spawn modes"). Determines *where* a step runs. Must reference an already-declared step; chains are followed to the step that actually owns the workstream. Must also be reachable through the step's own `needs` — directly, or transitively through a chain of `needs` (e.g. `docs: { needs: [review] }` may be `on: implement` if `review` itself `needs: [implement]`) — since placing work on a workstream you never causally wait for was never meaningful: `on` selects placement, `needs` still decides *when*, and the two are validated together, not independently. |
+| `spawn` | no | how the step's agent reaches its branch: `continue`, `handoff`, `stack` or `advisory` (see "Spawn modes"). Left out, an `on` step continues in the branch's pane when its agent is the branch's current one and hands off when it isn't, and a step with no `on` spawns its own branch. |
+| `done_when` | no | what, besides an idle lane, finishes the step: `commits`, `note` or `either` (see "Completion model"). Defaults to `note` for an advisory step and `commits` otherwise. |
 | `owns` | no | glob list, advisory only — for prompt context and collision-awareness. Not enforced by this runner or by kanstack; no new locking mechanism is built around it. |
 | `verify` | no | list of shell commands, run from the directory the runner itself was invoked in once the step's workstream goes idle. **All** must exit `0` for the step to count as complete; any nonzero exit fails the step (and the whole recipe). Run once each, no retries. |
 
 No other fields exist in v1 (no `retry`, `timeout`, `priority`, roles, conditions, or anything
 else) — see the design notes in the main repository for why.
 
+### Spawn modes
+
+kanstack keeps one pane, running one agent, per branch. `spawn` says how a step's agent gets
+to the code:
+
+| mode | needs `on` | what the runner calls | use when |
+| --- | --- | --- | --- |
+| `continue` | yes | `kanstack send <branch>` into the branch's existing pane | the same agent goes on, keeping its context |
+| `handoff` | yes | `kanstack stop <branch>`, then `kanstack spawn <branch>` with this step's agent, model and effort | a different agent takes over the branch, like a fresh-eyes review |
+| `stack` | yes | `kanstack spawn <target>-<step> --above <target>`, where `<target>` is the `on` step's branch | the step's changes should stay separate; an empty branch means it changed nothing |
+| `advisory` | no (rejected) | `kanstack spawn <step> --advisory` on its own branch | survey, research, triage: work not expected to commit |
+
+With no `spawn`, a step with no `on` spawns its own branch named after itself, and an `on` step
+picks between the first two: `handoff` when its agent differs from the agent last run on the
+branch, `continue` when it's the same. So a Claude review after a Codex implement gets a Claude
+pane rather than having its prompt typed into Codex's. The branch's current agent is recorded in
+the run's state (`branch_agents`), so a resumed run decides the same way.
+
+`continue` with an agent other than the branch's is rejected by `check`, with a message
+suggesting `handoff`. A sibling on the same branch that `needs` doesn't order against the step
+could still change the agent in between, so the runner checks again at launch and fails the
+step rather than typing its prompt into another agent's pane. `share` (several agents on one
+branch at once) isn't supported.
+
+A step `on` a `stack` step works on that step's branch (`<target>-<step>`), and one `on` an
+advisory step on the advisory step's branch.
+
 ### Completion model
 
-A step's completion is judged purely from kanstack's own observable state — never from reading
-chat output or any LLM "judge":
+A step's completion is judged purely from kanstack's own observable state and git — never from
+reading chat output or any LLM "judge":
 
-1. spawn (new workstream) or send (existing workstream, via `on`) the step's effective prompt;
-2. poll `kanstack status --json` until that workstream's `status` is `idle`;
-3. if the step has `verify` commands, run them all; every one must exit `0`;
-4. mark the step `complete`. Its dependents become runnable once *all* of *their* `needs` are
-   `complete`.
-5. a step with no `verify` commands is `complete` as soon as it goes `idle`.
+1. launch the step as its spawn mode says (spawn, send, or stop then spawn);
+2. poll `kanstack status --json` until that workstream's `status` is `idle`, and not on the
+   first read since launch (see below);
+3. check the step's `done_when`:
+   - `commits`: the branch's tip has moved since the step's `base`, its tip when it started;
+   - `note`: the agent has reported with `kanstack note <branch> "<report>"` since the step
+     launched;
+   - `either`: one of the two.
+
+   If it isn't met, the step isn't failed: it keeps polling, and its state records
+   `waiting_on: commits|note|either` so `runs` shows why it isn't done. `idle` alone isn't
+   trusted, since it also fires between an agent's turns and after its own housekeeping;
+4. if the step has `verify` commands, run them all; every one must exit `0`;
+5. mark the step `done`. Its dependents become runnable once *all* of *their* `needs` are
+   `done`.
+
+A step that may legitimately change nothing, like a review, should say `done_when: either`.
+When `done_when` accepts a note, the step's prompt asks the agent for one, and the note's text
+is stored in the step's state as its `report`. Notes are read back through
+`kanstack events --since <offset>` (kind `"note"`, matching the step's branch); `<offset>` is
+the events log's length when the step launched, so a note from before then doesn't count. If
+several arrive, the last one is the report.
 
 ### Design choices this runner makes (and why)
 
 **Polling `status --json`, not `events`.** kanstack offers both a poll (`status --json`) and a
 push-ish cue to re-poll (`events --json`, an append-only JSONL log). This runner polls
-`status --json` directly on a fixed interval. It's a short-lived process, not a daemon, so there
+`status --json` directly on a fixed interval, and only reads `events` for the notes that
+`done_when` looks for, once a step's lane is trusted idle. It's a short-lived process, not a daemon, so there
 is no gain from a separate always-on log tail, and polling keeps the implementation to one
 straightforward loop instead of two coordinated ones (a blocking `events --follow` reader feeding
 a separate scheduling loop). `events --json` remains a reasonable choice for a longer-lived
@@ -186,10 +240,12 @@ lanes, and attempt counts survive.
 The state dir and key are kanstack's own for the repository (`KANSTACK_STATE_PATH`, else
 `$XDG_STATE_HOME/kanstack`, else `~/.local/state/kanstack`; the key hashes the repository's
 root), mirrored in `src/state.rs`. `state.json` records the recipe's path and hash, the
-directory `run` was invoked in, and for each step its status (`pending`, `launching`,
-`running`, `verifying`, `done` or `failed`), `attempt`, `branch`, `pane`, `base` and `tip`
-(its branch's commit when it started and when it finished, from git), `started_at` and
-`last_error`.
+directory `run` was invoked in, each branch's current agent (`branch_agents`), and for each step
+its status (`pending`, `launching`, `running`, `verifying`, `done` or `failed`), `attempt`,
+`branch`, `pane`, `base` and `tip` (its branch's commit when it started and when it finished,
+from git), `started_at`, `last_error`, `notes_from` (the events log's length when it launched),
+`report` (its agent's note) and `waiting_on` (set while its lane is idle but its `done_when`
+isn't met).
 
 **Snapshots, not a journal.** Transitions are minutes apart, so the whole `state.json` is
 rewritten on each one: temp file, fsync, rename, fsync the directory. A reader such as `runs`
@@ -206,13 +262,18 @@ is first matched against its lane in one `status --json` read:
 | The lane is | Resume does |
 | --- | --- |
 | busy (or waiting, or unknown) | Reattach and keep polling. |
-| idle | Run the step's `verify` commands, which must be safe to re-run. |
+| idle | Judge the step by its `done_when`, then run its `verify` commands, which must be safe to re-run. A step that was already `verifying` had its `done_when` met, and only re-runs `verify`. |
 | gone (absent, dead, or no pane) | Count a failed attempt. There are no retries yet, so the step fails. |
 
 Resume never sends a prompt to a lane that still exists — not even for a step that was only
 `launching`, whose send may never have landed — because a duplicate send garbles the agent's
-input. The first-read rule above still holds: unless the step was already `verifying`, an
-`idle` on resume's own read is only trusted on the next one. Several unfinished runs are
+input. Instead, `done_when` catches a send that never landed: with no new commits and no note,
+the step waits rather than passing. The first-read rule above still holds: unless the step was
+already `verifying`, an `idle` on resume's own read is only trusted on the next one.
+
+One gap remains: a step whose `base` couldn't be recorded counts any branch tip as new
+commits. That only happens when the orchestrator was killed between `kanstack spawn` creating
+a new branch and reading its tip. Several unfinished runs are
 resumed one after another; a lane keeps working in its pane while its run waits its turn.
 
 **One orchestrator per repository.** `run` and `resume` take an exclusive, non-blocking
@@ -234,8 +295,10 @@ recipe error: step "review" depends on unknown step "implementt"
 Rejected: missing/unsupported `version`, missing/empty `steps`, an empty step id, a step missing
 `agent` or `prompt`, an invalid `effort` value, a `needs` or `on` entry naming an unknown step, a
 step that `needs` or is `on` itself, a cycle in `needs`, a placement cycle through `on`, an `on`
-target not reachable (directly or transitively) through the step's own `needs`, and malformed
-YAML front matter.
+target not reachable (directly or transitively) through the step's own `needs`, an unknown
+`spawn` mode (including `share`) or `done_when`, `spawn: continue`, `handoff` or `stack` without
+an `on`, `spawn: advisory` with one, `spawn: continue` with an agent other than the one on the
+branch by then, and malformed YAML front matter.
 
 ## What this crate does not do
 

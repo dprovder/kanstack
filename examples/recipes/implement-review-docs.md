@@ -13,6 +13,8 @@ steps:
     effort: high
     needs: [implement]
     on: implement
+    spawn: handoff
+    done_when: either
     prompt: Review the implementation and fix any issue you find.
     verify:
       - cargo test

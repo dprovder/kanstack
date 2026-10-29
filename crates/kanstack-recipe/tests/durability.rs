@@ -1,117 +1,28 @@
 //! Durable runs: snapshots on disk, resume after a crash, the orchestrator lock and the
-//! recipe-hash check. Like `verification_gating.rs`, these drive a stand-in `kanstack` shell
-//! script, never a real one. Crashes are real: the stand-in's `spawn` can `kill -9` the
+//! recipe-hash check. Like `verification_gating.rs`, these drive the stand-in `kanstack` in
+//! `common`, never a real one. Crashes are real: the stand-in's `spawn` can `kill -9` the
 //! `kanstack-recipe` process that called it, before or after the lane comes up.
 
+mod common;
+
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::time::Duration;
+
+use common::{calls_log, fast_opts, git, init_repo, lane_status, tip, write_fake_kanstack};
 
 use kanstack_recipe::kanstack::KanstackClient;
 use kanstack_recipe::lock::{LockError, OrchestratorLock};
-use kanstack_recipe::recipe;
+use kanstack_recipe::recipe::{self, DoneWhen};
 use kanstack_recipe::resume::{resume, ResumeError};
-use kanstack_recipe::run::{start_run, RunOptions};
+use kanstack_recipe::run::start_run;
 use kanstack_recipe::state::{recipe_hash, RunState, RunStatus, RunStore, StepRecord, StepStatus};
-
-/// Writes an executable fake `kanstack` into `dir`.
-///
-/// - Every call is appended to `calls.log`, one line each (`status` included).
-/// - `spawn <branch>` brings up a lane for `<branch>` (a line in `lanes`). If `crash_before_spawn`
-///   exists it is removed and the caller is killed first, so no lane comes up; if
-///   `crash_after_spawn` exists, the caller is killed after the lane is up. If `repo_path`
-///   exists, `spawn` makes an empty commit in that git repository, standing in for the agent's
-///   work.
-/// - The Nth `status --json` call prints `status.N.json` if the test wrote one, else reports
-///   every lane in `lanes` as `idle` on pane `%7`.
-fn write_fake_kanstack(dir: &Path) -> PathBuf {
-    let script_path = dir.join("kanstack");
-    let script = r#"#!/bin/sh
-DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-cmd="$1"
-shift
-
-case "$cmd" in
-  spawn)
-    branch="$1"
-    echo "spawn $*" >> "$DIR/calls.log"
-    if [ -f "$DIR/crash_before_spawn" ]; then
-      rm "$DIR/crash_before_spawn"
-      kill -9 "$PPID"
-      exit 1
-    fi
-    if [ -f "$DIR/repo_path" ]; then
-      git -C "$(cat "$DIR/repo_path")" -c user.name=t -c user.email=t@t commit -q --allow-empty -m work
-    fi
-    echo "$branch" >> "$DIR/lanes"
-    if [ -f "$DIR/crash_after_spawn" ]; then
-      rm "$DIR/crash_after_spawn"
-      kill -9 "$PPID"
-      exit 1
-    fi
-    printf '{"schema":1,"ok":true,"command":"spawn","workstream":"%s","result":{"created":true,"pane":"%%7","agent":"codex","workspace":null,"model":null,"effort":null}}\n' "$branch"
-    ;;
-  send)
-    echo "send $*" >> "$DIR/calls.log"
-    printf '{"schema":1,"ok":true,"command":"send","workstream":"%s","result":{"pane":"%%7"}}\n' "$1"
-    ;;
-  status)
-    echo "status" >> "$DIR/calls.log"
-    n=$(( $(cat "$DIR/status_count" 2>/dev/null || echo 0) + 1 ))
-    echo "$n" > "$DIR/status_count"
-    if [ -f "$DIR/status.$n.json" ]; then
-      cat "$DIR/status.$n.json"
-      exit 0
-    fi
-    printf '{"schema":1,"workstreams":['
-    first=1
-    if [ -f "$DIR/lanes" ]; then
-      while IFS= read -r b; do
-        if [ "$first" != "1" ]; then printf ','; fi
-        first=0
-        printf '{"branch":"%s","pane":"%%7","agent":"codex","item":null,"status":"idle","lane":null}' "$b"
-      done < "$DIR/lanes"
-    fi
-    printf '],"workspace":null,"workspace_blocked":null}\n'
-    ;;
-  *)
-    echo "fake kanstack: unsupported command: $cmd" >&2
-    exit 2
-    ;;
-esac
-"#;
-    fs::write(&script_path, script).unwrap();
-    let mut perms = fs::metadata(&script_path).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&script_path, perms).unwrap();
-    script_path
-}
-
-/// A `status.N.json` reporting `branch` with lane status `status`.
-fn lane_status(dir: &Path, n: u32, branch: &str, status: &str) {
-    fs::write(
-        dir.join(format!("status.{n}.json")),
-        format!(r#"{{"schema":1,"workstreams":[{{"branch":"{branch}","pane":"%7","agent":"codex","item":null,"status":"{status}","lane":null}}],"workspace":null,"workspace_blocked":null}}"#),
-    )
-    .unwrap();
-}
-
-fn calls_log(dir: &Path) -> String {
-    fs::read_to_string(dir.join("calls.log")).unwrap_or_default()
-}
-
-fn fast_opts() -> RunOptions {
-    RunOptions {
-        poll_interval: Duration::from_millis(5),
-    }
-}
 
 const TWO_STEPS: &str = "---\nversion: 1\nsteps:\n  a:\n    agent: codex\n    prompt: Do A\n  b:\n    agent: codex\n    needs: [a]\n    prompt: Do B\n---\nctx\n";
 const ONE_STEP: &str = "---\nversion: 1\nsteps:\n  a:\n    agent: codex\n    prompt: Do A\n---\nctx\n";
 
-/// A scratch layout: the fake kanstack, a recipe file, a run store and a working directory.
+/// A scratch layout: the fake kanstack, a recipe file, a run store and a working directory
+/// that's a git repository, where the fake's agents commit.
 struct Scratch {
     _tmp: tempfile::TempDir,
     bin_dir: PathBuf,
@@ -129,6 +40,7 @@ impl Scratch {
             fs::create_dir_all(dir).unwrap();
         }
         write_fake_kanstack(&bin_dir);
+        init_repo(&workdir, &bin_dir);
         let recipe_path = root.join("land.md");
         fs::write(&recipe_path, recipe_source).unwrap();
         Scratch { _tmp: tmp, bin_dir, recipe_path, state_path, workdir }
@@ -164,6 +76,20 @@ impl Scratch {
             .env("KANSTACK_STATE_PATH", &self.state_path)
             .output()
             .unwrap()
+    }
+
+    /// An open lane on `branch`, created at `HEAD`. Returns that commit, a step's `base`.
+    fn lane(&self, branch: &str) -> String {
+        git(&self.workdir, &["branch", branch]);
+        fs::write(self.bin_dir.join("lanes"), format!("{branch}\n")).unwrap();
+        git(&self.workdir, &["rev-parse", "HEAD"])
+    }
+
+    /// [`Scratch::lane`], with the agent's commit not landed yet: the next `status` lands it.
+    fn lane_mid_turn(&self, branch: &str) -> String {
+        let base = self.lane(branch);
+        fs::write(self.bin_dir.join("pending_commits"), format!("{branch}\n")).unwrap();
+        base
     }
 
     fn kanstack_bin(&self) -> String {
@@ -264,8 +190,8 @@ fn resume_reattaches_to_a_busy_lane() {
 #[test]
 fn resume_does_not_trust_idle_on_its_first_read_of_a_running_step() {
     let s = Scratch::new(ONE_STEP);
-    s.saved_run(&[("a", in_flight(StepStatus::Running, 1))]);
-    fs::write(s.bin_dir.join("lanes"), "a\n").unwrap();
+    let base = s.lane_mid_turn("a");
+    s.saved_run(&[("a", StepRecord { base: Some(base), ..in_flight(StepStatus::Running, 1) })]);
 
     let outcome = resume(&s.store(), &s.client(), &fast_opts(), "1-land", false).unwrap();
     assert!(!outcome.failed);
@@ -287,7 +213,7 @@ fn resume_skips_done_steps() {
         base: Some("a1b2c3d".to_string()),
         tip: Some("9c8d7e6".to_string()),
         started_at: Some(1),
-        last_error: None,
+        ..StepRecord::default()
     };
     s.saved_run(&[("a", done.clone())]);
 
@@ -355,7 +281,18 @@ fn a_second_orchestrator_is_refused_the_lock() {
     let held = OrchestratorLock::try_acquire(&store).unwrap();
     assert!(matches!(OrchestratorLock::try_acquire(&store), Err(LockError::Held(_))));
     drop(held);
-    OrchestratorLock::try_acquire(&store).expect("dropping the holder releases the lock");
+    // Another test's thread can fork a child while the lock is held here, and that child
+    // shares the locked file until its exec closes it (the fd is close-on-exec), so allow
+    // that moment to pass.
+    let mut reacquired = OrchestratorLock::try_acquire(&store);
+    for _ in 0..100 {
+        if reacquired.is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        reacquired = OrchestratorLock::try_acquire(&store);
+    }
+    reacquired.expect("dropping the holder releases the lock");
 }
 
 #[test]
@@ -417,15 +354,7 @@ fn resume_refuses_a_finished_run() {
 #[test]
 fn records_each_steps_base_and_tip() {
     let s = Scratch::new(ONE_STEP);
-    let git = |args: &[&str]| {
-        let out = Command::new("git").arg("-C").arg(&s.workdir).args(["-c", "user.name=t", "-c", "user.email=t@t"]).args(args).output().unwrap();
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    };
-    git(&["init", "-q", "-b", "a"]);
-    git(&["commit", "-q", "--allow-empty", "-m", "base"]);
-    let base = git(&["rev-parse", "HEAD"]);
-    fs::write(s.bin_dir.join("repo_path"), s.workdir.to_str().unwrap()).unwrap();
+    let head = git(&s.workdir, &["rev-parse", "HEAD"]);
 
     let source = fs::read_to_string(&s.recipe_path).unwrap();
     let recipe = recipe::parse(&source).unwrap();
@@ -434,7 +363,55 @@ fn records_each_steps_base_and_tip() {
     assert!(!outcome.failed);
 
     let a = &s.store().load("2-land").unwrap().steps["a"];
-    assert_eq!(a.base.as_deref(), Some(base.as_str()));
-    assert_eq!(a.tip.as_deref(), Some(git(&["rev-parse", "HEAD"]).as_str()));
+    assert_eq!(a.base.as_deref(), Some(head.as_str()), "the spawn created `a` at HEAD");
+    assert_eq!(a.tip.as_deref(), Some(tip(&s.workdir, "a").as_str()));
     assert_ne!(a.base, a.tip, "the stand-in agent committed during the step");
+}
+
+/// The agent's `kanstack note` report is stored in the step's state, so it survives a crash:
+/// here the orchestrator is killed for real by the step's own `verify`, after the note was
+/// read, and the report is still there once resume re-runs verify and finishes the step.
+#[test]
+fn a_steps_report_survives_a_resume() {
+    let s = Scratch::new("---\nversion: 1\nsteps:\n  a:\n    agent: codex\n    done_when: note\n    prompt: Do A\n    verify:\n      - \"[ -f crashed ] || { touch crashed; kill -9 $PPID; }\"\n---\nctx\n");
+    fs::write(s.bin_dir.join("notes"), "").unwrap();
+    fs::write(s.bin_dir.join("no_commits"), "").unwrap();
+    let output = s.cli(&["run", s.recipe_path.to_str().unwrap(), "--kanstack-bin", &s.kanstack_bin()]);
+    assert!(!output.status.success(), "the orchestrator was killed mid-verify");
+
+    let a = &s.cli_runs()[0].steps["a"];
+    assert_eq!((a.status, a.report.as_deref()), (StepStatus::Verifying, Some("report from a")), "{a:?}");
+
+    let output = s.cli(&["resume", "--kanstack-bin", &s.kanstack_bin()]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let runs = s.cli_runs();
+    let a = &runs[0].steps["a"];
+    assert_eq!((runs[0].status, a.status, a.report.as_deref()), (RunStatus::Done, StepStatus::Done, Some("report from a")), "{a:?}");
+    assert_eq!(calls_log(&s.bin_dir).matches("spawn ").count(), 1);
+}
+
+/// The lost-send case: the orchestrator crashed while `launching` a step whose lane exists
+/// but is idle, so the prompt may never have arrived. Resume doesn't re-send it, and no longer
+/// marks the step done either: with no commits since its base it waits (`waiting_on`), and
+/// here fails once the lane dies.
+#[test]
+fn resume_judges_a_launching_step_on_an_idle_lane_by_done_when() {
+    let s = Scratch::new(ONE_STEP);
+    let base = s.lane("a");
+    let run = s.saved_run(&[("a", StepRecord { base: Some(base), ..in_flight(StepStatus::Launching, 1) })]);
+    fs::write(s.bin_dir.join("snapshot_path"), s.store().state_path(&run.id).to_str().unwrap()).unwrap();
+    lane_status(&s.bin_dir, 5, "a", "dead");
+
+    let outcome = resume(&s.store(), &s.client(), &fast_opts(), "1-land", false).unwrap();
+    assert!(outcome.failed);
+
+    let waiting: RunState = serde_json::from_str(&fs::read_to_string(s.bin_dir.join("snapshot.3.json")).unwrap()).unwrap();
+    let a = &waiting.steps["a"];
+    assert_eq!((a.status, a.waiting_on), (StepStatus::Running, Some(DoneWhen::Commits)), "{a:?}");
+
+    let a = &s.store().load("1-land").unwrap().steps["a"];
+    assert_eq!((a.status, a.waiting_on), (StepStatus::Failed, None), "{a:?}");
+    assert!(a.last_error.as_deref().unwrap_or_default().contains("died"), "{a:?}");
+    let calls = calls_log(&s.bin_dir);
+    assert!(!calls.contains("spawn ") && !calls.contains("send "), "{calls}");
 }

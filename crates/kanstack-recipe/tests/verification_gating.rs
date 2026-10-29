@@ -1,111 +1,43 @@
-//! End-to-end tests of `run_recipe` against a stand-in `kanstack` binary — a small shell
-//! script that records every call it receives and reports every branch it has seen `spawn`ed
-//! as `idle` on the very first `status --json` poll, so these tests run in milliseconds and
-//! never touch a real `kanstack`, a real multiplexer, or a real coding agent.
+//! End-to-end tests of `run_recipe` against the stand-in `kanstack` in `common`, which reports
+//! every lane it has opened as `idle` from the very first `status --json` poll and commits each
+//! agent's turn on that poll, so these tests run in milliseconds and never touch a real
+//! `kanstack`, a real multiplexer, or a real coding agent.
+
+mod common;
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
+use common::{calls_log, fast_opts};
 use kanstack_recipe::graph::StepState;
 use kanstack_recipe::kanstack::KanstackClient;
 use kanstack_recipe::recipe;
-use kanstack_recipe::run::{run_recipe, RunOptions};
+use kanstack_recipe::run::run_recipe;
 
-/// Writes an executable fake `kanstack` into `dir`. `fail_spawn_branch`, when set, makes
-/// `spawn` on that exact branch return `ok:false` (a `workstream_exists` conflict) instead of
-/// succeeding; every other branch spawns/sends successfully. `status_fail_count` makes the
-/// first N `status --json` calls fail with `ok:false` before status starts succeeding, to
-/// simulate a transient (or persistent, if N is large) failure reading status.
+/// The stand-in `kanstack` from `common` in `dir`, with its agents committing to a repository
+/// at `dir/work` (the run's workdir, see [`run`]). `fail_spawn_branch`, when set, makes `spawn`
+/// on that exact branch return `ok:false` (a `workstream_exists` conflict); `status_fail_count`
+/// makes the first N `status --json` calls fail with `ok:false` before status starts
+/// succeeding, to simulate a transient (or persistent, if N is large) failure reading status.
 ///
-/// Every invocation is appended, one line per call, to `calls.log` next to the script
-/// (including `status`, so a test can see how many polls happened between two other calls —
-/// that ordering is what proves two steps sharing a workstream were serialized rather than
-/// both launched in the same tick). Every branch that was `spawn`ed successfully is
-/// remembered in `branches.log` so `status --json` can report it `idle` once it's succeeding.
+/// Every call is logged in `calls.log`, `status` included, so a test can see how many polls
+/// happened between two other calls — that ordering is what proves two steps sharing a
+/// workstream were serialized rather than both launched in the same tick.
 fn write_fake_kanstack(dir: &Path, fail_spawn_branch: Option<&str>, status_fail_count: u32) -> PathBuf {
-    let script_path = dir.join("kanstack");
-    let fail_check = match fail_spawn_branch {
-        Some(b) => format!(
-            r#"if [ "$branch" = "{b}" ]; then
-    printf '{{"schema":1,"ok":false,"command":"spawn","error":{{"code":"workstream_exists","message":"forced failure for test"}}}}\n'
-    exit 4
-  fi
-"#
-        ),
-        None => String::new(),
-    };
-
+    let bin = common::write_fake_kanstack(dir);
+    if let Some(branch) = fail_spawn_branch {
+        fs::write(dir.join("fail_spawn_branch"), branch).unwrap();
+    }
     if status_fail_count > 0 {
         fs::write(dir.join("status_fail_remaining"), status_fail_count.to_string()).unwrap();
     }
-
-    let script = format!(
-        r#"#!/bin/sh
-set -e
-DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-cmd="$1"
-shift
-
-case "$cmd" in
-  spawn)
-    branch="$1"
-    echo "spawn $*" >> "$DIR/calls.log"
-    {fail_check}
-    echo "$branch" >> "$DIR/branches.log"
-    printf '{{"schema":1,"ok":true,"command":"spawn","workstream":"%s","result":{{"created":true,"pane":"%%1","agent":"codex","workspace":null,"model":null,"effort":null}}}}\n' "$branch"
-    ;;
-  send)
-    target="$1"
-    echo "send $*" >> "$DIR/calls.log"
-    printf '{{"schema":1,"ok":true,"command":"send","workstream":"%s","result":{{"pane":"%%1"}}}}\n' "$target"
-    ;;
-  status)
-    echo "status" >> "$DIR/calls.log"
-    if [ -f "$DIR/status_fail_remaining" ]; then
-      remaining=$(cat "$DIR/status_fail_remaining")
-      if [ "$remaining" -gt 0 ]; then
-        echo $((remaining - 1)) > "$DIR/status_fail_remaining"
-        printf '{{"schema":1,"ok":false,"command":"status","error":{{"code":"internal","message":"forced transient failure for test"}}}}\n'
-        exit 1
-      fi
-    fi
-    printf '{{"schema":1,"workstreams":['
-    first=1
-    if [ -f "$DIR/branches.log" ]; then
-      while IFS= read -r b; do
-        if [ "$first" != "1" ]; then printf ','; fi
-        first=0
-        printf '{{"branch":"%s","pane":"%%1","agent":"codex","item":null,"status":"idle","lane":null}}' "$b"
-      done < "$DIR/branches.log"
-    fi
-    printf '],"workspace":null,"workspace_blocked":null}}\n'
-    ;;
-  *)
-    echo "fake kanstack: unsupported command: $cmd" >&2
-    exit 2
-    ;;
-esac
-"#,
-        fail_check = fail_check,
-    );
-
-    fs::write(&script_path, script).unwrap();
-    let mut perms = fs::metadata(&script_path).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&script_path, perms).unwrap();
-    script_path
+    common::init_repo(&dir.join("work"), dir);
+    bin
 }
 
-fn calls_log(dir: &Path) -> String {
-    fs::read_to_string(dir.join("calls.log")).unwrap_or_default()
-}
-
-fn fast_opts() -> RunOptions {
-    RunOptions {
-        poll_interval: Duration::from_millis(5),
-    }
+/// `run_recipe` in the repository [`write_fake_kanstack`] set up in `dir`.
+fn run(recipe: &recipe::Recipe, client: &KanstackClient, dir: &Path) -> kanstack_recipe::run::RunOutcome {
+    run_recipe(recipe, client, &fast_opts(), &dir.join("work"))
 }
 
 #[test]
@@ -118,7 +50,7 @@ fn no_verify_completes_as_soon_as_idle() {
     .unwrap();
 
     let client = KanstackClient::new(bin);
-    let outcome = run_recipe(&recipe, &client, &fast_opts());
+    let outcome = run(&recipe, &client, tmp.path());
 
     assert!(!outcome.failed);
     assert_eq!(outcome.states["a"], StepState::Complete);
@@ -135,7 +67,7 @@ fn passing_verify_completes_the_step() {
     .unwrap();
 
     let client = KanstackClient::new(bin);
-    let outcome = run_recipe(&recipe, &client, &fast_opts());
+    let outcome = run(&recipe, &client, tmp.path());
 
     assert!(!outcome.failed);
     assert_eq!(outcome.states["a"], StepState::Complete);
@@ -151,7 +83,7 @@ fn failing_verify_fails_the_step_and_blocks_its_dependents() {
     .unwrap();
 
     let client = KanstackClient::new(bin);
-    let outcome = run_recipe(&recipe, &client, &fast_opts());
+    let outcome = run(&recipe, &client, tmp.path());
 
     assert!(outcome.failed);
     assert_eq!(outcome.states["a"], StepState::Failed);
@@ -175,7 +107,7 @@ fn spawn_failure_fails_the_step_and_independent_sibling_still_runs() {
     .unwrap();
 
     let client = KanstackClient::new(bin);
-    let outcome = run_recipe(&recipe, &client, &fast_opts());
+    let outcome = run(&recipe, &client, tmp.path());
 
     assert!(outcome.failed);
     assert_eq!(outcome.states["a"], StepState::Failed);
@@ -183,17 +115,19 @@ fn spawn_failure_fails_the_step_and_independent_sibling_still_runs() {
     assert_eq!(outcome.states["b"], StepState::Complete);
 }
 
+/// With the same agent, an `on` step with no `spawn` continues in the existing pane (see
+/// `spawn_modes.rs` for a different agent, which hands off instead).
 #[test]
 fn on_places_dependent_step_on_the_same_branch_via_send() {
     let tmp = tempfile::tempdir().unwrap();
     let bin = write_fake_kanstack(tmp.path(), None, 0);
     let recipe = recipe::parse(
-        "---\nversion: 1\nsteps:\n  implement:\n    agent: codex\n    prompt: Implement\n  review:\n    agent: claude\n    needs: [implement]\n    on: implement\n    prompt: Review\n---\nctx\n",
+        "---\nversion: 1\nsteps:\n  implement:\n    agent: codex\n    prompt: Implement\n  review:\n    agent: codex\n    needs: [implement]\n    on: implement\n    prompt: Review\n---\nctx\n",
     )
     .unwrap();
 
     let client = KanstackClient::new(bin);
-    let outcome = run_recipe(&recipe, &client, &fast_opts());
+    let outcome = run(&recipe, &client, tmp.path());
 
     assert!(!outcome.failed);
     assert_eq!(outcome.states["implement"], StepState::Complete);
@@ -251,7 +185,7 @@ fn idle_is_not_trusted_on_the_first_status_read_after_launch() {
     .unwrap();
 
     let client = KanstackClient::new(bin);
-    let outcome = run_recipe(&recipe, &client, &fast_opts());
+    let outcome = run(&recipe, &client, tmp.path());
 
     assert!(!outcome.failed);
     assert_eq!(outcome.states["a"], StepState::Complete);
@@ -282,7 +216,7 @@ fn siblings_sharing_one_on_target_complete_one_at_a_time() {
     .unwrap();
 
     let client = KanstackClient::new(bin);
-    let outcome = run_recipe(&recipe, &client, &fast_opts());
+    let outcome = run(&recipe, &client, tmp.path());
 
     assert!(!outcome.failed);
     assert_eq!(outcome.states["implement"], StepState::Complete);
@@ -336,7 +270,7 @@ fn single_transient_status_failure_does_not_fail_the_run() {
     .unwrap();
 
     let client = KanstackClient::new(bin);
-    let outcome = run_recipe(&recipe, &client, &fast_opts());
+    let outcome = run(&recipe, &client, tmp.path());
 
     assert!(
         !outcome.failed,
@@ -360,7 +294,7 @@ fn persistent_status_failures_eventually_fail_running_steps() {
     .unwrap();
 
     let client = KanstackClient::new(bin);
-    let outcome = run_recipe(&recipe, &client, &fast_opts());
+    let outcome = run(&recipe, &client, tmp.path());
 
     assert!(outcome.failed);
     assert_eq!(outcome.states["a"], StepState::Failed);

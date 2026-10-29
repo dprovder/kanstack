@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::recipe::Recipe;
+use crate::recipe::{Recipe, SpawnMode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepState {
@@ -31,29 +31,34 @@ pub fn runnable_steps(recipe: &Recipe, states: &HashMap<String, StepState>) -> V
         .collect()
 }
 
-/// Follows a step's `on` chain to the step that actually owns the workstream (the one with no
-/// `on` of its own) — the branch name a step's work should land on.
+/// The branch a step's work lands on. A step with no `on` (or with `spawn: advisory`) owns a
+/// branch named after itself; a `stack` step owns `<target>-<step>`, where `<target>` is its
+/// `on` step's branch; any other `on` step works on its `on` step's branch, followed down the
+/// chain.
 ///
 /// [`crate::recipe::parse`] already rejects an `on` cycle at validation time, so a *parsed*
 /// recipe can never reach one here. But `Recipe`/`Step` are public, plain data — a caller using
 /// this crate as a library can build one by hand and skip `parse()` entirely — so this still
-/// guards against looping forever on a hand-built cyclic `on` chain: it stops and returns the
-/// first repeated step id once it revisits one, rather than hanging.
+/// guards against looping forever on a hand-built cyclic `on` chain: it stops at the first
+/// step id it revisits, rather than hanging.
 pub fn resolve_workstream(recipe: &Recipe, step_id: &str) -> String {
     let mut seen = HashSet::new();
+    // Stack steps passed on the way down, nearest first: each adds `-<step>` to the branch.
+    let mut stacked = Vec::new();
     let mut current = step_id.to_string();
-    seen.insert(current.clone());
-    loop {
-        match recipe.steps.get(&current).and_then(|s| s.on.clone()) {
-            Some(next) => {
-                if !seen.insert(next.clone()) {
-                    return current;
-                }
-                current = next;
+    while seen.insert(current.clone()) {
+        let Some(step) = recipe.steps.get(&current) else { break };
+        match (&step.on, step.spawn) {
+            (None, _) | (Some(_), Some(SpawnMode::Advisory)) => break,
+            (Some(next), Some(SpawnMode::Stack)) => {
+                stacked.push(current.clone());
+                current = next.clone();
             }
-            None => return current,
+            (Some(next), _) => current = next.clone(),
         }
     }
+    stacked.reverse();
+    std::iter::once(current).chain(stacked).collect::<Vec<_>>().join("-")
 }
 
 #[cfg(test)]
@@ -204,6 +209,8 @@ mod tests {
                 on: Some("b".to_string()),
                 owns: vec![],
                 verify: vec![],
+                spawn: None,
+                done_when: crate::recipe::DoneWhen::Commits,
             },
         );
         steps.insert(
@@ -218,6 +225,8 @@ mod tests {
                 on: Some("a".to_string()),
                 owns: vec![],
                 verify: vec![],
+                spawn: None,
+                done_when: crate::recipe::DoneWhen::Commits,
             },
         );
         let recipe = Recipe {
@@ -239,5 +248,17 @@ mod tests {
         assert_eq!(resolve_workstream(&recipe, "implement"), "implement");
         assert_eq!(resolve_workstream(&recipe, "review"), "implement");
         assert_eq!(resolve_workstream(&recipe, "docs"), "implement");
+    }
+
+    #[test]
+    fn resolve_workstream_names_stacked_and_advisory_branches() {
+        let recipe = parse(
+            "---\nversion: 1\nsteps:\n  implement:\n    agent: codex\n    prompt: I\n  review:\n    agent: claude\n    needs: [implement]\n    on: implement\n    spawn: stack\n    prompt: R\n  fix:\n    agent: claude\n    needs: [review]\n    on: review\n    prompt: F\n  deeper:\n    agent: claude\n    needs: [review]\n    on: review\n    spawn: stack\n    prompt: D\n  survey:\n    agent: claude\n    spawn: advisory\n    prompt: S\n---\n",
+        )
+        .unwrap();
+        assert_eq!(resolve_workstream(&recipe, "review"), "implement-review");
+        assert_eq!(resolve_workstream(&recipe, "fix"), "implement-review", "an `on` a stack step works on its branch");
+        assert_eq!(resolve_workstream(&recipe, "deeper"), "implement-review-deeper");
+        assert_eq!(resolve_workstream(&recipe, "survey"), "survey");
     }
 }

@@ -1,6 +1,18 @@
 //! Drives a [`Recipe`] to completion by shelling out to `kanstack` through [`KanstackClient`]
-//! and polling `status --json` until each step's workstream goes idle (see this crate's README,
-//! "Completion model" and "Why polling, not `events`").
+//! and polling `status --json` until each step's workstream goes idle and its `done_when` is
+//! met (see this crate's README, "Spawn modes" and "Completion model").
+//!
+//! **How a step reaches its branch** is decided at launch ([`Driver::plan_launch`]): a step
+//! with no `on` (or an advisory one) spawns its own branch, `stack` spawns `<target>-<step>`
+//! `--above` its target, `continue` sends into the target branch's pane, and `handoff` stops
+//! that pane's agent and spawns the step's own on the same branch. An `on` step with no
+//! `spawn` continues when its agent is the branch's current one ([`RunState::branch_agents`])
+//! and hands off when it isn't.
+//!
+//! **Idle is necessary, not sufficient.** A trusted idle only ends a step once its `done_when`
+//! holds: its branch tip moved since its `base` (`commits`), or a `kanstack note` about its
+//! branch arrived in the events log after it launched (`note`), or either. Until then the step
+//! keeps polling with `waiting_on` set, so `runs` shows why it isn't done.
 //!
 //! Failure policy: a step that fails to spawn/send, or whose `verify` commands don't all exit
 //! 0, is marked `failed` and none of its dependents ever become runnable (their `needs` can
@@ -45,8 +57,8 @@ use std::thread;
 use std::time::Duration;
 
 use crate::graph::{resolve_workstream, runnable_steps, StepState};
-use crate::kanstack::KanstackClient;
-use crate::recipe::Recipe;
+use crate::kanstack::{KanstackClient, KanstackError};
+use crate::recipe::{Recipe, SpawnMode, Step};
 use crate::state::{now_secs, RunState, RunStatus, RunStore, StepRecord, StepStatus};
 
 /// How many consecutive `status --json` failures in a row are tolerated as transient before
@@ -72,10 +84,10 @@ pub struct RunOutcome {
     pub failed: bool,
 }
 
-/// Runs `recipe` from scratch, keeping its state in memory only.
-pub fn run_recipe(recipe: &Recipe, client: &KanstackClient, opts: &RunOptions) -> RunOutcome {
-    let workdir = std::env::current_dir().unwrap_or_default();
-    let mut run = RunState::new("in-memory", recipe, Path::new(""), String::new(), workdir);
+/// Runs `recipe` from scratch, keeping its state in memory only. `workdir` is where `verify`
+/// commands run and git is asked for branch tips.
+pub fn run_recipe(recipe: &Recipe, client: &KanstackClient, opts: &RunOptions, workdir: &Path) -> RunOutcome {
+    let mut run = RunState::new("in-memory", recipe, Path::new(""), String::new(), workdir.to_path_buf());
     Driver::new(recipe, client, opts, None).drive(&mut run)
 }
 
@@ -94,6 +106,17 @@ pub fn resume_run(recipe: &Recipe, client: &KanstackClient, opts: &RunOptions, s
     let mut driver = Driver::new(recipe, client, opts, Some(store));
     driver.reconcile(run);
     driver.drive(run)
+}
+
+/// How a step reaches its branch this attempt.
+enum Launch {
+    /// `kanstack spawn` a new lane: the step's own branch, or a `stack` branch `--above` its
+    /// target's.
+    Spawn { above: Option<String> },
+    /// `kanstack send` into the branch's existing pane.
+    Continue,
+    /// `kanstack stop` the branch's lane, then `kanstack spawn` this step's agent on it.
+    Handoff,
 }
 
 struct Driver<'a> {
@@ -218,11 +241,37 @@ impl<'a> Driver<'a> {
             .collect()
     }
 
+    /// How `step_id` reaches `branch`, from its `spawn` mode, or for an `on` step with none,
+    /// from whether its agent is the branch's current one. `Err` when `continue` would hand the
+    /// prompt to another agent: parse rejects the cases `needs` orders, and this catches a
+    /// sibling on the same branch that ran in between.
+    fn plan_launch(&self, run: &RunState, step_id: &str, branch: &str) -> Result<Launch, String> {
+        let step = &self.recipe.steps[step_id];
+        let on = match (&step.on, step.spawn) {
+            (None, _) | (Some(_), Some(SpawnMode::Advisory)) => return Ok(Launch::Spawn { above: None }),
+            (Some(on), _) => on,
+        };
+        // A run saved before branch agents were recorded only knows the target step's agent.
+        let current = run.branch_agents.get(branch).unwrap_or(&self.recipe.steps[on].agent);
+        match step.spawn {
+            Some(SpawnMode::Stack) => Ok(Launch::Spawn {
+                above: Some(resolve_workstream(self.recipe, on)),
+            }),
+            Some(SpawnMode::Handoff) => Ok(Launch::Handoff),
+            Some(SpawnMode::Continue) if *current != step.agent => Err(format!(
+                "`spawn: continue` would send {}'s prompt to {current}, the agent on \"{branch}\"; use `spawn: handoff`",
+                step.agent
+            )),
+            None if *current != step.agent => Ok(Launch::Handoff),
+            _ => Ok(Launch::Continue),
+        }
+    }
+
     /// Spawns or sends `step_id` onto `branch`. `true` if it's now running there.
     fn launch(&mut self, run: &mut RunState, step_id: &str, branch: &str) -> bool {
         let step = &self.recipe.steps[step_id];
-        let effective_prompt = self.recipe.effective_prompt(step_id);
-        let placed_on_existing = step.on.is_some();
+        let plan = self.plan_launch(run, step_id, branch);
+        let prompt = self.recipe.launch_prompt(step_id, branch);
 
         println!(
             "→ {:<15} running   {} / {} / {}{}",
@@ -230,16 +279,23 @@ impl<'a> Driver<'a> {
             step.agent,
             step.model.as_deref().unwrap_or("default"),
             step.effort.map(|e| e.as_str()).unwrap_or("default"),
-            if placed_on_existing {
-                format!(" (on {branch})")
-            } else {
-                String::new()
+            match &plan {
+                Ok(Launch::Spawn { above: Some(target) }) => format!(" (stack {branch} above {target})"),
+                Ok(Launch::Spawn { above: None }) if step.spawn == Some(SpawnMode::Advisory) => " (advisory)".to_string(),
+                Ok(Launch::Continue) => format!(" (continue on {branch})"),
+                Ok(Launch::Handoff) => format!(" (handoff on {branch})"),
+                _ => String::new(),
             }
         );
+
+        // Read before the launch, so the agent's note can't land ahead of where this attempt's
+        // notes are read from.
+        let notes_from = step.done_when.allows_note().then(|| self.client.events_end());
 
         // Record before acting: a launch that couldn't be recorded never happens, and one that
         // was recorded has used up its attempt even if this process dies mid-spawn.
         let base = branch_tip(&run.workdir, branch);
+        let previous_agent = run.branch_agents.insert(branch.to_string(), step.agent.clone());
         let rec = record(run, step_id);
         rec.status = StepStatus::Launching;
         rec.attempt += 1;
@@ -249,14 +305,17 @@ impl<'a> Driver<'a> {
         rec.tip = None;
         rec.started_at = Some(now_secs());
         rec.last_error = None;
+        rec.notes_from = notes_from.as_ref().and_then(|r| r.as_ref().ok().copied());
+        rec.report = None;
+        rec.waiting_on = None;
         if !self.persist(run) {
             return false;
         }
 
-        let launch_result = if placed_on_existing {
-            self.client.send(branch, &effective_prompt).map(|r| r.pane)
-        } else {
-            self.client.spawn(branch, step, &effective_prompt).map(|r| r.pane)
+        let launch_result = match (plan, notes_from) {
+            (Err(e), _) => Err(e),
+            (_, Some(Err(e))) => Err(format!("could not read kanstack's events log: {e}")),
+            (Ok(plan), _) => self.act(plan, branch, step, &prompt).map_err(|e| e.to_string()),
         };
 
         match launch_result {
@@ -276,9 +335,25 @@ impl<'a> Driver<'a> {
                 true
             }
             Err(e) => {
+                match previous_agent {
+                    Some(agent) => run.branch_agents.insert(branch.to_string(), agent),
+                    None => run.branch_agents.remove(branch),
+                };
                 eprintln!("✗ {step_id:<15} failed    {e}");
-                self.fail(run, step_id, e.to_string());
+                self.fail(run, step_id, e);
                 false
+            }
+        }
+    }
+
+    /// Carries out `plan`, returning the pane the step now runs in.
+    fn act(&self, plan: Launch, branch: &str, step: &Step, prompt: &str) -> Result<Option<String>, KanstackError> {
+        match plan {
+            Launch::Continue => self.client.send(branch, prompt).map(|r| r.pane),
+            Launch::Spawn { above } => self.client.spawn(branch, step, prompt, above.as_deref()).map(|r| r.pane),
+            Launch::Handoff => {
+                self.client.stop(branch)?;
+                self.client.spawn(branch, step, prompt, None).map(|r| r.pane)
             }
         }
     }
@@ -299,7 +374,7 @@ impl<'a> Driver<'a> {
                     *reads += 1;
                     let reads = *reads;
                     match status_by_branch.get(branch.as_str()).copied() {
-                        Some("idle") if reads >= 2 => self.finish_step(run, step_id),
+                        Some("idle") if reads >= 2 => self.on_trusted_idle(run, step_id),
                         Some("idle") => {
                             // First read since launch — too early to trust: the harness may
                             // not have started the turn we just sent it yet. Keep polling.
@@ -347,10 +422,12 @@ impl<'a> Driver<'a> {
     /// agent's input, and a missing one is the lesser evil.
     ///
     /// The read taken here counts as the first since reattaching, so an `idle` on it is only
-    /// acted on at once for a step that was already `verifying` (its lane was trusted idle
-    /// before the crash). A `launching` or `running` step may have been sent its prompt a
-    /// moment before the crash, which a first `idle` can't tell apart from a finished turn —
-    /// the runner's usual rule — so it runs `verify` on the next idle read instead.
+    /// acted on at once for a step that was already `verifying` (its lane was trusted idle and
+    /// its `done_when` met before the crash). A `launching` or `running` step may have been
+    /// sent its prompt a moment before the crash, which a first `idle` can't tell apart from a
+    /// finished turn — the runner's usual rule — so it's judged on the next idle read instead,
+    /// by its `done_when` like any other: a send that never landed leaves no commits and no
+    /// note, so the step waits rather than passing.
     fn reconcile(&mut self, run: &mut RunState) {
         let in_flight = self.in_flight(run);
         if in_flight.is_empty() {
@@ -415,8 +492,46 @@ impl<'a> Driver<'a> {
         }
     }
 
-    /// A step's workstream has gone idle: run its `verify` commands (if any) and mark it
-    /// `done` or `failed`. No `verify` at all means idle alone is sufficient.
+    /// A step's lane is trusted idle. If its `done_when` is met, store the agent's report (if
+    /// any) and finish it; if not, record what it's waiting on and keep polling. A failed read
+    /// of the events log counts as no note yet, and is retried on the next idle read.
+    fn on_trusted_idle(&mut self, run: &mut RunState, step_id: &str) {
+        let done_when = self.recipe.steps[step_id].done_when;
+        let rec = &run.steps[step_id];
+        let branch = rec.branch.clone().unwrap_or_default();
+
+        // A base of `null` means the branch didn't exist when the step started (or git
+        // couldn't say), so any tip at all is movement.
+        let committed = done_when.allows_commits()
+            && branch_tip(&run.workdir, &branch).is_some_and(|tip| rec.base.as_deref() != Some(tip.as_str()));
+        let report = if done_when.allows_note() {
+            match self.client.notes_since(rec.notes_from.unwrap_or(0)) {
+                Ok(notes) => notes.into_iter().rfind(|n| n.branch == branch).map(|n| n.text),
+                Err(e) => {
+                    eprintln!("! {step_id:<15} could not read kanstack's events log, retrying: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        if committed || report.is_some() {
+            let rec = record(run, step_id);
+            rec.waiting_on = None;
+            if report.is_some() {
+                rec.report = report;
+            }
+            self.finish_step(run, step_id);
+        } else if run.steps[step_id].waiting_on != Some(done_when) {
+            println!("… {step_id:<15} idle, waiting on {}", done_when.waiting_label());
+            record(run, step_id).waiting_on = Some(done_when);
+            self.persist(run);
+        }
+    }
+
+    /// A step's lane is trusted idle and its `done_when` is met: run its `verify` commands (if
+    /// any) and mark it `done` or `failed`. No `verify` at all means it's done now.
     fn finish_step(&mut self, run: &mut RunState, step_id: &str) {
         self.status_reads_since_launch.remove(step_id);
         let step = &self.recipe.steps[step_id];
@@ -479,6 +594,7 @@ impl<'a> Driver<'a> {
         rec.status = status;
         rec.tip = tip;
         rec.last_error = error;
+        rec.waiting_on = None;
         self.persist(run);
     }
 }
